@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::accept_async;
 use tungstenite::protocol::Message as WsMessage;
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::broker::{Broker, message::Message};
 use crate::client::Client;
