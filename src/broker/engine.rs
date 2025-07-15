@@ -48,9 +48,14 @@ impl Broker {
     /// Publishes a message to all subscribers of a topic
     pub fn publish(&self, msg: Message) {
         if let Some(topic) = self.topics.get(&msg.topic) {
-            let text = serde_json::to_string(&msg).unwrap_or_default();
+            let text = match serde_json::to_string(&msg) {
+                Ok(json) => json,
+                Err(e) => {
+                    eprintln!("Failed to serialize message: {:?}", e);
+                    return;
+                }
+            };
             let ws_msg = WsMessage::text(text);
-
             for sub_id in &topic.subscribers {
                 if let Some(client) = self.clients.get(sub_id) {
                     if let Err(e) = client.sender.send(ws_msg.clone()) {
