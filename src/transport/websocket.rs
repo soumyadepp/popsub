@@ -11,6 +11,13 @@ use crate::broker::{Broker, message::Message};
 use crate::client::Client;
 use crate::transport::message::ClientMessage;
 
+/// Starts the WebSocket server
+/// Listens for incoming WebSocket connections
+/// Accepts connections and spawns a task for each client
+/// Handles client messages, including subscriptions, unsubscriptions, and publishing messages
+/// Manages the broker state and ensures messages are sent to the appropriate clients
+/// This function is the entry point for the WebSocket server, allowing clients to connect and interact
+/// with the broker system through WebSocket messages.
 pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
     let listener = TcpListener::bind(addr).await.expect("Can't bind");
 
@@ -31,10 +38,9 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
 
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-            // Create channel for this client
             let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
-            // Register client before doing anything else
+            // Register the client
             {
                 let mut broker = broker.lock().unwrap();
                 broker.register_client(Client {
@@ -43,8 +49,20 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 });
             }
 
-            // Spawn a task to forward messages from broker → client
+            // Cleanup task for receive loop
+            let cleanup_client = {
+                let broker = broker.clone();
+                let client_id = client_id.clone();
+                async move {
+                    let mut broker = broker.lock().unwrap();
+                    broker.cleanup_client(&client_id);
+                }
+            };
+
+            // Send loop (broker → client) with cleanup on failure
+            let broker_clone = broker.clone();
             let client_id_clone = client_id.clone();
+
             spawn(async move {
                 while let Some(msg) = rx.recv().await {
                     if let Err(e) = ws_sender.send(msg).await {
@@ -52,10 +70,13 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                         break;
                     }
                 }
+
+                let mut broker = broker_clone.lock().unwrap();
+                broker.cleanup_client(&client_id_clone);
                 println!("Send loop closed for {}", client_id_clone);
             });
 
-            // Handle incoming messages from client
+            // Handle messages from client
             while let Some(Ok(msg)) = ws_receiver.next().await {
                 if msg.is_text() {
                     let text = msg.to_text().unwrap();
@@ -88,19 +109,19 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                         }
 
                         Err(err) => {
-                            eprintln!("Invalid client message: {} | {}", err, text);
+                            eprintln!(
+                                "Invalid client message from {}: {} | {}",
+                                client_id,
+                                err,
+                                &text.chars().take(100).collect::<String>()
+                            );
                         }
                     }
                 }
             }
 
-            println!("{} disconnected", client_id);
-
-            // Optional: clean up disconnected client
-            {
-                let mut broker = broker.lock().unwrap();
-                broker.remove_client(&client_id);
-            }
+            // Cleanup after receive loop exits
+            cleanup_client.await;
         });
     }
 }

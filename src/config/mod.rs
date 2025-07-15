@@ -7,6 +7,9 @@ use settings::Settings;
 
 pub use settings::{BrokerSettings, ServerSettings};
 
+/// Loads the configuration from the default file and environment variables
+/// Merges the configuration with default values
+/// Returns a `Settings` struct containing the server and broker configurations
 pub fn load_config() -> Result<Settings, ConfigError> {
     let builder = Config::builder()
         .add_source(File::with_name("config/default").required(false))
