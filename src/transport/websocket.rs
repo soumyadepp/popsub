@@ -6,18 +6,12 @@ use tokio_tungstenite::accept_async;
 use tungstenite::protocol::Message as WsMessage;
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::broker::{Broker, message::Message};
 use crate::client::Client;
 use crate::transport::message::ClientMessage;
 
-/// Starts the WebSocket server
-/// Listens for incoming WebSocket connections
-/// Accepts connections and spawns a task for each client
-/// Handles client messages, including subscriptions, unsubscriptions, and publishing messages
-/// Manages the broker state and ensures messages are sent to the appropriate clients
-/// This function is the entry point for the WebSocket server, allowing clients to connect and interact
-/// with the broker system through WebSocket messages.
 pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
     let listener = TcpListener::bind(addr).await.expect("Can't bind");
 
@@ -37,7 +31,6 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
             };
 
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
             let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
             // Register the client
@@ -49,37 +42,46 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 });
             }
 
-            // Cleanup task for receive loop
-            let cleanup_client = {
+            // Shared flag to ensure cleanup is only called once
+            let cleanup_called = Arc::new(AtomicBool::new(false));
+
+            // Define cleanup logic
+            let do_cleanup = {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
-                async move {
-                    let mut broker = broker.lock().unwrap();
-                    broker.cleanup_client(&client_id);
+                let cleanup_called = cleanup_called.clone();
+
+                move || {
+                    if !cleanup_called.swap(true, Ordering::SeqCst) {
+                        let mut broker = broker.lock().unwrap();
+                        broker.cleanup_client(&client_id);
+                    }
                 }
             };
 
-            // Send loop (broker → client) with cleanup on failure
-            let broker_clone = broker.clone();
-            let client_id_clone = client_id.clone();
+            // Send loop: broker → client
+            {
+                let client_id = client_id.clone();
+                let do_cleanup = do_cleanup.clone();
 
-            spawn(async move {
-                while let Some(msg) = rx.recv().await {
-                    if let Err(e) = ws_sender.send(msg).await {
-                        eprintln!("Failed to send message to {}: {}", client_id_clone, e);
-                        break;
+                spawn(async move {
+                    while let Some(msg) = rx.recv().await {
+                        if let Err(e) = ws_sender.send(msg).await {
+                            eprintln!("Failed to send message to {}: {}", client_id, e);
+                            break;
+                        }
                     }
-                }
 
-                let mut broker = broker_clone.lock().unwrap();
-                broker.cleanup_client(&client_id_clone);
-                println!("Send loop closed for {}", client_id_clone);
-            });
+                    do_cleanup();
+                    println!("Send loop closed for {}", client_id);
+                });
+            }
 
-            // Handle messages from client
+            // Receive loop: client → broker
             while let Some(Ok(msg)) = ws_receiver.next().await {
                 if msg.is_text() {
                     let text = msg.to_text().unwrap();
+
                     match serde_json::from_str::<ClientMessage>(text) {
                         Ok(ClientMessage::Subscribe { topic }) => {
                             let mut broker = broker.lock().unwrap();
@@ -99,13 +101,12 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                             timestamp,
                         }) => {
                             let broker = broker.lock().unwrap();
-                            let printable_topic = topic.clone();
                             broker.publish(Message {
-                                topic,
+                                topic: topic.clone(),
                                 payload,
                                 timestamp,
                             });
-                            println!("{} published to {}", client_id, printable_topic);
+                            println!("{} published to {}", client_id, topic);
                         }
 
                         Err(err) => {
@@ -120,8 +121,8 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 }
             }
 
-            // Cleanup after receive loop exits
-            cleanup_client.await;
+            // Run cleanup when receive loop exits
+            do_cleanup();
         });
     }
 }
