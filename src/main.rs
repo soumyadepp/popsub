@@ -4,6 +4,7 @@
 mod broker;
 mod client;
 mod config;
+mod persistence;
 mod transport;
 
 use broker::Broker;

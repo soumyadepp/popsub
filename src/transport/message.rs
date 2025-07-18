@@ -17,6 +17,6 @@ pub enum ClientMessage {
     Publish {
         topic: String,
         payload: String,
-        timestamp: u64,
+        timestamp: i64,
     },
 }

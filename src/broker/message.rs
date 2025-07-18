@@ -14,5 +14,5 @@ use serde::{Deserialize, Serialize};
 pub struct Message {
     pub topic: String,
     pub payload: String,
-    pub timestamp: u64,
+    pub timestamp: i64,
 }

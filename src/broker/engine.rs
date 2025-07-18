@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use crate::broker::message::Message;
 use crate::broker::topic::{SubscriberId, Topic};
 use crate::client::Client;
+use crate::persistence;
+use crate::persistence::sled_store::Persistence;
 use tungstenite::protocol::Message as WsMessage;
 
 /// Represents the broker that manages topics and clients
@@ -15,6 +17,7 @@ use tungstenite::protocol::Message as WsMessage;
 pub struct Broker {
     topics: HashMap<String, Topic>,
     clients: HashMap<SubscriberId, Client>,
+    persistence: Persistence,
 }
 
 impl Broker {
@@ -24,6 +27,7 @@ impl Broker {
         Self {
             topics: HashMap::new(),
             clients: HashMap::new(),
+            persistence: Persistence::default(),
         }
     }
 
@@ -48,11 +52,31 @@ impl Broker {
 
     /// Subscribes a client to a topic. Automatically creates the topic if it doesn't exist.
     pub fn subscribe(&mut self, topic: &str, subscriber: SubscriberId) {
+        // Clone before moving
+        let subscriber_clone = subscriber.clone();
+
         let topic = self
             .topics
             .entry(topic.to_string())
             .or_insert_with(|| Topic::new(topic));
-        topic.subscribe(subscriber);
+
+        topic.subscribe(subscriber); // move happens here
+
+        if let Some(client) = self.clients.get(&subscriber_clone) {
+            let stored_messages = self.persistence.load_messages(&topic.name.as_str());
+
+            for stored in stored_messages {
+                let replay_msg = Message {
+                    topic: stored.topic.clone(),
+                    payload: stored.payload.clone(),
+                    timestamp: stored.timestamp,
+                };
+
+                if let Ok(json) = serde_json::to_string(&replay_msg) {
+                    let _ = client.sender.send(WsMessage::text(json));
+                }
+            }
+        }
     }
 
     /// Unsubscribes a client from a topic
@@ -70,6 +94,7 @@ impl Broker {
     /// This is essential for the pub/sub functionality, allowing messages to be sent to all subscribers
     /// of a topic in a structured format
     pub fn publish(&self, msg: Message) {
+        self.persistence.store_message(&msg.topic, &msg.payload);
         if let Some(topic) = self.topics.get(&msg.topic) {
             let text = match serde_json::to_string(&msg) {
                 Ok(json) => json,
