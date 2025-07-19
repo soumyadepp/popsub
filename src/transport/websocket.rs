@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::broker::{Broker, message::Message};
-use crate::client::{Client};
+use crate::client::Client;
 use crate::transport::message::ClientMessage;
 
 /// Starts the asynchronous WebSocket server and handles client communication.

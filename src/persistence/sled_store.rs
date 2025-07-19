@@ -266,7 +266,8 @@ mod tests {
         let topic = "max_limit_test";
 
         for i in 0..5 {
-            (topic, format!("msg{i}"));
+            let msg = format!("msg{i}");
+            persistence.store_message(topic, &msg);
             std::thread::sleep(std::time::Duration::from_millis(2)); // ensure timestamp uniqueness
         }
 
