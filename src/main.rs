@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 mod broker;
 mod client;
 mod config;
@@ -8,7 +5,6 @@ mod persistence;
 mod transport;
 
 use broker::Broker;
-use broker::message::Message;
 use std::sync::{Arc, Mutex};
 use transport::websocket::start_websocket_server;
 

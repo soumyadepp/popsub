@@ -3,16 +3,29 @@ use std::collections::HashMap;
 use crate::broker::message::Message;
 use crate::broker::topic::{SubscriberId, Topic};
 use crate::client::Client;
-use crate::persistence;
 use crate::persistence::sled_store::Persistence;
 use tungstenite::protocol::Message as WsMessage;
 
-/// Represents the broker that manages topics and clients
-/// It allows clients to subscribe to topics, publish messages, and manage client connections
-/// The broker maintains a mapping of topics to subscribers and provides methods for message handling
-/// It is responsible for ensuring that messages are delivered to all subscribers of a topic
-/// The `Broker` struct is the core of the pub/sub system, enabling communication between clients
-/// and managing the state of topics and subscribers.
+/// The central broker for managing topics, clients, and message persistence
+/// in the Pub/Sub system.
+///
+/// Responsible for:
+/// - Tracking topic-to-subscriber mappings.
+/// - Managing connected clients and their channels.
+/// - Storing and replaying messages using the `Persistence` layer.
+///
+/// # Fields
+///
+/// - `topics` - A map of topic names to `Topic` instances, tracking subscriber lists.
+/// - `clients` - A map of subscriber IDs to their corresponding `Client` state (likely includes WebSocket senders).
+/// - `persistence` - The message storage backend, supporting TTL and message replay.
+///
+/// # Example
+///
+/// ```rust
+/// let broker = Broker::default();
+/// broker.subscribe("news", subscriber_id, client);
+/// ```
 #[derive(Debug, Default)]
 pub struct Broker {
     topics: HashMap<String, Topic>,
@@ -21,8 +34,9 @@ pub struct Broker {
 }
 
 impl Broker {
-    /// Creates a new instance of the Broker
-    /// Initializes an empty set of topics and clients
+    /// Creates a new instance of the broker with empty topics and clients.
+    ///
+    /// Uses the default configuration for the persistence layer.
     pub fn new() -> Self {
         Self {
             topics: HashMap::new(),
@@ -31,26 +45,32 @@ impl Broker {
         }
     }
 
-    /// Registers a new client with the broker
-    /// Adds the client to the broker's list of clients
-    /// This method is used when a new client connects to the broker
-    /// It ensures that the broker keeps track of all active clients
-    /// This is essential for the pub/sub functionality, as it allows the broker to send messages
-    /// to the correct clients based on their subscriptions
+    /// Registers a client with the broker.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - The client instance containing a unique ID and a message sender channel.
     pub fn register_client(&mut self, client: Client) {
         self.clients.insert(client.id.clone(), client);
     }
 
-    /// Removes a client from the broker
-    /// This method is used to clean up clients that are no longer active
-    /// It ensures that the broker's state remains consistent and does not hold references to inactive clients
-    /// It is essential for maintaining the integrity of the pub/sub system, as it prevents memory leaks
-    /// and ensures that only active clients are retained in the broker's state.
+    /// Removes a client from the broker using their ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The ID of the client to remove.
     pub fn remove_client(&mut self, client_id: &SubscriberId) {
         self.clients.remove(client_id);
     }
 
-    /// Subscribes a client to a topic. Automatically creates the topic if it doesn't exist.
+    /// Subscribes a client to a given topic. If the topic doesn't exist, it's created.
+    ///
+    /// On subscription, any recent messages from the persistence layer are replayed to the client.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The name of the topic to subscribe to.
+    /// * `subscriber` - The subscriber's unique ID.
     pub fn subscribe(&mut self, topic: &str, subscriber: SubscriberId) {
         // Clone before moving
         let subscriber_clone = subscriber.clone();
@@ -79,22 +99,28 @@ impl Broker {
         }
     }
 
-    /// Unsubscribes a client from a topic
-    /// If the topic does not exist, it will not perform any action
+    /// Unsubscribes a client from a specific topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic name.
+    /// * `subscriber` - The ID of the subscriber to remove.
     pub fn unsubscribe(&mut self, topic: &str, subscriber: &SubscriberId) {
         if let Some(t) = self.topics.get_mut(topic) {
             t.unsubscribe(subscriber);
         }
     }
 
-    /// Publishes a message to all subscribers of a topic
-    /// If the topic does not exist, it will not send the message
-    /// This method serializes the message to JSON format before sending it
-    /// It handles errors in serialization and sending messages to clients
-    /// This is essential for the pub/sub functionality, allowing messages to be sent to all subscribers
-    /// of a topic in a structured format
+    /// Publishes a message to a topic and broadcasts it to all active subscribers.
+    ///
+    /// Also stores the message via the persistence layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - The message to broadcast.
     pub fn publish(&self, msg: Message) {
         self.persistence.store_message(&msg.topic, &msg.payload);
+
         if let Some(topic) = self.topics.get(&msg.topic) {
             let text = match serde_json::to_string(&msg) {
                 Ok(json) => json,
@@ -104,6 +130,7 @@ impl Broker {
                 }
             };
             let ws_msg = WsMessage::text(text);
+
             for sub_id in &topic.subscribers {
                 if let Some(client) = self.clients.get(sub_id) {
                     if let Err(e) = client.sender.send(ws_msg.clone()) {
@@ -118,9 +145,11 @@ impl Broker {
         }
     }
 
-    /// Cleans up a client by removing it and unsubscribing it from all topics
-    /// This is useful for when a client disconnects or is no longer active
-    /// It ensures that the broker's state remains consistent and does not hold references to inactive clients
+    /// Cleans up a client by removing them and unsubscribing them from all topics.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The ID of the client to remove and unsubscribe.
     pub fn cleanup_client(&mut self, client_id: &SubscriberId) {
         self.remove_client(client_id);
 

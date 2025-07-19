@@ -1,24 +1,32 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
+/// Unique identifier for a subscriber (e.g., a WebSocket client ID).
 pub type SubscriberId = String;
 
-/// Represents a topic in the broker system
-/// Contains a name and a set of subscribers
-/// The topic is identified by its name and can have multiple subscribers
-/// Subscribers can subscribe to or unsubscribe from the topic
-/// This struct is used to manage the subscribers of a topic
-/// It allows for adding and removing subscribers, enabling the pub/sub functionality
-/// The `Topic` struct is essential for the broker's operation, as it maintains the state
-/// of each topic and its subscribers.
+/// Represents a Pub/Sub topic, which maintains a list of subscribers.
+///
+/// Each `Topic` has a name and tracks all subscribed clients by their `SubscriberId`.
 #[derive(Debug, Default)]
 pub struct Topic {
+    /// Name of the topic.
     pub name: String,
+
+    /// Set of subscriber IDs subscribed to this topic.
     pub subscribers: HashSet<SubscriberId>,
 }
 
 impl Topic {
-    /// Creates a new instance of the Topic with the given name
-    /// Initializes an empty set of subscribers
+    /// Creates a new `Topic` with the given name and no subscribers.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the topic to initialize.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let topic = Topic::new("news");
+    /// ```
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -26,16 +34,26 @@ impl Topic {
         }
     }
 
-    /// Subscribes a new subscriber to the topic
-    /// Adds the subscriber's ID to the set of subscribers
-    /// If the subscriber is already subscribed, it has no effect
+    /// Subscribes a client (by ID) to the topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The subscriber's unique ID.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// topic.subscribe("client123".to_string());
+    /// ```
     pub fn subscribe(&mut self, id: SubscriberId) {
         self.subscribers.insert(id);
     }
 
-    /// Unsubscribes a subscriber from the topic
-    /// Removes the subscriber's ID from the set of subscribers
-    /// If the subscriber is not subscribed, it has no effect
+    /// Unsubscribes a client from the topic.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The subscriber ID to remove.
     pub fn unsubscribe(&mut self, id: &SubscriberId) {
         self.subscribers.remove(id);
     }

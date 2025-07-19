@@ -2,28 +2,35 @@
 
 **PopSub** is a minimalist, in-memory publish/subscribe server built with Rust, `tokio`, and `tokio-tungstenite`. It supports:
 
-- WebSocket client connections
+- WebSocket-based client communication
 - Topic-based `subscribe`, `unsubscribe`, and `publish`
-- Real-time message broadcasting to all subscribers
-- Client management with per-client message channels
+- Real-time message broadcasting
+- Per-client message channels
+- Replay of past messages to reconnecting clients
 
 ---
 
 ## 🚀 Features
 
-- Async runtime with Tokio
-- Safe sharing of state across threads using `Arc<Mutex<…>>`
-- JSON-based messaging using `serde`
-- Prevents duplicate subscriptions
-- Supports clean client registration & removal
+- Asynchronous runtime powered by **Tokio**
+- **Safe concurrency** with `Arc<Mutex<...>>` and `DashMap`
+- **JSON-based protocol** with `serde`
+- Prevents **duplicate subscriptions**
+- **Graceful client disconnection handling**
+- **Message history** replay support on reconnect
+- Extensible and minimal design
 
 ---
 
 ## 🛠️ Prerequisites
 
-- Rust (1.70+ recommended) with `cargo`
-- `rustfmt` (optional, for formatting)
-- `tokio`, `tokio-tungstenite`, `serde`, etc. (configured in `Cargo.toml`)
+- Rust (`1.70+` recommended)
+- [`rustfmt`](https://rust-lang.github.io/rustfmt/) (optional for code formatting)
+- Dependencies like:
+  - `tokio`
+  - `tokio-tungstenite`
+  - `serde`, `serde_json`
+  - `futures`, `dashmap`, etc. (defined in `Cargo.toml`)
 
 ---
 
@@ -97,6 +104,36 @@ Broadcasted messages look like:
   "timestamp": 1689475200
 }
 ```
+
+## 🔁 Reconnect and Replay
+
+PopSub supports automatic **message replay** for clients that disconnect and reconnect.
+
+- When a client reconnects and **resubscribes to a topic**, the server **replays the last N messages** (e.g., last 10) published to that topic.
+- This ensures clients don’t miss messages due to short-term network issues or refreshes.
+
+### 🔄 How it works
+
+- The server stores a **fixed-size buffer** of recent messages per topic (e.g., using a ring buffer).
+- On resubscription, the server looks up the topic’s stored messages and sends them immediately after subscribing.
+
+### 📦 Example Replay
+
+Let’s say:
+
+1. Client A subscribes to `chat`
+2. Three messages are published to `chat`
+3. Client A disconnects
+4. Client A reconnects and resubscribes to `chat`
+
+Client A will automatically receive the last 3 messages upon resubscription 🎉
+
+> This feature is especially useful for clients in unstable networks or switching tabs/devices.
+
+### ⚙️ Configuration
+
+- You can customize the **replay buffer size** per topic (e.g., 10 messages) in the codebase.
+- Optionally, extend this to support **persistent replay** via disk or database.
 
 ## Testing with WebSocket King
 

@@ -12,6 +12,38 @@ use crate::broker::{Broker, message::Message};
 use crate::client::Client;
 use crate::transport::message::ClientMessage;
 
+/// Starts the asynchronous WebSocket server and handles client communication.
+///
+/// Binds to the given address and spawns a new task for each incoming client connection.
+/// Each client is identified with a UUID, registered with the broker, and can:
+/// - Subscribe to topics
+/// - Unsubscribe from topics
+/// - Publish messages to topics
+///
+/// Incoming client messages must conform to the `ClientMessage` enum.
+/// Outgoing messages are sent using a Tokio unbounded channel (`mpsc::UnboundedSender`).
+///
+/// This function also ensures proper cleanup of client subscriptions on disconnects.
+///
+/// # Arguments
+///
+/// * `addr` - The address (e.g., `"127.0.0.1:8080"`) to bind the WebSocket server to.
+/// * `broker` - A shared, thread-safe instance of the message broker, used to manage topics, clients, and persistence.
+///
+/// # Panics
+///
+/// Panics if the TCP listener cannot bind to the provided address.
+///
+/// # Example
+///
+/// ```rust
+/// let broker = Arc::new(Mutex::new(Broker::new()));
+/// start_websocket_server("127.0.0.1:8080", broker).await;
+/// ```
+///
+/// # Notes
+/// - This function runs indefinitely until externally terminated.
+/// - Each client is cleaned up exactly once (guaranteed by an `AtomicBool`).
 pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
     let listener = TcpListener::bind(addr).await.expect("Can't bind");
 
@@ -33,7 +65,6 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
             let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
-            // Register the client
             {
                 let mut broker = broker.lock().unwrap();
                 broker.register_client(Client {
@@ -42,10 +73,8 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 });
             }
 
-            // Shared flag to ensure cleanup is only called once
             let cleanup_called = Arc::new(AtomicBool::new(false));
 
-            // Define cleanup logic
             let do_cleanup = {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
@@ -59,7 +88,6 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 }
             };
 
-            // Send loop: broker → client
             {
                 let client_id = client_id.clone();
                 let do_cleanup = do_cleanup.clone();
@@ -77,7 +105,6 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 });
             }
 
-            // Receive loop: client → broker
             while let Some(Ok(msg)) = ws_receiver.next().await {
                 if msg.is_text() {
                     let text = msg.to_text().unwrap();
@@ -121,7 +148,6 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 }
             }
 
-            // Run cleanup when receive loop exits
             do_cleanup();
         });
     }

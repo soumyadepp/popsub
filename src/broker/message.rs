@@ -1,15 +1,28 @@
 use serde::{Deserialize, Serialize};
 
-/// Represents a message in the broker system
-/// Contains a topic, payload, and timestamp
-/// The topic is the channel to which the message belongs
-/// The payload is the content of the message
-/// The timestamp indicates when the message was created
-/// This struct is used for serialization and deserialization of messages
-/// to and from JSON format, allowing for easy communication between clients and the broker
-/// It is also used to publish messages to subscribers of a topic
-/// The `Message` struct is essential for the pub/sub functionality of the broker
-/// It allows clients to send and receive messages in a structured format
+/// Represents a published message in the Pub/Sub system.
+///
+/// A message consists of a topic identifier, the payload content,
+/// and a timestamp indicating when it was published.
+///
+/// This structure is used for serialization to and from JSON
+/// for communication over WebSocket and for persistence.
+///
+/// # Fields
+///
+/// - `topic` - The name of the topic this message belongs to.
+/// - `payload` - The actual message content, usually a JSON-encoded string.
+/// - `timestamp` - The Unix timestamp (in seconds) representing when the message was created.
+///
+/// # Example
+///
+/// ```rust
+/// let msg = Message {
+///     topic: "sensor_updates".to_string(),
+///     payload: "{\"temp\":25}".to_string(),
+///     timestamp: 1_725_000_000,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub topic: String,

@@ -1,60 +1,62 @@
 use serde::Deserialize;
 
-/// Represents the configuration settings for the application
-/// This struct contains settings for the server and broker,
+/// Top-level configuration settings for the application.
+///
+/// Includes settings for both the server and the message broker.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub server: ServerSettings,
     pub broker: BrokerSettings,
 }
 
-/// Represents the server settings for the application
-/// Contains the host and port on which the server will run.
+/// Configuration settings for the server.
+///
+/// Defines the host and port the server will bind to.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerSettings {
     pub host: String,
     pub port: u16,
 }
-/// Represents the broker settings for the application
-/// Contains settings related to the broker's operation, such as maximum connections and message TTL.
-/// These settings are used to configure the broker's behavior and resource limits.
+
+/// Configuration settings for the broker.
+///
+/// Controls operational parameters like maximum connections and message time-to-live.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BrokerSettings {
     pub max_connections: usize,
     pub message_ttl_secs: u64,
 }
 
-/// Represents partial settings that can be loaded from configuration files or environment variables
-/// This struct allows for flexible configuration where only certain fields may be specified.
-/// It is used to load settings that may not be fully defined, allowing defaults to be applied
-/// when necessary.
+/// Partial configuration settings loaded from files or environment.
+///
+/// Allows partial specification of settings. Missing values can be filled using defaults.
 #[derive(Debug, Deserialize)]
 pub struct PartialSettings {
     pub server: Option<PartialServerSettings>,
     pub broker: Option<PartialBrokerSettings>,
 }
 
-/// Represents partial server settings that can be loaded from configuration files or environment variables
-/// This struct allows for flexible configuration of the server's host and port.
+/// Partial server settings.
+///
+/// Used when loading server configuration from external sources with optional values.
 #[derive(Debug, Deserialize)]
 pub struct PartialServerSettings {
     pub host: Option<String>,
     pub port: Option<u16>,
 }
 
-/// Represents partial broker settings that can be loaded from configuration files or environment variables
-/// This struct allows for flexible configuration of the broker's maximum connections and message TTL.
-/// It is used to load settings that may not be fully defined, allowing defaults to be applied
-/// when necessary.
+/// Partial broker settings.
+///
+/// Used for broker configuration from external sources with optional values.
 #[derive(Debug, Deserialize)]
 pub struct PartialBrokerSettings {
     pub max_connections: Option<usize>,
     pub message_ttl_secs: Option<u64>,
 }
 
-/// Default implementation for `Settings`
-/// Provides default values for server and broker settings.
-/// This implementation ensures that if no configuration is provided, the application will still have sensible defaults.
+/// Provides default values for `Settings`.
+///
+/// Ensures the application has sensible defaults if no configuration is provided.
 impl Default for Settings {
     fn default() -> Self {
         Self {

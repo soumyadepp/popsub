@@ -7,9 +7,33 @@ use settings::Settings;
 
 pub use settings::{BrokerSettings, ServerSettings};
 
-/// Loads the configuration from the default file and environment variables
-/// Merges the configuration with default values
-/// Returns a `Settings` struct containing the server and broker configurations
+/// Loads application settings from file, environment, and defaults.
+///
+/// This function reads configuration values from:
+/// 1. An optional `config/default` file (TOML/YAML/JSON).
+/// 2. Environment variables with `_` separators (e.g., `SERVER_PORT`).
+///
+/// Missing fields are filled using default values defined in `Settings::default()`.
+///
+/// # Returns
+///
+/// A fully resolved [`Settings`] struct, or a [`ConfigError`] if deserialization fails.
+///
+/// # Environment Variable Examples
+///
+/// - `SERVER_HOST=0.0.0.0`
+/// - `BROKER_MAX_CONNECTIONS=2000`
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be parsed or deserialized.
+///
+/// # Example
+///
+/// ```rust
+/// let settings = load_config().expect("Failed to load config");
+/// println!("Running on {}:{}", settings.server.host, settings.server.port);
+/// ```
 pub fn load_config() -> Result<Settings, ConfigError> {
     let builder = Config::builder()
         .add_source(File::with_name("config/default").required(false))
