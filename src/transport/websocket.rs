@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::broker::{Broker, message::Message};
-use crate::client::Client;
+use crate::client::{Client};
 use crate::transport::message::ClientMessage;
 
 /// Starts the asynchronous WebSocket server and handles client communication.
@@ -47,7 +47,7 @@ use crate::transport::message::ClientMessage;
 pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
     let listener = TcpListener::bind(addr).await.expect("Can't bind");
 
-    println!("WebSocket server listening on ws://{}", addr);
+    println!("WebSocket server listening on ws://{addr}");
 
     while let Ok((stream, _)) = listener.accept().await {
         let broker = broker.clone();
@@ -57,7 +57,7 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
             let ws_stream = match accept_async(stream).await {
                 Ok(ws) => ws,
                 Err(e) => {
-                    eprintln!("WebSocket handshake error: {}", e);
+                    eprintln!("WebSocket handshake error: {e}");
                     return;
                 }
             };
@@ -95,13 +95,13 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                 spawn(async move {
                     while let Some(msg) = rx.recv().await {
                         if let Err(e) = ws_sender.send(msg).await {
-                            eprintln!("Failed to send message to {}: {}", client_id, e);
+                            eprintln!("Failed to send message to {client_id}: {e}");
                             break;
                         }
                     }
 
                     do_cleanup();
-                    println!("Send loop closed for {}", client_id);
+                    println!("Send loop closed for {client_id}");
                 });
             }
 
@@ -113,19 +113,16 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                         Ok(ClientMessage::Subscribe { topic }) => {
                             let mut broker = broker.lock().unwrap();
                             broker.subscribe(&topic, client_id.clone());
-                            println!("{} subscribed to {}", client_id, topic);
+                            println!("{client_id} subscribed to {topic}");
                         }
 
                         Ok(ClientMessage::Unsubscribe { topic }) => {
                             let mut broker = broker.lock().unwrap();
                             broker.unsubscribe(&topic, &client_id);
-                            println!("{} unsubscribed from {}", client_id, topic);
+                            println!("{client_id} unsubscribed from {topic}");
                         }
 
-                        Ok(ClientMessage::Publish {
-                            topic,
-                            payload,
-                        }) => {
+                        Ok(ClientMessage::Publish { topic, payload }) => {
                             let broker = broker.lock().unwrap();
                             let timestamp = chrono::Utc::now().timestamp_millis();
                             broker.publish(Message {
@@ -133,7 +130,7 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                                 payload,
                                 timestamp,
                             });
-                            println!("{} published to {}", client_id, topic);
+                            println!("{client_id} published to {topic}");
                         }
 
                         Err(err) => {

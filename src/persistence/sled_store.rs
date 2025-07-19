@@ -106,7 +106,7 @@ impl Persistence {
         let serialized = match serde_json::to_vec(&msg) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("Failed to serialize message: {:?}", e);
+                eprintln!("Failed to serialize message: {e}");
                 return;
             }
         };
@@ -114,7 +114,7 @@ impl Persistence {
         let topic_tree = match self.db.open_tree(topic) {
             Ok(tree) => tree,
             Err(e) => {
-                eprintln!("Failed to open topic tree '{}': {:?}", topic, e);
+                eprintln!("Failed to open topic tree '{topic}': {e}");
                 return;
             }
         };
@@ -123,7 +123,7 @@ impl Persistence {
         let key = format!("{:020}_{}", msg.timestamp, Uuid::new_v4());
 
         if let Err(e) = topic_tree.insert(key.as_bytes(), serialized) {
-            eprintln!("Failed to store message in topic '{}': {:?}", topic, e);
+            eprintln!("Failed to store message in topic '{topic}': {e}");
             return;
         }
 
@@ -141,7 +141,7 @@ impl Persistence {
 
                 for key in keys_to_delete {
                     if let Err(e) = topic_tree.remove(key) {
-                        eprintln!("Failed to remove old message from '{}': {:?}", topic, e);
+                        eprintln!("Failed to remove old message from '{topic}': {e}");
                     }
                 }
             }
@@ -180,7 +180,7 @@ impl Persistence {
     fn cleanup_old_messages(&self, topic: &str) {
         if let Some(ttl) = self.ttl_seconds {
             let now = Utc::now().timestamp_millis(); // match precision with store_message
-            let expiry_time = now - (ttl as i64 * 1000); // convert TTL to millis
+            let expiry_time = now - (ttl * 1000); // convert TTL to millis
 
             let topic_tree = self.db.open_tree(topic).unwrap();
             let old_keys: Vec<_> = topic_tree
@@ -266,7 +266,7 @@ mod tests {
         let topic = "max_limit_test";
 
         for i in 0..5 {
-            persistence.store_message(topic, &format!("msg{}", i));
+            (topic, format!("msg{i}"));
             std::thread::sleep(std::time::Duration::from_millis(2)); // ensure timestamp uniqueness
         }
 

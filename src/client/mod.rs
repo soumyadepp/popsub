@@ -1,3 +1,3 @@
-pub mod client;
+mod pubsub_client;
 
-pub use client::Client;
+pub use pubsub_client::Client;

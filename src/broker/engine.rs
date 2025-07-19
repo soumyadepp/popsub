@@ -83,7 +83,7 @@ impl Broker {
         topic.subscribe(subscriber); // move happens here
 
         if let Some(client) = self.clients.get(&subscriber_clone) {
-            let stored_messages = self.persistence.load_messages(&topic.name.as_str());
+            let stored_messages = self.persistence.load_messages(topic.name.as_str());
 
             for stored in stored_messages {
                 let replay_msg = Message {
@@ -127,7 +127,7 @@ impl Broker {
             let text = match serde_json::to_string(&msg) {
                 Ok(json) => json,
                 Err(e) => {
-                    eprintln!("Failed to serialize message: {:?}", e);
+                    eprintln!("Failed to serialize message: {e}");
                     return;
                 }
             };
@@ -136,10 +136,10 @@ impl Broker {
             for sub_id in &topic.subscribers {
                 if let Some(client) = self.clients.get(sub_id) {
                     if let Err(e) = client.sender.send(ws_msg.clone()) {
-                        eprintln!("Failed to send to {}: {}", sub_id, e);
+                        eprintln!("Failed to send to {sub_id}: {e}");
                     }
                 } else {
-                    eprintln!("No client registered with id: {}", sub_id);
+                    eprintln!("No client registered with id: {sub_id}");
                 }
             }
         } else {
@@ -157,9 +157,9 @@ impl Broker {
 
         for (topic, subscribers) in self.topics.iter_mut() {
             subscribers.unsubscribe(client_id);
-            println!("Unsubscribed {} from topic {}", client_id, topic);
+            println!("Unsubscribed {client_id} from topic {topic}");
         }
 
-        println!("Cleaned up client {}", client_id);
+        println!("Cleaned up client {client_id}");
     }
 }
