@@ -9,14 +9,14 @@ use serde::Deserialize;
 ///
 /// - `Subscribe` - Subscribe to a given topic.
 /// - `Unsubscribe` - Unsubscribe from a given topic.
-/// - `Publish` - Publish a message to a topic (with a payload and timestamp).
+/// - `Publish` - Publish a message to a topic (with a payload).
 ///
 /// # JSON Format
 ///
 /// ```json
 /// { "type": "subscribe", "topic": "updates" }
 /// { "type": "unsubscribe", "topic": "updates" }
-/// { "type": "publish", "topic": "updates", "payload": "data", "timestamp": 1725000000 }
+/// { "type": "publish", "topic": "updates", "payload": "data"}
 /// ```
 ///
 /// # Usage
@@ -46,7 +46,5 @@ pub enum ClientMessage {
         topic: String,
         /// The actual message payload (usually JSON-encoded string).
         payload: String,
-        /// The Unix timestamp (in seconds) of when the message was created.
-        timestamp: i64,
     },
 }

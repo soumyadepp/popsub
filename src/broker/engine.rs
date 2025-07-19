@@ -118,7 +118,9 @@ impl Broker {
     /// # Arguments
     ///
     /// * `msg` - The message to broadcast.
-    pub fn publish(&self, msg: Message) {
+    pub fn publish(&self, mut msg: Message) {
+        msg.timestamp = chrono::Utc::now().timestamp_millis();
+
         self.persistence.store_message(&msg.topic, &msg.payload);
 
         if let Some(topic) = self.topics.get(&msg.topic) {

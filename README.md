@@ -91,7 +91,6 @@ Clients communicate using JSON messages:
   "type": "publish",
   "topic": "chat",
   "payload": "Hello world!",
-  "timestamp": 1689475200
 }
 ```
 
@@ -159,8 +158,7 @@ Client A will automatically receive the last 3 messages upon resubscription 🎉
 {
   "type": "publish",
   "topic": "chat",
-  "payload": "Hello from Tab 1!",
-  "timestamp": 1689475300
+  "payload": "Hello from Tab 1!"
 }
 ```
 

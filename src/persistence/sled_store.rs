@@ -1,6 +1,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sled::Db;
+use uuid::Uuid;
 
 /// Represents a message that has been published to a topic and stored for later replay.
 ///
@@ -99,7 +100,7 @@ impl Persistence {
         let msg = StoredMessage {
             topic: topic.to_string(),
             payload: payload.to_string(),
-            timestamp: Utc::now().timestamp(),
+            timestamp: Utc::now().timestamp_millis(),
         };
 
         let serialized = match serde_json::to_vec(&msg) {
@@ -118,8 +119,10 @@ impl Persistence {
             }
         };
 
-        // Insert new message
-        if let Err(e) = topic_tree.insert(msg.timestamp.to_be_bytes(), serialized) {
+        // Key: zero-padded millis timestamp + UUID for uniqueness and order
+        let key = format!("{:020}_{}", msg.timestamp, Uuid::new_v4());
+
+        if let Err(e) = topic_tree.insert(key.as_bytes(), serialized) {
             eprintln!("Failed to store message in topic '{}': {:?}", topic, e);
             return;
         }
@@ -127,13 +130,12 @@ impl Persistence {
         // Enforce max_messages_per_topic
         if let Some(max) = self.max_messages_per_topic {
             let total_messages = topic_tree.len();
-
             if total_messages > max {
                 let excess = total_messages - max;
 
                 let keys_to_delete: Vec<_> = topic_tree
                     .iter()
-                    .take(excess)
+                    .take(excess) // oldest keys first
                     .filter_map(|entry| entry.ok().map(|(k, _)| k))
                     .collect();
 
@@ -177,20 +179,26 @@ impl Persistence {
     /// * `topic` - The topic for which to clean up old messages.
     fn cleanup_old_messages(&self, topic: &str) {
         if let Some(ttl) = self.ttl_seconds {
-            let now = Utc::now().timestamp();
-            let expiry_time = now - ttl;
+            let now = Utc::now().timestamp_millis(); // match precision with store_message
+            let expiry_time = now - (ttl as i64 * 1000); // convert TTL to millis
 
             let topic_tree = self.db.open_tree(topic).unwrap();
             let old_keys: Vec<_> = topic_tree
                 .iter()
                 .filter_map(|res| res.ok())
-                .filter_map(|(key, _)| {
-                    if key.len() == 8 {
-                        let ts = i64::from_be_bytes(key[..].try_into().unwrap());
-                        if ts < expiry_time { Some(key) } else { None }
-                    } else {
-                        None
+                .filter_map(|(key_bytes, _)| {
+                    // convert to UTF-8 string
+                    if let Ok(key_str) = std::str::from_utf8(&key_bytes) {
+                        // key format: "00000000000012345678_uuid"
+                        if let Some((ts_str, _)) = key_str.split_once('_') {
+                            if let Ok(ts) = ts_str.parse::<i64>() {
+                                if ts < expiry_time {
+                                    return Some(key_bytes);
+                                }
+                            }
+                        }
                     }
+                    None
                 })
                 .collect();
 
@@ -212,5 +220,87 @@ impl std::fmt::Debug for Persistence {
 impl Default for Persistence {
     fn default() -> Self {
         Self::new("pubsub_db", Some(3600), Some(1000)) // TTL: 1 hour, Max: 1000 messages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn create_test_persistence(ttl: Option<i64>, max: Option<usize>) -> Persistence {
+        let dir = tempdir().unwrap();
+        Persistence::new(dir.path().to_str().unwrap(), ttl, max)
+    }
+
+    #[test]
+    fn test_store_and_load_message() {
+        let persistence = create_test_persistence(None, None);
+        let topic = "test_topic";
+
+        persistence.store_message(topic, "hello");
+        let messages = persistence.load_messages(topic);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].payload, "hello");
+        assert_eq!(messages[0].topic, topic);
+    }
+
+    #[test]
+    fn test_ttl_removes_old_messages() {
+        let persistence = create_test_persistence(Some(1), None);
+        let topic = "ttl_test";
+
+        persistence.store_message(topic, "msg1");
+        sleep(Duration::from_secs(2)); // Wait so the TTL expires
+        let messages = persistence.load_messages(topic);
+
+        assert!(messages.is_empty(), "Messages should be expired");
+    }
+
+    #[test]
+    fn test_max_messages_limit() {
+        let persistence = create_test_persistence(Some(1000), Some(3));
+        let topic = "max_limit_test";
+
+        for i in 0..5 {
+            persistence.store_message(topic, &format!("msg{}", i));
+            std::thread::sleep(std::time::Duration::from_millis(2)); // ensure timestamp uniqueness
+        }
+
+        let messages = persistence.load_messages(topic);
+
+        // Collect payloads and assert length
+        let mut payloads: Vec<_> = messages.iter().map(|m| m.payload.clone()).collect();
+        payloads.sort(); // Sort if ordering isn't guaranteed
+
+        let expected = vec!["msg2", "msg3", "msg4"];
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads, expected);
+    }
+
+    #[test]
+    fn test_empty_topic_returns_empty_vec() {
+        let persistence = create_test_persistence(None, None);
+        let messages = persistence.load_messages("nonexistent_topic");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let msg = StoredMessage {
+            topic: "roundtrip".into(),
+            payload: "{\"key\":42}".into(),
+            timestamp: 1725000000,
+        };
+
+        let data = serde_json::to_vec(&msg).unwrap();
+        let parsed: StoredMessage = serde_json::from_slice(&data).unwrap();
+
+        assert_eq!(msg.topic, parsed.topic);
+        assert_eq!(msg.payload, parsed.payload);
+        assert_eq!(msg.timestamp, parsed.timestamp);
     }
 }

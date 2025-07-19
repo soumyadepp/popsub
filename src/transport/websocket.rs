@@ -125,9 +125,9 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                         Ok(ClientMessage::Publish {
                             topic,
                             payload,
-                            timestamp,
                         }) => {
                             let broker = broker.lock().unwrap();
+                            let timestamp = chrono::Utc::now().timestamp_millis();
                             broker.publish(Message {
                                 topic: topic.clone(),
                                 payload,
