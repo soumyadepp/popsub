@@ -16,6 +16,7 @@ target
 snap.*
 db
 conf
+pubsub_db
 
 
 # RustRover
