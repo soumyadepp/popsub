@@ -61,10 +61,8 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                     return;
                 }
             };
-
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
             let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
-
             {
                 let mut broker = broker.lock().unwrap();
                 broker.register_client(Client {

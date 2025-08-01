@@ -84,14 +84,12 @@ impl Broker {
 
         if let Some(client) = self.clients.get(&subscriber_clone) {
             let stored_messages = self.persistence.load_messages(topic.name.as_str());
-
             for stored in stored_messages {
                 let replay_msg = Message {
                     topic: stored.topic.clone(),
                     payload: stored.payload.clone(),
                     timestamp: stored.timestamp,
                 };
-
                 if let Ok(json) = serde_json::to_string(&replay_msg) {
                     let _ = client.sender.send(WsMessage::text(json));
                 }
