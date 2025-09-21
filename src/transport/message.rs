@@ -58,5 +58,16 @@ pub enum ClientMessage {
         topic: String,
         /// The actual content of the message, typically a JSON-encoded string.
         payload: String,
+        /// Optional message ID for QoS.
+        message_id: Option<String>,
+        /// Optional Quality of Service level.
+        qos: Option<u8>,
+    },
+
+    /// Represents a client's acknowledgement of a received message.
+    #[serde(rename = "ack")]
+    Ack {
+        /// The ID of the message being acknowledged.
+        message_id: String,
     },
 }

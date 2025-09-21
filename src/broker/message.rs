@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 ///     topic: "sensor_updates".to_string(),
 ///     payload: "{{\"temp\":25}}".to_string(),
 ///     timestamp: 1_725_000_000,
+///     message_id: "some_unique_id".to_string(),
+///     qos: 0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,4 +31,6 @@ pub struct Message {
     pub topic: String,
     pub payload: String,
     pub timestamp: i64,
+    pub message_id: String,
+    pub qos: u8,
 }
