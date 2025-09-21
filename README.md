@@ -7,6 +7,8 @@
 - Real-time message broadcasting
 - Per-client message channels
 - Replay of past messages to reconnecting clients
+- **Quality of Service (QoS) Level 1 (At Least Once) delivery with retry mechanism**
+- **Acknowledgement (ACK) mechanism for reliable message delivery**
 
 ---
 
@@ -18,6 +20,8 @@
 - Prevents **duplicate subscriptions**
 - **Graceful client disconnection handling**
 - **Message history** replay support on reconnect
+- **QoS Level 1 (At Least Once) delivery with configurable retries**
+- **Acknowledgement (ACK) mechanism for reliable message delivery**
 - Extensible and minimal design
 
 ---
@@ -86,11 +90,28 @@ Clients communicate using JSON messages:
 // Unsubscribe
 { "type": "unsubscribe", "topic": "chat" }
 
-// Publish
+// Publish (QoS 0 - At Most Once)
 {
   "type": "publish",
   "topic": "chat",
-  "payload": "Hello world!",
+  "payload": "Hello world!"
+}
+
+// Publish (QoS 1 - At Least Once)
+// Requires a unique message_id. Broker will re-send if no ACK is received.
+{
+  "type": "publish",
+  "topic": "my_critical_topic",
+  "payload": "Important message!",
+  "message_id": "some_unique_message_id_123",
+  "qos": 1
+}
+
+// Acknowledge a QoS 1 message
+// Send this after successfully processing a QoS 1 message.
+{
+  "type": "ack",
+  "message_id": "some_unique_message_id_123"
 }
 ```
 
@@ -100,7 +121,9 @@ Broadcasted messages look like:
 {
   "topic": "chat",
   "payload": "Hello world!",
-  "timestamp": 1689475200
+  "timestamp": 1689475200,
+  "message_id": "generated_or_provided_id",
+  "qos": 0 // or 1
 }
 ```
 
@@ -164,11 +187,38 @@ Client A will automatically receive the last 3 messages upon resubscription 🎉
 
 6. You should see that message appear in Tab 2 — 🎉 real-time pub/sub in action!
 
+### Sending ACK Messages
+
+When you receive a QoS 1 message (where `"qos": 1` is present in the message payload), the broker expects an acknowledgment from your client. If it doesn't receive one within the configured timeout, it will re-send the message.
+
+To send an ACK message in WebSocket King:
+
+1.  **Receive a QoS 1 message:** Observe the incoming message in WebSocket King. It will look something like this:
+    ```json
+    {
+      "topic": "my_critical_topic",
+      "payload": "Important message!",
+      "timestamp": 1689475200,
+      "message_id": "some_unique_message_id_123",
+      "qos": 1
+    }
+    ```
+
+2.  **Extract the `message_id`:** From the received message, copy the value of the `message_id` field (e.g., `"some_unique_message_id_123"`).
+
+3.  **Construct and Send the ACK:** In WebSocket King, send a new message with the following JSON format, replacing `"your_message_id_here"` with the actual `message_id` you extracted:
+    ```json
+    {
+      "type": "ack",
+      "message_id": "your_message_id_here"
+    }
+    ```
+
+Once the broker receives this ACK, it will stop re-sending that specific message.
+
 ## Next Steps
 
-✅ Clean up disconnected clients automatically
 
-💾 Add persistence or message history
 
 🔐 Add authentication and access control
 
