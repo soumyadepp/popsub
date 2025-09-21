@@ -36,9 +36,16 @@ use crate::transport::message::ClientMessage;
 ///
 /// # Example
 ///
-/// ```rust
-/// let broker = Arc::new(Mutex::new(Broker::new()));
-/// start_websocket_server("127.0.0.1:8080", broker).await;
+/// ```rust,no_run
+/// use std::sync::{Arc, Mutex};
+/// use popsub::broker::Broker;
+/// use popsub::transport::websocket::start_websocket_server;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let broker = Arc::new(Mutex::new(Broker::new()));
+///     start_websocket_server("127.0.0.1:8080", broker).await;
+/// }
 /// ```
 ///
 /// # Notes

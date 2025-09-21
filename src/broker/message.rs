@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 /// # Example
 ///
 /// ```rust
+/// use popsub::broker::message::Message;
 /// let msg = Message {
 ///     topic: "sensor_updates".to_string(),
-///     payload: "{\"temp\":25}".to_string(),
+///     payload: "{{\"temp\":25}}".to_string(),
 ///     timestamp: 1_725_000_000,
 /// };
 /// ```

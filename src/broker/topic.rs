@@ -29,6 +29,7 @@ impl Topic {
     /// # Example
     ///
     /// ```rust
+    /// use popsub::broker::topic::Topic;
     /// let topic = Topic::new("news");
     /// ```
     pub fn new(name: &str) -> Self {
@@ -47,6 +48,8 @@ impl Topic {
     /// # Example
     ///
     /// ```rust
+    /// use popsub::broker::topic::Topic;
+    /// let mut topic = Topic::new("news");
     /// topic.subscribe("client123".to_string());
     /// ```
     pub fn subscribe(&mut self, id: SubscriberId) {

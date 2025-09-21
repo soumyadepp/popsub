@@ -28,7 +28,13 @@ use tungstenite::protocol::Message as WsMessage;
 /// # Example
 ///
 /// ```rust
-/// let broker = Broker::default();
+/// use popsub::broker::Broker;
+/// use popsub::persistence::sled_store::Persistence;
+/// use tempfile::tempdir;
+///
+/// let dir = tempdir().unwrap();
+/// let persistence = Persistence::new(dir.path().to_str().unwrap(), None, None);
+/// let broker = Broker::new_with_persistence(persistence);
 /// // The broker can now be used to manage clients and topics.
 /// ```
 #[derive(Debug)]

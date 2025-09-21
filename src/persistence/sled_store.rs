@@ -17,6 +17,7 @@ use uuid::Uuid;
 /// # Example
 ///
 /// ```rust
+/// use popsub::persistence::sled_store::StoredMessage;
 /// let msg = StoredMessage {
 ///     topic: "sensor_data".to_string(),
 ///     payload: "{\"temp\":22}".to_string(),
@@ -53,12 +54,9 @@ pub struct StoredMessage {
 ///
 /// ```rust
 /// use sled::Config;
-/// let config = Config::new().path("messages.db");
-/// let persistence = Persistence {
-///     db: sled::open(config).unwrap(),
-///     ttl_seconds: Some(3600), // Messages expire after 1 hour
-///     max_messages_per_topic: Some(100), // Retain up to 100 messages per topic
-/// };
+/// use popsub::persistence::sled_store::Persistence;
+/// let persistence = Persistence::new("messages.db", Some(3600), Some(100));
+/// // The persistence can now be used to store and retrieve messages.
 /// ```
 #[derive(Clone)]
 pub struct Persistence {

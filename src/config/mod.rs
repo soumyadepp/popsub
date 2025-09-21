@@ -39,6 +39,7 @@ pub use settings::{BrokerSettings, ServerSettings};
 /// # Example
 ///
 /// ```rust
+/// use popsub::config::load_config;
 /// let settings = load_config().expect("Failed to load config");
 /// println!("Running on {}:{}", settings.server.host, settings.server.port);
 /// ```
