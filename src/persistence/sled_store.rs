@@ -204,12 +204,11 @@ impl Persistence {
                     // convert to UTF-8 string
                     if let Ok(key_str) = std::str::from_utf8(&key_bytes) {
                         // key format: "00000000000012345678_uuid"
-                        if let Some((ts_str, _)) = key_str.split_once('_') {
-                            if let Ok(ts) = ts_str.parse::<i64>() {
-                                if ts < expiry_time {
-                                    return Some(key_bytes);
-                                }
-                            }
+                        if let Some((ts_str, _)) = key_str.split_once('_')
+                            && let Ok(ts) = ts_str.parse::<i64>()
+                            && ts < expiry_time
+                        {
+                            return Some(key_bytes);
                         }
                     }
                     None
