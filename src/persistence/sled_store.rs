@@ -5,13 +5,14 @@ use uuid::Uuid;
 
 /// Represents a message that has been published to a topic and stored for later replay.
 ///
-/// Useful for scenarios where subscribers reconnect and need to receive past messages.
+/// This struct is used to serialize and deserialize messages for persistent storage,
+/// enabling features like message history and replay for reconnecting clients.
 ///
 /// # Fields
 ///
-/// - `topic` - The name of the topic this message belongs to.
-/// - `payload` - The actual content of the message.
-/// - `timestamp` - Unix timestamp (in milliseconds or seconds) indicating when the message was published.
+/// - `topic`: The name of the topic to which this message was published.
+/// - `payload`: The actual content of the message, typically a JSON string.
+/// - `timestamp`: The Unix timestamp (in milliseconds) indicating when the message was originally published.
 ///
 /// # Example
 ///
@@ -24,35 +25,48 @@ use uuid::Uuid;
 /// ```
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StoredMessage {
+    /// The topic to which the message belongs.
     pub topic: String,
+    /// The payload of the message.
     pub payload: String,
+    /// The timestamp when the message was published (in milliseconds).
     pub timestamp: i64,
 }
 
 /// Handles persistent storage of published messages for replay in a Pub/Sub system.
 ///
-/// Stores messages in a local database (e.g., `sled`), optionally applying TTL (time-to-live)
-/// and per-topic message retention limits.
+/// This struct manages an embedded `sled` database to store messages, providing
+/// durability and the ability to replay messages to clients. It supports optional
+/// time-to-live (TTL) for messages and limits on the number of messages retained per topic.
 ///
 /// # Fields
 ///
-/// - `db` - The underlying key-value store for message persistence.
-/// - `ttl_seconds` - Optional expiration time (in seconds) for each stored message. If `None`, messages are kept indefinitely.
-/// - `max_messages_per_topic` - Optional limit on the number of messages retained per topic. If `None`, all messages are retained.
+/// - `db`: The underlying `sled::Db` instance used for key-value storage.
+/// - `ttl_seconds`: An `Option<i64>` specifying the time-to-live for messages in seconds.
+///   If `Some(value)`, messages older than `value` seconds will be considered expired.
+///   If `None`, messages are retained indefinitely.
+/// - `max_messages_per_topic`: An `Option<usize>` specifying the maximum number of messages
+///   to retain per topic. If `Some(value)`, older messages will be pruned when the limit is exceeded.
+///   If `None`, all messages for a topic are retained (subject to `ttl_seconds`).
 ///
 /// # Example
 ///
 /// ```rust
+/// use sled::Config;
+/// let config = Config::new().path("messages.db");
 /// let persistence = Persistence {
-///     db: sled::open("messages.db").unwrap(),
-///     ttl_seconds: Some(3600),
-///     max_messages_per_topic: Some(100),
+///     db: sled::open(config).unwrap(),
+///     ttl_seconds: Some(3600), // Messages expire after 1 hour
+///     max_messages_per_topic: Some(100), // Retain up to 100 messages per topic
 /// };
 /// ```
 #[derive(Clone)]
 pub struct Persistence {
+    /// The `sled` database instance for storing messages.
     db: Db,
+    /// Optional time-to-live for messages in seconds.
     ttl_seconds: Option<i64>,
+    /// Optional maximum number of messages to retain per topic.
     max_messages_per_topic: Option<usize>,
 }
 

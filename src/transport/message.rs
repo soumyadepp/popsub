@@ -2,49 +2,61 @@ use serde::Deserialize;
 
 /// Represents messages sent **from the client to the server** in the Pub/Sub system.
 ///
-/// This enum is deserialized based on the `"type"` field in incoming JSON.
-/// Each variant corresponds to a supported client action.
+/// This enum defines the various types of requests a client can send to the server
+/// over a WebSocket connection. It is designed to be deserialized from JSON messages
+/// where a `"type"` field determines the variant.
 ///
 /// # Variants
 ///
-/// - `Subscribe` - Subscribe to a given topic.
-/// - `Unsubscribe` - Unsubscribe from a given topic.
-/// - `Publish` - Publish a message to a topic (with a payload).
+/// - `Subscribe`: Instructs the server to add the client to a topic's subscriber list.
+/// - `Unsubscribe`: Instructs the server to remove the client from a topic's subscriber list.
+/// - `Publish`: Sends a message with a payload to a specific topic, which the server
+///   will then broadcast to all active subscribers of that topic.
 ///
-/// # JSON Format
+/// # JSON Format Examples
 ///
 /// ```json
-/// { "type": "subscribe", "topic": "updates" }
-/// { "type": "unsubscribe", "topic": "updates" }
-/// { "type": "publish", "topic": "updates", "payload": "data"}
+/// // Subscribe to the "chat" topic
+/// { "type": "subscribe", "topic": "chat" }
+///
+/// // Unsubscribe from the "chat" topic
+/// { "type": "unsubscribe", "topic": "chat" }
+///
+/// // Publish a message to the "chat" topic
+/// {
+///   "type": "publish",
+///   "topic": "chat",
+///   "payload": "Hello everyone!"
+/// }
 /// ```
 ///
 /// # Usage
 ///
-/// Used to deserialize WebSocket messages sent by clients.
+/// This enum is primarily used by the WebSocket server to parse and handle
+/// incoming client requests.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    /// Subscribe to a topic.
+    /// Represents a client's request to subscribe to a specific topic.
     #[serde(rename = "subscribe")]
     Subscribe {
-        /// The topic name to subscribe to.
+        /// The name of the topic the client wishes to subscribe to.
         topic: String,
     },
 
-    /// Unsubscribe from a topic.
+    /// Represents a client's request to unsubscribe from a specific topic.
     #[serde(rename = "unsubscribe")]
     Unsubscribe {
-        /// The topic name to unsubscribe from.
+        /// The name of the topic the client wishes to unsubscribe from.
         topic: String,
     },
 
-    /// Publish a message to a topic.
+    /// Represents a client's request to publish a message to a specific topic.
     #[serde(rename = "publish")]
     Publish {
-        /// The target topic.
+        /// The name of the topic to which the message should be published.
         topic: String,
-        /// The actual message payload (usually JSON-encoded string).
+        /// The actual content of the message, typically a JSON-encoded string.
         payload: String,
     },
 }

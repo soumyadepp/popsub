@@ -1,3 +1,11 @@
+//! The `config` module handles the application's configuration management.
+//!
+//! It defines the structure of the application settings, provides default values,
+//! and implements the logic for loading configuration from various sources,
+//! such as configuration files and environment variables.
+//!
+//! This module uses the `config` crate for flexible and layered configuration.
+
 pub mod settings;
 
 use crate::config::settings::PartialSettings;

@@ -11,6 +11,11 @@ use tracing::{error, info};
 use tracing_subscriber;
 use transport::websocket::start_websocket_server;
 
+/// The main entry point for the PopSub server.
+///
+/// This function initializes the logger, loads the configuration, starts the
+/// WebSocket server, and listens for a shutdown signal (Ctrl+C) to gracefully
+/// terminate the application.
 #[tokio::main]
 async fn main() {
     // Initialize the tracing subscriber for logging

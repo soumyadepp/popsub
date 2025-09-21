@@ -4,18 +4,31 @@ use uuid::Uuid;
 
 /// Represents a connected WebSocket client in the Pub/Sub system.
 ///
-/// Each client is uniquely identified by an `id` and has a channel (`sender`)
-/// for sending messages to the client over WebSocket.
+/// Each client is uniquely identified by an `id` and has an associated
+/// `UnboundedSender` for sending WebSocket messages back to the client.
+/// This struct encapsulates the necessary information to manage a client's
+/// connection and communication within the Pub/Sub broker.
 #[derive(Debug)]
 pub struct Client {
-    /// Unique identifier for the client (e.g. UUID or connection ID).
+    /// A unique identifier for this client connection.
+    /// This is typically a UUID generated upon connection.
     pub id: String,
 
-    /// Channel to send WebSocket messages to the client.
+    /// An unbounded MPSC (Multi-Producer, Single-Consumer) sender channel
+    /// used to send `WsMessage`s to this specific client's WebSocket connection.
     pub sender: UnboundedSender<WsMessage>,
 }
 
 impl Client {
+    /// Creates a new `Client` instance with a randomly generated UUID and the provided sender.
+    ///
+    /// # Arguments
+    ///
+    /// * `sender` - An `UnboundedSender<WsMessage>` used to send messages to this client.
+    ///
+    /// # Returns
+    ///
+    /// A new `Client` instance.
     pub fn new(sender: UnboundedSender<WsMessage>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),

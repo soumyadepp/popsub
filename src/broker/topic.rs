@@ -5,13 +5,17 @@ pub type SubscriberId = String;
 
 /// Represents a Pub/Sub topic, which maintains a list of subscribers.
 ///
-/// Each `Topic` has a name and tracks all subscribed clients by their `SubscriberId`.
+/// A `Topic` is a named channel that clients can subscribe to in order to receive messages.
+/// It keeps track of all subscribers interested in the topic, ensuring that published
+/// messages are delivered to the correct clients.
 #[derive(Debug, Default)]
 pub struct Topic {
-    /// Name of the topic.
+    /// The unique name of the topic (e.g., "sports", "news").
     pub name: String,
 
-    /// Set of subscriber IDs subscribed to this topic.
+    /// A set of unique `SubscriberId`s for all clients subscribed to this topic.
+    /// Using a `HashSet` prevents duplicate subscriptions and provides efficient
+    /// addition and removal of subscribers.
     pub subscribers: HashSet<SubscriberId>,
 }
 

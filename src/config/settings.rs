@@ -2,28 +2,38 @@ use serde::Deserialize;
 
 /// Top-level configuration settings for the application.
 ///
-/// Includes settings for both the server and the message broker.
+/// This struct aggregates all configuration parameters required to run the PopSub server,
+/// including network settings for the server and operational parameters for the broker.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
+    /// Configuration specific to the WebSocket server, such as host and port.
     pub server: ServerSettings,
+    /// Configuration specific to the message broker, such as connection limits and message TTL.
     pub broker: BrokerSettings,
 }
 
 /// Configuration settings for the server.
 ///
-/// Defines the host and port the server will bind to.
+/// Defines the network parameters for the WebSocket server, including the address
+/// it will bind to and the port it will listen on.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerSettings {
+    /// The host address (e.g., "127.0.0.1" or "0.0.0.0") the server will bind to.
     pub host: String,
+    /// The port number the server will listen on.
     pub port: u16,
 }
 
 /// Configuration settings for the broker.
 ///
-/// Controls operational parameters like maximum connections and message time-to-live.
+/// Controls operational parameters for the message broker, such as limits on
+/// concurrent connections and the time-to-live for messages in the persistence layer.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BrokerSettings {
+    /// The maximum number of concurrent client connections the broker will accept.
     pub max_connections: usize,
+    /// The time-to-live (in seconds) for messages stored in the persistence layer.
+    /// Messages older than this duration may be purged.
     pub message_ttl_secs: u64,
 }
 

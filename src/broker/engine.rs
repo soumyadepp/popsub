@@ -9,27 +9,35 @@ use tungstenite::protocol::Message as WsMessage;
 /// The central broker for managing topics, clients, and message persistence
 /// in the Pub/Sub system.
 ///
-/// Responsible for:
-/// - Tracking topic-to-subscriber mappings.
-/// - Managing connected clients and their channels.
-/// - Storing and replaying messages using the `Persistence` layer.
+/// The `Broker` is the heart of the server, responsible for:
+/// - Tracking topic-to-subscriber mappings in memory.
+/// - Managing connected clients and their associated WebSocket senders.
+/// - Storing messages using a persistence layer to support message replay.
+/// - Broadcasting messages to all subscribers of a topic.
+/// - Cleaning up client state upon disconnection.
 ///
 /// # Fields
 ///
-/// - `topics` - A map of topic names to `Topic` instances, tracking subscriber lists.
-/// - `clients` - A map of subscriber IDs to their corresponding `Client` state (likely includes WebSocket senders).
-/// - `persistence` - The message storage backend, supporting TTL and message replay.
+/// - `topics`: A `HashMap` where keys are topic names and values are `Topic` instances.
+///   This provides fast lookups of topics and their subscriber lists.
+/// - `clients`: A `HashMap` that maps unique `SubscriberId`s to their corresponding `Client`
+///   structs. This allows the broker to efficiently find and send messages to specific clients.
+/// - `persistence`: The storage backend responsible for persisting messages. This enables
+///   features like message replay for clients that reconnect.
 ///
 /// # Example
 ///
 /// ```rust
 /// let broker = Broker::default();
-/// broker.subscribe("news", subscriber_id, client);
+/// // The broker can now be used to manage clients and topics.
 /// ```
 #[derive(Debug)]
 pub struct Broker {
+    /// A map of topic names to `Topic` instances.
     pub(crate) topics: HashMap<String, Topic>,
+    /// A map of subscriber IDs to their corresponding `Client` state.
     pub(crate) clients: HashMap<SubscriberId, Client>,
+    /// The message storage backend.
     persistence: Persistence,
 }
 
@@ -130,13 +138,18 @@ impl Broker {
         }
     }
 
-    /// Publishes a message to a topic and broadcasts it to all active subscribers.
+    /// Publishes a message to a topic, storing it and broadcasting it to all subscribers.
     ///
-    /// Also stores the message via the persistence layer.
+    /// This method performs two key actions:
+    /// 1.  It stores the message in the persistence layer, allowing it to be replayed
+    ///     to clients that subscribe or reconnect later.
+    /// 2.  It broadcasts the message to all currently subscribed clients of the topic.
+    ///
+    /// A timestamp is added to the message before it is stored and broadcast.
     ///
     /// # Arguments
     ///
-    /// * `msg` - The message to broadcast.
+    /// * `msg` - The `Message` to be published. The `topic` field determines where it's sent.
     pub fn publish(&self, mut msg: Message) {
         msg.timestamp = chrono::Utc::now().timestamp_millis();
 

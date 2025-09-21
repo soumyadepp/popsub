@@ -51,7 +51,6 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
 
     while let Ok((stream, _)) = listener.accept().await {
         let broker = broker.clone();
-        let client_id = format!("client-{}", uuid::Uuid::new_v4());
 
         tokio::spawn(async move {
             let ws_stream = match accept_async(stream).await {
@@ -63,12 +62,11 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
             };
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
             let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+            let client = Client::new(tx.clone());
+            let client_id = client.id.clone();
             {
                 let mut broker = broker.lock().unwrap();
-                broker.register_client(Client {
-                    id: client_id.clone(),
-                    sender: tx.clone(),
-                });
+                broker.register_client(client);
             }
 
             let cleanup_called = Arc::new(AtomicBool::new(false));
