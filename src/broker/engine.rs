@@ -26,11 +26,23 @@ use tungstenite::protocol::Message as WsMessage;
 /// let broker = Broker::default();
 /// broker.subscribe("news", subscriber_id, client);
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Broker {
-    topics: HashMap<String, Topic>,
-    clients: HashMap<SubscriberId, Client>,
+    pub(crate) topics: HashMap<String, Topic>,
+    pub(crate) clients: HashMap<SubscriberId, Client>,
     persistence: Persistence,
+}
+
+impl Default for Broker {
+    fn default() -> Self {
+        if cfg!(test) {
+            let dir = tempfile::tempdir().unwrap();
+            let persistence = Persistence::new(dir.path().to_str().unwrap(), None, None);
+            Self::new_with_persistence(persistence)
+        } else {
+            Self::new()
+        }
+    }
 }
 
 impl Broker {
@@ -42,6 +54,15 @@ impl Broker {
             topics: HashMap::new(),
             clients: HashMap::new(),
             persistence: Persistence::default(),
+        }
+    }
+
+    /// Creates a new instance of the broker with a specific persistence layer.
+    pub fn new_with_persistence(persistence: Persistence) -> Self {
+        Self {
+            topics: HashMap::new(),
+            clients: HashMap::new(),
+            persistence,
         }
     }
 

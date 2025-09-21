@@ -304,4 +304,16 @@ mod tests {
         assert_eq!(msg.payload, parsed.payload);
         assert_eq!(msg.timestamp, parsed.timestamp);
     }
+
+    #[test]
+    fn test_cleanup_old_messages_no_ttl() {
+        let persistence = create_test_persistence(None, None);
+        let topic = "no_ttl_test";
+
+        persistence.store_message(topic, "msg1");
+        sleep(Duration::from_secs(2)); // Wait
+        let messages = persistence.load_messages(topic);
+
+        assert_eq!(messages.len(), 1, "Message should not be expired");
+    }
 }

@@ -1,5 +1,6 @@
 use tokio::sync::mpsc::UnboundedSender;
 use tungstenite::protocol::Message as WsMessage;
+use uuid::Uuid;
 
 /// Represents a connected WebSocket client in the Pub/Sub system.
 ///
@@ -12,4 +13,13 @@ pub struct Client {
 
     /// Channel to send WebSocket messages to the client.
     pub sender: UnboundedSender<WsMessage>,
+}
+
+impl Client {
+    pub fn new(sender: UnboundedSender<WsMessage>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            sender,
+        }
+    }
 }

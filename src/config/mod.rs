@@ -1,4 +1,4 @@
-mod settings;
+pub mod settings;
 
 use crate::config::settings::PartialSettings;
 use config::{Config, ConfigError, Environment, File};
@@ -74,3 +74,6 @@ pub fn load_config() -> Result<Settings, ConfigError> {
         },
     })
 }
+
+#[cfg(test)]
+mod tests;
