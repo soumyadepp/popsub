@@ -8,7 +8,6 @@ use broker::Broker;
 use config::load_config;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
-use tracing_subscriber;
 use transport::websocket::start_websocket_server;
 
 /// The main entry point for the PopSub server.
