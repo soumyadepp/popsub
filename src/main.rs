@@ -4,7 +4,7 @@ mod config;
 mod persistence;
 mod transport;
 
-use broker::Broker;
+use broker::engine::Broker;
 use config::load_config;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
@@ -31,6 +31,9 @@ async fn main() {
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let broker = Arc::new(Mutex::new(Broker::new()));
+
+    // Spawn the retry loop for QoS 1 messages
+    tokio::spawn(Broker::start_retry_loop(broker.clone()));
 
     // Run the server and listen for a shutdown signal
     tokio::select! {

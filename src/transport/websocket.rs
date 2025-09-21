@@ -125,15 +125,28 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                             println!("{client_id} unsubscribed from {topic}");
                         }
 
-                        Ok(ClientMessage::Publish { topic, payload }) => {
-                            let broker = broker.lock().unwrap();
+                        Ok(ClientMessage::Publish {
+                            topic,
+                            payload,
+                            message_id,
+                            qos,
+                        }) => {
+                            let mut broker = broker.lock().unwrap();
                             let timestamp = chrono::Utc::now().timestamp_millis();
                             broker.publish(Message {
                                 topic: topic.clone(),
                                 payload,
                                 timestamp,
+                                message_id: message_id
+                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                                qos: qos.unwrap_or(0),
                             });
                             println!("{client_id} published to {topic}");
+                        }
+
+                        Ok(ClientMessage::Ack { message_id }) => {
+                            let mut broker = broker.lock().unwrap();
+                            broker.handle_ack(&message_id);
                         }
 
                         Err(err) => {
