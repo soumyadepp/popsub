@@ -37,6 +37,13 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    /// Represents a client's request to authenticate.
+    #[serde(rename = "auth")]
+    Auth {
+        /// The authentication token.
+        token: String,
+    },
+
     /// Represents a client's request to subscribe to a specific topic.
     #[serde(rename = "subscribe")]
     Subscribe {

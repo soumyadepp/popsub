@@ -17,6 +17,9 @@ pub struct Client {
     /// An unbounded MPSC (Multi-Producer, Single-Consumer) sender channel
     /// used to send `WsMessage`s to this specific client's WebSocket connection.
     pub sender: UnboundedSender<WsMessage>,
+
+    /// A flag to indicate if the client is authenticated.
+    pub authenticated: bool,
 }
 
 impl Client {
@@ -33,6 +36,7 @@ impl Client {
         Self {
             id: Uuid::new_v4().to_string(),
             sender,
+            authenticated: false,
         }
     }
 }

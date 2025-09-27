@@ -8,6 +8,9 @@ use uuid::Uuid;
 // This is a helper function that simulates the message handling part of the websocket server.
 async fn handle_message(broker: Arc<Mutex<Broker>>, client_id: String, msg: String) {
     match serde_json::from_str::<ClientMessage>(&msg) {
+        Ok(ClientMessage::Auth { .. }) => {
+            // Auth not handled in this test helper
+        }
         Ok(ClientMessage::Subscribe { topic }) => {
             let mut broker = broker.lock().unwrap();
             broker.subscribe(&topic, client_id.clone());

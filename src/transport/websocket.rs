@@ -111,18 +111,44 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
             while let Some(Ok(msg)) = ws_receiver.next().await {
                 if msg.is_text() {
                     let text = msg.to_text().unwrap();
+                    let mut broker_lock = broker.lock().unwrap();
+                    let client = broker_lock.clients.get_mut(&client_id).unwrap();
 
                     match serde_json::from_str::<ClientMessage>(text) {
+                        Ok(ClientMessage::Auth { token }) => {
+                            if token == "supersecrettoken" {
+                                client.authenticated = true;
+                                println!("{client_id} authenticated successfully");
+                                let _ = client.sender.send(WsMessage::Text(
+                                    "{{\"status\": \"authenticated\"}}".to_string().into(),
+                                ));
+                            } else {
+                                eprintln!("{{client_id}} authentication failed");
+                                let _ = client.sender.send(WsMessage::Text(
+                                    "{{\"error\": \"authentication failed\"}}"
+                                        .to_string()
+                                        .into(),
+                                ));
+                                break; // Close connection
+                            }
+                        }
+                        Ok(_) if !client.authenticated => {
+                            eprintln!("Client {client_id} sent message before authentication");
+                            let _ = client.sender.send(WsMessage::Text(
+                                "{{\"error\": \"must authenticate first\"}}"
+                                    .to_string()
+                                    .into(),
+                            ));
+                            break; // Close connection
+                        }
                         Ok(ClientMessage::Subscribe { topic }) => {
-                            let mut broker = broker.lock().unwrap();
-                            broker.subscribe(&topic, client_id.clone());
-                            println!("{client_id} subscribed to {topic}");
+                            broker_lock.subscribe(&topic, client_id.clone());
+                            println!("{{client_id}} subscribed to {{topic}}");
                         }
 
                         Ok(ClientMessage::Unsubscribe { topic }) => {
-                            let mut broker = broker.lock().unwrap();
-                            broker.unsubscribe(&topic, &client_id);
-                            println!("{client_id} unsubscribed from {topic}");
+                            broker_lock.unsubscribe(&topic, &client_id);
+                            println!("{{client_id}} unsubscribed from {{topic}}");
                         }
 
                         Ok(ClientMessage::Publish {
@@ -131,9 +157,8 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                             message_id,
                             qos,
                         }) => {
-                            let mut broker = broker.lock().unwrap();
                             let timestamp = chrono::Utc::now().timestamp_millis();
-                            broker.publish(Message {
+                            broker_lock.publish(Message {
                                 topic: topic.clone(),
                                 payload,
                                 timestamp,
@@ -141,19 +166,16 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                 qos: qos.unwrap_or(0),
                             });
-                            println!("{client_id} published to {topic}");
+                            println!("{{client_id}} published to {{topic}}");
                         }
 
                         Ok(ClientMessage::Ack { message_id }) => {
-                            let mut broker = broker.lock().unwrap();
-                            broker.handle_ack(&message_id);
+                            broker_lock.handle_ack(&message_id);
                         }
 
                         Err(err) => {
                             eprintln!(
-                                "Invalid client message from {}: {} | {}",
-                                client_id,
-                                err,
+                                "Invalid client message from {client_id}: {err} | {}",
                                 &text.chars().take(100).collect::<String>()
                             );
                         }
