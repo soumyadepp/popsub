@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Represents messages sent **from the client to the server** in the Pub/Sub system.
 ///
@@ -44,6 +44,15 @@ pub enum ClientMessage {
         token: String,
     },
 
+    /// Represents a client's request to login.
+    #[serde(rename = "login")]
+    Login {
+        /// The username.
+        username: String,
+        /// The password.
+        password: String,
+    },
+
     /// Represents a client's request to subscribe to a specific topic.
     #[serde(rename = "subscribe")]
     Subscribe {
@@ -77,4 +86,25 @@ pub enum ClientMessage {
         /// The ID of the message being acknowledged.
         message_id: String,
     },
+}
+
+/// Represents messages sent **from the server to the client**.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum ServerMessage {
+    /// Represents a response to a login request.
+    #[serde(rename = "login_response")]
+    LoginResponse {
+        /// The JWT token.
+        token: String,
+    },
+}
+
+/// Represents the claims of a JWT.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Claims {
+    /// The subject of the token (the user ID).
+    pub sub: String,
+    /// The expiration time of the token.
+    pub exp: usize,
 }

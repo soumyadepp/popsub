@@ -10,6 +10,9 @@ host = "127.0.0.1"
 # Port number for the WebSocket server to listen on
 port = 8080
 
+# Secret key for signing and verifying JWTs. It is recommended to use a strong, unique secret.
+jwt_secret = "a_very_secret_key"
+
 # ========================
 # Broker Configuration
 # ========================

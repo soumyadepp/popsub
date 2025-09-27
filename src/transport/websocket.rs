@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use jsonwebtoken::{EncodingKey, Header};
 use tokio::net::TcpListener;
 use tokio::spawn;
 use tokio::sync::mpsc;
@@ -10,7 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::broker::{Broker, message::Message};
 use crate::client::Client;
-use crate::transport::message::ClientMessage;
+use crate::config::Settings;
+use crate::transport::message::{Claims, ClientMessage, ServerMessage};
+use jsonwebtoken::{DecodingKey, Validation, decode, encode};
 
 /// Starts the asynchronous WebSocket server and handles client communication.
 ///
@@ -40,24 +43,29 @@ use crate::transport::message::ClientMessage;
 /// use std::sync::{Arc, Mutex};
 /// use popsub::broker::Broker;
 /// use popsub::transport::websocket::start_websocket_server;
+/// use popsub::config::settings::Settings;
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let broker = Arc::new(Mutex::new(Broker::new()));
-///     start_websocket_server("127.0.0.1:8080", broker).await;
+///     // Note: In a real application, settings would be loaded from config.
+///     // For this example, we're passing a dummy settings object.
+///     let settings = Settings::default();
+///     start_websocket_server("127.0.0.1:8080", broker, settings).await;
 /// }
 /// ```
 ///
 /// # Notes
 /// - This function runs indefinitely until externally terminated.
 /// - Each client is cleaned up exactly once (guaranteed by an `AtomicBool`).
-pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
+pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>, settings: Settings) {
     let listener = TcpListener::bind(addr).await.expect("Can't bind");
 
     println!("WebSocket server listening on ws://{addr}");
 
     while let Ok((stream, _)) = listener.accept().await {
         let broker = broker.clone();
+        let settings = settings.clone();
 
         tokio::spawn(async move {
             let ws_stream = match accept_async(stream).await {
@@ -115,21 +123,55 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                     let client = broker_lock.clients.get_mut(&client_id).unwrap();
 
                     match serde_json::from_str::<ClientMessage>(text) {
-                        Ok(ClientMessage::Auth { token }) => {
-                            if token == "supersecrettoken" {
-                                client.authenticated = true;
-                                println!("{client_id} authenticated successfully");
+                        Ok(ClientMessage::Login { username, password }) => {
+                            // In a real application, you would validate the username and password against a database.
+                            if username == "admin" && password == "password" {
+                                let claims = Claims {
+                                    sub: username.clone(),
+                                    exp: (chrono::Utc::now() + chrono::Duration::hours(24))
+                                        .timestamp()
+                                        as usize,
+                                };
+                                let token = encode(
+                                    &Header::default(),
+                                    &claims,
+                                    &EncodingKey::from_secret(settings.server.jwt_secret.as_ref()),
+                                )
+                                .unwrap();
+
+                                let response = ServerMessage::LoginResponse { token };
                                 let _ = client.sender.send(WsMessage::Text(
-                                    "{{\"status\": \"authenticated\"}}".to_string().into(),
+                                    serde_json::to_string(&response).unwrap().into(),
                                 ));
                             } else {
-                                eprintln!("{{client_id}} authentication failed");
                                 let _ = client.sender.send(WsMessage::Text(
-                                    "{{\"error\": \"authentication failed\"}}"
-                                        .to_string()
-                                        .into(),
+                                    "{{\"error\": \"invalid credentials\"}}".to_string().into(),
                                 ));
-                                break; // Close connection
+                            }
+                        }
+                        Ok(ClientMessage::Auth { token }) => {
+                            let validation = Validation::default();
+                            match decode::<Claims>(
+                                &token,
+                                &DecodingKey::from_secret(settings.server.jwt_secret.as_ref()),
+                                &validation,
+                            ) {
+                                Ok(_) => {
+                                    client.authenticated = true;
+                                    println!("{client_id} authenticated successfully");
+                                    let _ = client.sender.send(WsMessage::Text(
+                                        "{{\"status\": \"authenticated\"}}".to_string().into(),
+                                    ));
+                                }
+                                Err(_) => {
+                                    eprintln!("{client_id} authentication failed");
+                                    let _ = client.sender.send(WsMessage::Text(
+                                        "{{\"error\": \"authentication failed\"}}"
+                                            .to_string()
+                                            .into(),
+                                    ));
+                                    break; // Close connection
+                                }
                             }
                         }
                         Ok(_) if !client.authenticated => {
@@ -143,12 +185,12 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                         }
                         Ok(ClientMessage::Subscribe { topic }) => {
                             broker_lock.subscribe(&topic, client_id.clone());
-                            println!("{{client_id}} subscribed to {{topic}}");
+                            println!("{client_id} subscribed to {topic}");
                         }
 
                         Ok(ClientMessage::Unsubscribe { topic }) => {
                             broker_lock.unsubscribe(&topic, &client_id);
-                            println!("{{client_id}} unsubscribed from {{topic}}");
+                            println!("{client_id} unsubscribed from {topic}");
                         }
 
                         Ok(ClientMessage::Publish {
@@ -166,7 +208,7 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>) {
                                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                 qos: qos.unwrap_or(0),
                             });
-                            println!("{{client_id}} published to {{topic}}");
+                            println!("{client_id} published to {topic}");
                         }
 
                         Ok(ClientMessage::Ack { message_id }) => {
