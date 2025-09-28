@@ -72,7 +72,7 @@ impl Default for Broker {
 
 impl Broker {
     /// The maximum number of times a QoS 1 message will be re-sent before being dropped.
-    pub const MAX_RETRIES: u8 = 3;
+    pub const MAX_RETRIES: u8 = 5;
 
     /// The duration in milliseconds after which an unacknowledged message will be re-sent.
     const ACK_TIMEOUT_MS: i64 = 5000; // 5 seconds

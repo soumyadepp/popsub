@@ -51,15 +51,15 @@ use jsonwebtoken::{DecodingKey, Validation, decode, encode};
 ///     // Note: In a real application, settings would be loaded from config.
 ///     // For this example, we're passing a dummy settings object.
 ///     let settings = Settings::default();
-///     start_websocket_server("127.0.0.1:8080", broker, settings).await;
+///     start_websocket_server("127.0.0.1:8080".to_string(), broker, settings).await;
 /// }
 /// ```
 ///
 /// # Notes
 /// - This function runs indefinitely until externally terminated.
 /// - Each client is cleaned up exactly once (guaranteed by an `AtomicBool`).
-pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>, settings: Settings) {
-    let listener = TcpListener::bind(addr).await.expect("Can't bind");
+pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, settings: Settings) {
+    let listener = TcpListener::bind(addr.clone()).await.expect("Can't bind");
 
     println!("WebSocket server listening on ws://{addr}");
 
@@ -144,8 +144,11 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>, sett
                                     serde_json::to_string(&response).unwrap().into(),
                                 ));
                             } else {
+                                let response = ServerMessage::Error {
+                                    message: "invalid credentials".to_string(),
+                                };
                                 let _ = client.sender.send(WsMessage::Text(
-                                    "{{\"error\": \"invalid credentials\"}}".to_string().into(),
+                                    serde_json::to_string(&response).unwrap().into(),
                                 ));
                             }
                         }
@@ -159,16 +162,18 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>, sett
                                 Ok(_) => {
                                     client.authenticated = true;
                                     println!("{client_id} authenticated successfully");
+                                    let response = ServerMessage::Authenticated {};
                                     let _ = client.sender.send(WsMessage::Text(
-                                        "{{\"status\": \"authenticated\"}}".to_string().into(),
+                                        serde_json::to_string(&response).unwrap().into(),
                                     ));
                                 }
                                 Err(_) => {
                                     eprintln!("{client_id} authentication failed");
+                                    let response = ServerMessage::Error {
+                                        message: "authentication failed".to_string(),
+                                    };
                                     let _ = client.sender.send(WsMessage::Text(
-                                        "{{\"error\": \"authentication failed\"}}"
-                                            .to_string()
-                                            .into(),
+                                        serde_json::to_string(&response).unwrap().into(),
                                     ));
                                     break; // Close connection
                                 }
@@ -176,10 +181,11 @@ pub async fn start_websocket_server(addr: &str, broker: Arc<Mutex<Broker>>, sett
                         }
                         Ok(_) if !client.authenticated => {
                             eprintln!("Client {client_id} sent message before authentication");
+                            let response = ServerMessage::Error {
+                                message: "must authenticate first".to_string(),
+                            };
                             let _ = client.sender.send(WsMessage::Text(
-                                "{{\"error\": \"must authenticate first\"}}"
-                                    .to_string()
-                                    .into(),
+                                serde_json::to_string(&response).unwrap().into(),
                             ));
                             break; // Close connection
                         }

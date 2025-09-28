@@ -10,3 +10,5 @@ pub mod websocket;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod websocket_tests;
