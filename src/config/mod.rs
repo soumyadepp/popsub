@@ -11,7 +11,7 @@ pub mod settings;
 use crate::config::settings::PartialSettings;
 use config::{Config, ConfigError, Environment, File};
 
-use settings::Settings;
+pub use settings::Settings;
 
 pub use settings::{BrokerSettings, ServerSettings};
 
@@ -68,6 +68,11 @@ pub fn load_config() -> Result<Settings, ConfigError> {
                 .as_ref()
                 .and_then(|s| s.port)
                 .unwrap_or(default.server.port),
+            jwt_secret: partial
+                .server
+                .as_ref()
+                .and_then(|s| s.jwt_secret.clone())
+                .unwrap_or(default.server.jwt_secret),
         },
         broker: BrokerSettings {
             max_connections: partial

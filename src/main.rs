@@ -37,7 +37,7 @@ async fn main() {
 
     // Run the server and listen for a shutdown signal
     tokio::select! {
-        _ = start_websocket_server(&addr, broker) => {
+        _ = start_websocket_server(addr, broker, config.clone()) => {
             error!("WebSocket server exited unexpectedly.");
         }
         _ = tokio::signal::ctrl_c() => {

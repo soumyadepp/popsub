@@ -72,7 +72,7 @@ impl Default for Broker {
 
 impl Broker {
     /// The maximum number of times a QoS 1 message will be re-sent before being dropped.
-    pub const MAX_RETRIES: u8 = 3;
+    pub const MAX_RETRIES: u8 = 5;
 
     /// The duration in milliseconds after which an unacknowledged message will be re-sent.
     const ACK_TIMEOUT_MS: i64 = 5000; // 5 seconds
@@ -226,9 +226,9 @@ impl Broker {
     /// Removes the acknowledged message from the pending_acks.
     pub fn handle_ack(&mut self, message_id: &str) {
         if self.pending_acks.remove(message_id).is_some() {
-            println!("ACK received for message_id: {}", message_id);
+            println!("ACK received for message_id: {message_id}");
         } else {
-            eprintln!("Received ACK for unknown message_id: {}", message_id);
+            eprintln!("Received ACK for unknown message_id: {message_id}");
         }
     }
 

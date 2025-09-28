@@ -22,6 +22,8 @@ pub struct ServerSettings {
     pub host: String,
     /// The port number the server will listen on.
     pub port: u16,
+    /// The secret key used for signing and verifying JWTs.
+    pub jwt_secret: String,
 }
 
 /// Configuration settings for the broker.
@@ -53,6 +55,7 @@ pub struct PartialSettings {
 pub struct PartialServerSettings {
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub jwt_secret: Option<String>,
 }
 
 /// Partial broker settings.
@@ -73,6 +76,7 @@ impl Default for Settings {
             server: ServerSettings {
                 host: "127.0.0.1".to_string(),
                 port: 8080,
+                jwt_secret: "default_secret".to_string(),
             },
             broker: BrokerSettings {
                 max_connections: 1000,
