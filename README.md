@@ -99,11 +99,4 @@ Examples and testing
 - Run the test suite with `cargo test --workspace`.
 - Run Clippy with `cargo clippy --workspace` and format with `cargo fmt`.
 
-If you want me to:
-
-- add a one-line example showing how to start the server in the background and capture logs, or
-- expand the README with a short section that maps the JSON protocol to the types in code (helpful for contributors),
-
-tell me which and I’ll add it.
-
-License: Apache 2.0
+### License: Apache 2.0
