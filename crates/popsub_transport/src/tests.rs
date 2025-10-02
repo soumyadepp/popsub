@@ -197,3 +197,28 @@ async fn test_handle_ack() {
             .contains_key("ack_message_id")
     );
 }
+
+#[tokio::test]
+async fn test_send_loop_forwards_message() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<tungstenite::protocol::Message>();
+    let (cap_tx, cap_rx) = std::sync::mpsc::sync_channel::<String>(1);
+
+    // Spawn forwarder similar to the send loop — forwards text messages into cap_tx
+    std::thread::spawn(move || {
+        // synchronous thread loop reading from tokio mpsc via a small runtime
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            while let Some(msg) = rx.recv().await {
+                if msg.is_text() {
+                    let _ = cap_tx.send(msg.to_text().unwrap().to_string());
+                }
+            }
+        });
+    });
+
+    tx.send(tungstenite::protocol::Message::Text("hello".into()))
+        .unwrap();
+
+    let received = cap_rx.recv().expect("should receive message");
+    assert_eq!(received, "hello");
+}

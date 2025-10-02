@@ -23,6 +23,8 @@ use tungstenite::protocol::Message as WsMessage;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tracing::{error, info, warn};
+
 use crate::message::{Claims, ClientMessage, ServerMessage};
 use jsonwebtoken::{DecodingKey, Validation, decode, encode};
 use popsub_broker::engine::Broker;
@@ -32,7 +34,130 @@ use popsub_config::Settings;
 pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, settings: Settings) {
     let listener = TcpListener::bind(addr.clone()).await.expect("Can't bind");
 
-    println!("WebSocket server listening on ws://{addr}");
+    info!("WebSocket server listening on ws://{}", addr);
+
+    /// Actions that need to be applied to the broker after handling client-local logic.
+    enum BrokerAction {
+        Subscribe(String),
+        Unsubscribe(String),
+        Publish(popsub_broker::message::Message),
+        Ack(String),
+    }
+
+    /// Handle the parts of a parsed client message that only need access to the
+    /// per-client state (and can run while holding a mutable borrow to the client).
+    /// Returns (continue_flag, optional BrokerAction).
+    fn handle_parsed_message(
+        client: &mut Client,
+        msg: ClientMessage,
+        encoding_key: &EncodingKey,
+        decoding_key: &DecodingKey,
+        validation: &Validation,
+        _settings: &Settings,
+    ) -> (bool, Option<BrokerAction>) {
+        match msg {
+            ClientMessage::Login { username, password } => {
+                if username == "admin" && password == "password" {
+                    let claims = Claims {
+                        sub: username.clone(),
+                        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp()
+                            as usize,
+                    };
+                    let token = encode(&Header::default(), &claims, encoding_key).unwrap();
+
+                    let response = ServerMessage::LoginResponse { token };
+                    let _ = client.sender.send(WsMessage::Text(
+                        serde_json::to_string(&response).unwrap().into(),
+                    ));
+                } else {
+                    let response = ServerMessage::Error {
+                        message: "invalid credentials".to_string(),
+                    };
+                    let _ = client.sender.send(WsMessage::Text(
+                        serde_json::to_string(&response).unwrap().into(),
+                    ));
+                }
+                (true, None)
+            }
+            ClientMessage::Auth { token } => {
+                match decode::<Claims>(&token, decoding_key, validation) {
+                    Ok(_) => {
+                        client.authenticated = true;
+                        info!(client_id = %client.id, "authenticated successfully");
+                        let response = ServerMessage::Authenticated {};
+                        let _ = client.sender.send(WsMessage::Text(
+                            serde_json::to_string(&response).unwrap().into(),
+                        ));
+                        (true, None)
+                    }
+                    Err(_) => {
+                        warn!(client_id = %client.id, "authentication failed");
+                        let response = ServerMessage::Error {
+                            message: "authentication failed".to_string(),
+                        };
+                        let _ = client.sender.send(WsMessage::Text(
+                            serde_json::to_string(&response).unwrap().into(),
+                        ));
+                        (false, None)
+                    }
+                }
+            }
+            _ if !client.authenticated => {
+                warn!(client_id = %client.id, "sent message before authentication");
+                let response = ServerMessage::Error {
+                    message: "must authenticate first".to_string(),
+                };
+                let _ = client.sender.send(WsMessage::Text(
+                    serde_json::to_string(&response).unwrap().into(),
+                ));
+                (false, None)
+            }
+            ClientMessage::Subscribe { topic } => (true, Some(BrokerAction::Subscribe(topic))),
+            ClientMessage::Unsubscribe { topic } => (true, Some(BrokerAction::Unsubscribe(topic))),
+            ClientMessage::Publish {
+                topic,
+                payload,
+                message_id,
+                qos,
+            } => {
+                let timestamp = chrono::Utc::now().timestamp_millis();
+                let msg = popsub_broker::message::Message {
+                    topic: topic.clone(),
+                    payload,
+                    timestamp,
+                    message_id: message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    qos: qos.unwrap_or(0),
+                };
+                (true, Some(BrokerAction::Publish(msg)))
+            }
+            ClientMessage::Ack { message_id } => (true, Some(BrokerAction::Ack(message_id))),
+        }
+    }
+
+    /// Spawn a task that takes messages from the broker->client channel and sends
+    /// them over the WebSocket. Kept generic over the sink type to avoid pulling
+    /// concrete stream types into the signature.
+    fn spawn_send_loop<S, F>(
+        mut ws_sender: S,
+        mut rx: mpsc::UnboundedReceiver<WsMessage>,
+        client_id: String,
+        do_cleanup: F,
+    ) where
+        S: futures_util::Sink<WsMessage, Error = tungstenite::Error> + Unpin + Send + 'static,
+        F: Fn() + Send + Clone + 'static,
+    {
+        spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Err(e) = ws_sender.send(msg).await {
+                    error!(client_id = %client_id, %e, "Failed to send message");
+                    break;
+                }
+            }
+
+            do_cleanup();
+            info!(client_id = %client_id, "Send loop closed");
+        });
+    }
 
     while let Ok((stream, _)) = listener.accept().await {
         let broker = broker.clone();
@@ -46,8 +171,8 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                     return;
                 }
             };
-            let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-            let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+            let (ws_sender, mut ws_receiver) = ws_stream.split();
+            let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
             let client = Client::new(tx.clone());
             let client_id = client.id.clone();
             {
@@ -70,128 +195,74 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                 }
             };
 
-            {
-                let client_id = client_id.clone();
-                let do_cleanup = do_cleanup.clone();
+            // Precompute JWT keys/validation for this connection so we don't recreate them per-message
+            let encoding_key = EncodingKey::from_secret(settings.server.jwt_secret.as_ref());
+            let decoding_key = DecodingKey::from_secret(settings.server.jwt_secret.as_ref());
+            let validation = Validation::default();
 
-                spawn(async move {
-                    while let Some(msg) = rx.recv().await {
-                        if let Err(e) = ws_sender.send(msg).await {
-                            eprintln!("Failed to send message to {client_id}: {e}");
-                            break;
-                        }
-                    }
-
-                    do_cleanup();
-                    println!("Send loop closed for {client_id}");
-                });
-            }
-
+            spawn_send_loop(ws_sender, rx, client_id.clone(), do_cleanup.clone());
             while let Some(Ok(msg)) = ws_receiver.next().await {
                 if msg.is_text() {
                     let text = msg.to_text().unwrap();
-                    let mut broker_lock = broker.lock().unwrap();
-                    let client = broker_lock.clients.get_mut(&client_id).unwrap();
 
-                    match serde_json::from_str::<ClientMessage>(text) {
-                        Ok(ClientMessage::Login { username, password }) => {
-                            if username == "admin" && password == "password" {
-                                let claims = Claims {
-                                    sub: username.clone(),
-                                    exp: (chrono::Utc::now() + chrono::Duration::hours(24))
-                                        .timestamp()
-                                        as usize,
-                                };
-                                let token = encode(
-                                    &Header::default(),
-                                    &claims,
-                                    &EncodingKey::from_secret(settings.server.jwt_secret.as_ref()),
-                                )
-                                .unwrap();
-
-                                let response = ServerMessage::LoginResponse { token };
-                                let _ = client.sender.send(WsMessage::Text(
-                                    serde_json::to_string(&response).unwrap().into(),
-                                ));
-                            } else {
-                                let response = ServerMessage::Error {
-                                    message: "invalid credentials".to_string(),
-                                };
-                                let _ = client.sender.send(WsMessage::Text(
-                                    serde_json::to_string(&response).unwrap().into(),
-                                ));
-                            }
-                        }
-                        Ok(ClientMessage::Auth { token }) => {
-                            let validation = Validation::default();
-                            match decode::<Claims>(
-                                &token,
-                                &DecodingKey::from_secret(settings.server.jwt_secret.as_ref()),
-                                &validation,
-                            ) {
-                                Ok(_) => {
-                                    client.authenticated = true;
-                                    println!("{client_id} authenticated successfully");
-                                    let response = ServerMessage::Authenticated {};
-                                    let _ = client.sender.send(WsMessage::Text(
-                                        serde_json::to_string(&response).unwrap().into(),
-                                    ));
-                                }
-                                Err(_) => {
-                                    eprintln!("{client_id} authentication failed");
-                                    let response = ServerMessage::Error {
-                                        message: "authentication failed".to_string(),
-                                    };
-                                    let _ = client.sender.send(WsMessage::Text(
-                                        serde_json::to_string(&response).unwrap().into(),
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(_) if !client.authenticated => {
-                            eprintln!("Client {client_id} sent message before authentication");
-                            let response = ServerMessage::Error {
-                                message: "must authenticate first".to_string(),
-                            };
-                            let _ = client.sender.send(WsMessage::Text(
-                                serde_json::to_string(&response).unwrap().into(),
-                            ));
-                            break;
-                        }
-                        Ok(ClientMessage::Subscribe { topic }) => {
-                            broker_lock.subscribe(&topic, client_id.clone());
-                            println!("{client_id} subscribed to {topic}");
-                        }
-                        Ok(ClientMessage::Unsubscribe { topic }) => {
-                            broker_lock.unsubscribe(&topic, &client_id);
-                            println!("{client_id} unsubscribed from {topic}");
-                        }
-                        Ok(ClientMessage::Publish {
-                            topic,
-                            payload,
-                            message_id,
-                            qos,
-                        }) => {
-                            let timestamp = chrono::Utc::now().timestamp_millis();
-                            broker_lock.publish(popsub_broker::message::Message {
-                                topic: topic.clone(),
-                                payload,
-                                timestamp,
-                                message_id: message_id
-                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                                qos: qos.unwrap_or(0),
-                            });
-                            println!("{client_id} published to {topic}");
-                        }
-                        Ok(ClientMessage::Ack { message_id }) => {
-                            broker_lock.handle_ack(&message_id);
-                        }
+                    // Parse before taking the broker lock to keep lock scope small
+                    let parsed = match serde_json::from_str::<ClientMessage>(text) {
+                        Ok(pm) => pm,
                         Err(err) => {
-                            eprintln!(
-                                "Invalid client message from {client_id}: {err} | {}",
-                                &text.chars().take(100).collect::<String>()
-                            );
+                            error!(client_id = %client_id, "Invalid client message: {} | {}", err, &text.chars().take(100).collect::<String>());
+                            continue;
+                        }
+                    };
+
+                    // Borrow broker to find the client and handle client-local logic
+                    let continue_flag: bool;
+                    let maybe_action: Option<BrokerAction>;
+
+                    {
+                        let mut broker_lock = broker.lock().unwrap();
+                        let client = match broker_lock.clients.get_mut(&client_id) {
+                            Some(c) => c,
+                            None => {
+                                warn!(client_id = %client_id, "Client not found in broker during message handling");
+                                do_cleanup();
+                                break;
+                            }
+                        };
+
+                        let (cont, action) = handle_parsed_message(
+                            client,
+                            parsed,
+                            &encoding_key,
+                            &decoding_key,
+                            &validation,
+                            &settings,
+                        );
+                        continue_flag = cont;
+                        maybe_action = action;
+                    }
+
+                    if !continue_flag {
+                        break;
+                    }
+
+                    if let Some(action) = maybe_action {
+                        let mut broker_lock = broker.lock().unwrap();
+                        match action {
+                            BrokerAction::Subscribe(topic) => {
+                                broker_lock.subscribe(&topic, client_id.clone());
+                                info!(client_id = %client_id, topic = %topic, "subscribed");
+                            }
+                            BrokerAction::Unsubscribe(topic) => {
+                                broker_lock.unsubscribe(&topic, &client_id);
+                                info!(client_id = %client_id, topic = %topic, "unsubscribed");
+                            }
+                            BrokerAction::Publish(msg) => {
+                                broker_lock.publish(msg);
+                                // topic logged by publisher side earlier when message created
+                            }
+                            BrokerAction::Ack(message_id) => {
+                                broker_lock.handle_ack(&message_id);
+                            }
                         }
                     }
                 }

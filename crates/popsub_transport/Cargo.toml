@@ -13,6 +13,7 @@ jsonwebtoken = "9.3.0"
 futures-util = "0.3.31"
 chrono = { version = "0.4.41", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4"] }
+tracing = "0.1.41"
 
 popsub_broker = { path = "../popsub_broker" }
 popsub_client = { path = "../popsub_client" }

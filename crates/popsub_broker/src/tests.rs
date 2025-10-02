@@ -301,3 +301,87 @@ async fn test_broker_qos1_retry_mechanism() {
             .contains_key(&message_id)
     );
 }
+
+#[test]
+fn test_collect_retry_candidates_and_resend() {
+    let mut broker = Broker::default();
+
+    // Insert a pending message that is overdue and one that is not
+    let overdue_id = "overdue".to_string();
+    let recent_id = "recent".to_string();
+
+    broker.pending_acks.insert(
+        overdue_id.clone(),
+        super::engine::PendingMessage {
+            message: crate::message::Message {
+                topic: "t".to_string(),
+                payload: "p".to_string(),
+                timestamp: 0,
+                message_id: overdue_id.clone(),
+                qos: 1,
+            },
+            sent_at: chrono::Utc::now().timestamp_millis()
+                - (Broker::ACK_TIMEOUT.as_millis() as i64 + 1000),
+            retries: 0,
+        },
+    );
+
+    broker.pending_acks.insert(
+        recent_id.clone(),
+        super::engine::PendingMessage {
+            message: crate::message::Message {
+                topic: "t".to_string(),
+                payload: "p".to_string(),
+                timestamp: 0,
+                message_id: recent_id.clone(),
+                qos: 1,
+            },
+            sent_at: chrono::Utc::now().timestamp_millis(),
+            retries: 0,
+        },
+    );
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let (to_resend, to_drop) = broker.collect_retry_candidates(now);
+
+    assert!(to_resend.contains(&overdue_id));
+    assert!(!to_resend.contains(&recent_id));
+    assert!(to_drop.is_empty());
+
+    // Test resend_pending_message updates retries and returns true
+    let mut broker2 = Broker::default();
+    let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+    let client = Client::new(tx);
+    let client_id = client.id.clone();
+    broker2.register_client(client);
+    broker2.subscribe("t", client_id.clone());
+
+    broker2.pending_acks.insert(
+        overdue_id.clone(),
+        super::engine::PendingMessage {
+            message: crate::message::Message {
+                topic: "t".to_string(),
+                payload: "p".to_string(),
+                timestamp: 0,
+                message_id: overdue_id.clone(),
+                qos: 1,
+            },
+            sent_at: chrono::Utc::now().timestamp_millis()
+                - (Broker::ACK_TIMEOUT.as_millis() as i64 + 1000),
+            retries: 0,
+        },
+    );
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let attempted = broker2.resend_pending_message(&overdue_id, now);
+    assert!(attempted);
+    assert_eq!(broker2.pending_acks.get(&overdue_id).unwrap().retries, 1);
+
+    // Ensure a message was sent to the client
+    let received = rx.try_recv().unwrap();
+    if let WsMessage::Text(_) = received {
+        // ok
+    } else {
+        panic!("Expected text message");
+    }
+}

@@ -1092,6 +1092,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "tungstenite",
  "uuid",
 ]
@@ -1143,6 +1144,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
  "tungstenite",
  "uuid",
 ]
