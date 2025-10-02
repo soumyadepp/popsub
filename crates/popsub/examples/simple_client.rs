@@ -20,7 +20,7 @@ async fn main() {
 
     // 2. Read LoginResponse
     if let Some(Ok(WsMessage::Text(msg))) = ws_stream.next().await {
-        println!("Login response: {}", msg);
+        println!("Login response: {msg}");
         // Extract token
         let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
         if let Some(token) = v.get("token").and_then(|t| t.as_str()) {
@@ -31,7 +31,7 @@ async fn main() {
                 .await
                 .unwrap();
             if let Some(Ok(WsMessage::Text(auth_resp))) = ws_stream.next().await {
-                println!("Auth response: {}", auth_resp);
+                println!("Auth response: {auth_resp}");
             }
 
             // 4. Subscribe
@@ -50,7 +50,7 @@ async fn main() {
 
             // Read any incoming message
             if let Some(Ok(WsMessage::Text(incoming))) = ws_stream.next().await {
-                println!("Incoming: {}", incoming);
+                println!("Incoming: {incoming}");
             }
         }
     }
