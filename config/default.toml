@@ -1,0 +1,9 @@
+# PopSub default configuration
+[server]
+host = "127.0.0.1"
+port = 8080
+jwt_secret = "a_very_secret_key"
+
+[broker]
+max_connections = 1000
+message_ttl_secs = 3600

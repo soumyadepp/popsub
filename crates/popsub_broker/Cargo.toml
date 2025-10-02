@@ -1,0 +1,16 @@
+[package]
+name = "popsub_broker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+uuid = { version = "1.8", features = ["v4"] }
+chrono = { version = "0.4.41", features = ["serde"] }
+
+popsub_client = { path = "../popsub_client" }
+popsub_persistence = { path = "../popsub_persistence" }
+tokio = { version = "1.46.1", features = ["full"] }
+tungstenite = "0.28.0"
+tempfile = "3.20.0"
