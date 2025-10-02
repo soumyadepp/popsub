@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod persistence_tests {
     use crate::Persistence;
     use crate::sled_store::StoredMessage;
 

@@ -10,8 +10,9 @@ pub fn init(default_level: &str) {
         _ => tracing::Level::INFO,
     };
 
-    tracing_subscriber::fmt()
+    // Use try_init so tests and libraries can call this multiple times without panicking
+    let _ = tracing_subscriber::fmt()
         .with_max_level(lvl)
         .with_target(false)
-        .init();
+        .try_init();
 }

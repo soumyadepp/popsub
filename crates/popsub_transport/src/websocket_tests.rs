@@ -68,15 +68,12 @@ async fn test_login_success() {
         .unwrap();
     let raw_data = response.into_data();
     let server_msg: ServerMessage = serde_json::from_slice(&raw_data).unwrap_or_else(|e| {
-        panic!(
-            "Failed to deserialize ServerMessage from '{:?}': {}",
-            raw_data, e
-        );
+        panic!("Failed to deserialize ServerMessage from {raw_data:?}: {e}");
     });
 
     let token = match server_msg {
         ServerMessage::LoginResponse { token } => token,
-        _ => panic!("Expected LoginResponse, got {:?}", server_msg),
+        _ => panic!("Expected LoginResponse, got {server_msg:?}"),
     };
 
     // 3. Send Auth message with the received token
@@ -96,15 +93,12 @@ async fn test_login_success() {
         .unwrap();
     let raw_data = auth_response.into_data();
     let server_msg: ServerMessage = serde_json::from_slice(&raw_data).unwrap_or_else(|e| {
-        panic!(
-            "Failed to deserialize ServerMessage from '{:?}': {}",
-            raw_data, e
-        );
+        panic!("Failed to deserialize ServerMessage from {raw_data:?}: {e}");
     });
 
     match server_msg {
         ServerMessage::Authenticated {} => {}
-        _ => panic!("Expected Authenticated, got {:?}", server_msg),
+        _ => panic!("Expected Authenticated, got {server_msg:?}"),
     };
 }
 
@@ -135,17 +129,14 @@ async fn test_login_failure() {
         .unwrap();
     let raw_data = response.into_data();
     let server_msg: ServerMessage = serde_json::from_slice(&raw_data).unwrap_or_else(|e| {
-        panic!(
-            "Failed to deserialize ServerMessage from '{:?}': {}",
-            raw_data, e
-        );
+        panic!("Failed to deserialize ServerMessage from {raw_data:?}: {e}");
     });
 
     match server_msg {
         ServerMessage::Error { message } => {
             assert_eq!(message, "invalid credentials");
         }
-        _ => panic!("Expected Error, got {:?}", server_msg),
+        _ => panic!("Expected Error, got {server_msg:?}"),
     };
 }
 
@@ -175,17 +166,14 @@ async fn test_auth_failure_invalid_token() {
         .unwrap();
     let raw_data = response.into_data();
     let server_msg: ServerMessage = serde_json::from_slice(&raw_data).unwrap_or_else(|e| {
-        panic!(
-            "Failed to deserialize ServerMessage from '{:?}': {}",
-            raw_data, e
-        );
+        panic!("Failed to deserialize ServerMessage from {raw_data:?}: {e}");
     });
 
     match server_msg {
         ServerMessage::Error { message } => {
             assert_eq!(message, "authentication failed");
         }
-        _ => panic!("Expected Error, got {:?}", server_msg),
+        _ => panic!("Expected Error, got {server_msg:?}"),
     };
 }
 
@@ -215,17 +203,14 @@ async fn test_action_before_auth_fails() {
         .unwrap();
     let raw_data = response.into_data();
     let server_msg: ServerMessage = serde_json::from_slice(&raw_data).unwrap_or_else(|e| {
-        panic!(
-            "Failed to deserialize ServerMessage from '{:?}': {}",
-            raw_data, e
-        );
+        panic!("Failed to deserialize ServerMessage from {raw_data:?}: {e}");
     });
 
     match server_msg {
         ServerMessage::Error { message } => {
             assert_eq!(message, "must authenticate first");
         }
-        _ => panic!("Expected Error, got {:?}", server_msg),
+        _ => panic!("Expected Error, got {server_msg:?}"),
     };
 
     // Explicitly close the WebSocket stream

@@ -76,21 +76,21 @@ impl Persistence {
             return;
         }
 
-        if let Some(max) = self.max_messages_per_topic {
+        if let Some(max) = self.max_messages_per_topic
+            && topic_tree.len() > max
+        {
             let total_messages = topic_tree.len();
-            if total_messages > max {
-                let excess = total_messages - max;
+            let excess = total_messages - max;
 
-                let keys_to_delete: Vec<_> = topic_tree
-                    .iter()
-                    .take(excess)
-                    .filter_map(|entry| entry.ok().map(|(k, _)| k))
-                    .collect();
+            let keys_to_delete: Vec<_> = topic_tree
+                .iter()
+                .take(excess)
+                .filter_map(|entry| entry.ok().map(|(k, _)| k))
+                .collect();
 
-                for key in keys_to_delete {
-                    if let Err(e) = topic_tree.remove(key) {
-                        eprintln!("Failed to remove old message from '{topic}': {e}");
-                    }
+            for key in keys_to_delete {
+                if let Err(e) = topic_tree.remove(key) {
+                    eprintln!("Failed to remove old message from '{topic}': {e}");
                 }
             }
         }
@@ -119,14 +119,12 @@ impl Persistence {
                 .iter()
                 .filter_map(|res| res.ok())
                 .filter_map(|(key_bytes, _)| {
-                    if let Ok(key_str) = std::str::from_utf8(&key_bytes) {
-                        if let Some((ts_str, _)) = key_str.split_once('_') {
-                            if let Ok(ts) = ts_str.parse::<i64>() {
-                                if ts < expiry_time {
-                                    return Some(key_bytes);
-                                }
-                            }
-                        }
+                    if let Ok(key_str) = std::str::from_utf8(&key_bytes)
+                        && let Some((ts_str, _)) = key_str.split_once('_')
+                        && let Ok(ts) = ts_str.parse::<i64>()
+                        && ts < expiry_time
+                    {
+                        return Some(key_bytes);
                     }
                     None
                 })
