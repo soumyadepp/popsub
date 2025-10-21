@@ -9,7 +9,10 @@ mod persistence_tests {
 
     fn create_test_persistence(ttl: Option<i64>, max: Option<usize>) -> Persistence {
         let dir = tempdir().unwrap();
-        Persistence::new(dir.path().to_str().unwrap(), ttl, max)
+        let persistence =
+            Persistence::new(dir.path().to_str().expect("path to_str failed"), ttl, max)
+                .expect("Failed to create persistence");
+        return persistence;
     }
 
     #[test]
@@ -17,9 +20,10 @@ mod persistence_tests {
         let persistence = create_test_persistence(None, None);
         let topic = "test_topic";
 
-        persistence.store_message(topic, "hello");
-        let messages = persistence.load_messages(topic);
-
+        let _ = persistence.store_message(topic, "hello");
+        let messages = persistence
+            .load_messages(topic)
+            .expect("Failed to load messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].payload, "hello");
         assert_eq!(messages[0].topic, topic);
@@ -30,11 +34,13 @@ mod persistence_tests {
         let persistence = create_test_persistence(Some(1), None);
         let topic = "ttl_test";
 
-        persistence.store_message(topic, "msg1");
+        let _ = persistence.store_message(topic, "msg1");
         sleep(Duration::from_secs(2)); // Wait so the TTL expires
         let messages = persistence.load_messages(topic);
-
-        assert!(messages.is_empty(), "Messages should be expired");
+        assert!(
+            Result::unwrap(messages).is_empty(),
+            "Messages should be expired"
+        );
     }
 
     #[test]
@@ -44,26 +50,27 @@ mod persistence_tests {
 
         for i in 0..5 {
             let msg = format!("msg{i}");
-            persistence.store_message(topic, &msg);
+            let _ = persistence.store_message(topic, &msg);
             std::thread::sleep(std::time::Duration::from_millis(2)); // ensure timestamp uniqueness
         }
-
-        let messages = persistence.load_messages(topic);
-
-        // Collect payloads and assert length
-        let mut payloads: Vec<_> = messages.iter().map(|m| m.payload.clone()).collect();
-        payloads.sort(); // Sort if ordering isn't guaranteed
-
-        let expected = vec!["msg2", "msg3", "msg4"];
-        assert_eq!(payloads.len(), 3);
-        assert_eq!(payloads, expected);
+        // use result
+        let messages = persistence
+            .load_messages(topic)
+            .expect("Failed to load messages");
+        assert_eq!(messages.len(), 3, "Should only keep max 3 messages");
+        assert_eq!(messages[0].payload, "msg2");
+        assert_eq!(messages[1].payload, "msg3");
+        assert_eq!(messages[2].payload, "msg4");
     }
 
     #[test]
     fn test_empty_topic_returns_empty_vec() {
         let persistence = create_test_persistence(None, None);
         let messages = persistence.load_messages("nonexistent_topic");
-        assert!(messages.is_empty());
+        assert!(
+            messages.unwrap().is_empty(),
+            "Expected no messages for nonexistent topic"
+        );
     }
 
     #[test]
@@ -87,10 +94,14 @@ mod persistence_tests {
         let persistence = create_test_persistence(None, None);
         let topic = "no_ttl_test";
 
-        persistence.store_message(topic, "msg1");
+        let _ = persistence.store_message(topic, "msg1");
         sleep(Duration::from_secs(2)); // Wait
         let messages = persistence.load_messages(topic);
 
-        assert_eq!(messages.len(), 1, "Message should not be expired");
+        assert_eq!(
+            Result::unwrap(messages).len(),
+            1,
+            "Message should not be expired"
+        );
     }
 }

@@ -11,6 +11,7 @@
 //!   exceeded oldest messages are removed.
 
 use chrono::Utc;
+use popsub_utils::error::{PopSubError, Result};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use uuid::Uuid;
@@ -35,46 +36,36 @@ impl Persistence {
         path: &str,
         ttl_seconds: Option<i64>,
         max_messages_per_topic: Option<usize>,
-    ) -> Self {
-        let db = sled::open(path).expect("Failed to open sled DB");
-        Self {
+    ) -> Result<Self> {
+        let db = sled::open(path).map_err(|e| PopSubError::Persistence(e.to_string()))?;
+        Ok(Self {
             db,
             ttl_seconds,
             max_messages_per_topic,
-        }
+        })
     }
 
     /// Store a message in the topic's tree. Keys are timestamp-prefixed so
     /// iteration yields messages in chronological order.
-    pub fn store_message(&self, topic: &str, payload: &str) {
+    pub fn store_message(&self, topic: &str, payload: &str) -> Result<()> {
         let msg = StoredMessage {
             topic: topic.to_string(),
             payload: payload.to_string(),
             timestamp: Utc::now().timestamp_millis(),
         };
 
-        let serialized = match serde_json::to_vec(&msg) {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("Failed to serialize message: {e}");
-                return;
-            }
-        };
+        let serialized = serde_json::to_vec(&msg)?;
 
-        let topic_tree = match self.db.open_tree(topic) {
-            Ok(tree) => tree,
-            Err(e) => {
-                eprintln!("Failed to open topic tree '{topic}': {e}");
-                return;
-            }
-        };
+        let topic_tree = self
+            .db
+            .open_tree(topic)
+            .map_err(|e| PopSubError::Persistence(e.to_string()))?;
 
         let key = format!("{:020}_{}", msg.timestamp, Uuid::new_v4());
 
-        if let Err(e) = topic_tree.insert(key.as_bytes(), serialized) {
-            eprintln!("Failed to store message in topic '{topic}': {e}");
-            return;
-        }
+        topic_tree
+            .insert(key.as_bytes(), serialized)
+            .map_err(|e| PopSubError::Persistence(e.to_string()))?;
 
         if let Some(max) = self.max_messages_per_topic
             && topic_tree.len() > max
@@ -89,32 +80,39 @@ impl Persistence {
                 .collect();
 
             for key in keys_to_delete {
-                if let Err(e) = topic_tree.remove(key) {
-                    eprintln!("Failed to remove old message from '{topic}': {e}");
-                }
+                topic_tree
+                    .remove(key)
+                    .map_err(|e| PopSubError::Persistence(e.to_string()))?;
             }
         }
+        Ok(())
     }
 
     /// Load messages for a topic honoring TTL and retention policy.
-    pub fn load_messages(&self, topic: &str) -> Vec<StoredMessage> {
-        self.cleanup_old_messages(topic);
-        let topic_tree = self.db.open_tree(topic).unwrap();
+    pub fn load_messages(&self, topic: &str) -> Result<Vec<StoredMessage>> {
+        self.cleanup_old_messages(topic)?;
+        let topic_tree = self
+            .db
+            .open_tree(topic)
+            .map_err(|e| PopSubError::Persistence(e.to_string()))?;
 
-        topic_tree
+        Ok(topic_tree
             .iter()
             .filter_map(|res| res.ok())
             .filter_map(|(_, val)| serde_json::from_slice(&val).ok())
-            .collect()
+            .collect())
     }
 
     /// Remove messages older than the TTL for a single topic.
-    fn cleanup_old_messages(&self, topic: &str) {
+    fn cleanup_old_messages(&self, topic: &str) -> Result<()> {
         if let Some(ttl) = self.ttl_seconds {
             let now = Utc::now().timestamp_millis();
             let expiry_time = now - (ttl * 1000);
 
-            let topic_tree = self.db.open_tree(topic).unwrap();
+            let topic_tree = self
+                .db
+                .open_tree(topic)
+                .map_err(|e| PopSubError::Persistence(e.to_string()))?;
             let old_keys: Vec<_> = topic_tree
                 .iter()
                 .filter_map(|res| res.ok())
@@ -134,6 +132,7 @@ impl Persistence {
                 let _ = topic_tree.remove(key);
             }
         }
+        Ok(())
     }
 }
 
@@ -148,5 +147,6 @@ impl std::fmt::Debug for Persistence {
 impl Default for Persistence {
     fn default() -> Self {
         Self::new("pubsub_db", Some(3600), Some(1000))
+            .expect("Failed to create default persistence")
     }
 }

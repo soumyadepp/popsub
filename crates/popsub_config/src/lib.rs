@@ -34,6 +34,21 @@ pub fn load_config() -> Result<Settings, ConfigError> {
                 .as_ref()
                 .and_then(|s| s.jwt_secret.clone())
                 .unwrap_or(default.server.jwt_secret),
+            jwt_expiration_hours: partial
+                .server
+                .as_ref()
+                .and_then(|s| s.jwt_expiration_hours)
+                .unwrap_or(default.server.jwt_expiration_hours),
+            username: partial
+                .server
+                .as_ref()
+                .and_then(|s| s.username.clone())
+                .unwrap_or(default.server.username),
+            password: partial
+                .server
+                .as_ref()
+                .and_then(|s| s.password.clone())
+                .unwrap_or(default.server.password),
         },
         broker: BrokerSettings {
             max_connections: partial
@@ -46,6 +61,16 @@ pub fn load_config() -> Result<Settings, ConfigError> {
                 .as_ref()
                 .and_then(|b| b.message_ttl_secs)
                 .unwrap_or(default.broker.message_ttl_secs),
+            ack_timeout_ms: partial
+                .broker
+                .as_ref()
+                .and_then(|b| b.ack_timeout_ms)
+                .unwrap_or(default.broker.ack_timeout_ms),
+            max_retries: partial
+                .broker
+                .as_ref()
+                .and_then(|b| b.max_retries)
+                .unwrap_or(default.broker.max_retries),
         },
     })
 }
