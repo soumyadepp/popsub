@@ -9,10 +9,8 @@ mod persistence_tests {
 
     fn create_test_persistence(ttl: Option<i64>, max: Option<usize>) -> Persistence {
         let dir = tempdir().unwrap();
-        let persistence =
-            Persistence::new(dir.path().to_str().expect("path to_str failed"), ttl, max)
-                .expect("Failed to create persistence");
-        return persistence;
+        Persistence::new(dir.path().to_str().expect("path to_str failed"), ttl, max)
+            .expect("Failed to create persistence")
     }
 
     #[test]
