@@ -23,7 +23,8 @@ async fn setup_server_and_client() -> (
     let temp_dir = tempdir().expect("Failed to create temp dir");
     let persistence = Persistence::new(temp_dir.path().to_str().unwrap(), None, None);
     let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
-        persistence.clone(),
+        persistence.expect("Failed to create persistence"),
+        settings.broker.clone(),
     )));
 
     tokio::spawn(start_websocket_server(

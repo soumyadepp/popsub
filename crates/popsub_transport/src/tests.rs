@@ -1,5 +1,6 @@
 pub use crate::message::ClientMessage;
 pub use popsub_broker::Broker;
+use popsub_config::Settings;
 use popsub_persistence::Persistence;
 pub use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -52,7 +53,10 @@ async fn handle_message(broker: Arc<Mutex<Broker>>, client_id: String, msg: Stri
 async fn test_handle_subscribe() {
     let tmp = tempdir().unwrap();
     let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(persistence)));
+    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
+        Result::unwrap(persistence),
+        Settings::default().broker,
+    )));
     let client_id = "test_client".to_string();
 
     let msg = json!({
@@ -72,7 +76,10 @@ async fn test_handle_subscribe() {
 async fn test_handle_unsubscribe() {
     let tmp = tempdir().unwrap();
     let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(persistence)));
+    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
+        Result::unwrap(persistence),
+        Settings::default().broker,
+    )));
     let client_id = "test_client".to_string();
 
     // First, subscribe the client to the topic
@@ -98,7 +105,10 @@ async fn test_handle_unsubscribe() {
 async fn test_handle_publish() {
     let tmp = tempdir().unwrap();
     let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(persistence)));
+    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
+        Result::unwrap(persistence),
+        Settings::default().broker,
+    )));
     let client_id = "test_client".to_string();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = popsub_client::Client::new(tx);
@@ -137,7 +147,10 @@ async fn test_handle_publish() {
 async fn test_handle_ack() {
     let tmp = tempdir().unwrap();
     let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(persistence)));
+    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
+        Result::unwrap(persistence),
+        Settings::default().broker,
+    )));
     let client_id = "test_client".to_string();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = popsub_client::Client::new(tx);

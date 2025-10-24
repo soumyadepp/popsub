@@ -14,6 +14,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{EncodingKey, Header};
+use popsub_utils::error::{PopSubError, Result};
 use tokio::net::TcpListener;
 use tokio::spawn;
 use tokio::sync::mpsc;
@@ -53,31 +54,39 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
         encoding_key: &EncodingKey,
         decoding_key: &DecodingKey,
         validation: &Validation,
-        _settings: &Settings,
-    ) -> (bool, Option<BrokerAction>) {
+        settings: &Settings,
+    ) -> Result<(bool, Option<BrokerAction>)> {
+        fn send_server_message(client: &mut Client, message: ServerMessage) -> Result<()> {
+            let json = serde_json::to_string(&message)?;
+            client
+                .sender
+                .send(WsMessage::Text(json.into()))
+                .map_err(|e| {
+                    error!(client_id = %client.id, "Failed to send message: {}", e);
+                    PopSubError::Client("Failed to send message".to_string())
+                })
+        }
+
         match msg {
             ClientMessage::Login { username, password } => {
-                if username == "admin" && password == "password" {
+                if username == settings.server.username && password == settings.server.password {
                     let claims = Claims {
                         sub: username.clone(),
-                        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp()
-                            as usize,
+                        exp: (chrono::Utc::now()
+                            + chrono::Duration::hours(settings.server.jwt_expiration_hours as i64))
+                        .timestamp() as usize,
                     };
-                    let token = encode(&Header::default(), &claims, encoding_key).unwrap();
+                    let token = encode(&Header::default(), &claims, encoding_key)?;
 
                     let response = ServerMessage::LoginResponse { token };
-                    let _ = client.sender.send(WsMessage::Text(
-                        serde_json::to_string(&response).unwrap().into(),
-                    ));
+                    send_server_message(client, response)?;
                 } else {
                     let response = ServerMessage::Error {
                         message: "invalid credentials".to_string(),
                     };
-                    let _ = client.sender.send(WsMessage::Text(
-                        serde_json::to_string(&response).unwrap().into(),
-                    ));
+                    send_server_message(client, response)?;
                 }
-                (true, None)
+                Ok((true, None))
             }
             ClientMessage::Auth { token } => {
                 match decode::<Claims>(&token, decoding_key, validation) {
@@ -85,20 +94,16 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                         client.authenticated = true;
                         info!(client_id = %client.id, "authenticated successfully");
                         let response = ServerMessage::Authenticated {};
-                        let _ = client.sender.send(WsMessage::Text(
-                            serde_json::to_string(&response).unwrap().into(),
-                        ));
-                        (true, None)
+                        send_server_message(client, response)?;
+                        Ok((true, None))
                     }
                     Err(_) => {
                         warn!(client_id = %client.id, "authentication failed");
                         let response = ServerMessage::Error {
                             message: "authentication failed".to_string(),
                         };
-                        let _ = client.sender.send(WsMessage::Text(
-                            serde_json::to_string(&response).unwrap().into(),
-                        ));
-                        (false, None)
+                        send_server_message(client, response)?;
+                        Ok((false, None))
                     }
                 }
             }
@@ -107,13 +112,13 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                 let response = ServerMessage::Error {
                     message: "must authenticate first".to_string(),
                 };
-                let _ = client.sender.send(WsMessage::Text(
-                    serde_json::to_string(&response).unwrap().into(),
-                ));
-                (false, None)
+                send_server_message(client, response)?;
+                Ok((false, None))
             }
-            ClientMessage::Subscribe { topic } => (true, Some(BrokerAction::Subscribe(topic))),
-            ClientMessage::Unsubscribe { topic } => (true, Some(BrokerAction::Unsubscribe(topic))),
+            ClientMessage::Subscribe { topic } => Ok((true, Some(BrokerAction::Subscribe(topic)))),
+            ClientMessage::Unsubscribe { topic } => {
+                Ok((true, Some(BrokerAction::Unsubscribe(topic))))
+            }
             ClientMessage::Publish {
                 topic,
                 payload,
@@ -128,9 +133,9 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                     message_id: message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     qos: qos.unwrap_or(0),
                 };
-                (true, Some(BrokerAction::Publish(msg)))
+                Ok((true, Some(BrokerAction::Publish(msg))))
             }
-            ClientMessage::Ack { message_id } => (true, Some(BrokerAction::Ack(message_id))),
+            ClientMessage::Ack { message_id } => Ok((true, Some(BrokerAction::Ack(message_id)))),
         }
     }
 
@@ -176,7 +181,7 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
             let client = Client::new(tx.clone());
             let client_id = client.id.clone();
             {
-                let mut broker = broker.lock().unwrap();
+                let mut broker = broker.lock().expect("Broker lock poisoned");
                 broker.register_client(client);
             }
 
@@ -189,7 +194,7 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
 
                 move || {
                     if !cleanup_called.swap(true, Ordering::SeqCst) {
-                        let mut broker = broker.lock().unwrap();
+                        let mut broker = broker.lock().expect("Broker lock poisoned");
                         broker.cleanup_client(&client_id);
                     }
                 }
@@ -203,7 +208,13 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
             spawn_send_loop(ws_sender, rx, client_id.clone(), do_cleanup.clone());
             while let Some(Ok(msg)) = ws_receiver.next().await {
                 if msg.is_text() {
-                    let text = msg.to_text().unwrap();
+                    let text = match msg.to_text() {
+                        Ok(text) => text,
+                        Err(_) => {
+                            warn!(client_id = %client_id, "Received non-text message");
+                            continue;
+                        }
+                    };
 
                     // Parse before taking the broker lock to keep lock scope small
                     let parsed = match serde_json::from_str::<ClientMessage>(text) {
@@ -219,7 +230,7 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                     let maybe_action: Option<BrokerAction>;
 
                     {
-                        let mut broker_lock = broker.lock().unwrap();
+                        let mut broker_lock = broker.lock().expect("Broker lock poisoned");
                         let client = match broker_lock.clients.get_mut(&client_id) {
                             Some(c) => c,
                             None => {
@@ -229,16 +240,29 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                             }
                         };
 
-                        let (cont, action) = handle_parsed_message(
+                        match handle_parsed_message(
                             client,
                             parsed,
                             &encoding_key,
                             &decoding_key,
                             &validation,
                             &settings,
-                        );
-                        continue_flag = cont;
-                        maybe_action = action;
+                        ) {
+                            Ok((cont, action)) => {
+                                continue_flag = cont;
+                                maybe_action = action;
+                            }
+                            Err(e) => {
+                                error!(client_id = %client_id, "Error handling message: {}", e);
+                                let response = ServerMessage::Error {
+                                    message: "internal server error".to_string(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&response) {
+                                    let _ = client.sender.send(WsMessage::Text(json.into()));
+                                }
+                                break;
+                            }
+                        }
                     }
 
                     if !continue_flag {
@@ -246,7 +270,7 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
                     }
 
                     if let Some(action) = maybe_action {
-                        let mut broker_lock = broker.lock().unwrap();
+                        let mut broker_lock = broker.lock().expect("Broker lock poisoned");
                         match action {
                             BrokerAction::Subscribe(topic) => {
                                 broker_lock.subscribe(&topic, client_id.clone());

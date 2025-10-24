@@ -1,5 +1,6 @@
 use super::Broker;
 use popsub_client::Client;
+use popsub_config::Settings;
 use tokio::sync::mpsc;
 use tungstenite::protocol::Message as WsMessage;
 
@@ -246,7 +247,7 @@ async fn test_broker_qos1_retry_mechanism() {
     }
 
     // Simulate MAX_RETRIES timeouts and re-sends
-    for i in 0..Broker::MAX_RETRIES {
+    for i in 0..Settings::default().broker.max_retries {
         tokio::time::sleep(tokio::time::Duration::from_millis(5100)).await; // Advance time beyond ACK_TIMEOUT_MS
         tokio::spawn(Broker::start_retry_loop(broker_arc.clone())); // Spawn the retry loop
 

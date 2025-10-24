@@ -15,11 +15,13 @@
 //!   re-send pending QoS=1 messages when ACKs are not received within a
 //!   configured timeout. Retries are capped to avoid infinite resend loops.
 
+use popsub_config::Settings;
 use std::collections::HashMap;
 
 use crate::message::Message;
 use crate::topic::{SubscriberId, Topic};
 use popsub_client::Client;
+use popsub_config::settings::BrokerSettings;
 use popsub_persistence::Persistence;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -46,17 +48,10 @@ pub struct Broker {
     pub clients: HashMap<SubscriberId, Client>,
     pub pending_acks: HashMap<String, PendingMessage>,
     persistence: Persistence,
+    settings: BrokerSettings,
 }
 
 impl Broker {
-    /// Maximum number of delivery retries for QoS=1 messages before dropping.
-    ///
-    /// This prevents endless redelivery loops for clients that never ACK.
-    pub const MAX_RETRIES: u8 = 5;
-
-    /// Timeout in milliseconds after which an un-ACKed message is considered
-    /// eligible for retry. The retry loop checks this periodically.
-    const ACK_TIMEOUT_MS: i64 = 5000;
     /// ACK timeout as a Duration. Prefer Duration-based APIs internally.
     pub const ACK_TIMEOUT: Duration = Duration::from_millis(5000);
 }
@@ -64,11 +59,13 @@ impl Broker {
 impl Default for Broker {
     fn default() -> Self {
         if cfg!(test) {
-            let dir = tempfile::tempdir().unwrap();
-            let persistence = Persistence::new(dir.path().to_str().unwrap(), None, None);
-            Self::new_with_persistence(persistence)
+            let dir = tempfile::tempdir().expect("Failed to create temp dir");
+            let persistence =
+                Persistence::new(dir.path().to_str().expect("path to_str failed"), None, None)
+                    .expect("Failed to create persistence");
+            Self::new_with_persistence(persistence, Settings::default().broker)
         } else {
-            Self::new()
+            Self::new(Settings::default().broker)
         }
     }
 }
@@ -78,23 +75,25 @@ impl Broker {
     /// Create a new in-memory broker using the default persistence backend.
     ///
     /// The broker starts empty (no topics, clients or pending messages).
-    pub fn new() -> Self {
+    pub fn new(settings: BrokerSettings) -> Self {
         Self {
             topics: HashMap::new(),
             clients: HashMap::new(),
             pending_acks: HashMap::new(),
             persistence: Persistence::default(),
+            settings,
         }
     }
     /// Create a broker backed by the provided `Persistence` implementation.
     ///
     /// This is useful for tests or when you want to control where messages are stored.
-    pub fn new_with_persistence(persistence: Persistence) -> Self {
+    pub fn new_with_persistence(persistence: Persistence, settings: BrokerSettings) -> Self {
         Self {
             topics: HashMap::new(),
             clients: HashMap::new(),
             pending_acks: HashMap::new(),
             persistence,
+            settings,
         }
     }
     /// Register a newly connected client with the broker.
@@ -127,17 +126,23 @@ impl Broker {
         topic.subscribe(subscriber);
 
         if let Some(client) = self.clients.get(&subscriber_clone) {
-            let stored_messages = self.persistence.load_messages(topic.name.as_str());
-            for stored in stored_messages {
-                let replay_msg = Message {
-                    topic: stored.topic.clone(),
-                    payload: stored.payload.clone(),
-                    timestamp: stored.timestamp,
-                    message_id: Uuid::new_v4().to_string(),
-                    qos: 0,
-                };
-                if let Ok(json) = serde_json::to_string(&replay_msg) {
-                    let _ = client.sender.send(WsMessage::text(json));
+            match self.persistence.load_messages(topic.name.as_str()) {
+                Ok(stored_messages) => {
+                    for stored in stored_messages {
+                        let replay_msg = Message {
+                            topic: stored.topic.clone(),
+                            payload: stored.payload.clone(),
+                            timestamp: stored.timestamp,
+                            message_id: Uuid::new_v4().to_string(),
+                            qos: 0,
+                        };
+                        if let Ok(json) = serde_json::to_string(&replay_msg) {
+                            let _ = client.sender.send(WsMessage::text(json));
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load messages for topic {}: {}", topic.name, e);
                 }
             }
         }
@@ -167,8 +172,8 @@ impl Broker {
         let mut to_drop = Vec::new();
 
         for (message_id, pending_msg) in &self.pending_acks {
-            if now_ms - pending_msg.sent_at > Self::ACK_TIMEOUT_MS {
-                if pending_msg.retries >= Self::MAX_RETRIES {
+            if now_ms - pending_msg.sent_at > self.settings.ack_timeout_ms as i64 {
+                if pending_msg.retries >= self.settings.max_retries {
                     to_drop.push(message_id.clone());
                 } else {
                     to_resend.push(message_id.clone());
@@ -239,7 +244,9 @@ impl Broker {
             );
         }
 
-        self.persistence.store_message(&msg.topic, &msg.payload);
+        if let Err(e) = self.persistence.store_message(&msg.topic, &msg.payload) {
+            error!("Failed to store message: {}", e);
+        }
 
         if let Some(topic) = self.topics.get(&msg.topic) {
             let text = match serde_json::to_string(&msg) {
@@ -292,27 +299,27 @@ impl Broker {
 
             let (messages_to_resend, messages_to_drop) = {
                 // Use a scoped borrow to call the read-only helper
-                let broker_read = broker.lock().unwrap();
+                let broker_read = broker.lock().expect("Broker lock poisoned");
                 broker_read.collect_retry_candidates(current_time)
             };
 
             for message_id in messages_to_drop {
                 if let Ok(mut broker_write) = broker.try_lock() {
                     if broker_write.pending_acks.remove(&message_id).is_some() {
-                        warn!(message_id = %message_id, retries = %Self::MAX_RETRIES, "Message dropped after max retries");
+                        warn!(message_id = %message_id, retries = %broker_write.settings.max_retries, "Message dropped after max retries");
                     }
                 } else {
                     // Fallback: acquire blocking lock
-                    let mut broker_write = broker.lock().unwrap();
+                    let mut broker_write = broker.lock().expect("Broker lock poisoned");
                     if broker_write.pending_acks.remove(&message_id).is_some() {
-                        warn!(message_id = %message_id, retries = %Self::MAX_RETRIES, "Message dropped after max retries");
+                        warn!(message_id = %message_id, retries = %broker_write.settings.max_retries, "Message dropped after max retries");
                     }
                 }
             }
 
             for message_id in messages_to_resend {
                 // Resend with a write lock
-                let mut broker_write = broker.lock().unwrap();
+                let mut broker_write = broker.lock().expect("Broker lock poisoned");
                 let _ = broker_write.resend_pending_message(&message_id, current_time);
             }
         }

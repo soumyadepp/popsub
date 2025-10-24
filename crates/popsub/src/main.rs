@@ -47,7 +47,7 @@ async fn main() {
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let broker = Arc::new(Mutex::new(Broker::new()));
+    let broker = Arc::new(Mutex::new(Broker::new(config.broker.clone())));
 
     tokio::spawn(Broker::start_retry_loop(broker.clone()));
 

@@ -6,3 +6,8 @@ edition = "2024"
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = "0.3"
+thiserror = "1.0"
+serde_json = "1.0"
+jsonwebtoken = "9.3.1"
+tungstenite = "0.28.0"
+config = "0.13"

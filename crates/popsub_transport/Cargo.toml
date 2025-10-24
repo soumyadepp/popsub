@@ -9,7 +9,7 @@ serde_json = "1.0.140"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-tungstenite = "0.28.0"
 tungstenite = "0.28.0"
-jsonwebtoken = "9.3.0"
+jsonwebtoken = "9.3.1"
 futures-util = "0.3.31"
 chrono = { version = "0.4.41", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4"] }
@@ -19,6 +19,7 @@ popsub_broker = { path = "../popsub_broker" }
 popsub_client = { path = "../popsub_client" }
 popsub_config = { path = "../popsub_config" }
 popsub_persistence = { path = "../popsub_persistence" }
+popsub_utils = { path = "../popsub_utils" }
 
 [dev-dependencies]
 tempfile = "3.20.0"
