@@ -3,7 +3,8 @@
 //! `Client` models a connected client and holds the sending side of a
 //! per-client channel used by the broker/transport to push messages. The
 //! `authenticated` flag is updated by the transport after successful JWT
-//! validation.
+//! validation. The `username` is populated after successful authentication
+//! and is used for authorization checks.
 
 use tokio::sync::mpsc::UnboundedSender;
 use tungstenite::protocol::Message as WsMessage;
@@ -14,6 +15,8 @@ pub struct Client {
     pub id: String,
     pub sender: UnboundedSender<WsMessage>,
     pub authenticated: bool,
+    /// The username of the authenticated user (populated after auth).
+    pub username: Option<String>,
 }
 
 impl Client {
@@ -24,6 +27,7 @@ impl Client {
             id: Uuid::new_v4().to_string(),
             sender,
             authenticated: false,
+            username: None,
         }
     }
 }

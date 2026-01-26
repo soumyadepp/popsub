@@ -1,6 +1,7 @@
 [workspace]
 members = [
 	"crates/popsub",
+	"crates/popsub_auth",
 	"crates/popsub_broker",
 	"crates/popsub_client",
 	"crates/popsub_config",
