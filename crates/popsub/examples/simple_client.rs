@@ -113,23 +113,23 @@ async fn main() {
             WsMessage::Text(text) => {
                 println!("Received: {text}");
                 // Parse and check if it's our published message
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if v.get("Message").is_some() {
-                        // Acknowledge QoS 1 messages
-                        if let Some(msg_id) = v
-                            .get("Message")
-                            .and_then(|m| m.get("message_id"))
-                            .and_then(|id| id.as_str())
-                        {
-                            let ack = json!({"Ack": {"message_id": msg_id}});
-                            ws_stream
-                                .send(WsMessage::Text(ack.to_string().into()))
-                                .await
-                                .unwrap();
-                            println!("Sent ACK for message: {msg_id}");
-                        }
-                        break; // Exit after receiving our message
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                    && v.get("Message").is_some()
+                {
+                    // Acknowledge QoS 1 messages
+                    if let Some(msg_id) = v
+                        .get("Message")
+                        .and_then(|m| m.get("message_id"))
+                        .and_then(|id| id.as_str())
+                    {
+                        let ack = json!({"Ack": {"message_id": msg_id}});
+                        ws_stream
+                            .send(WsMessage::Text(ack.to_string().into()))
+                            .await
+                            .unwrap();
+                        println!("Sent ACK for message: {msg_id}");
                     }
+                    break; // Exit after receiving our message
                 }
             }
             WsMessage::Close(_) => {
