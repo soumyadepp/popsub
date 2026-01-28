@@ -65,14 +65,13 @@ impl SlidingWindow {
     }
 
     fn get_or_create_window(&self, key: &str) -> dashmap::mapref::one::Ref<'_, String, Window> {
-        if !self.windows.contains_key(key) {
-            self.windows.insert(
-                key.to_string(),
-                Window {
-                    timestamps: Mutex::new(VecDeque::new()),
-                },
-            );
-        }
+        // Use entry API to avoid race condition between contains_key and get
+        self.windows
+            .entry(key.to_string())
+            .or_insert_with(|| Window {
+                timestamps: Mutex::new(VecDeque::new()),
+            });
+        // Safe to unwrap: we just inserted if missing
         self.windows.get(key).unwrap()
     }
 

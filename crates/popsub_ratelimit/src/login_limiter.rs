@@ -27,8 +27,10 @@ pub enum LoginStatus {
 /// State for a single user/IP.
 #[derive(Default)]
 struct LoginState {
-    /// Number of consecutive failed attempts.
+    /// Number of failed attempts in current cycle (resets after lockout expires).
     failures: u32,
+    /// Number of lockout cycles (used for exponential backoff).
+    lockout_count: u32,
     /// Time of last failure (for lockout calculation).
     last_failure: Option<Instant>,
     /// Whether currently locked out.
@@ -163,10 +165,11 @@ impl LoginRateLimiter {
         &self,
         key: &str,
     ) -> dashmap::mapref::one::Ref<'_, String, Mutex<LoginState>> {
-        if !self.states.contains_key(key) {
-            self.states
-                .insert(key.to_string(), Mutex::new(LoginState::default()));
-        }
+        // Use entry API to avoid race condition between contains_key and get
+        self.states
+            .entry(key.to_string())
+            .or_insert_with(|| Mutex::new(LoginState::default()));
+        // Safe to unwrap: we just inserted if missing
         self.states.get(key).unwrap()
     }
 
@@ -205,20 +208,25 @@ impl LoginRateLimiter {
         if let Some(locked_until) = state.locked_until
             && now >= locked_until
         {
-            // Lockout expired, but keep failure count for exponential backoff
+            // Lockout expired: reset failure count but keep lockout_count for exponential backoff.
+            // This ensures users get a fresh set of max_attempts after each lockout expires,
+            // while still increasing lockout duration for repeated lockout cycles.
             state.locked_until = None;
+            state.failures = 0;
         }
 
         state.failures += 1;
         state.last_failure = Some(now);
 
         if state.failures >= self.config.max_attempts {
+            // Increment lockout count for exponential backoff calculation
+            state.lockout_count += 1;
+
             let lockout_duration = if self.config.exponential_backoff {
-                // Exponential backoff: double duration for each lockout
-                let multiplier = state.failures / self.config.max_attempts;
+                // Exponential backoff: double duration for each lockout cycle
                 let base_millis = self.config.lockout_duration.as_millis() as u64;
-                let exponential_millis =
-                    base_millis.saturating_mul(2_u64.saturating_pow(multiplier.saturating_sub(1)));
+                let exponential_millis = base_millis
+                    .saturating_mul(2_u64.saturating_pow(state.lockout_count.saturating_sub(1)));
                 let max_millis = self.config.max_lockout_duration.as_millis() as u64;
                 Duration::from_millis(exponential_millis.min(max_millis))
             } else {
@@ -237,16 +245,17 @@ impl LoginRateLimiter {
 
     /// Record a successful login.
     ///
-    /// Resets failure count and clears lockout.
+    /// Resets failure count, lockout count, and clears lockout.
     pub async fn record_success(&self, key: &str) {
         let state_ref = self.get_or_create_state(key);
         let mut state = state_ref.lock().unwrap();
 
-        if state.failures > 0 {
-            info!(key = %key, previous_failures = state.failures, "Login successful, resetting failure count");
+        if state.failures > 0 || state.lockout_count > 0 {
+            info!(key = %key, previous_failures = state.failures, lockout_count = state.lockout_count, "Login successful, resetting failure count");
         }
 
         state.failures = 0;
+        state.lockout_count = 0;
         state.last_failure = None;
         state.locked_until = None;
     }

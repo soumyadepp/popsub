@@ -3,7 +3,7 @@
 //! Classic rate limiting algorithm with burst support.
 //! Tokens are added at a fixed rate, and each request consumes one token.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -11,11 +11,19 @@ use dashmap::DashMap;
 use crate::RateLimiter;
 
 /// Token bucket state for a single key.
+/// Both tokens and last_refill are wrapped in a single Mutex to ensure
+/// atomic updates and prevent race conditions during refill operations.
 struct Bucket {
+    /// Current number of tokens and last refill time, protected by a single mutex.
+    state: Mutex<BucketState>,
+}
+
+/// Internal state of a bucket, protected by a mutex.
+struct BucketState {
     /// Current number of tokens available.
-    tokens: AtomicU64,
+    tokens: u64,
     /// Last time tokens were added.
-    last_refill: std::sync::Mutex<Instant>,
+    last_refill: Instant,
 }
 
 /// Token Bucket rate limiter.
@@ -69,61 +77,68 @@ impl TokenBucket {
     }
 
     fn get_or_create_bucket(&self, key: &str) -> dashmap::mapref::one::Ref<'_, String, Bucket> {
-        if !self.buckets.contains_key(key) {
-            self.buckets.insert(
-                key.to_string(),
-                Bucket {
-                    tokens: AtomicU64::new(self.capacity),
-                    last_refill: std::sync::Mutex::new(Instant::now()),
-                },
-            );
-        }
-        self.buckets.get(key).unwrap()
+        // Use entry API to atomically get or insert, avoiding race conditions
+        // between contains_key check and get() that could occur with concurrent reset().
+        self.buckets
+            .entry(key.to_string())
+            .or_insert_with(|| Bucket {
+                state: Mutex::new(BucketState {
+                    tokens: self.capacity,
+                    last_refill: Instant::now(),
+                }),
+            })
+            .downgrade()
     }
 
-    fn refill_tokens(&self, bucket: &Bucket) {
-        let mut last_refill = bucket.last_refill.lock().unwrap();
+    /// Refill tokens based on elapsed time and attempt to consume one token.
+    /// Returns true if a token was successfully consumed, false otherwise.
+    /// This method handles both refilling and consuming atomically under a single lock.
+    fn refill_and_try_consume(&self, bucket: &Bucket) -> bool {
+        let mut state = bucket.state.lock().unwrap();
         let now = Instant::now();
-        let elapsed = now.duration_since(*last_refill);
+        let elapsed = now.duration_since(state.last_refill);
 
         if elapsed >= self.interval {
             let intervals = elapsed.as_nanos() / self.interval.as_nanos();
             let tokens_to_add = (intervals as u64) * self.rate;
-
-            let current = bucket.tokens.load(Ordering::Relaxed);
-            let new_tokens = (current + tokens_to_add).min(self.capacity);
-            bucket.tokens.store(new_tokens, Ordering::Relaxed);
-
-            *last_refill = now;
+            state.tokens = (state.tokens + tokens_to_add).min(self.capacity);
+            state.last_refill = now;
         }
+
+        if state.tokens > 0 {
+            state.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Refill tokens and return the current count.
+    fn refill_and_get_remaining(&self, bucket: &Bucket) -> u64 {
+        let mut state = bucket.state.lock().unwrap();
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill);
+
+        if elapsed >= self.interval {
+            let intervals = elapsed.as_nanos() / self.interval.as_nanos();
+            let tokens_to_add = (intervals as u64) * self.rate;
+            state.tokens = (state.tokens + tokens_to_add).min(self.capacity);
+            state.last_refill = now;
+        }
+
+        state.tokens
     }
 }
 
 impl RateLimiter for TokenBucket {
     async fn try_acquire(&self, key: &str) -> bool {
         let bucket = self.get_or_create_bucket(key);
-        self.refill_tokens(&bucket);
-
-        loop {
-            let current = bucket.tokens.load(Ordering::Relaxed);
-            if current == 0 {
-                return false;
-            }
-
-            if bucket
-                .tokens
-                .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
-                return true;
-            }
-        }
+        self.refill_and_try_consume(&bucket)
     }
 
     async fn remaining(&self, key: &str) -> u64 {
         let bucket = self.get_or_create_bucket(key);
-        self.refill_tokens(&bucket);
-        bucket.tokens.load(Ordering::Relaxed)
+        self.refill_and_get_remaining(&bucket)
     }
 
     async fn reset(&self, key: &str) {
@@ -132,13 +147,12 @@ impl RateLimiter for TokenBucket {
 
     async fn retry_after(&self, key: &str) -> Option<u64> {
         let bucket = self.get_or_create_bucket(key);
-        let current = bucket.tokens.load(Ordering::Relaxed);
+        let state = bucket.state.lock().unwrap();
 
-        if current > 0 {
+        if state.tokens > 0 {
             None
         } else {
-            let last_refill = bucket.last_refill.lock().unwrap();
-            let elapsed = Instant::now().duration_since(*last_refill);
+            let elapsed = Instant::now().duration_since(state.last_refill);
             let remaining = self.interval.saturating_sub(elapsed);
             Some(remaining.as_secs().max(1))
         }
