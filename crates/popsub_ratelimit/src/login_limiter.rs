@@ -202,11 +202,11 @@ impl LoginRateLimiter {
         let now = Instant::now();
 
         // Check if lockout has expired
-        if let Some(locked_until) = state.locked_until {
-            if now >= locked_until {
-                // Lockout expired, but keep failure count for exponential backoff
-                state.locked_until = None;
-            }
+        if let Some(locked_until) = state.locked_until
+            && now >= locked_until
+        {
+            // Lockout expired, but keep failure count for exponential backoff
+            state.locked_until = None;
         }
 
         state.failures += 1;
