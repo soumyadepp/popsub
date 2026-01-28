@@ -137,26 +137,83 @@ let readonly_role = Role::ReadOnly {
 
 ## Custom User Store
 
-Implement the `UserStore` trait for custom backends:
+The auth system uses a trait-based storage abstraction, allowing you to plug in any database backend.
+
+### Using a Custom Store
 
 ```rust
 use popsub_auth::store::UserStore;
-use popsub_auth::{User, AuthError};
+use popsub_auth::service::{AuthConfig, AuthService};
+use std::sync::Arc;
 
-struct DatabaseUserStore { /* ... */ }
+// Create your custom store
+let my_store: Arc<dyn UserStore> = Arc::new(MyDatabaseStore::new());
 
-impl UserStore for DatabaseUserStore {
-    fn get_user(&self, username: &str) -> Result<Option<User>, AuthError> {
-        // Query database
+// Use it with AuthService
+let config = AuthConfig::default();
+let auth_service = AuthService::with_store(config, my_store);
+```
+
+### Implementing a Custom Store
+
+Implement the `UserStore` trait for your database:
+
+```rust
+use popsub_auth::store::UserStore;
+use popsub_auth::user::User;
+use popsub_auth::error::{AuthError, Result};
+
+pub struct PostgresUserStore {
+    pool: sqlx::PgPool,
+}
+
+impl UserStore for PostgresUserStore {
+    fn get_user(&self, username: &str) -> Result<Option<User>> {
+        // Query: SELECT * FROM users WHERE username = $1
+        todo!()
     }
 
-    fn add_user(&self, user: User) -> Result<(), AuthError> {
-        // Insert into database
+    fn add_user(&self, user: User) -> Result<()> {
+        // Query: INSERT INTO users (username, password_hash, role, ...) VALUES (...)
+        todo!()
     }
 
-    // ... other methods
+    fn update_user(&self, user: User) -> Result<()> {
+        // Query: UPDATE users SET ... WHERE username = $1
+        todo!()
+    }
+
+    fn remove_user(&self, username: &str) -> Result<bool> {
+        // Query: DELETE FROM users WHERE username = $1
+        todo!()
+    }
+
+    fn user_exists(&self, username: &str) -> Result<bool> {
+        // Query: SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)
+        todo!()
+    }
+
+    fn list_usernames(&self) -> Result<Vec<String>> {
+        // Query: SELECT username FROM users
+        todo!()
+    }
+
+    fn user_count(&self) -> Result<usize> {
+        // Query: SELECT COUNT(*) FROM users
+        todo!()
+    }
 }
 ```
+
+### Available Backends
+
+| Backend    | Status      | Notes                             |
+| ---------- | ----------- | --------------------------------- |
+| In-Memory  | ✅ Built-in | Default, for dev/testing          |
+| PostgreSQL | 📝 Example  | Implement with `sqlx`             |
+| SQLite     | 📝 Example  | Implement with `rusqlite`         |
+| Redis      | 📝 Example  | Implement with `redis-rs`         |
+| Sled       | 📝 Example  | Use existing `popsub_persistence` |
 
 ## Security Considerations
 

@@ -14,21 +14,50 @@
 
 use futures_util::{SinkExt, StreamExt};
 use popsub_auth::AuthService;
+use popsub_ratelimit::{LoginRateLimiter, RateLimiter, TokenBucket};
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::TcpListener;
 use tokio::spawn;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::accept_async;
 use tungstenite::protocol::Message as WsMessage;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tracing::{error, info, warn};
 
 use crate::message::{ClientMessage, ServerMessage};
 use popsub_broker::engine::Broker;
 use popsub_client::Client;
+
+/// Rate limiter configuration for the WebSocket server.
+#[derive(Clone)]
+pub struct RateLimiters {
+    /// Rate limiter for login/register attempts (per username/IP).
+    pub login_limiter: Arc<LoginRateLimiter>,
+    /// Rate limiter for messages (per client connection).
+    pub message_limiter: Arc<TokenBucket>,
+}
+
+impl Default for RateLimiters {
+    fn default() -> Self {
+        Self {
+            // 5 failed attempts, 5 minute lockout, exponential backoff up to 1 hour
+            login_limiter: Arc::new(
+                LoginRateLimiter::builder()
+                    .max_attempts(5)
+                    .lockout_duration(Duration::from_secs(300))
+                    .exponential_backoff(true)
+                    .max_lockout_duration(Duration::from_secs(3600))
+                    .build(),
+            ),
+            // 100 messages per second, burst of 50
+            message_limiter: Arc::new(TokenBucket::new(100, 50, Duration::from_secs(1))),
+        }
+    }
+}
 
 /// Start the WebSocket server with authentication support.
 ///
@@ -42,6 +71,24 @@ pub async fn start_websocket_server_with_auth(
     broker: Arc<Mutex<Broker>>,
     auth_service: Arc<RwLock<AuthService>>,
 ) {
+    start_websocket_server_with_rate_limiting(addr, broker, auth_service, RateLimiters::default())
+        .await
+}
+
+/// Start the WebSocket server with authentication and custom rate limiting.
+///
+/// # Arguments
+///
+/// * `addr` - The address to bind the server to (e.g., "127.0.0.1:8080")
+/// * `broker` - The shared broker instance
+/// * `auth_service` - The authentication service for login/auth/authorization
+/// * `rate_limiters` - Custom rate limiter configuration
+pub async fn start_websocket_server_with_rate_limiting(
+    addr: String,
+    broker: Arc<Mutex<Broker>>,
+    auth_service: Arc<RwLock<AuthService>>,
+    rate_limiters: RateLimiters,
+) {
     let listener = TcpListener::bind(addr.clone()).await.expect("Can't bind");
 
     info!("WebSocket server listening on ws://{}", addr);
@@ -49,6 +96,7 @@ pub async fn start_websocket_server_with_auth(
     while let Ok((stream, _)) = listener.accept().await {
         let broker = broker.clone();
         let auth_service = auth_service.clone();
+        let rate_limiters = rate_limiters.clone();
 
         tokio::spawn(async move {
             let ws_stream = match accept_async(stream).await {
@@ -111,7 +159,9 @@ pub async fn start_websocket_server_with_auth(
                     };
 
                     // Handle the message
-                    let result = handle_message(&broker, &auth_service, &client_id, parsed);
+                    let result =
+                        handle_message(&broker, &auth_service, &rate_limiters, &client_id, parsed)
+                            .await;
 
                     match result {
                         Ok(should_continue) => {
@@ -144,22 +194,39 @@ pub async fn start_websocket_server_with_auth(
 /// Handle a parsed client message with authentication and authorization.
 ///
 /// Returns `Ok(true)` to continue processing, `Ok(false)` to disconnect the client.
-fn handle_message(
+async fn handle_message(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
+    rate_limiters: &RateLimiters,
     client_id: &str,
     msg: ClientMessage,
 ) -> Result<bool> {
     match msg {
         ClientMessage::Login { username, password } => {
-            handle_login(broker, auth_service, client_id, &username, &password)
+            handle_login(
+                broker,
+                auth_service,
+                rate_limiters,
+                client_id,
+                &username,
+                &password,
+            )
+            .await
         }
         ClientMessage::Register { username, password } => {
-            handle_register(broker, auth_service, client_id, &username, &password)
+            handle_register(
+                broker,
+                auth_service,
+                rate_limiters,
+                client_id,
+                &username,
+                &password,
+            )
+            .await
         }
-        ClientMessage::Auth { token } => handle_auth(broker, auth_service, client_id, &token),
+        ClientMessage::Auth { token } => handle_auth(broker, auth_service, client_id, &token).await,
         ClientMessage::Subscribe { topic } => {
-            handle_subscribe(broker, auth_service, client_id, &topic)
+            handle_subscribe(broker, auth_service, client_id, &topic).await
         }
         ClientMessage::Unsubscribe { topic } => handle_unsubscribe(broker, client_id, &topic),
         ClientMessage::Publish {
@@ -167,39 +234,69 @@ fn handle_message(
             payload,
             message_id,
             qos,
-        } => handle_publish(
-            broker,
-            auth_service,
-            client_id,
-            &topic,
-            payload,
-            message_id,
-            qos,
-        ),
+        } => {
+            handle_publish(
+                broker,
+                auth_service,
+                rate_limiters,
+                client_id,
+                &topic,
+                payload,
+                message_id,
+                qos,
+            )
+            .await
+        }
         ClientMessage::Ack { message_id } => handle_ack(broker, client_id, &message_id),
     }
 }
 
 /// Handle registration request - create a new user account.
-fn handle_register(
+async fn handle_register(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
+    rate_limiters: &RateLimiters,
     client_id: &str,
     username: &str,
     password: &str,
 ) -> Result<bool> {
-    let mut auth = auth_service.write().map_err(|_| PopSubError::Lock)?;
+    // Check rate limit for registration attempts (use username as key)
+    if !rate_limiters.login_limiter.check_allowed(username).await {
+        let status = rate_limiters.login_limiter.check_status(username).await;
+        let retry_after = match status {
+            popsub_ratelimit::LoginStatus::LockedOut { retry_after } => retry_after,
+            _ => 0,
+        };
+        warn!(
+            client_id = %client_id,
+            username = %username,
+            retry_after = %retry_after,
+            "registration rate limited"
+        );
+        let response = ServerMessage::RegisterResponse {
+            success: false,
+            message: format!("Too many attempts. Try again in {retry_after} seconds."),
+        };
+        send_to_client(broker, client_id, response)?;
+        return Ok(true);
+    }
 
-    let response = match auth.register_user(username, password) {
+    let auth = auth_service.read().await;
+
+    let response = match auth.register_user(username, password).await {
         Ok(()) => {
             info!(client_id = %client_id, username = %username, "registration successful");
+            // Reset rate limit on success
+            rate_limiters.login_limiter.record_success(username).await;
             ServerMessage::RegisterResponse {
                 success: true,
-                message: "registration successful".to_string(),
+                message: "User registered successfully".to_string(),
             }
         }
         Err(e) => {
             warn!(client_id = %client_id, username = %username, "registration failed: {}", e);
+            // Record failure for rate limiting
+            rate_limiters.login_limiter.record_failure(username).await;
             ServerMessage::RegisterResponse {
                 success: false,
                 message: e.to_string(),
@@ -213,40 +310,66 @@ fn handle_register(
 }
 
 /// Handle login request - authenticate user and return JWT token.
-fn handle_login(
+async fn handle_login(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
+    rate_limiters: &RateLimiters,
     client_id: &str,
     username: &str,
     password: &str,
 ) -> Result<bool> {
-    let auth = auth_service.read().map_err(|_| PopSubError::Lock)?;
+    // Check rate limit for login attempts
+    if !rate_limiters.login_limiter.check_allowed(username).await {
+        let status = rate_limiters.login_limiter.check_status(username).await;
+        let retry_after = match status {
+            popsub_ratelimit::LoginStatus::LockedOut { retry_after } => retry_after,
+            _ => 0,
+        };
+        warn!(
+            client_id = %client_id,
+            username = %username,
+            retry_after = %retry_after,
+            "login rate limited"
+        );
+        let response = ServerMessage::Error {
+            message: format!("Too many login attempts. Try again in {retry_after} seconds."),
+        };
+        send_to_client(broker, client_id, response)?;
+        return Ok(true);
+    }
 
-    let response = match auth.login(username, password) {
+    let auth = auth_service.read().await;
+
+    let response = match auth.login(username, password).await {
         Ok(token) => {
             info!(client_id = %client_id, username = %username, "login successful");
+            // Reset rate limit on successful login
+            rate_limiters.login_limiter.record_success(username).await;
             ServerMessage::LoginResponse { token }
         }
         Err(e) => {
             warn!(client_id = %client_id, username = %username, "login failed: {}", e);
+            // Record failure for rate limiting
+            rate_limiters.login_limiter.record_failure(username).await;
             ServerMessage::Error {
                 message: "invalid credentials".to_string(),
             }
         }
     };
 
+    drop(auth);
     send_to_client(broker, client_id, response)?;
     Ok(true)
 }
 
 /// Handle auth request - validate JWT token and mark client as authenticated.
-fn handle_auth(
+async fn handle_auth(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
     client_id: &str,
     token: &str,
 ) -> Result<bool> {
-    let auth = auth_service.read().map_err(|_| PopSubError::Lock)?;
+    let auth = auth_service.read().await;
 
     match auth.validate_token(token) {
         Ok(claims) => {
@@ -278,39 +401,44 @@ fn handle_auth(
 }
 
 /// Handle subscribe request with authorization check.
-fn handle_subscribe(
+async fn handle_subscribe(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
     client_id: &str,
     topic: &str,
 ) -> Result<bool> {
-    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
+    // First check authentication and get username
+    let (username, sender) = {
+        let broker_lock = broker.lock().expect("Broker lock poisoned");
 
-    let client = match broker_lock.clients.get(client_id) {
-        Some(c) => c,
-        None => {
-            warn!(client_id = %client_id, "Client not found");
+        let client = match broker_lock.clients.get(client_id) {
+            Some(c) => c,
+            None => {
+                warn!(client_id = %client_id, "Client not found");
+                return Ok(false);
+            }
+        };
+
+        // Check authentication
+        if !client.authenticated {
+            warn!(client_id = %client_id, "subscribe attempt before authentication");
+            let response = ServerMessage::Error {
+                message: "must authenticate first".to_string(),
+            };
+            let json = serde_json::to_string(&response)?;
+            let _ = client.sender.send(WsMessage::Text(json.into()));
             return Ok(false);
         }
-    };
 
-    // Check authentication
-    if !client.authenticated {
-        warn!(client_id = %client_id, "subscribe attempt before authentication");
-        let response = ServerMessage::Error {
-            message: "must authenticate first".to_string(),
-        };
-        let json = serde_json::to_string(&response)?;
-        let _ = client.sender.send(WsMessage::Text(json.into()));
-        return Ok(false);
-    }
+        (
+            client.username.clone().unwrap_or_default(),
+            client.sender.clone(),
+        )
+    }; // broker_lock dropped here
 
-    let username = client.username.clone().unwrap_or_default();
-    let sender = client.sender.clone();
-
-    // Check authorization
-    let auth = auth_service.read().map_err(|_| PopSubError::Lock)?;
-    if !auth.can_subscribe(&username, topic) {
+    // Check authorization (async)
+    let auth = auth_service.read().await;
+    if !auth.can_subscribe(&username, topic).await {
         warn!(client_id = %client_id, username = %username, topic = %topic, "subscribe denied");
         let response = ServerMessage::Error {
             message: format!("not authorized to subscribe to '{topic}'"),
@@ -322,7 +450,8 @@ fn handle_subscribe(
     }
     drop(auth);
 
-    // Perform subscription
+    // Re-acquire broker lock for subscription
+    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
     broker_lock.subscribe(topic, client_id.to_string());
     info!(client_id = %client_id, username = %username, topic = %topic, "subscribed");
 
@@ -360,43 +489,60 @@ fn handle_unsubscribe(broker: &Arc<Mutex<Broker>>, client_id: &str, topic: &str)
     Ok(true)
 }
 
-/// Handle publish request with authorization check.
-fn handle_publish(
+/// Handle publish request with authorization check and rate limiting.
+#[allow(clippy::too_many_arguments)]
+async fn handle_publish(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
+    rate_limiters: &RateLimiters,
     client_id: &str,
     topic: &str,
     payload: String,
     message_id: Option<String>,
     qos: Option<u8>,
 ) -> Result<bool> {
-    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
-
-    let client = match broker_lock.clients.get(client_id) {
-        Some(c) => c,
-        None => {
-            warn!(client_id = %client_id, "Client not found");
-            return Ok(false);
-        }
-    };
-
-    // Check authentication
-    if !client.authenticated {
-        warn!(client_id = %client_id, "publish attempt before authentication");
+    // Check message rate limit first
+    if !rate_limiters.message_limiter.try_acquire(client_id).await {
+        warn!(client_id = %client_id, "message rate limited");
         let response = ServerMessage::Error {
-            message: "must authenticate first".to_string(),
+            message: "Rate limited. Too many messages.".to_string(),
         };
-        let json = serde_json::to_string(&response)?;
-        let _ = client.sender.send(WsMessage::Text(json.into()));
-        return Ok(false);
+        send_to_client(broker, client_id, response)?;
+        return Ok(true); // Don't disconnect, just rate limit
     }
 
-    let username = client.username.clone().unwrap_or_default();
-    let sender = client.sender.clone();
+    // First check authentication and get username
+    let (username, sender) = {
+        let broker_lock = broker.lock().expect("Broker lock poisoned");
 
-    // Check authorization
-    let auth = auth_service.read().map_err(|_| PopSubError::Lock)?;
-    if !auth.can_publish(&username, topic) {
+        let client = match broker_lock.clients.get(client_id) {
+            Some(c) => c,
+            None => {
+                warn!(client_id = %client_id, "Client not found");
+                return Ok(false);
+            }
+        };
+
+        // Check authentication
+        if !client.authenticated {
+            warn!(client_id = %client_id, "publish attempt before authentication");
+            let response = ServerMessage::Error {
+                message: "must authenticate first".to_string(),
+            };
+            let json = serde_json::to_string(&response)?;
+            let _ = client.sender.send(WsMessage::Text(json.into()));
+            return Ok(false);
+        }
+
+        (
+            client.username.clone().unwrap_or_default(),
+            client.sender.clone(),
+        )
+    }; // broker_lock dropped here
+
+    // Check authorization (async)
+    let auth = auth_service.read().await;
+    if !auth.can_publish(&username, topic).await {
         warn!(client_id = %client_id, username = %username, topic = %topic, "publish denied");
         let response = ServerMessage::Error {
             message: format!("not authorized to publish to '{topic}'"),
@@ -407,6 +553,9 @@ fn handle_publish(
         return Ok(true); // Don't disconnect, just deny this request
     }
     drop(auth);
+
+    // Re-acquire broker lock for publishing
+    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
 
     // Create and publish the message
     let timestamp = chrono::Utc::now().timestamp_millis();
@@ -514,7 +663,7 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
         .with_expiration(settings.server.jwt_expiration_hours)
         .with_admin(&settings.server.username, &settings.server.password);
 
-    let auth_service = Arc::new(RwLock::new(AuthService::new(config)));
+    let auth_service = Arc::new(RwLock::new(AuthService::new(config).await));
 
     start_websocket_server_with_auth(addr, broker, auth_service).await
 }
