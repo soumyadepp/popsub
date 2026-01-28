@@ -326,15 +326,25 @@ mod postgres_store {
             match role_type {
                 "admin" => Ok(Role::Admin),
                 "user" => {
-                    let allowed_topics = role_data
-                        .map(|d| serde_json::from_value(d).unwrap_or_default())
-                        .unwrap_or_default();
+                    let allowed_topics = match role_data {
+                        Some(d) => serde_json::from_value(d).map_err(|e| {
+                            AuthError::Internal(format!(
+                                "Failed to deserialize role data for user role: {e}"
+                            ))
+                        })?,
+                        None => Vec::new(),
+                    };
                     Ok(Role::User { allowed_topics })
                 }
                 "readonly" => {
-                    let allowed_topics = role_data
-                        .map(|d| serde_json::from_value(d).unwrap_or_default())
-                        .unwrap_or_default();
+                    let allowed_topics = match role_data {
+                        Some(d) => serde_json::from_value(d).map_err(|e| {
+                            AuthError::Internal(format!(
+                                "Failed to deserialize role data for readonly role: {e}"
+                            ))
+                        })?,
+                        None => Vec::new(),
+                    };
                     Ok(Role::ReadOnly { allowed_topics })
                 }
                 _ => Err(AuthError::Internal(format!(

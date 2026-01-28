@@ -159,6 +159,7 @@ let auth_service = AuthService::with_store(config, my_store);
 Implement the `UserStore` trait for your database:
 
 ```rust
+use async_trait::async_trait;
 use popsub_auth::store::UserStore;
 use popsub_auth::user::User;
 use popsub_auth::error::{AuthError, Result};
@@ -167,38 +168,39 @@ pub struct PostgresUserStore {
     pool: sqlx::PgPool,
 }
 
+#[async_trait]
 impl UserStore for PostgresUserStore {
-    fn get_user(&self, username: &str) -> Result<Option<User>> {
+    async fn get_user(&self, username: &str) -> Result<Option<User>> {
         // Query: SELECT * FROM users WHERE username = $1
         todo!()
     }
 
-    fn add_user(&self, user: User) -> Result<()> {
+    async fn add_user(&self, user: User) -> Result<()> {
         // Query: INSERT INTO users (username, password_hash, role, ...) VALUES (...)
         todo!()
     }
 
-    fn update_user(&self, user: User) -> Result<()> {
+    async fn update_user(&self, user: User) -> Result<()> {
         // Query: UPDATE users SET ... WHERE username = $1
         todo!()
     }
 
-    fn remove_user(&self, username: &str) -> Result<bool> {
+    async fn remove_user(&self, username: &str) -> Result<bool> {
         // Query: DELETE FROM users WHERE username = $1
         todo!()
     }
 
-    fn user_exists(&self, username: &str) -> Result<bool> {
+    async fn user_exists(&self, username: &str) -> Result<bool> {
         // Query: SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)
         todo!()
     }
 
-    fn list_usernames(&self) -> Result<Vec<String>> {
+    async fn list_usernames(&self) -> Result<Vec<String>> {
         // Query: SELECT username FROM users
         todo!()
     }
 
-    fn user_count(&self) -> Result<usize> {
+    async fn user_count(&self) -> Result<usize> {
         // Query: SELECT COUNT(*) FROM users
         todo!()
     }

@@ -13,7 +13,7 @@
 //! Authorization is enforced per-topic based on user roles and permissions.
 
 use futures_util::{SinkExt, StreamExt};
-use popsub_auth::AuthService;
+use popsub_auth::{AuthError, AuthService};
 use popsub_ratelimit::{LoginRateLimiter, RateLimiter, TokenBucket};
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::TcpListener;
@@ -260,9 +260,11 @@ async fn handle_register(
     username: &str,
     password: &str,
 ) -> Result<bool> {
-    // Check rate limit for registration attempts (use username as key)
-    if !rate_limiters.login_limiter.check_allowed(username).await {
-        let status = rate_limiters.login_limiter.check_status(username).await;
+    // Check rate limit for registration attempts using client_id as the key.
+    // Using client_id instead of username prevents attackers from locking out
+    // arbitrary usernames by spamming registration attempts with that username.
+    if !rate_limiters.login_limiter.check_allowed(client_id).await {
+        let status = rate_limiters.login_limiter.check_status(client_id).await;
         let retry_after = match status {
             popsub_ratelimit::LoginStatus::LockedOut { retry_after } => retry_after,
             _ => 0,
@@ -287,7 +289,7 @@ async fn handle_register(
         Ok(()) => {
             info!(client_id = %client_id, username = %username, "registration successful");
             // Reset rate limit on success
-            rate_limiters.login_limiter.record_success(username).await;
+            rate_limiters.login_limiter.record_success(client_id).await;
             ServerMessage::RegisterResponse {
                 success: true,
                 message: "User registered successfully".to_string(),
@@ -295,8 +297,13 @@ async fn handle_register(
         }
         Err(e) => {
             warn!(client_id = %client_id, username = %username, "registration failed: {}", e);
-            // Record failure for rate limiting
-            rate_limiters.login_limiter.record_failure(username).await;
+            // Only rate limit for potential abuse attempts (e.g., probing for existing usernames),
+            // not for validation errors (username too short, password too weak, etc.)
+            // which are legitimate user mistakes that shouldn't be penalized.
+            let should_rate_limit = matches!(e, AuthError::UserAlreadyExists(_));
+            if should_rate_limit {
+                rate_limiters.login_limiter.record_failure(client_id).await;
+            }
             ServerMessage::RegisterResponse {
                 success: false,
                 message: e.to_string(),
@@ -304,7 +311,6 @@ async fn handle_register(
         }
     };
 
-    drop(auth);
     send_to_client(broker, client_id, response)?;
     Ok(true)
 }
@@ -349,15 +355,18 @@ async fn handle_login(
         }
         Err(e) => {
             warn!(client_id = %client_id, username = %username, "login failed: {}", e);
-            // Record failure for rate limiting
-            rate_limiters.login_limiter.record_failure(username).await;
+            // Only rate limit for credential errors (brute-force protection)
+            // Don't rate limit for internal errors to avoid lockout due to server issues
+            let should_rate_limit = matches!(e, AuthError::InvalidCredentials);
+            if should_rate_limit {
+                rate_limiters.login_limiter.record_failure(username).await;
+            }
             ServerMessage::Error {
                 message: "invalid credentials".to_string(),
             }
         }
     };
 
-    drop(auth);
     send_to_client(broker, client_id, response)?;
     Ok(true)
 }
@@ -393,7 +402,6 @@ async fn handle_auth(
             let response = ServerMessage::Error {
                 message: "authentication failed".to_string(),
             };
-            drop(auth);
             send_to_client(broker, client_id, response)?;
             Ok(false)
         }
@@ -501,17 +509,9 @@ async fn handle_publish(
     message_id: Option<String>,
     qos: Option<u8>,
 ) -> Result<bool> {
-    // Check message rate limit first
-    if !rate_limiters.message_limiter.try_acquire(client_id).await {
-        warn!(client_id = %client_id, "message rate limited");
-        let response = ServerMessage::Error {
-            message: "Rate limited. Too many messages.".to_string(),
-        };
-        send_to_client(broker, client_id, response)?;
-        return Ok(true); // Don't disconnect, just rate limit
-    }
-
     // First check authentication and get username
+    // Authentication is checked before rate limiting to prevent unauthenticated
+    // clients from consuming rate limit tokens of legitimate users.
     let (username, sender) = {
         let broker_lock = broker.lock().expect("Broker lock poisoned");
 
@@ -539,6 +539,17 @@ async fn handle_publish(
             client.sender.clone(),
         )
     }; // broker_lock dropped here
+
+    // Check message rate limit after authentication
+    // This ensures only authenticated clients consume rate limit tokens.
+    if !rate_limiters.message_limiter.try_acquire(client_id).await {
+        warn!(client_id = %client_id, "message rate limited");
+        let response = ServerMessage::Error {
+            message: "Rate limited. Too many messages.".to_string(),
+        };
+        send_to_client(broker, client_id, response)?;
+        return Ok(true); // Don't disconnect, just rate limit
+    }
 
     // Check authorization (async)
     let auth = auth_service.read().await;
