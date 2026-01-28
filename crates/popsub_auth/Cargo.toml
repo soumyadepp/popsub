@@ -5,6 +5,10 @@ edition = "2024"
 description = "Authentication and authorization module for PopSub"
 license = "MIT"
 
+[features]
+default = []
+postgres = ["sqlx/runtime-tokio", "sqlx/postgres"]
+
 [dependencies]
 # JWT handling
 jsonwebtoken = "9"
@@ -20,6 +24,10 @@ rand = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["sync"] }
+async-trait = "0.1"
+
+# Database (optional)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }

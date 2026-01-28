@@ -6,6 +6,7 @@ members = [
 	"crates/popsub_client",
 	"crates/popsub_config",
 	"crates/popsub_persistence",
+	"crates/popsub_ratelimit",
 	"crates/popsub_transport",
 	"crates/popsub_utils",
 ]

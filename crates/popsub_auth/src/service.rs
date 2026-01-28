@@ -112,22 +112,25 @@ impl AuthService {
     /// Create a new auth service with the given configuration.
     ///
     /// Uses an in-memory user store and creates a default admin user.
-    pub fn new(config: AuthConfig) -> Self {
+    pub async fn new(config: AuthConfig) -> Self {
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
         let user_store = Arc::new(InMemoryUserStore::new());
 
-        let mut service = Self {
+        let service = Self {
             jwt_service,
             user_store,
             config: config.clone(),
         };
 
         // Create default admin user
-        if let Err(e) = service.add_user(
-            &config.default_admin_username,
-            &config.default_admin_password,
-            Role::Admin,
-        ) {
+        if let Err(e) = service
+            .add_user(
+                &config.default_admin_username,
+                &config.default_admin_password,
+                Role::Admin,
+            )
+            .await
+        {
             warn!("Failed to create default admin: {}", e);
         } else {
             info!(
@@ -140,6 +143,10 @@ impl AuthService {
     }
 
     /// Create a new auth service with a custom user store.
+    ///
+    /// Note: This does NOT create a default admin user. You should either:
+    /// 1. Pre-populate the store with an admin user, or
+    /// 2. Call `add_user()` after creation to add an admin
     pub fn with_store(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
 
@@ -148,6 +155,42 @@ impl AuthService {
             user_store: store,
             config,
         }
+    }
+
+    /// Create a new auth service with a custom store and initialize the default admin.
+    pub async fn with_store_and_admin(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
+        let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
+
+        let service = Self {
+            jwt_service,
+            user_store: store,
+            config: config.clone(),
+        };
+
+        // Create default admin user if it doesn't exist
+        if !service
+            .user_exists(&config.default_admin_username)
+            .await
+            .unwrap_or(false)
+        {
+            if let Err(e) = service
+                .add_user(
+                    &config.default_admin_username,
+                    &config.default_admin_password,
+                    Role::Admin,
+                )
+                .await
+            {
+                warn!("Failed to create default admin: {}", e);
+            } else {
+                info!(
+                    "Created default admin user: {}",
+                    config.default_admin_username
+                );
+            }
+        }
+
+        service
     }
 
     /// Get a reference to the JWT service.
@@ -170,7 +213,7 @@ impl AuthService {
     /// assigns the configured default role to new users.
     ///
     /// Returns an error if registration is disabled or the user already exists.
-    pub fn register_user(&mut self, username: &str, password: &str) -> Result<()> {
+    pub async fn register_user(&self, username: &str, password: &str) -> Result<()> {
         if !self.config.allow_registration {
             return Err(AuthError::PermissionDenied(
                 "user registration is disabled".to_string(),
@@ -192,7 +235,7 @@ impl AuthService {
         }
 
         // Check if user already exists
-        if self.user_store.user_exists(username)? {
+        if self.user_store.user_exists(username).await? {
             return Err(AuthError::UserAlreadyExists(username.to_string()));
         }
 
@@ -209,23 +252,23 @@ impl AuthService {
 
         let password_hash = hash_password(password)?;
         let user = User::new(username, password_hash, role);
-        self.user_store.add_user(user)?;
+        self.user_store.add_user(user).await?;
         info!("Registered new user: {}", username);
         Ok(())
     }
 
     /// Add a new user with the given credentials and role.
-    pub fn add_user(&mut self, username: &str, password: &str, role: Role) -> Result<()> {
+    pub async fn add_user(&self, username: &str, password: &str, role: Role) -> Result<()> {
         let password_hash = hash_password(password)?;
         let user = User::new(username, password_hash, role);
-        self.user_store.add_user(user)?;
+        self.user_store.add_user(user).await?;
         info!("Added new user: {}", username);
         Ok(())
     }
 
     /// Remove a user by username.
-    pub fn remove_user(&self, username: &str) -> Result<bool> {
-        let removed = self.user_store.remove_user(username)?;
+    pub async fn remove_user(&self, username: &str) -> Result<bool> {
+        let removed = self.user_store.remove_user(username).await?;
         if removed {
             info!("Removed user: {}", username);
         }
@@ -233,42 +276,44 @@ impl AuthService {
     }
 
     /// Get a user by username.
-    pub fn get_user(&self, username: &str) -> Result<Option<User>> {
-        self.user_store.get_user(username)
+    pub async fn get_user(&self, username: &str) -> Result<Option<User>> {
+        self.user_store.get_user(username).await
     }
 
     /// Check if a user exists.
-    pub fn user_exists(&self, username: &str) -> Result<bool> {
-        self.user_store.user_exists(username)
+    pub async fn user_exists(&self, username: &str) -> Result<bool> {
+        self.user_store.user_exists(username).await
     }
 
     /// List all usernames.
-    pub fn list_users(&self) -> Result<Vec<String>> {
-        self.user_store.list_usernames()
+    pub async fn list_users(&self) -> Result<Vec<String>> {
+        self.user_store.list_usernames().await
     }
 
     /// Update a user's role.
-    pub fn update_user_role(&self, username: &str, role: Role) -> Result<()> {
+    pub async fn update_user_role(&self, username: &str, role: Role) -> Result<()> {
         let mut user = self
             .user_store
-            .get_user(username)?
+            .get_user(username)
+            .await?
             .ok_or_else(|| AuthError::UserNotFound(username.to_string()))?;
 
         user.role = role;
-        self.user_store.update_user(user)?;
+        self.user_store.update_user(user).await?;
         info!("Updated role for user: {}", username);
         Ok(())
     }
 
     /// Update a user's password.
-    pub fn update_user_password(&self, username: &str, new_password: &str) -> Result<()> {
+    pub async fn update_user_password(&self, username: &str, new_password: &str) -> Result<()> {
         let mut user = self
             .user_store
-            .get_user(username)?
+            .get_user(username)
+            .await?
             .ok_or_else(|| AuthError::UserNotFound(username.to_string()))?;
 
         user.password_hash = hash_password(new_password)?;
-        self.user_store.update_user(user)?;
+        self.user_store.update_user(user).await?;
         info!("Updated password for user: {}", username);
         Ok(())
     }
@@ -278,10 +323,11 @@ impl AuthService {
     // ========================
 
     /// Authenticate a user and return a JWT token.
-    pub fn login(&self, username: &str, password: &str) -> Result<String> {
+    pub async fn login(&self, username: &str, password: &str) -> Result<String> {
         let user = self
             .user_store
-            .get_user(username)?
+            .get_user(username)
+            .await?
             .ok_or(AuthError::InvalidCredentials)?;
 
         if !user.enabled {
@@ -323,16 +369,16 @@ impl AuthService {
     // ========================
 
     /// Check if a user can subscribe to a topic.
-    pub fn can_subscribe(&self, username: &str, topic: &str) -> bool {
-        match self.user_store.get_user(username) {
+    pub async fn can_subscribe(&self, username: &str, topic: &str) -> bool {
+        match self.user_store.get_user(username).await {
             Ok(Some(user)) => self.check_subscribe_permission(&user, topic),
             _ => false,
         }
     }
 
     /// Check if a user can publish to a topic.
-    pub fn can_publish(&self, username: &str, topic: &str) -> bool {
-        match self.user_store.get_user(username) {
+    pub async fn can_publish(&self, username: &str, topic: &str) -> bool {
+        match self.user_store.get_user(username).await {
             Ok(Some(user)) => self.check_publish_permission(&user, topic),
             _ => false,
         }
@@ -369,8 +415,8 @@ impl AuthService {
     }
 
     /// Authorize a subscribe action, returning an error if not permitted.
-    pub fn authorize_subscribe(&self, username: &str, topic: &str) -> Result<()> {
-        if self.can_subscribe(username, topic) {
+    pub async fn authorize_subscribe(&self, username: &str, topic: &str) -> Result<()> {
+        if self.can_subscribe(username, topic).await {
             Ok(())
         } else {
             Err(AuthError::TopicNotAuthorized {
@@ -381,8 +427,8 @@ impl AuthService {
     }
 
     /// Authorize a publish action, returning an error if not permitted.
-    pub fn authorize_publish(&self, username: &str, topic: &str) -> Result<()> {
-        if self.can_publish(username, topic) {
+    pub async fn authorize_publish(&self, username: &str, topic: &str) -> Result<()> {
+        if self.can_publish(username, topic).await {
             Ok(())
         } else {
             Err(AuthError::TopicNotAuthorized {
@@ -466,10 +512,10 @@ impl UserBuilder {
     }
 
     /// Register this user with an auth service.
-    pub fn register(self, auth: &mut AuthService) -> Result<()> {
+    pub async fn register(self, auth: &AuthService) -> Result<()> {
         let username = self.username.clone();
         let password = self.password.clone();
         let role = self.build_role();
-        auth.add_user(&username, &password, role)
+        auth.add_user(&username, &password, role).await
     }
 }

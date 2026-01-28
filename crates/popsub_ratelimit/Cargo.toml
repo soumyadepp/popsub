@@ -1,0 +1,19 @@
+[package]
+name = "popsub_ratelimit"
+version = "0.1.0"
+edition = "2024"
+description = "Rate limiting utilities for PopSub"
+license = "MIT"
+
+[dependencies]
+# Time handling
+tokio = { version = "1", features = ["time", "sync"] }
+
+# Data structures
+dashmap = "6"
+
+# Utilities
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
