@@ -1,6 +1,6 @@
 # popsub_ratelimit
 
-A flexible, reusable rate limiting library for PopSub.
+Per-key rate limiters for PopSub: token bucket, sliding window and login lockout.
 
 ## Features
 

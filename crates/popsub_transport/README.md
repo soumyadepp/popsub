@@ -2,4 +2,4 @@
 
 WebSocket transport implementation using `tokio-tungstenite`.
 
-Provides `start_websocket_server(addr, broker, settings)` to run the server.
+Provides `start_websocket_server(addr, broker, settings)` to run the server. It checks logins, topic permissions and rate limits before calling the broker.

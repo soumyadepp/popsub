@@ -1,19 +1,17 @@
-//! Broker engine
+//! The `Broker` engine: topic routing, delivery to client channels, QoS 1 retries and replay.
 //!
-//! This module contains the in-memory broker implementation responsible for:
-//! - managing topics and subscriber lists
-//! - publishing messages to subscribers
-//! - tracking QoS=1 pending messages and retrying until acknowledged
-//! - persisting messages for replay via the `Persistence` abstraction
+//! The broker is synchronous and has no locking of its own. The server keeps
+//! one `Arc<Mutex<Broker>>` and every connection task locks it for each call,
+//! so callers must not hold that lock across an `.await`. Delivery pushes
+//! `tungstenite` messages into each client's unbounded channel, so no call
+//! here waits on the network. Calls that touch persistence (`publish` and
+//! `subscribe`) do disk work while the caller holds the lock.
 //!
-//! Concurrency and usage notes:
-//! - The public API here is synchronous and designed to be held behind a
-//!   lock (for example `Arc<Mutex<Broker>>`) by the transport layer. Callers
-//!   should avoid holding the broker lock across network I/O to prevent
-//!   blocking other operations.
-//! - The retry loop is designed to be run as a background task and will
-//!   re-send pending QoS=1 messages when ACKs are not received within a
-//!   configured timeout. Retries are capped to avoid infinite resend loops.
+//! QoS 1 messages are kept in `pending_acks`, keyed by message id only. One
+//! ACK from any subscriber clears the message for all of them, and every
+//! retry goes to every current subscriber of the topic. `start_retry_loop`
+//! is the background task that resends unacknowledged messages and drops
+//! them after `max_retries` resends.
 
 use popsub_config::Settings;
 use std::collections::HashMap;
@@ -28,35 +26,58 @@ use tracing::{error, info, warn};
 use tungstenite::protocol::Message as WsMessage;
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
-/// A pending QoS=1 message tracked by the broker until an ACK is received.
+/// A QoS 1 message the broker keeps until it is acknowledged or dropped.
 ///
-/// Contains the original `Message`, the last `sent_at` timestamp (ms since
-/// epoch) and a retry counter used by the retry loop.
+/// There is one entry per message id, shared by all subscribers of the topic.
+#[derive(Debug, Clone)]
 pub struct PendingMessage {
-    /// The message payload and metadata to be (re-)sent.
+    /// The message as it was published, resent unchanged on each retry.
     pub message: Message,
-    /// When the message was last sent (milliseconds since epoch).
+    /// When the message was last sent, in milliseconds since the UNIX epoch.
     pub sent_at: i64,
-    /// Number of times the broker has retried delivery for this message.
+    /// How many times the retry loop has resent the message.
     pub retries: u8,
 }
 
+/// The in-memory broker: topics, connected clients and unacknowledged QoS 1 messages.
+///
+/// All methods take `&self` or `&mut self` and never block on the network.
+/// The server shares one instance behind a mutex; see the module docs for
+/// what that implies.
 #[derive(Debug)]
 pub struct Broker {
+    /// Topics by name. A topic is created on its first subscribe and never removed.
     pub topics: HashMap<String, Topic>,
+    /// Connected clients by id, used to reach each subscriber's channel.
     pub clients: HashMap<SubscriberId, Client>,
+    /// Unacknowledged QoS 1 messages by message id, shared by all subscribers.
     pub pending_acks: HashMap<String, PendingMessage>,
+    /// Store that published messages are written to and replayed from.
     persistence: Persistence,
+    /// ACK timeout and retry limit used by the retry loop.
     settings: BrokerSettings,
 }
 
 impl Broker {
-    /// ACK timeout as a Duration. Prefer Duration-based APIs internally.
+    /// Default ACK timeout of 5000 ms.
+    ///
+    /// Only tests read this. The retry loop uses `settings.ack_timeout_ms`,
+    /// so the two can differ if either default changes.
     pub const ACK_TIMEOUT: Duration = Duration::from_millis(5000);
 }
 
 impl Default for Broker {
+    /// Creates a broker with the default broker settings.
+    ///
+    /// In test builds the store is opened in a fresh temporary directory. The
+    /// `TempDir` handle is dropped when this function returns, so the
+    /// directory is removed while the store still has it open. Outside tests
+    /// this calls `Broker::new`, which opens `pubsub_db` in the working
+    /// directory. Panics if the temporary directory or the store can't be
+    /// created.
+    ///
+    /// Returns:
+    ///     An empty broker.
     fn default() -> Self {
         if cfg!(test) {
             let dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -71,10 +92,17 @@ impl Default for Broker {
 }
 
 impl Broker {
-    // constants are defined earlier on the type; keep implementation block focused on behavior
-    /// Create a new in-memory broker using the default persistence backend.
+    /// Creates an empty broker backed by the default persistence store.
     ///
-    /// The broker starts empty (no topics, clients or pending messages).
+    /// The store is `Persistence::default()`, which always opens `pubsub_db`
+    /// in the working directory with its own TTL, so `message_ttl_secs` from
+    /// the settings is not applied. Panics if the store can't be opened.
+    ///
+    /// Args:
+    ///     settings: ACK timeout and retry limit for QoS 1 messages.
+    ///
+    /// Returns:
+    ///     A broker with no topics, clients or pending messages.
     pub fn new(settings: BrokerSettings) -> Self {
         Self {
             topics: HashMap::new(),
@@ -84,9 +112,17 @@ impl Broker {
             settings,
         }
     }
-    /// Create a broker backed by the provided `Persistence` implementation.
+
+    /// Creates an empty broker backed by the given persistence store.
     ///
-    /// This is useful for tests or when you want to control where messages are stored.
+    /// Use this in tests or wherever the store's path and limits need to be chosen.
+    ///
+    /// Args:
+    ///     persistence: The store to write published messages to and replay from.
+    ///     settings: ACK timeout and retry limit for QoS 1 messages.
+    ///
+    /// Returns:
+    ///     A broker with no topics, clients or pending messages.
     pub fn new_with_persistence(persistence: Persistence, settings: BrokerSettings) -> Self {
         Self {
             topics: HashMap::new(),
@@ -96,25 +132,39 @@ impl Broker {
             settings,
         }
     }
-    /// Register a newly connected client with the broker.
+
+    /// Registers a connected client so messages can be delivered to its channel.
     ///
-    /// The broker will store the client's outgoing sender and use it when
-    /// delivering messages to that client.
+    /// A client registered under an existing id replaces the old entry.
+    ///
+    /// Args:
+    ///     client: The client, keyed by its `id`.
     pub fn register_client(&mut self, client: Client) {
         self.clients.insert(client.id.clone(), client);
     }
-    /// Remove a client from the broker's registry.
+
+    /// Removes a client from the registry.
     ///
-    /// This does not automatically remove subscriptions; use `cleanup_client`
-    /// for a full teardown.
+    /// Its subscriptions stay in place; use `cleanup_client` to remove those too.
+    ///
+    /// Args:
+    ///     client_id: The id of the client to remove.
     pub fn remove_client(&mut self, client_id: &SubscriberId) {
         self.clients.remove(client_id);
     }
-    /// Subscribe `subscriber` to `topic`.
+
+    /// Subscribes a client to a topic and replays the topic's stored history to it.
     ///
-    /// If the topic does not exist it will be created. If there are stored
-    /// messages for the topic they will be replayed to the client (QoS=0
-    /// replay semantics).
+    /// The topic is created if it does not exist. If the client is registered,
+    /// every message the store holds for the topic is sent to it as QoS 0 with
+    /// a fresh message id and the timestamp the store recorded. The replay
+    /// happens on every call, including when the client was already
+    /// subscribed. The store is read while the caller holds the broker lock.
+    /// A failed read is logged and failed sends are ignored.
+    ///
+    /// Args:
+    ///     topic: The topic name.
+    ///     subscriber: The id of the client to subscribe.
     pub fn subscribe(&mut self, topic: &str, subscriber: SubscriberId) {
         let subscriber_clone = subscriber.clone();
 
@@ -148,10 +198,15 @@ impl Broker {
         }
     }
 
-    /// Send a prepared WebSocket message to all subscribers of `topic`.
+    /// Sends a WebSocket frame to every subscriber of a topic.
     ///
-    /// Logs send errors but does not remove subscribers; callers may choose
-    /// to act on channel closure separately.
+    /// A send to a closed channel is logged, and a subscriber id with no
+    /// registered client is logged as a warning. Neither removes the
+    /// subscriber; that happens in `cleanup_client`.
+    ///
+    /// Args:
+    ///     ws_msg: The frame to send. It is cloned for each subscriber.
+    ///     topic: The topic whose subscribers receive the frame.
     fn send_text_to_subscribers(&self, ws_msg: &WsMessage, topic: &Topic) {
         for sub_id in &topic.subscribers {
             if let Some(client) = self.clients.get(sub_id) {
@@ -164,9 +219,18 @@ impl Broker {
         }
     }
 
-    /// Collect messages that should be resent or dropped based on `now_ms`.
+    /// Finds pending messages whose ACK timeout has passed.
     ///
-    /// Returns a tuple `(to_resend, to_drop)` containing message IDs.
+    /// A message is due once more than `settings.ack_timeout_ms` has passed
+    /// since it was last sent. Due messages that have already been resent
+    /// `settings.max_retries` times are marked for dropping; the rest are
+    /// marked for resending. Nothing is changed.
+    ///
+    /// Args:
+    ///     now_ms: The current time in milliseconds since the UNIX epoch.
+    ///
+    /// Returns:
+    ///     A pair `(to_resend, to_drop)` of message ids.
     pub(crate) fn collect_retry_candidates(&self, now_ms: i64) -> (Vec<String>, Vec<String>) {
         let mut to_resend = Vec::new();
         let mut to_drop = Vec::new();
@@ -184,11 +248,21 @@ impl Broker {
         (to_resend, to_drop)
     }
 
-    /// Resend the pending message with id `message_id` and update its metadata.
-    /// Returns true if a resend was attempted, false if the pending message was missing.
+    /// Resends a pending message to every current subscriber of its topic.
+    ///
+    /// The entry's `sent_at` is set to `now_ms` and its retry count is
+    /// incremented before sending. Subscribers that joined after the original
+    /// publish receive the retry too. If the topic no longer exists, or the
+    /// message fails to serialise, nothing is sent but the retry still counts.
+    ///
+    /// Args:
+    ///     message_id: The id of the pending message.
+    ///     now_ms: The current time in milliseconds since the UNIX epoch.
+    ///
+    /// Returns:
+    ///     `true` if the message was pending, `false` if it was not found.
     pub(crate) fn resend_pending_message(&mut self, message_id: &str, now_ms: i64) -> bool {
         if let Some(pending_msg) = self.pending_acks.get_mut(message_id) {
-            // Update retry metadata
             pending_msg.sent_at = now_ms;
             pending_msg.retries += 1;
 
@@ -213,19 +287,33 @@ impl Broker {
         }
     }
 
-    /// Unsubscribe a subscriber from a topic if it exists.
+    /// Removes a client from a topic's subscribers.
+    ///
+    /// Does nothing if the topic does not exist. The topic itself is kept
+    /// even when it has no subscribers left.
+    ///
+    /// Args:
+    ///     topic: The topic name.
+    ///     subscriber: The id of the client to remove.
     pub fn unsubscribe(&mut self, topic: &str, subscriber: &SubscriberId) {
         if let Some(t) = self.topics.get_mut(topic) {
             t.unsubscribe(subscriber);
         }
     }
-    /// Publish a message to its topic.
+
+    /// Publishes a message to every current subscriber of its topic.
     ///
-    /// Behavior:
-    /// - Set the message timestamp and generate a message_id if missing.
-    /// - For QoS=1 messages, track them in `pending_acks` until ACKed.
-    /// - Persist the message via the persistence backend.
-    /// - Serialize and send the message to all current subscribers of the topic.
+    /// The timestamp is overwritten with the current time and an empty
+    /// `message_id` is replaced with a new UUID. A QoS 1 message is added to
+    /// `pending_acks` before delivery, even when the topic has no
+    /// subscribers. The payload is then written to the persistence store
+    /// while the caller holds the broker lock, so a slow disk delays every
+    /// other broker call. A store failure is logged and delivery goes ahead.
+    /// Publishing to a topic nobody has subscribed to stores the message and
+    /// logs "Topic not found".
+    ///
+    /// Args:
+    ///     msg: The message to publish.
     pub fn publish(&mut self, mut msg: Message) {
         msg.timestamp = chrono::Utc::now().timestamp_millis();
 
@@ -264,9 +352,14 @@ impl Broker {
         }
     }
 
-    /// Handle an ACK from a client for the given `message_id`.
+    /// Removes a QoS 1 message from `pending_acks` when a client acknowledges it.
     ///
-    /// If the message was pending, it is removed from `pending_acks`.
+    /// Pending entries are keyed by message id only and the sender is not
+    /// checked, so the first ACK from any client stops retries for every
+    /// subscriber. An ACK for an unknown id is logged and ignored.
+    ///
+    /// Args:
+    ///     message_id: The id from the client's ACK.
     pub fn handle_ack(&mut self, message_id: &str) {
         if self.pending_acks.remove(message_id).is_some() {
             info!(message_id = %message_id, "ACK received");
@@ -274,8 +367,14 @@ impl Broker {
             warn!(message_id = %message_id, "Received ACK for unknown message_id");
         }
     }
-    /// Clean up all resources associated with a client: remove registration
-    /// and unsubscribe it from all topics.
+
+    /// Removes a disconnected client and unsubscribes it from every topic.
+    ///
+    /// Pending QoS 1 messages are not touched, and topics left with no
+    /// subscribers are kept.
+    ///
+    /// Args:
+    ///     client_id: The id of the client to remove.
     pub fn cleanup_client(&mut self, client_id: &SubscriberId) {
         self.remove_client(client_id);
 
@@ -287,10 +386,18 @@ impl Broker {
         info!(client = %client_id, "Cleaned up client");
     }
 
-    /// Background retry loop that periodically checks for pending QoS=1
-    /// messages that should be retried or dropped.
+    /// Resends or drops overdue QoS 1 messages once a second, forever.
     ///
-    /// This method runs forever and should be spawned as a background task.
+    /// Spawn this as a background task. Each tick it locks the broker to
+    /// collect overdue messages, then locks it again for each message to drop
+    /// and each message to resend, so other callers can run in between. A
+    /// message is sent at most `1 + max_retries` times before it is dropped.
+    /// The lock is a `std::sync::Mutex` taken from async code, so a tick
+    /// blocks its worker thread while another caller holds the lock. Panics
+    /// if the lock is poisoned.
+    ///
+    /// Args:
+    ///     broker: The shared broker to retry messages on.
     pub async fn start_retry_loop(broker: std::sync::Arc<std::sync::Mutex<Broker>>) {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
@@ -298,7 +405,6 @@ impl Broker {
             let current_time = chrono::Utc::now().timestamp_millis();
 
             let (messages_to_resend, messages_to_drop) = {
-                // Use a scoped borrow to call the read-only helper
                 let broker_read = broker.lock().expect("Broker lock poisoned");
                 broker_read.collect_retry_candidates(current_time)
             };
@@ -309,7 +415,6 @@ impl Broker {
                         warn!(message_id = %message_id, retries = %broker_write.settings.max_retries, "Message dropped after max retries");
                     }
                 } else {
-                    // Fallback: acquire blocking lock
                     let mut broker_write = broker.lock().expect("Broker lock poisoned");
                     if broker_write.pending_acks.remove(&message_id).is_some() {
                         warn!(message_id = %message_id, retries = %broker_write.settings.max_retries, "Message dropped after max retries");
@@ -318,7 +423,6 @@ impl Broker {
             }
 
             for message_id in messages_to_resend {
-                // Resend with a write lock
                 let mut broker_write = broker.lock().expect("Broker lock poisoned");
                 let _ = broker_write.resend_pending_message(&message_id, current_time);
             }

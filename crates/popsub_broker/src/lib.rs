@@ -1,14 +1,10 @@
-//! popsub_broker
+//! In-memory message broker for PopSub: topics, subscriptions, delivery and QoS 1 retries.
 //!
-//! The broker crate contains the central message broker implementation
-//! responsible for managing topics, subscriptions, message persistence,
-//! and message delivery (including QoS 1 retry/ack behavior).
-//!
-//! Public types:
-//! - `Broker`: core engine to register clients, publish messages, manage topics.
-//!
-//! This crate is intended to be used by higher-level transport crates (WebSocket server)
-//! or binary crates that wire together network, configuration and persistence.
+//! The main type is `Broker`, which the WebSocket server keeps behind one
+//! shared mutex. Transport and binary crates register clients with it,
+//! forward subscribe, publish and ACK frames to it, and spawn its retry loop.
+//! Published messages are also written to `popsub_persistence` so new
+//! subscribers can be sent the topic history.
 
 pub mod engine;
 pub mod message;

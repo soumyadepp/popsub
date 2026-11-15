@@ -1,19 +1,19 @@
-//! Topic permissions and permission checking
+//! Topic permission patterns, MQTT-style wildcard matching, and the checks built on them.
 //!
-//! This module provides topic-level permission definitions and wildcard matching.
+//! `AuthService` uses `PermissionChecker` to evaluate `Role::User` and
+//! `Role::ReadOnly` topic lists. Admins skip these checks.
 
 use serde::{Deserialize, Serialize};
 
-/// Permission configuration for a specific topic or topic pattern.
+/// A topic pattern with separate subscribe and publish flags.
 ///
-/// Supports MQTT-style wildcards:
-/// - `+` matches a single level (e.g., `sensors/+/temperature`)
-/// - `#` matches multiple levels (e.g., `chat/#`)
-///
-/// `*` has no special meaning and only matches a literal `*` level.
+/// Patterns use MQTT-style wildcards: `+` matches exactly one level (as in
+/// `sensors/+/temperature`) and a trailing `#` matches the parent level and
+/// any number of levels below it (as in `chat/#`). `*` has no special meaning
+/// and only matches a literal `*` level.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopicPermission {
-    /// Topic pattern (may include wildcards).
+    /// Topic pattern, possibly containing `+` or `#` wildcards.
     pub pattern: String,
     /// Whether the user can subscribe to matching topics.
     pub can_subscribe: bool,
@@ -22,7 +22,15 @@ pub struct TopicPermission {
 }
 
 impl TopicPermission {
-    /// Create a new topic permission.
+    /// Builds a permission from a pattern and both flags.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern to match.
+    ///     can_subscribe: Whether matching topics may be subscribed to.
+    ///     can_publish: Whether matching topics may be published to.
+    ///
+    /// Returns:
+    ///     The permission.
     pub fn new(pattern: impl Into<String>, can_subscribe: bool, can_publish: bool) -> Self {
         Self {
             pattern: pattern.into(),
@@ -31,35 +39,68 @@ impl TopicPermission {
         }
     }
 
-    /// Create a read-only permission for a topic.
+    /// Builds a subscribe-only permission.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern to match.
+    ///
+    /// Returns:
+    ///     A permission with `can_subscribe` set and `can_publish` cleared.
     pub fn read_only(pattern: impl Into<String>) -> Self {
         Self::new(pattern, true, false)
     }
 
-    /// Create a write-only permission for a topic.
+    /// Builds a publish-only permission.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern to match.
+    ///
+    /// Returns:
+    ///     A permission with `can_publish` set and `can_subscribe` cleared.
     pub fn write_only(pattern: impl Into<String>) -> Self {
         Self::new(pattern, false, true)
     }
 
-    /// Create a full access permission for a topic.
+    /// Builds a permission that allows both subscribe and publish.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern to match.
+    ///
+    /// Returns:
+    ///     A permission with both flags set.
     pub fn full_access(pattern: impl Into<String>) -> Self {
         Self::new(pattern, true, true)
     }
 
-    /// Check if this permission matches the given topic.
+    /// Tests the topic against this permission's pattern, ignoring the flags.
+    ///
+    /// Args:
+    ///     topic: The concrete topic name.
+    ///
+    /// Returns:
+    ///     `true` when `topic_matches_pattern` accepts the topic.
     pub fn matches(&self, topic: &str) -> bool {
         topic_matches_pattern(&self.pattern, topic)
     }
 }
 
-/// Check if a topic matches a pattern with wildcards.
+/// Tests whether a concrete topic matches a pattern with MQTT-style wildcards.
 ///
-/// Wildcard rules:
-/// - `#` or `*` at the end matches any remaining levels
-/// - `+` matches exactly one level
-/// - Exact match otherwise
+/// Both strings are split on `/` and compared level by level. A `+` level
+/// matches any single topic level. A `#` level matches every remaining topic
+/// level, and pattern levels after it are ignored. A final `#` also matches
+/// zero levels, so `chat/#` matches `chat` itself, and a pattern of just `#`
+/// matches every topic. Every other level must be equal, and the pattern and
+/// topic must run out at the same time. `*` is compared literally.
 ///
-/// # Examples
+/// Args:
+///     pattern: The pattern, possibly containing `+` or `#`.
+///     topic: The concrete topic name.
+///
+/// Returns:
+///     `true` when the topic matches the pattern.
+///
+/// Example:
 ///
 /// ```
 /// use popsub_auth::permission::topic_matches_pattern;
@@ -71,12 +112,10 @@ impl TopicPermission {
 /// assert!(!topic_matches_pattern("chat/room1", "chat/room2"));
 /// ```
 pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
-    // Handle exact match
     if pattern == topic {
         return true;
     }
 
-    // Handle the multi-level wildcard
     if pattern == "#" {
         return true;
     }
@@ -91,14 +130,11 @@ pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
         let pattern_part = pattern_parts[pattern_idx];
 
         match pattern_part {
-            // Multi-level wildcard - matches everything remaining
             "#" => return true,
-            // Single-level wildcard - matches exactly one level
             "+" => {
                 pattern_idx += 1;
                 topic_idx += 1;
             }
-            // Exact match required
             _ => {
                 if pattern_part != topic_parts[topic_idx] {
                     return false;
@@ -109,13 +145,10 @@ pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
         }
     }
 
-    // Check if we've consumed both pattern and topic completely
-    // or if the last pattern part is a multi-level wildcard
     if pattern_idx == pattern_parts.len() && topic_idx == topic_parts.len() {
         return true;
     }
 
-    // Pattern ended with wildcard that wasn't processed
     if pattern_idx < pattern_parts.len() {
         let remaining = &pattern_parts[pattern_idx..];
         if remaining.len() == 1 && remaining[0] == "#" {
@@ -126,25 +159,50 @@ pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
     false
 }
 
-/// Permission checker that evaluates access based on user roles and topic patterns.
+/// Stateless helpers that decide subscribe and publish access from a permission list.
+///
+/// Access is granted when any entry both matches the topic and has the
+/// relevant flag set. Role handling (admins, disabled users) happens in
+/// `AuthService`, not here.
 pub struct PermissionChecker;
 
 impl PermissionChecker {
-    /// Check if the given permissions allow subscribing to the topic.
+    /// Decides whether a `Role::User` permission list allows subscribing to a topic.
+    ///
+    /// Args:
+    ///     permissions: The user's topic permissions.
+    ///     topic: The topic to subscribe to.
+    ///
+    /// Returns:
+    ///     `true` when some permission matches the topic and has `can_subscribe` set.
     pub fn can_subscribe(permissions: &[TopicPermission], topic: &str) -> bool {
         permissions
             .iter()
             .any(|p| p.can_subscribe && p.matches(topic))
     }
 
-    /// Check if the given permissions allow publishing to the topic.
+    /// Decides whether a `Role::User` permission list allows publishing to a topic.
+    ///
+    /// Args:
+    ///     permissions: The user's topic permissions.
+    ///     topic: The topic to publish to.
+    ///
+    /// Returns:
+    ///     `true` when some permission matches the topic and has `can_publish` set.
     pub fn can_publish(permissions: &[TopicPermission], topic: &str) -> bool {
         permissions
             .iter()
             .any(|p| p.can_publish && p.matches(topic))
     }
 
-    /// Check if a list of topic patterns (strings) allows subscribing to the topic.
+    /// Decides whether a `Role::ReadOnly` pattern list allows subscribing to a topic.
+    ///
+    /// Args:
+    ///     allowed_topics: The read-only user's topic patterns.
+    ///     topic: The topic to subscribe to.
+    ///
+    /// Returns:
+    ///     `true` when any pattern matches the topic.
     pub fn can_subscribe_readonly(allowed_topics: &[String], topic: &str) -> bool {
         allowed_topics
             .iter()
@@ -156,12 +214,14 @@ impl PermissionChecker {
 mod permission_tests {
     use super::*;
 
+    /// Checks that a pattern without wildcards matches only the identical topic.
     #[test]
     fn test_exact_match() {
         assert!(topic_matches_pattern("chat/room1", "chat/room1"));
         assert!(!topic_matches_pattern("chat/room1", "chat/room2"));
     }
 
+    /// Checks that a trailing `#` matches the parent level and any depth below it, but not other prefixes.
     #[test]
     fn test_multi_level_wildcard_hash() {
         assert!(topic_matches_pattern("chat/#", "chat"));
@@ -170,12 +230,14 @@ mod permission_tests {
         assert!(!topic_matches_pattern("chat/#", "other/room1"));
     }
 
+    /// Checks that `*` inside a pattern is treated as a literal level, not a wildcard.
     #[test]
     fn test_star_is_not_a_wildcard() {
         assert!(!topic_matches_pattern("chat/*", "chat/room1/messages"));
         assert!(!topic_matches_pattern("chat/*", "other/room1"));
     }
 
+    /// Checks that `+` matches exactly one level and fails when the level count differs.
     #[test]
     fn test_single_level_wildcard() {
         assert!(topic_matches_pattern(
@@ -193,6 +255,7 @@ mod permission_tests {
         assert!(!topic_matches_pattern("sensors/+/temp", "sensors/a/b/temp"));
     }
 
+    /// Checks that a lone `#` matches every topic while a lone `*` matches only itself.
     #[test]
     fn test_global_wildcard() {
         assert!(topic_matches_pattern("#", "anything"));
@@ -202,6 +265,7 @@ mod permission_tests {
         assert!(topic_matches_pattern("chat/*", "chat/*"));
     }
 
+    /// Checks that `PermissionChecker` honours the subscribe and publish flags of matching permissions.
     #[test]
     fn test_permission_checker() {
         let permissions = vec![

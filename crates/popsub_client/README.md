@@ -1,7 +1,7 @@
 # popsub_client
 
-Lightweight client types used by the broker and transport layer.
+The server-side record of one connected socket, shared by the broker and transport. This is not a client library.
 
 Exports:
 
-- `Client` — client id and message sender channel.
+- `Client`: connection id, outbound message channel, authenticated flag and username.

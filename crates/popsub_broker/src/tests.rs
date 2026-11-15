@@ -1,9 +1,12 @@
+//! Unit tests for the broker, using `tokio::sync::mpsc` channels as fake client connections.
+
 use super::Broker;
 use popsub_client::Client;
 use popsub_config::Settings;
 use tokio::sync::mpsc;
 use tungstenite::protocol::Message as WsMessage;
 
+/// Checks that a new topic has the given name and no subscribers.
 #[test]
 fn test_topic_new() {
     let topic = super::topic::Topic::new("test_topic");
@@ -11,6 +14,7 @@ fn test_topic_new() {
     assert!(topic.subscribers.is_empty());
 }
 
+/// Checks that subscribing adds the id to the topic's subscriber set.
 #[test]
 fn test_topic_subscribe() {
     let mut topic = super::topic::Topic::new("test_topic");
@@ -18,6 +22,7 @@ fn test_topic_subscribe() {
     assert!(topic.subscribers.contains("client1"));
 }
 
+/// Checks that unsubscribing removes the id from the topic's subscriber set.
 #[test]
 fn test_topic_unsubscribe() {
     let mut topic = super::topic::Topic::new("test_topic");
@@ -26,14 +31,16 @@ fn test_topic_unsubscribe() {
     assert!(!topic.subscribers.contains("client1"));
 }
 
+/// Checks that a default broker starts with no topics, clients or pending messages.
 #[test]
 fn test_broker_new() {
     let broker = Broker::default();
     assert!(broker.topics.is_empty());
     assert!(broker.clients.is_empty());
-    assert!(broker.pending_acks.is_empty()); // Added assertion for pending_acks
+    assert!(broker.pending_acks.is_empty());
 }
 
+/// Checks that a registered client is stored by id and removed by `remove_client`.
 #[test]
 fn test_broker_register_and_remove_client() {
     let mut broker = Broker::default();
@@ -48,6 +55,7 @@ fn test_broker_register_and_remove_client() {
     assert!(!broker.clients.contains_key(&client_id));
 }
 
+/// Checks that subscribing creates the topic with the client in it and unsubscribing removes the client.
 #[test]
 fn test_broker_subscribe_and_unsubscribe() {
     let mut broker = Broker::default();
@@ -66,6 +74,7 @@ fn test_broker_subscribe_and_unsubscribe() {
     assert!(!topic.subscribers.contains(&client_id));
 }
 
+/// Checks that a QoS 0 publish reaches the subscriber with its topic, payload, id and QoS intact.
 #[test]
 fn test_broker_publish() {
     let mut broker = Broker::default();
@@ -96,6 +105,7 @@ fn test_broker_publish() {
     }
 }
 
+/// Checks that a QoS 1 publish is delivered, held in `pending_acks`, and removed once acknowledged.
 #[test]
 fn test_broker_publish_qos1_and_ack() {
     let mut broker = Broker::default();
@@ -115,10 +125,8 @@ fn test_broker_publish_qos1_and_ack() {
     };
     broker.publish(message.clone());
 
-    // Assert that the message is in pending_acks
     assert!(broker.pending_acks.contains_key(&message_id));
 
-    // Simulate client receiving and acknowledging the message
     let received_msg = rx.try_recv().unwrap();
     if let WsMessage::Text(text) = received_msg {
         let received_message: crate::message::Message = serde_json::from_str(&text).unwrap();
@@ -130,10 +138,10 @@ fn test_broker_publish_qos1_and_ack() {
 
     broker.handle_ack(&message_id);
 
-    // Assert that the message is removed from pending_acks
     assert!(!broker.pending_acks.contains_key(&message_id));
 }
 
+/// Checks that an ACK for an unknown message id leaves `pending_acks` unchanged.
 #[test]
 fn test_broker_handle_ack_unknown_message_id() {
     let mut broker = Broker::default();
@@ -141,10 +149,10 @@ fn test_broker_handle_ack_unknown_message_id() {
 
     broker.handle_ack("unknown_message_id");
 
-    // Assert that pending_acks remains unchanged
     assert_eq!(broker.pending_acks.len(), initial_pending_acks_count);
 }
 
+/// Checks that `cleanup_client` removes the client and its subscription.
 #[test]
 fn test_broker_cleanup_client() {
     let mut broker = Broker::default();
@@ -160,20 +168,21 @@ fn test_broker_cleanup_client() {
     assert!(!topic.subscribers.contains(&client_id));
 }
 
+/// Checks that publishing to a topic with no subscribers does not panic.
 #[test]
 fn test_publish_to_nonexistent_topic() {
-    let mut broker = Broker::default(); // Changed to mut
+    let mut broker = Broker::default();
     let message = crate::message::Message {
         topic: "nonexistent_topic".to_string(),
         payload: "hello".to_string(),
         timestamp: 0,
-        message_id: "nonexistent_message".to_string(), // Added message_id
-        qos: 0,                                        // Added qos
+        message_id: "nonexistent_message".to_string(),
+        qos: 0,
     };
     broker.publish(message);
-    // No assertion, just checking for no panics and that a message is logged.
 }
 
+/// Checks that publishing to a subscriber whose channel is closed does not panic.
 #[test]
 fn test_publish_to_client_with_closed_channel() {
     let mut broker = Broker::default();
@@ -183,21 +192,19 @@ fn test_publish_to_client_with_closed_channel() {
     broker.register_client(client);
     broker.subscribe("test_topic", client_id.clone());
 
-    // Drop the receiver to close the channel
     drop(rx);
 
     let message = crate::message::Message {
         topic: "test_topic".to_string(),
         payload: "hello".to_string(),
         timestamp: 0,
-        message_id: "closed_channel_message".to_string(), // Added message_id
-        qos: 0,                                           // Added qos
+        message_id: "closed_channel_message".to_string(),
+        qos: 0,
     };
     broker.publish(message);
-
-    // No assertion, just checking for no panics and that an error is logged.
 }
 
+/// Checks that an unacknowledged QoS 1 message is resent `max_retries` times, then dropped, and that a late ACK for it is ignored.
 #[tokio::test]
 async fn test_broker_qos1_retry_mechanism() {
     let broker_arc = std::sync::Arc::new(std::sync::Mutex::new(Broker::default()));
@@ -206,7 +213,6 @@ async fn test_broker_qos1_retry_mechanism() {
     let client_id = client.id.clone();
 
     {
-        // Scope for mutable borrow of broker
         let mut broker = broker_arc.lock().unwrap();
         broker.register_client(client);
         broker.subscribe("test_topic", client_id.clone());
@@ -222,12 +228,10 @@ async fn test_broker_qos1_retry_mechanism() {
     };
 
     {
-        // Scope for mutable borrow of broker
         let mut broker = broker_arc.lock().unwrap();
         broker.publish(message.clone());
     }
 
-    // Assert that the message is initially in pending_acks
     assert!(
         broker_arc
             .lock()
@@ -236,7 +240,6 @@ async fn test_broker_qos1_retry_mechanism() {
             .contains_key(&message_id)
     );
 
-    // Consume the first message sent
     let received_msg = rx.recv().await.unwrap();
     if let WsMessage::Text(text) = received_msg {
         let received_message: crate::message::Message = serde_json::from_str(&text).unwrap();
@@ -246,17 +249,15 @@ async fn test_broker_qos1_retry_mechanism() {
         panic!("Expected a text message");
     }
 
-    // Simulate MAX_RETRIES timeouts and re-sends
     for i in 0..Settings::default().broker.max_retries {
-        tokio::time::sleep(tokio::time::Duration::from_millis(5100)).await; // Advance time beyond ACK_TIMEOUT_MS
-        tokio::spawn(Broker::start_retry_loop(broker_arc.clone())); // Spawn the retry loop
+        tokio::time::sleep(tokio::time::Duration::from_millis(5100)).await;
+        tokio::spawn(Broker::start_retry_loop(broker_arc.clone()));
 
         let re_sent_msg = rx.recv().await.unwrap();
         if let WsMessage::Text(text) = re_sent_msg {
             let re_sent_message: crate::message::Message = serde_json::from_str(&text).unwrap();
             assert_eq!(re_sent_message.message_id, message_id);
             assert_eq!(re_sent_message.qos, 1);
-            // Verify retries count
             assert_eq!(
                 broker_arc
                     .lock()
@@ -272,14 +273,11 @@ async fn test_broker_qos1_retry_mechanism() {
         }
     }
 
-    // Verify message is dropped after MAX_RETRIES
-    tokio::time::sleep(tokio::time::Duration::from_millis(5100)).await; // Advance time one more time
-    tokio::spawn(Broker::start_retry_loop(broker_arc.clone())); // Spawn the retry loop
+    tokio::time::sleep(tokio::time::Duration::from_millis(5100)).await;
+    tokio::spawn(Broker::start_retry_loop(broker_arc.clone()));
 
-    // Assert that no more messages are re-sent
     assert!(rx.try_recv().is_err());
 
-    // Assert that the message is removed from pending_acks
     assert!(
         !broker_arc
             .lock()
@@ -288,9 +286,7 @@ async fn test_broker_qos1_retry_mechanism() {
             .contains_key(&message_id)
     );
 
-    // Send ACK and verify message is removed from pending_acks (this ACK should be ignored)
     {
-        // Scope for mutable borrow of broker
         let mut broker = broker_arc.lock().unwrap();
         broker.handle_ack(&message_id);
     }
@@ -303,11 +299,11 @@ async fn test_broker_qos1_retry_mechanism() {
     );
 }
 
+/// Checks that only overdue messages are picked for resending and that a resend increments the retry count and reaches the subscriber.
 #[test]
 fn test_collect_retry_candidates_and_resend() {
     let mut broker = Broker::default();
 
-    // Insert a pending message that is overdue and one that is not
     let overdue_id = "overdue".to_string();
     let recent_id = "recent".to_string();
 
@@ -349,7 +345,6 @@ fn test_collect_retry_candidates_and_resend() {
     assert!(!to_resend.contains(&recent_id));
     assert!(to_drop.is_empty());
 
-    // Test resend_pending_message updates retries and returns true
     let mut broker2 = Broker::default();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
@@ -378,10 +373,8 @@ fn test_collect_retry_candidates_and_resend() {
     assert!(attempted);
     assert_eq!(broker2.pending_acks.get(&overdue_id).unwrap().retries, 1);
 
-    // Ensure a message was sent to the client
     let received = rx.try_recv().unwrap();
     if let WsMessage::Text(_) = received {
-        // ok
     } else {
         panic!("Expected text message");
     }

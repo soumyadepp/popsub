@@ -4,6 +4,6 @@ Contains the broker implementation (topics, subscriptions, message routing, pers
 
 Public API:
 
-- `Broker` — register clients, subscribe/unsubscribe clients, publish messages, handle acks.
+- `Broker`: registers clients, subscribes and unsubscribes them, publishes messages and handles acks.
 
 This crate is used by `popsub_transport` (WebSocket server) and the `popsub` binary.

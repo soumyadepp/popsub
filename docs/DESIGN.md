@@ -2,13 +2,13 @@
 
 | | |
 |---|---|
-| Status | Describes `main` as of November 2026, plus the proposed direction |
+| Status | Describes `main` as of November 2026, after authentication and rate limiting landed (#9, #12), plus the proposed direction |
 | Owner | Soumyadeep Ghosh |
 | Scope | The broker, its WebSocket protocol, persistence and delivery guarantees |
 
 ## 1. Summary
 
-PopSub is a single-process publish/subscribe broker written in Rust. Clients connect over WebSocket, log in, and then subscribe to topics or publish to them using a small JSON protocol. Messages can be sent fire-and-forget (QoS 0) or with acknowledgements and retries (QoS 1). Recent messages are stored per topic in an embedded `sled` database and replayed to new subscribers.
+PopSub is a single-process publish/subscribe broker written in Rust. Clients connect over WebSocket, log in as a user with per-topic permissions, and then subscribe to topics or publish to them using a small JSON protocol. Logins, registrations and publishing are rate limited. Messages can be sent fire-and-forget (QoS 0) or with acknowledgements and retries (QoS 1). Recent messages are stored per topic in an embedded `sled` database and replayed to new subscribers.
 
 This document describes how the system works today, where its guarantees hold and where they don't, and the changes needed before other people can depend on it.
 
@@ -35,12 +35,11 @@ This document describes how the system works today, where its guarantees hold an
 ```
                  popsub (CLI: server, client)
                    |
-        +----------+-------------------------+
-        |                                    |
- popsub_transport (WebSocket, protocol, auth) |
-        |                                    |
- popsub_broker (topics, routing, QoS 1 retries)
-        |              |
+ popsub_transport (WebSocket, protocol, auth and limit enforcement)
+        |                 |                    |
+ popsub_broker      popsub_auth          popsub_ratelimit
+ (topics, QoS 1)    (users, JWT, RBAC)   (token bucket, sliding window, lockouts)
+        |
  popsub_persistence   popsub_client (per-connection record)
         |
  popsub_utils (errors, logging)       popsub_config (settings loader)
@@ -48,15 +47,17 @@ This document describes how the system works today, where its guarantees hold an
 
 | Crate | Responsibility |
 |---|---|
-| `popsub` | Binary. Parses the CLI, loads config, starts the broker, the retry loop and the WebSocket server. Also contains a small demo client. |
-| `popsub_transport` | Accepts connections, parses `ClientMessage` JSON, enforces login then auth, issues and checks JWTs, and turns requests into broker calls. |
+| `popsub` | Binary. Parses the CLI, loads config, refuses published default secrets on public addresses, starts the broker, the retry loop and the WebSocket server. Also contains a small demo client. |
+| `popsub_transport` | Accepts connections, parses `ClientMessage` JSON, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls. |
+| `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
+| `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | The engine: topics, subscriber sets, publishing, QoS 1 pending table and retry loop, replay on subscribe. Synchronous API. |
 | `popsub_persistence` | `sled` store of recent messages per topic, with a TTL and a per-topic cap. |
-| `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag. Despite the name it is not a client library. |
-| `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. |
+| `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
+| `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
 | `popsub_utils` | `PopSubError`, the shared `Result` alias, and logging setup. |
 
-Dependencies point downwards only. The broker knows nothing about WebSockets beyond the message type it pushes into each client's channel.
+Dependencies point downwards only. The broker knows nothing about WebSockets, users or permissions; the transport checks those before calling it.
 
 ### 3.2 Runtime
 
@@ -72,6 +73,8 @@ Dependencies point downwards only. The broker knows nothing about WebSockets bey
 - **Send loop.** One per socket. Drains the client's channel and writes frames. When the socket fails it cleans the client up.
 - **Broker.** A single `Arc<std::sync::Mutex<Broker>>` shared by every task.
 - **Retry loop.** A background task that wakes every second, collects QoS 1 messages whose ACK is overdue, and resends or drops them.
+- **Auth service.** An `Arc<tokio::sync::RwLock<AuthService>>`. Handlers read client state under the broker lock, release it, check permissions under the auth lock, release that, then take the broker lock again to act. The two locks are never held together.
+- **Prune task.** Every minute, drops rate limiter entries for keys that have gone quiet.
 
 ## 4. Protocol
 
@@ -81,17 +84,19 @@ All frames are JSON text. Client messages are tagged with `type`.
 
 | `type` | Fields | Notes |
 |---|---|---|
-| `login` | `username`, `password` | Checked against the single configured user. Returns a JWT. |
+| `register` | `username`, `password` | Only when `server.allow_registration` is on. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`; passwords at least 8 characters. Allowed before `auth`. |
+| `login` | `username`, `password` | Checked against the user store (Argon2id). Returns a JWT. Rate limited, see section 10. |
 | `auth` | `token` | Must succeed before anything below is accepted. A bad token closes the connection. |
-| `subscribe` | `topic` | Creates the topic if needed and replays stored messages. |
+| `subscribe` | `topic` | Requires subscribe permission for the topic. Creates the topic if needed and replays stored messages. |
 | `unsubscribe` | `topic` | |
-| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | Broker sets `timestamp` and generates `message_id` when missing. |
+| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | Requires publish permission and is rate limited per user. Broker sets `timestamp` and generates `message_id` when missing. |
 | `ack` | `message_id` | Confirms a QoS 1 delivery. |
 
 ### 4.2 Server to client
 
 | Frame | Shape |
 |---|---|
+| Register result | `{"type":"register_response","success":true,"message":"..."}` |
 | Login result | `{"type":"login_response","token":"..."}` |
 | Auth result | `{"type":"authenticated"}` |
 | Error | `{"type":"error","message":"..."}` |
@@ -102,9 +107,10 @@ All frames are JSON text. Client messages are tagged with `type`.
 ### 4.3 Session order
 
 1. Connect.
-2. `login`. Wrong credentials produce an error and the connection stays open.
-3. `auth` with the token. Failure closes the connection.
-4. Any other request. Requests before successful `auth` produce an error and close the connection.
+2. Optionally `register`. The connection stays open whatever the result.
+3. `login`. Wrong credentials or a lockout produce an error and the connection stays open.
+4. `auth` with the token. Failure closes the connection.
+5. Any other request. Sending one before successful `auth` produces an error and closes the connection. A permission denial or a publish rate limit produces an error and the connection stays open.
 
 ## 5. Message lifecycle
 
@@ -158,33 +164,59 @@ The README and the portfolio both describe PopSub as at-least-once. That is only
 
 ## 9. Configuration
 
-Sources, later ones winning: built-in defaults, `config/default.toml`, then environment variables using `_` as the separator (`SERVER_PORT`, `BROKER_MAX_RETRIES`).
+Sources, later ones winning: built-in defaults, `config/default.toml`, then environment variables.
+
+Environment variables name a section and a key. Keys made of one word take a single underscore (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need a double underscore after the section (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`), because a single underscore can't tell the section from the key.
 
 | Key | Default | Used by |
 |---|---|---|
-| `server.host` | `127.0.0.1` | Transport |
+| `server.host` | `127.0.0.1` | Transport, and the default-secrets check |
 | `server.port` | `8080` | Transport |
-| `server.jwt_secret` | `default_secret` in code, `a_very_secret_key` in `config/default.toml` | Transport |
-| `server.jwt_expiration_hours` | `24` | Transport |
-| `server.username`, `server.password` | `admin`, `password` | Transport |
+| `server.jwt_secret` | `default_secret` in code, `a_very_secret_key` in `config/default.toml` | Auth |
+| `server.jwt_expiration_hours` | `24` | Auth |
+| `server.username`, `server.password` | `admin`, `password` | Auth, which creates this admin user at startup |
+| `server.allow_registration` | `false` | Auth |
+| `server.registration_role` | `none` | Auth. `none`, `readonly` or `full`; anything else means `none` |
 | `broker.max_connections` | `1000` | Nothing. Not enforced. |
 | `broker.message_ttl_secs` | `3600` | Nothing. Persistence uses its own default. |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop |
 
+Rate limits are set in code (`RateLimiters::default`), not in config.
+
 ## 10. Security
 
-**On `main`**
+**Identity and permissions**
 
-- One shared username and password from config. Any authenticated client may publish or subscribe to any topic.
-- JWTs are HS256 with the configured secret. Expiry is checked once, at `auth`; a long-lived connection outlives its token.
+- Users live in a `UserStore`: in memory by default (rebuilt at each start, so self-registered users disappear on restart), or Postgres with the `postgres` feature.
+- The admin from `server.username` and `server.password` is created at startup with full access.
+- Roles: `Admin` (everything), `User` with a list of topic patterns that each allow subscribe, publish or both, and `ReadOnly` with subscribe-only patterns. Patterns use `+` for one level and `#` for the rest. `*` is not special.
+- Permissions are looked up from the store on every subscribe and publish, so disabling a user or changing their role takes effect immediately, without waiting for the token to expire.
+- Self-registration is off by default. When on, new users get the role named by `server.registration_role`, which defaults to no topics.
+
+**Tokens**
+
+- HS256 JWTs signed with `server.jwt_secret`, carrying the username, expiry and role. Refreshing keeps the role.
+- Expiry is checked once, at `auth`. A long-lived connection outlives its token.
+
+**Limits**
+
+| What | Key | Limit |
+|---|---|---|
+| Failed logins | address and username together | 5, then a lockout from 5 minutes that doubles up to an hour |
+| Failed logins | address, across all usernames | 20, then a lockout from 15 minutes that doubles up to an hour |
+| Registration attempts | address | 5 per hour, successful or not |
+| Publishing | username, shared by all of a user's connections | 100 a second, bursts of 50 |
+
+- Keying failed logins by address and username together means someone guessing a password from one machine locks out only themselves.
+- Limits use the socket's address. Behind a reverse proxy every client shares the proxy's address, so put limits at the proxy too.
+- Idle limiter entries are pruned every minute, so memory doesn't grow with every address or username ever tried.
+
+**Defaults and exposure**
+
+- The server refuses to listen on a non-loopback address while `jwt_secret` is one of the published defaults or the admin password is `password`. On localhost it starts and logs a warning. The auth library also warns when constructed with those values.
+- Taken usernames get a generic "registration failed", so registration can't be used to discover accounts.
 - No TLS in the process. Run it behind a TLS-terminating proxy.
-- No rate limits, connection cap or message size limit beyond the WebSocket library's defaults.
-- Default credentials and secrets ship in the repo, and the server starts happily with them.
-
-**On `feat/add-auth` (unmerged, about 5,000 lines)**
-
-- A user store, role-based permissions per topic, JWT handling in its own crate, and login, sliding-window and token-bucket rate limiters. This covers most of the gaps above and needs a review and merge.
 
 ## 11. Failure modes
 
@@ -194,6 +226,9 @@ Sources, later ones winning: built-in defaults, `config/default.toml`, then envi
 | Subscriber reads slowly | Its channel grows without bound until memory runs out. |
 | Publisher sends to a topic nobody subscribes to | Stored for replay. QoS 1 entry lingers until retries are exhausted. |
 | Two publishers reuse a `message_id` | The second overwrites the first in `pending_acks`. |
+| Someone guesses a user's password | That address and username pair locks out after 5 failures; the address locks out after 20 across all usernames. The real user, from another address, is unaffected. |
+| A client floods publishes | Its user's token bucket empties and further publishes get an error until it refills. |
+| The server restarts | Self-registered users are lost with the in-memory store. The admin is recreated from config. |
 | `sled` write fails | Logged. The message is still delivered live. |
 | Broker process restarts | Retained history survives. In-flight QoS 1 state and all sessions are lost. |
 | A task panics while holding the lock | The mutex is poisoned and every later `.lock().expect(...)` panics. The server effectively stops. |
@@ -207,11 +242,12 @@ Sources, later ones winning: built-in defaults, `config/default.toml`, then envi
 5. One global lock, with disk I/O inside it.
 6. Publisher-chosen ids can collide.
 7. Delivered messages lack a `type` tag.
-8. `max_connections` and `message_ttl_secs` are ignored, and the storage path is hard-coded.
-9. Two versions of the `config` crate in the workspace (`popsub_utils` uses 0.13, `popsub_config` uses 0.15), so `PopSubError::Config` can't wrap errors from the loader.
-10. `popsub_broker` depends on `tempfile` at runtime because `Broker::default` branches on `cfg!(test)`.
-11. Security gaps in section 10, mostly addressed by `feat/add-auth`.
-12. No client libraries, release artefacts, health check or metrics.
+8. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
+9. Token expiry is only checked at `auth`.
+10. `max_connections` and `message_ttl_secs` are ignored, the storage path is hard-coded, and rate limits aren't configurable.
+11. Two versions of the `config` crate in the workspace (`popsub_utils` uses 0.13, `popsub_config` uses 0.15), so `PopSubError::Config` can't wrap errors from the loader.
+12. `popsub_broker` depends on `tempfile` at runtime because `Broker::default` branches on `cfg!(test)`.
+13. No client libraries, release artefacts, health check or metrics.
 
 ## 13. Proposed direction
 
@@ -227,10 +263,14 @@ Sources, later ones winning: built-in defaults, `config/default.toml`, then envi
 
 ### Phase 2: safe to expose
 
-- Review and merge `feat/add-auth`.
-- Refuse to start with default secrets or credentials outside a `--dev` flag.
-- Enforce connection, message size and rate limits.
-- Re-check token expiry on each request, or close connections when tokens expire.
+Done in #9 and #12: users and per-topic permissions, rate limits on logins, registration and publishing, registration off by default, and refusal of published defaults on public addresses.
+
+Remaining:
+
+- An admin message or CLI command to grant topics and manage users.
+- Close connections when their token expires, or re-check expiry on each request.
+- Enforce connection and message size limits, and make rate limits configurable.
+- Trust a proxy's forwarded address when configured, so limits work behind one.
 - Document running behind a TLS proxy.
 
 ### Phase 3: adoptable
@@ -247,7 +287,7 @@ Replicate topic logs across three nodes with Raft (for example `openraft`). Only
 
 ## 14. Testing
 
-- 33 tests on `main` across the crates: topic and broker unit tests, persistence round trips, config loading, and WebSocket tests that start a real server on a free port and drive login, auth and errors.
+- 97 tests on `main` across the crates: topic and broker unit tests, persistence round trips, config loading including environment variables, auth (registration rules, roles, wildcards, tokens, default secrets), rate limiters (including concurrent resets and pruning), and WebSocket tests that start a real server on a free port and drive registration, login, lockouts, auth and errors.
 - CI runs `cargo fmt --check`, `cargo clippy -D warnings`, a build and the tests on every push and pull request to `main`. `make ci` runs the same locally.
 - Missing: tests for QoS 1 with several subscribers, reconnection, restart recovery and slow consumers. These are the tests phase 1 should start with, written first and failing.
 

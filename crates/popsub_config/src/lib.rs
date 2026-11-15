@@ -1,3 +1,9 @@
+//! Loads PopSub's server and broker settings.
+//!
+//! Values come from `config/default.toml` (relative to the working
+//! directory), then environment variables, then `Settings::default()` for
+//! anything neither source set. The setting types live in `settings`.
+
 pub mod settings;
 pub mod tests;
 
@@ -18,10 +24,11 @@ pub use settings::{BrokerSettings, ServerSettings};
 /// section apart from the key.
 ///
 /// Returns:
-///   The merged settings.
+///     The merged settings.
 ///
 /// Raises:
-///   ConfigError: When a source can't be read or a value has the wrong type.
+///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
+///     ConfigError::Type: When a value from the file or the environment has the wrong type.
 pub fn load_config() -> Result<Settings, ConfigError> {
     load_config_with_env(None)
 }
@@ -29,14 +36,21 @@ pub fn load_config() -> Result<Settings, ConfigError> {
 /// Loads settings as `load_config` does, reading environment variables from
 /// `env` instead of the process when given. Used by tests.
 ///
+/// The environment is added twice, once split on `_` and once on `__`, so
+/// both `SERVER_PORT` and `SERVER__JWT_SECRET` reach the right key. A
+/// multi-word key written with single underscores (`SERVER_JWT_SECRET`)
+/// becomes a nested key that no field matches, and is ignored.
+///
 /// Args:
-///   env: Variables to use in place of the process environment.
+///     env: Variables to use in place of the process environment, or `None`
+///         to read the process environment.
 ///
 /// Returns:
-///   The merged settings.
+///     The merged settings.
 ///
 /// Raises:
-///   ConfigError: When a source can't be read or a value has the wrong type.
+///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
+///     ConfigError::Type: When a value from the file or the environment has the wrong type.
 pub fn load_config_with_env(
     env: Option<std::collections::HashMap<String, String>>,
 ) -> Result<Settings, ConfigError> {
@@ -124,15 +138,13 @@ mod env_tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Checks that values in `config/default.toml`, read from a temporary working directory, override the defaults.
     #[test]
     fn load_config_from_file_overrides_defaults() {
-        // Create a temporary directory and set it as current dir so load_config
-        // will pick up config/default.toml from there.
         let tmp = TempDir::new().expect("create tempdir");
         let orig = env::current_dir().expect("current_dir");
         env::set_current_dir(tmp.path()).expect("set current dir");
 
-        // create config dir and default.toml
         fs::create_dir_all("config").expect("create config dir");
         let toml = r#"
             [server]
@@ -153,7 +165,6 @@ mod env_tests {
         assert_eq!(cfg.broker.max_connections, 10);
         assert_eq!(cfg.broker.message_ttl_secs, 60);
 
-        // restore cwd
         env::set_current_dir(orig).expect("restore cwd");
     }
 }
