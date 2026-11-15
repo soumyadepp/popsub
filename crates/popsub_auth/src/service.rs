@@ -100,7 +100,38 @@ impl Default for AuthConfig {
     }
 }
 
+/// JWT secrets that appear in PopSub's code or sample config.
+const PUBLISHED_SECRETS: [&str; 3] = [
+    "change_me_in_production",
+    "default_secret",
+    "a_very_secret_key",
+];
+
+/// The admin password that appears in PopSub's code and sample config.
+const PUBLISHED_PASSWORD: &str = "password";
+
 impl AuthConfig {
+    /// Lists settings that still use values published with PopSub.
+    ///
+    /// Returns:
+    ///   A description of each insecure setting, empty when there are none.
+    pub fn insecure_defaults(&self) -> Vec<&'static str> {
+        let mut found = Vec::new();
+        if PUBLISHED_SECRETS.contains(&self.jwt_secret.as_str()) {
+            found.push("the JWT secret is a published default");
+        }
+        if self.default_admin_password == PUBLISHED_PASSWORD {
+            found.push("the default admin password is the published default");
+        }
+        found
+    }
+
+    fn warn_if_insecure(&self) {
+        for problem in self.insecure_defaults() {
+            warn!("{problem}; set your own before exposing this service");
+        }
+    }
+
     /// Create a new config with the given JWT secret.
     pub fn new(jwt_secret: impl Into<String>) -> Self {
         Self {
@@ -159,6 +190,7 @@ impl AuthService {
     ///
     /// Uses an in-memory user store and creates a default admin user.
     pub async fn new(config: AuthConfig) -> Self {
+        config.warn_if_insecure();
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
         let user_store = Arc::new(InMemoryUserStore::new());
 
@@ -194,6 +226,7 @@ impl AuthService {
     /// 1. Pre-populate the store with an admin user, or
     /// 2. Call `add_user()` after creation to add an admin
     pub fn with_store(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
+        config.warn_if_insecure();
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
 
         Self {
@@ -205,6 +238,7 @@ impl AuthService {
 
     /// Create a new auth service with a custom store and initialize the default admin.
     pub async fn with_store_and_admin(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
+        config.warn_if_insecure();
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
 
         let service = Self {

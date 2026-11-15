@@ -20,7 +20,7 @@ Authentication and authorization module for PopSub.
 │  │             │  │  (trait)    │  │                     │  │
 │  │ - generate  │  │             │  │  - can_subscribe    │  │
 │  │ - validate  │  │ - get_user  │  │  - can_publish      │  │
-│  │ - refresh   │  │ - add_user  │  │  - can_admin        │  │
+│  │ - refresh   │  │ - add_user  │  │                     │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```

@@ -359,3 +359,11 @@ async fn test_registration_with_limited_role() {
     assert!(!auth.can_subscribe("limited", "private/secret").await);
     assert!(!auth.can_publish("limited", "private/secret").await);
 }
+
+#[test]
+fn test_insecure_defaults_are_detected() {
+    assert_eq!(AuthConfig::default().insecure_defaults().len(), 2);
+
+    let custom = AuthConfig::new("a-long-random-secret").with_admin("admin", "not-the-default");
+    assert!(custom.insecure_defaults().is_empty());
+}
