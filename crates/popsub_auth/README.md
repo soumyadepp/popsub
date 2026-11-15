@@ -7,7 +7,7 @@ Authentication and authorization module for PopSub.
 - **JWT Token Management**: Secure token generation, validation, and refresh
 - **Password Hashing**: Argon2-based password hashing for secure credential storage
 - **Role-Based Access Control (RBAC)**: Fine-grained permissions for topics
-- **Wildcard Topic Patterns**: MQTT-style wildcards (`+`, `#`, `*`) for flexible authorization
+- **Wildcard Topic Patterns**: MQTT-style wildcards (`+` and `#`) for flexible authorization
 - **Pluggable User Storage**: Trait-based storage abstraction with in-memory default
 
 ## Architecture
@@ -59,7 +59,7 @@ use popsub_auth::service::UserBuilder;
 
 UserBuilder::new("bob", "bob_password")
     .allow_topic("notifications/#")
-    .allow_subscribe("public/*")
+    .allow_subscribe("public/#")
     .register(&mut auth)
     .unwrap();
 ```
@@ -110,7 +110,7 @@ Topic-specific permissions with granular control:
 let user_role = Role::User {
     allowed_topics: vec![
         TopicPermission::new("chat/#", true, true),   // subscribe + publish
-        TopicPermission::new("sensors/*", true, false), // subscribe only
+        TopicPermission::new("sensors/#", true, false), // subscribe only
     ],
 };
 ```
@@ -121,7 +121,7 @@ Can only subscribe, never publish:
 
 ```rust
 let readonly_role = Role::ReadOnly {
-    allowed_topics: vec!["news/#".to_string(), "updates/*".to_string()],
+    allowed_topics: vec!["news/#".to_string(), "updates/#".to_string()],
 };
 ```
 
@@ -132,8 +132,9 @@ let readonly_role = Role::ReadOnly {
 | `chat/room1`     | Exact match             | `chat/room1`                        |
 | `chat/+`         | Single level            | `chat/room1`, `chat/room2`          |
 | `chat/#`         | Multiple levels         | `chat/room1`, `chat/room1/messages` |
-| `chat/*`         | Multiple levels (alias) | Same as `#`                         |
 | `sensors/+/temp` | Single level in middle  | `sensors/living/temp`               |
+
+`*` is not a wildcard. It only matches a level that is literally `*`.
 
 ## Custom User Store
 
@@ -212,10 +213,28 @@ impl UserStore for PostgresUserStore {
 | Backend    | Status      | Notes                             |
 | ---------- | ----------- | --------------------------------- |
 | In-Memory  | ✅ Built-in | Default, for dev/testing          |
-| PostgreSQL | 📝 Example  | Implement with `sqlx`             |
+| PostgreSQL | ✅ Built-in | `PostgresUserStore`, behind the `postgres` feature |
 | SQLite     | 📝 Example  | Implement with `rusqlite`         |
 | Redis      | 📝 Example  | Implement with `redis-rs`         |
 | Sled       | 📝 Example  | Use existing `popsub_persistence` |
+
+### PostgreSQL setup
+
+1. Build with the feature: `cargo build -p popsub_auth --features postgres`.
+2. Create the store with `PostgresUserStore::new_with_migrations(pool)`, which creates the `users` table if it is missing. If you manage schema yourself, run `migrations/001_create_users_table.sql` and use `PostgresUserStore::new(pool)` instead.
+3. Pass the store to `AuthService::with_store_and_admin`.
+
+CI compiles this store (`--all-features`) but does not run it against a database, so test it against your own Postgres before relying on it.
+
+## Registration defaults
+
+Registration is off unless you turn it on with `AuthConfig::with_registration(true)`. Users who register get no topics until an admin grants them some, unless you choose a role with `with_default_role`:
+
+- `DefaultUserRole::LimitedAccess(vec![])`: no topics (the default)
+- `DefaultUserRole::ReadOnly`: subscribe to every topic
+- `DefaultUserRole::FullAccess`: publish and subscribe to every topic
+
+Usernames must be 3 to 32 letters, digits, `_`, `.` or `-`. Passwords must be at least 8 characters.
 
 ## Security Considerations
 
@@ -226,4 +245,4 @@ impl UserStore for PostgresUserStore {
 
 ## License
 
-MIT
+Apache-2.0

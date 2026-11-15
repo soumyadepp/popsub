@@ -85,7 +85,7 @@ async fn test_readonly_user() {
     let auth = AuthService::new(config).await;
 
     let role = Role::ReadOnly {
-        allowed_topics: vec!["news/#".to_string(), "updates/*".to_string()],
+        allowed_topics: vec!["news/#".to_string(), "updates/#".to_string()],
     };
     auth.add_user("reader", "reader123", role).await.unwrap();
 
@@ -102,7 +102,7 @@ async fn test_user_builder() {
 
     UserBuilder::new("bob", "bob123")
         .allow_topic("chat/#")
-        .allow_subscribe("sensors/*")
+        .allow_subscribe("sensors/#")
         .register(&auth)
         .await
         .unwrap();
@@ -138,6 +138,7 @@ async fn test_token_refresh() {
 
     let claims = auth.validate_token(&new_token).unwrap();
     assert_eq!(claims.sub, "admin");
+    assert_eq!(claims.role.as_deref(), Some("admin"));
 }
 
 #[tokio::test]
@@ -248,9 +249,39 @@ async fn test_user_registration() {
     let token = auth.login("newuser", "password123").await.unwrap();
     assert!(!token.is_empty());
 
-    // Default role should be full access
-    assert!(auth.can_subscribe("newuser", "any/topic").await);
-    assert!(auth.can_publish("newuser", "any/topic").await);
+    // New users get no topics until an admin grants them
+    assert!(!auth.can_subscribe("newuser", "any/topic").await);
+    assert!(!auth.can_publish("newuser", "any/topic").await);
+}
+
+#[tokio::test]
+async fn test_default_config_is_closed() {
+    let auth = AuthService::new(AuthConfig::default()).await;
+
+    assert!(!auth.is_registration_enabled());
+    assert!(auth.register_user("newuser", "password123").await.is_err());
+    assert!(!auth.user_exists("newuser").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_username_and_password_rules() {
+    let config = AuthConfig::default().with_registration(true);
+    let auth = AuthService::new(config).await;
+
+    for bad in ["has space", "semi;colon", "émile", "x".repeat(33).as_str()] {
+        assert!(
+            auth.register_user(bad, "password123").await.is_err(),
+            "{bad}"
+        );
+    }
+    assert!(
+        auth.register_user("ok_user.name-1", "password123")
+            .await
+            .is_ok()
+    );
+
+    assert!(auth.register_user("shortpass", "seven77").await.is_err());
+    assert!(auth.register_user("longpass", "eight888").await.is_ok());
 }
 
 #[tokio::test]
@@ -310,7 +341,7 @@ async fn test_registration_with_limited_role() {
         .with_registration(true)
         .with_default_role(DefaultUserRole::LimitedAccess(vec![
             TopicPermission::full_access("public/#"),
-            TopicPermission::read_only("announcements/*"),
+            TopicPermission::read_only("announcements/#"),
         ]));
     let auth = AuthService::new(config).await;
 

@@ -14,6 +14,52 @@ use crate::store::{InMemoryUserStore, UserStore, hash_password, verify_password}
 use crate::user::{Role, User};
 
 /// Configuration for the authentication service.
+/// Shortest password accepted at registration.
+pub const MIN_PASSWORD_LENGTH: usize = 8;
+
+/// Username length limits accepted at registration.
+pub const USERNAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=32;
+
+/// Checks a username is 3 to 32 characters of letters, digits, `_`, `.` or `-`.
+///
+/// Args:
+///   username: The requested username.
+///
+/// Raises:
+///   AuthError::PermissionDenied: When the username breaks either rule.
+pub fn validate_username(username: &str) -> Result<()> {
+    if !USERNAME_LENGTH.contains(&username.chars().count()) {
+        return Err(AuthError::PermissionDenied(format!(
+            "username must be {} to {} characters",
+            USERNAME_LENGTH.start(),
+            USERNAME_LENGTH.end()
+        )));
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+    if !username.chars().all(allowed) {
+        return Err(AuthError::PermissionDenied(
+            "username may only contain letters, digits, '_', '.' and '-'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a password meets the minimum length.
+///
+/// Args:
+///   password: The requested password.
+///
+/// Raises:
+///   AuthError::PermissionDenied: When the password is too short.
+pub fn validate_password(password: &str) -> Result<()> {
+    if password.chars().count() < MIN_PASSWORD_LENGTH {
+        return Err(AuthError::PermissionDenied(format!(
+            "password must be at least {MIN_PASSWORD_LENGTH} characters"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// Secret key for JWT signing.
@@ -48,8 +94,8 @@ impl Default for AuthConfig {
             jwt_expiration_hours: 24,
             default_admin_username: "admin".to_string(),
             default_admin_password: "password".to_string(),
-            allow_registration: true,
-            default_user_role: DefaultUserRole::FullAccess,
+            allow_registration: false,
+            default_user_role: DefaultUserRole::LimitedAccess(Vec::new()),
         }
     }
 }
@@ -220,19 +266,8 @@ impl AuthService {
             ));
         }
 
-        // Validate username
-        if username.is_empty() || username.len() < 3 {
-            return Err(AuthError::PermissionDenied(
-                "username must be at least 3 characters".to_string(),
-            ));
-        }
-
-        // Validate password
-        if password.len() < 6 {
-            return Err(AuthError::PermissionDenied(
-                "password must be at least 6 characters".to_string(),
-            ));
-        }
+        validate_username(username)?;
+        validate_password(password)?;
 
         // Check if user already exists
         if self.user_store.user_exists(username).await? {
