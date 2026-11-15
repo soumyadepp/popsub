@@ -65,14 +65,37 @@ impl SlidingWindow {
     }
 
     fn get_or_create_window(&self, key: &str) -> dashmap::mapref::one::Ref<'_, String, Window> {
-        // Use entry API to avoid race condition between contains_key and get
         self.windows
             .entry(key.to_string())
             .or_insert_with(|| Window {
                 timestamps: Mutex::new(VecDeque::new()),
-            });
-        // Safe to unwrap: we just inserted if missing
-        self.windows.get(key).unwrap()
+            })
+            .downgrade()
+    }
+
+    /// Forget keys whose window holds no requests any more.
+    ///
+    /// Call this periodically so keys from clients that have gone away don't
+    /// accumulate. A pruned key behaves exactly like a key seen for the first
+    /// time, which is correct because its window is empty.
+    ///
+    /// Returns:
+    ///   How many fewer keys are tracked afterwards. Approximate when other
+    ///   tasks add keys at the same time.
+    pub fn prune_idle(&self) -> usize {
+        let now = Instant::now();
+        let before = self.windows.len();
+        self.windows.retain(|_, window| {
+            let timestamps = window.timestamps.get_mut().unwrap();
+            self.cleanup_old_entries(timestamps, now);
+            !timestamps.is_empty()
+        });
+        before.saturating_sub(self.windows.len())
+    }
+
+    /// Number of keys currently tracked.
+    pub fn tracked_keys(&self) -> usize {
+        self.windows.len()
     }
 
     fn cleanup_old_entries(&self, timestamps: &mut VecDeque<Instant>, now: Instant) {

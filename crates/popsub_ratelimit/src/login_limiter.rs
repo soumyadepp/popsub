@@ -165,12 +165,42 @@ impl LoginRateLimiter {
         &self,
         key: &str,
     ) -> dashmap::mapref::one::Ref<'_, String, Mutex<LoginState>> {
-        // Use entry API to avoid race condition between contains_key and get
         self.states
             .entry(key.to_string())
-            .or_insert_with(|| Mutex::new(LoginState::default()));
-        // Safe to unwrap: we just inserted if missing
-        self.states.get(key).unwrap()
+            .or_insert_with(|| Mutex::new(LoginState::default()))
+            .downgrade()
+    }
+
+    /// Forget keys that are not locked out and have had no failure for
+    /// `max_idle`.
+    ///
+    /// Without this, every username or address ever tried stays in memory.
+    /// Pruning also forgets the exponential backoff history for that key, so
+    /// choose `max_idle` at least as long as the maximum lockout.
+    ///
+    /// Args:
+    ///   max_idle: How long a key must have been quiet before it is removed.
+    ///
+    /// Returns:
+    ///   How many fewer keys are tracked afterwards. Approximate when other
+    ///   tasks add keys at the same time.
+    pub fn prune_idle(&self, max_idle: Duration) -> usize {
+        let now = Instant::now();
+        let before = self.states.len();
+        self.states.retain(|_, state| {
+            let state = state.get_mut().unwrap();
+            let locked = state.locked_until.is_some_and(|until| now < until);
+            let recent = state
+                .last_failure
+                .is_some_and(|last| now.duration_since(last) < max_idle);
+            locked || recent
+        });
+        before.saturating_sub(self.states.len())
+    }
+
+    /// Number of keys currently tracked.
+    pub fn tracked_keys(&self) -> usize {
+        self.states.len()
     }
 
     /// Check if a login attempt is allowed.

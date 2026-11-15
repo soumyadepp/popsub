@@ -90,6 +90,34 @@ impl TokenBucket {
             .downgrade()
     }
 
+    /// Forget buckets that have not been touched for `max_idle`.
+    ///
+    /// Call this periodically so buckets for clients that have gone away
+    /// don't accumulate. Choose `max_idle` long enough for an empty bucket to
+    /// have refilled completely, so a pruned key gets no more tokens than it
+    /// would have had anyway.
+    ///
+    /// Args:
+    ///   max_idle: How long a bucket must have been unused before removal.
+    ///
+    /// Returns:
+    ///   How many fewer keys are tracked afterwards. Approximate when other
+    ///   tasks add keys at the same time.
+    pub fn prune_idle(&self, max_idle: Duration) -> usize {
+        let now = Instant::now();
+        let before = self.buckets.len();
+        self.buckets.retain(|_, bucket| {
+            let state = bucket.state.get_mut().unwrap();
+            now.duration_since(state.last_refill) < max_idle
+        });
+        before.saturating_sub(self.buckets.len())
+    }
+
+    /// Number of keys currently tracked.
+    pub fn tracked_keys(&self) -> usize {
+        self.buckets.len()
+    }
+
     /// Refill tokens based on elapsed time and attempt to consume one token.
     /// Returns true if a token was successfully consumed, false otherwise.
     /// This method handles both refilling and consuming atomically under a single lock.

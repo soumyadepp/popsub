@@ -133,4 +133,4 @@ tokio::spawn(async move {
 
 ## License
 
-MIT
+Apache-2.0
