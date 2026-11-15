@@ -58,7 +58,18 @@ Configuration
   message_ttl_secs = 3600
   ```
 
+- The server refuses to listen on anything other than localhost while `jwt_secret` or the admin `password` still have their published default values. On localhost it starts with a warning.
+- Registration is off by default. Turn it on with `allow_registration = true` under `[server]`. `registration_role` decides what new users can do: `none` (the default, no topics until an admin grants them), `readonly` or `full`.
+
 Protocol basics (short)
+
+- Register, when the server allows it:
+
+  ```json
+  { "type": "register", "username": "alice", "password": "at-least-8-chars" }
+  ```
+
+  The reply is `{ "type": "register_response", "success": true, "message": "..." }`. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`. Passwords are at least 8 characters. A taken username gets a plain "registration failed", so the endpoint can't be used to discover accounts.
 
 - Login to obtain a JWT:
 
@@ -92,6 +103,12 @@ Protocol basics (short)
   ```json
   { "type": "ack", "message_id": "id-123" }
   ```
+
+Permissions and limits
+
+- Each user has topic permissions. Patterns use MQTT-style wildcards: `+` matches one level and `#` matches the rest. Wildcards apply to permissions only; subscriptions still name an exact topic.
+- Failed logins are limited per address and username together (5, then a lockout that grows), and per address across all usernames (20). Registrations are limited to 5 per address per hour. Publishing is limited per user.
+- Limits use the address of the connecting socket. Behind a reverse proxy every client shares the proxy's address, so put limits at the proxy too.
 
 Examples and testing
 

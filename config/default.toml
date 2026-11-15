@@ -6,6 +6,8 @@ jwt_secret = "a_very_secret_key"
 jwt_expiration_hours = 24
 username = "admin"
 password = "password"
+allow_registration = false
+registration_role = "none"
 
 [broker]
 max_connections = 1000

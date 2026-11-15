@@ -49,6 +49,16 @@ pub fn load_config() -> Result<Settings, ConfigError> {
                 .as_ref()
                 .and_then(|s| s.password.clone())
                 .unwrap_or(default.server.password),
+            allow_registration: partial
+                .server
+                .as_ref()
+                .and_then(|s| s.allow_registration)
+                .unwrap_or(default.server.allow_registration),
+            registration_role: partial
+                .server
+                .as_ref()
+                .and_then(|s| s.registration_role.clone())
+                .unwrap_or(default.server.registration_role),
         },
         broker: BrokerSettings {
             max_connections: partial

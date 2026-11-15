@@ -9,7 +9,7 @@ use popsub_broker::engine::Broker;
 use popsub_config::load_config;
 use popsub_transport::websocket::start_websocket_server;
 use std::sync::{Arc, Mutex};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "popsub")]
@@ -46,6 +46,20 @@ async fn main() {
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
+    let insecure = config.insecure_defaults();
+    if !insecure.is_empty() {
+        if !config.server.is_loopback() {
+            return Err(format!(
+                "refusing to listen on {} with published defaults ({}). Set them in config/default.toml or the environment.",
+                config.server.host,
+                insecure.join(", ")
+            )
+            .into());
+        }
+        for problem in &insecure {
+            warn!("{problem}. Fine for local development, never for a public address.");
+        }
+    }
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let broker = Arc::new(Mutex::new(Broker::new(config.broker.clone())));
 
