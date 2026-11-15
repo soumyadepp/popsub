@@ -50,7 +50,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     if !insecure.is_empty() {
         if !config.server.is_loopback() {
             return Err(format!(
-                "refusing to listen on {} with published defaults ({}). Set them in config/default.toml or the environment.",
+                "refusing to listen on {} with published defaults ({}). Set them in config/default.toml, or with SERVER__JWT_SECRET and SERVER_PASSWORD.",
                 config.server.host,
                 insecure.join(", ")
             )

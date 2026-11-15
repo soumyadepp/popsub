@@ -44,7 +44,7 @@ The example client connects, logs in (to get a JWT), authenticates, subscribes t
 
 Configuration
 
-- The loader reads `config/default.toml` if present, and falls back to environment variables. Environment variables use `_` as a separator: `SERVER_HOST`, `SERVER_PORT`, `BROKER_MAX_CONNECTIONS`.
+- The loader reads `config/default.toml` if present, then environment variables, which win. Single-word keys use one underscore after the section (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need two (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`).
 - Example `config/default.toml`:
 
   ```toml

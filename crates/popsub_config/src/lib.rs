@@ -8,10 +8,42 @@ pub use settings::Settings;
 
 pub use settings::{BrokerSettings, ServerSettings};
 
+/// Loads settings from `config/default.toml`, then the environment, then
+/// built-in defaults for anything still missing.
+///
+/// Environment variables name a section and a key. Single-word keys work
+/// with one underscore (`SERVER_PORT`). Keys that contain an underscore
+/// need a double underscore after the section (`SERVER__JWT_SECRET`,
+/// `BROKER__MAX_RETRIES`), because a single underscore can't tell the
+/// section apart from the key.
+///
+/// Returns:
+///   The merged settings.
+///
+/// Raises:
+///   ConfigError: When a source can't be read or a value has the wrong type.
 pub fn load_config() -> Result<Settings, ConfigError> {
+    load_config_with_env(None)
+}
+
+/// Loads settings as `load_config` does, reading environment variables from
+/// `env` instead of the process when given. Used by tests.
+///
+/// Args:
+///   env: Variables to use in place of the process environment.
+///
+/// Returns:
+///   The merged settings.
+///
+/// Raises:
+///   ConfigError: When a source can't be read or a value has the wrong type.
+pub fn load_config_with_env(
+    env: Option<std::collections::HashMap<String, String>>,
+) -> Result<Settings, ConfigError> {
     let builder = Config::builder()
         .add_source(File::with_name("config/default").required(false))
-        .add_source(Environment::default().separator("_"));
+        .add_source(Environment::default().separator("_").source(env.clone()))
+        .add_source(Environment::default().separator("__").source(env));
 
     let config = builder.build()?;
     let partial: PartialSettings = config.try_deserialize()?;
