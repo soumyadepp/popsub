@@ -99,4 +99,15 @@ Examples and testing
 - Run the test suite with `cargo test --workspace`.
 - Run Clippy with `cargo clippy --workspace` and format with `cargo fmt`.
 
+Make targets
+
+- `make` lists every target.
+- `make demo` starts a server, runs the example client against it and stops. Use `make demo PORT=8090` if 8080 is taken.
+- `make server`, `make client`, `make test`, `make lint` and `make ci` (the same checks GitHub Actions runs).
+- Add `JOBS=2` to any target if a full build runs out of memory.
+
+Design
+
+- `docs/DESIGN.md` covers the protocol, delivery guarantees, persistence, known gaps and the roadmap.
+
 ### License: Apache 2.0
