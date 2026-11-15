@@ -13,8 +13,8 @@
 //! Authorization is enforced per-topic based on user roles and permissions.
 
 use futures_util::{SinkExt, StreamExt};
-use popsub_auth::AuthService;
-use popsub_ratelimit::{LoginRateLimiter, RateLimiter, TokenBucket};
+use popsub_auth::{AuthError, AuthService};
+use popsub_ratelimit::{LoginRateLimiter, RateLimiter, SlidingWindow, TokenBucket};
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::TcpListener;
 use tokio::spawn;
@@ -35,10 +35,39 @@ use popsub_client::Client;
 /// Rate limiter configuration for the WebSocket server.
 #[derive(Clone)]
 pub struct RateLimiters {
-    /// Rate limiter for login/register attempts (per username/IP).
+    /// Failed logins per address and username pair. Keying by the pair means
+    /// someone guessing passwords for a user locks out only themselves, not
+    /// the real user connecting from elsewhere.
     pub login_limiter: Arc<LoginRateLimiter>,
-    /// Rate limiter for messages (per client connection).
+    /// Failed logins per address across all usernames, to slow down guessing
+    /// spread over many accounts.
+    pub ip_login_limiter: Arc<LoginRateLimiter>,
+    /// Registration attempts per address. Every attempt counts, so
+    /// reconnecting doesn't reset the allowance.
+    pub register_limiter: Arc<SlidingWindow>,
+    /// Published messages per authenticated user, shared by all of that
+    /// user's connections.
     pub message_limiter: Arc<TokenBucket>,
+}
+
+/// How often idle rate limiter entries are pruned.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+/// Login limiter entries are kept at least as long as the longest lockout.
+const LOGIN_IDLE: Duration = Duration::from_secs(3600);
+/// Message buckets refill fully well within this time.
+const MESSAGE_IDLE: Duration = Duration::from_secs(600);
+
+impl RateLimiters {
+    /// Remove entries for keys that have been quiet long enough to forget.
+    ///
+    /// Returns:
+    ///   How many entries were removed in total.
+    pub fn prune_idle(&self) -> usize {
+        self.login_limiter.prune_idle(LOGIN_IDLE)
+            + self.ip_login_limiter.prune_idle(LOGIN_IDLE)
+            + self.register_limiter.prune_idle()
+            + self.message_limiter.prune_idle(MESSAGE_IDLE)
+    }
 }
 
 impl Default for RateLimiters {
@@ -53,6 +82,17 @@ impl Default for RateLimiters {
                     .max_lockout_duration(Duration::from_secs(3600))
                     .build(),
             ),
+            // 20 failed logins from one address, across any usernames
+            ip_login_limiter: Arc::new(
+                LoginRateLimiter::builder()
+                    .max_attempts(20)
+                    .lockout_duration(Duration::from_secs(900))
+                    .exponential_backoff(true)
+                    .max_lockout_duration(Duration::from_secs(3600))
+                    .build(),
+            ),
+            // 5 registration attempts per address per hour
+            register_limiter: Arc::new(SlidingWindow::new(5, Duration::from_secs(3600))),
             // 100 messages per second, burst of 50
             message_limiter: Arc::new(TokenBucket::new(100, 50, Duration::from_secs(1))),
         }
@@ -93,7 +133,22 @@ pub async fn start_websocket_server_with_rate_limiting(
 
     info!("WebSocket server listening on ws://{}", addr);
 
-    while let Ok((stream, _)) = listener.accept().await {
+    {
+        let rate_limiters = rate_limiters.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(PRUNE_INTERVAL);
+            loop {
+                ticker.tick().await;
+                let pruned = rate_limiters.prune_idle();
+                if pruned > 0 {
+                    info!(pruned, "pruned idle rate limiter entries");
+                }
+            }
+        });
+    }
+
+    while let Ok((stream, peer)) = listener.accept().await {
+        let peer_ip = peer.ip().to_string();
         let broker = broker.clone();
         let auth_service = auth_service.clone();
         let rate_limiters = rate_limiters.clone();
@@ -159,9 +214,15 @@ pub async fn start_websocket_server_with_rate_limiting(
                     };
 
                     // Handle the message
-                    let result =
-                        handle_message(&broker, &auth_service, &rate_limiters, &client_id, parsed)
-                            .await;
+                    let result = handle_message(
+                        &broker,
+                        &auth_service,
+                        &rate_limiters,
+                        &client_id,
+                        &peer_ip,
+                        parsed,
+                    )
+                    .await;
 
                     match result {
                         Ok(should_continue) => {
@@ -199,6 +260,7 @@ async fn handle_message(
     auth_service: &Arc<RwLock<AuthService>>,
     rate_limiters: &RateLimiters,
     client_id: &str,
+    peer_ip: &str,
     msg: ClientMessage,
 ) -> Result<bool> {
     match msg {
@@ -208,6 +270,7 @@ async fn handle_message(
                 auth_service,
                 rate_limiters,
                 client_id,
+                peer_ip,
                 &username,
                 &password,
             )
@@ -219,6 +282,7 @@ async fn handle_message(
                 auth_service,
                 rate_limiters,
                 client_id,
+                peer_ip,
                 &username,
                 &password,
             )
@@ -252,27 +316,23 @@ async fn handle_message(
 }
 
 /// Handle registration request - create a new user account.
+#[allow(clippy::too_many_arguments)]
 async fn handle_register(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
     rate_limiters: &RateLimiters,
     client_id: &str,
+    peer_ip: &str,
     username: &str,
     password: &str,
 ) -> Result<bool> {
-    // Check rate limit for registration attempts (use username as key)
-    if !rate_limiters.login_limiter.check_allowed(username).await {
-        let status = rate_limiters.login_limiter.check_status(username).await;
-        let retry_after = match status {
-            popsub_ratelimit::LoginStatus::LockedOut { retry_after } => retry_after,
-            _ => 0,
-        };
-        warn!(
-            client_id = %client_id,
-            username = %username,
-            retry_after = %retry_after,
-            "registration rate limited"
-        );
+    if !rate_limiters.register_limiter.try_acquire(peer_ip).await {
+        let retry_after = rate_limiters
+            .register_limiter
+            .retry_after(peer_ip)
+            .await
+            .unwrap_or(1);
+        warn!(client_id = %client_id, peer_ip = %peer_ip, retry_after, "registration rate limited");
         let response = ServerMessage::RegisterResponse {
             success: false,
             message: format!("Too many attempts. Try again in {retry_after} seconds."),
@@ -286,8 +346,6 @@ async fn handle_register(
     let response = match auth.register_user(username, password).await {
         Ok(()) => {
             info!(client_id = %client_id, username = %username, "registration successful");
-            // Reset rate limit on success
-            rate_limiters.login_limiter.record_success(username).await;
             ServerMessage::RegisterResponse {
                 success: true,
                 message: "User registered successfully".to_string(),
@@ -295,38 +353,58 @@ async fn handle_register(
         }
         Err(e) => {
             warn!(client_id = %client_id, username = %username, "registration failed: {}", e);
-            // Record failure for rate limiting
-            rate_limiters.login_limiter.record_failure(username).await;
             ServerMessage::RegisterResponse {
                 success: false,
-                message: e.to_string(),
+                message: registration_error_message(&e),
             }
         }
     };
 
-    drop(auth);
     send_to_client(broker, client_id, response)?;
     Ok(true)
 }
 
+/// Turns a registration error into text that is safe to show the client.
+///
+/// Validation messages are shown as they are, because they help a genuine
+/// user fix their input. Whether a username is already taken is not
+/// revealed, so the endpoint can't be used to list existing accounts.
+///
+/// Args:
+///   error: The error from the auth service.
+///
+/// Returns:
+///   The message to send back.
+fn registration_error_message(error: &AuthError) -> String {
+    match error {
+        AuthError::PermissionDenied(reason) => reason.clone(),
+        _ => "registration failed".to_string(),
+    }
+}
+
 /// Handle login request - authenticate user and return JWT token.
+#[allow(clippy::too_many_arguments)]
 async fn handle_login(
     broker: &Arc<Mutex<Broker>>,
     auth_service: &Arc<RwLock<AuthService>>,
     rate_limiters: &RateLimiters,
     client_id: &str,
+    peer_ip: &str,
     username: &str,
     password: &str,
 ) -> Result<bool> {
-    // Check rate limit for login attempts
-    if !rate_limiters.login_limiter.check_allowed(username).await {
-        let status = rate_limiters.login_limiter.check_status(username).await;
-        let retry_after = match status {
-            popsub_ratelimit::LoginStatus::LockedOut { retry_after } => retry_after,
-            _ => 0,
-        };
+    let pair_key = format!("{peer_ip}|{username}");
+    let blocked = match rate_limiters.ip_login_limiter.check_status(peer_ip).await {
+        popsub_ratelimit::LoginStatus::LockedOut { retry_after } => Some(retry_after),
+        _ => match rate_limiters.login_limiter.check_status(&pair_key).await {
+            popsub_ratelimit::LoginStatus::LockedOut { retry_after } => Some(retry_after),
+            _ => None,
+        },
+    };
+    if let Some(retry_after) = blocked {
         warn!(
             client_id = %client_id,
+            peer_ip = %peer_ip,
             username = %username,
             retry_after = %retry_after,
             "login rate limited"
@@ -343,21 +421,21 @@ async fn handle_login(
     let response = match auth.login(username, password).await {
         Ok(token) => {
             info!(client_id = %client_id, username = %username, "login successful");
-            // Reset rate limit on successful login
-            rate_limiters.login_limiter.record_success(username).await;
+            rate_limiters.login_limiter.record_success(&pair_key).await;
             ServerMessage::LoginResponse { token }
         }
         Err(e) => {
             warn!(client_id = %client_id, username = %username, "login failed: {}", e);
-            // Record failure for rate limiting
-            rate_limiters.login_limiter.record_failure(username).await;
+            if matches!(e, AuthError::InvalidCredentials) {
+                rate_limiters.login_limiter.record_failure(&pair_key).await;
+                rate_limiters.ip_login_limiter.record_failure(peer_ip).await;
+            }
             ServerMessage::Error {
                 message: "invalid credentials".to_string(),
             }
         }
     };
 
-    drop(auth);
     send_to_client(broker, client_id, response)?;
     Ok(true)
 }
@@ -393,7 +471,6 @@ async fn handle_auth(
             let response = ServerMessage::Error {
                 message: "authentication failed".to_string(),
             };
-            drop(auth);
             send_to_client(broker, client_id, response)?;
             Ok(false)
         }
@@ -501,17 +578,9 @@ async fn handle_publish(
     message_id: Option<String>,
     qos: Option<u8>,
 ) -> Result<bool> {
-    // Check message rate limit first
-    if !rate_limiters.message_limiter.try_acquire(client_id).await {
-        warn!(client_id = %client_id, "message rate limited");
-        let response = ServerMessage::Error {
-            message: "Rate limited. Too many messages.".to_string(),
-        };
-        send_to_client(broker, client_id, response)?;
-        return Ok(true); // Don't disconnect, just rate limit
-    }
-
     // First check authentication and get username
+    // Authentication is checked before rate limiting to prevent unauthenticated
+    // clients from consuming rate limit tokens of legitimate users.
     let (username, sender) = {
         let broker_lock = broker.lock().expect("Broker lock poisoned");
 
@@ -539,6 +608,17 @@ async fn handle_publish(
             client.sender.clone(),
         )
     }; // broker_lock dropped here
+
+    // Check message rate limit after authentication
+    // This ensures only authenticated clients consume rate limit tokens.
+    if !rate_limiters.message_limiter.try_acquire(&username).await {
+        warn!(client_id = %client_id, "message rate limited");
+        let response = ServerMessage::Error {
+            message: "Rate limited. Too many messages.".to_string(),
+        };
+        send_to_client(broker, client_id, response)?;
+        return Ok(true); // Don't disconnect, just rate limit
+    }
 
     // Check authorization (async)
     let auth = auth_service.read().await;
@@ -661,9 +741,78 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
 
     let config = AuthConfig::new(&settings.server.jwt_secret)
         .with_expiration(settings.server.jwt_expiration_hours)
-        .with_admin(&settings.server.username, &settings.server.password);
+        .with_admin(&settings.server.username, &settings.server.password)
+        .with_registration(settings.server.allow_registration)
+        .with_default_role(registration_role(&settings.server.registration_role));
 
     let auth_service = Arc::new(RwLock::new(AuthService::new(config).await));
 
     start_websocket_server_with_auth(addr, broker, auth_service).await
+}
+
+/// Maps the `server.registration_role` setting to the role self-registered
+/// users receive.
+///
+/// Args:
+///   name: `none`, `readonly` or `full`. Anything else is treated as `none`
+///     and logged, so a typo never grants more access than intended.
+///
+/// Returns:
+///   The default role for new users.
+pub fn registration_role(name: &str) -> popsub_auth::DefaultUserRole {
+    use popsub_auth::DefaultUserRole;
+    match name {
+        "full" => DefaultUserRole::FullAccess,
+        "readonly" => DefaultUserRole::ReadOnly,
+        "none" => DefaultUserRole::LimitedAccess(Vec::new()),
+        other => {
+            warn!(role = %other, "unknown registration_role, giving new users no topics");
+            DefaultUserRole::LimitedAccess(Vec::new())
+        }
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    #[test]
+    fn taken_usernames_are_not_revealed() {
+        let taken = AuthError::UserAlreadyExists("alice".to_string());
+        assert_eq!(registration_error_message(&taken), "registration failed");
+
+        let invalid = AuthError::PermissionDenied("username must be 3 to 32 characters".into());
+        assert_eq!(
+            registration_error_message(&invalid),
+            "username must be 3 to 32 characters"
+        );
+    }
+
+    #[test]
+    fn unknown_registration_roles_grant_nothing() {
+        use popsub_auth::DefaultUserRole;
+        assert!(matches!(
+            registration_role("full"),
+            DefaultUserRole::FullAccess
+        ));
+        assert!(matches!(
+            registration_role("readonly"),
+            DefaultUserRole::ReadOnly
+        ));
+        for name in ["none", "admin", "Full", ""] {
+            assert!(
+                matches!(registration_role(name), DefaultUserRole::LimitedAccess(ref topics) if topics.is_empty()),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_forgets_idle_message_buckets() {
+        let limiters = RateLimiters::default();
+        limiters.message_limiter.try_acquire("alice").await;
+        assert_eq!(limiters.message_limiter.tracked_keys(), 1);
+        assert_eq!(limiters.prune_idle(), 0);
+        assert_eq!(limiters.message_limiter.prune_idle(Duration::ZERO), 1);
+    }
 }

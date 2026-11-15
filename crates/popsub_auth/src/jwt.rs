@@ -112,7 +112,10 @@ impl JwtService {
     /// The old token must still be valid (not expired).
     pub fn refresh_token(&self, token: &str) -> Result<String> {
         let claims = self.validate_token(token)?;
-        self.generate_token(&claims.sub)
+        match claims.role.as_deref() {
+            Some(role) => self.generate_token_with_role(&claims.sub, role),
+            None => self.generate_token(&claims.sub),
+        }
     }
 
     /// Get the encoding key (for external use if needed).

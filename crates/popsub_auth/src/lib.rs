@@ -39,7 +39,7 @@
 //!         "secure_password",
 //!         Role::User {
 //!             allowed_topics: vec![
-//!                 TopicPermission::new("chat/*", true, true),
+//!                 TopicPermission::new("chat/#", true, true),
 //!                 TopicPermission::new("sensors/#", true, false),
 //!             ],
 //!         },

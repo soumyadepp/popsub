@@ -3,7 +3,7 @@ name = "popsub_auth"
 version = "0.1.0"
 edition = "2024"
 description = "Authentication and authorization module for PopSub"
-license = "MIT"
+license = "Apache-2.0"
 
 [features]
 default = []
@@ -30,12 +30,9 @@ async-trait = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
 
 # Utilities
-uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 thiserror = "2"
 
-# Internal crates
-popsub_utils = { path = "../popsub_utils" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

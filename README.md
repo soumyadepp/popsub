@@ -44,7 +44,7 @@ The example client connects, logs in (to get a JWT), authenticates, subscribes t
 
 Configuration
 
-- The loader reads `config/default.toml` if present, and falls back to environment variables. Environment variables use `_` as a separator: `SERVER_HOST`, `SERVER_PORT`, `BROKER_MAX_CONNECTIONS`.
+- The loader reads `config/default.toml` if present, then environment variables, which win. Single-word keys use one underscore after the section (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need two (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`).
 - Example `config/default.toml`:
 
   ```toml
@@ -58,7 +58,18 @@ Configuration
   message_ttl_secs = 3600
   ```
 
+- The server refuses to listen on anything other than localhost while `jwt_secret` or the admin `password` still have their published default values. On localhost it starts with a warning.
+- Registration is off by default. Turn it on with `allow_registration = true` under `[server]`. `registration_role` decides what new users can do: `none` (the default, no topics until an admin grants them), `readonly` or `full`.
+
 Protocol basics (short)
+
+- Register, when the server allows it:
+
+  ```json
+  { "type": "register", "username": "alice", "password": "at-least-8-chars" }
+  ```
+
+  The reply is `{ "type": "register_response", "success": true, "message": "..." }`. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`. Passwords are at least 8 characters. A taken username gets a plain "registration failed", so the endpoint can't be used to discover accounts.
 
 - Login to obtain a JWT:
 
@@ -93,10 +104,27 @@ Protocol basics (short)
   { "type": "ack", "message_id": "id-123" }
   ```
 
+Permissions and limits
+
+- Each user has topic permissions. Patterns use MQTT-style wildcards: `+` matches one level and `#` matches the rest. Wildcards apply to permissions only; subscriptions still name an exact topic.
+- Failed logins are limited per address and username together (5, then a lockout that grows), and per address across all usernames (20). Registrations are limited to 5 per address per hour. Publishing is limited per user.
+- Limits use the address of the connecting socket. Behind a reverse proxy every client shares the proxy's address, so put limits at the proxy too.
+
 Examples and testing
 
 - A simple example client is at `crates/popsub/examples/simple_client.rs`.
 - Run the test suite with `cargo test --workspace`.
 - Run Clippy with `cargo clippy --workspace` and format with `cargo fmt`.
+
+Make targets
+
+- `make` lists every target.
+- `make demo` starts a server, runs the example client against it and stops. Use `make demo PORT=8090` if 8080 is taken.
+- `make server`, `make client`, `make test`, `make lint` and `make ci` (the same checks GitHub Actions runs).
+- Add `JOBS=2` to any target if a full build runs out of memory.
+
+Design
+
+- `docs/DESIGN.md` covers the protocol, delivery guarantees, persistence, known gaps and the roadmap.
 
 ### License: Apache 2.0

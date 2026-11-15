@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 /// Supports MQTT-style wildcards:
 /// - `+` matches a single level (e.g., `sensors/+/temperature`)
 /// - `#` matches multiple levels (e.g., `chat/#`)
-/// - `*` is also supported as an alias for `#` (e.g., `chat/*`)
+///
+/// `*` has no special meaning and only matches a literal `*` level.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopicPermission {
     /// Topic pattern (may include wildcards).
@@ -75,8 +76,8 @@ pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
         return true;
     }
 
-    // Handle multi-level wildcards (# or *)
-    if pattern == "#" || pattern == "*" {
+    // Handle the multi-level wildcard
+    if pattern == "#" {
         return true;
     }
 
@@ -91,7 +92,7 @@ pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
 
         match pattern_part {
             // Multi-level wildcard - matches everything remaining
-            "#" | "*" => return true,
+            "#" => return true,
             // Single-level wildcard - matches exactly one level
             "+" => {
                 pattern_idx += 1;
@@ -117,7 +118,7 @@ pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
     // Pattern ended with wildcard that wasn't processed
     if pattern_idx < pattern_parts.len() {
         let remaining = &pattern_parts[pattern_idx..];
-        if remaining.len() == 1 && (remaining[0] == "#" || remaining[0] == "*") {
+        if remaining.len() == 1 && remaining[0] == "#" {
             return true;
         }
     }
@@ -170,9 +171,8 @@ mod permission_tests {
     }
 
     #[test]
-    fn test_multi_level_wildcard_star() {
-        assert!(topic_matches_pattern("chat/*", "chat/room1"));
-        assert!(topic_matches_pattern("chat/*", "chat/room1/messages"));
+    fn test_star_is_not_a_wildcard() {
+        assert!(!topic_matches_pattern("chat/*", "chat/room1/messages"));
         assert!(!topic_matches_pattern("chat/*", "other/room1"));
     }
 
@@ -197,7 +197,9 @@ mod permission_tests {
     fn test_global_wildcard() {
         assert!(topic_matches_pattern("#", "anything"));
         assert!(topic_matches_pattern("#", "any/thing/at/all"));
-        assert!(topic_matches_pattern("*", "anything"));
+        assert!(!topic_matches_pattern("*", "anything"));
+        assert!(!topic_matches_pattern("chat/*", "chat/room1"));
+        assert!(topic_matches_pattern("chat/*", "chat/*"));
     }
 
     #[test]

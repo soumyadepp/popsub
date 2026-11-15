@@ -60,6 +60,8 @@ pub use sliding_window::SlidingWindow;
 pub use token_bucket::TokenBucket;
 
 /// Common trait for all rate limiters.
+/// The async_fn_in_trait lint is allowed here because this trait is used
+/// internally and we don't need to expose Send bounds on the futures.
 #[allow(async_fn_in_trait)]
 pub trait RateLimiter: Send + Sync {
     /// Try to acquire permission for a request.
