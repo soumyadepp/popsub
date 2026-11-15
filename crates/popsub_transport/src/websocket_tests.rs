@@ -230,3 +230,90 @@ async fn test_action_before_auth_fails() {
     let broker_lock = broker.lock().unwrap();
     assert!(broker_lock.clients.is_empty());
 }
+
+async fn send_and_receive(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    msg: &ClientMessage,
+) -> ServerMessage {
+    ws_stream
+        .send(WsMessage::Text(serde_json::to_string(msg).unwrap().into()))
+        .await
+        .expect("Failed to send message");
+    let raw = ws_stream
+        .next()
+        .await
+        .expect("Did not receive response")
+        .unwrap()
+        .into_data();
+    serde_json::from_slice(&raw)
+        .unwrap_or_else(|e| panic!("Failed to deserialize ServerMessage from {raw:?}: {e}"))
+}
+
+#[tokio::test]
+async fn registration_is_disabled_by_default() {
+    let (stream, _settings, _temp_dir, _) = setup_server_and_client().await;
+    let (mut ws_stream, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+        .await
+        .expect("WebSocket handshake failed");
+
+    let response = send_and_receive(
+        &mut ws_stream,
+        &ClientMessage::Register {
+            username: "mallory".to_string(),
+            password: "password123".to_string(),
+        },
+    )
+    .await;
+
+    match response {
+        ServerMessage::RegisterResponse { success, message } => {
+            assert!(!success);
+            assert_eq!(message, "user registration is disabled");
+        }
+        other => panic!("Expected RegisterResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn locking_out_one_username_leaves_others_usable() {
+    let (stream, settings, _temp_dir, _) = setup_server_and_client().await;
+    let (mut ws_stream, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+        .await
+        .expect("WebSocket handshake failed");
+
+    for _ in 0..5 {
+        send_and_receive(
+            &mut ws_stream,
+            &ClientMessage::Login {
+                username: "someone_else".to_string(),
+                password: "wrong_password".to_string(),
+            },
+        )
+        .await;
+    }
+    let locked = send_and_receive(
+        &mut ws_stream,
+        &ClientMessage::Login {
+            username: "someone_else".to_string(),
+            password: "wrong_password".to_string(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(&locked, ServerMessage::Error { message } if message.starts_with("Too many login attempts")),
+        "expected a lockout, got {locked:?}"
+    );
+
+    let admin = send_and_receive(
+        &mut ws_stream,
+        &ClientMessage::Login {
+            username: settings.server.username.clone(),
+            password: settings.server.password.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(admin, ServerMessage::LoginResponse { .. }),
+        "admin should still log in, got {admin:?}"
+    );
+}

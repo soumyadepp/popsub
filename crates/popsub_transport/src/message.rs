@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+// Re-export Claims from popsub_auth for backward compatibility
+pub use popsub_auth::Claims;
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
@@ -7,6 +10,8 @@ pub enum ClientMessage {
     Auth { token: String },
     #[serde(rename = "login")]
     Login { username: String, password: String },
+    #[serde(rename = "register")]
+    Register { username: String, password: String },
     #[serde(rename = "subscribe")]
     Subscribe { topic: String },
     #[serde(rename = "unsubscribe")]
@@ -27,6 +32,8 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     #[serde(rename = "login_response")]
     LoginResponse { token: String },
+    #[serde(rename = "register_response")]
+    RegisterResponse { success: bool, message: String },
     #[serde(rename = "authenticated")]
     Authenticated {},
     #[serde(rename = "error")]
@@ -39,10 +46,4 @@ pub enum ServerMessage {
         message_id: String,
         qos: u8,
     },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: String,
-    pub exp: usize,
 }

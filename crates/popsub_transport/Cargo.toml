@@ -15,10 +15,12 @@ chrono = { version = "0.4.41", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4"] }
 tracing = "0.1.41"
 
+popsub_auth = { path = "../popsub_auth" }
 popsub_broker = { path = "../popsub_broker" }
 popsub_client = { path = "../popsub_client" }
 popsub_config = { path = "../popsub_config" }
 popsub_persistence = { path = "../popsub_persistence" }
+popsub_ratelimit = { path = "../popsub_ratelimit" }
 popsub_utils = { path = "../popsub_utils" }
 
 [dev-dependencies]

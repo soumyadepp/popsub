@@ -17,6 +17,9 @@ async fn handle_message(broker: Arc<Mutex<Broker>>, client_id: String, msg: Stri
         Ok(ClientMessage::Login { .. }) => {
             // Login not handled in this test helper
         }
+        Ok(ClientMessage::Register { .. }) => {
+            // Register not handled in this test helper
+        }
         Ok(ClientMessage::Subscribe { topic }) => {
             let mut broker = broker.lock().unwrap();
             broker.subscribe(&topic, client_id.clone());
