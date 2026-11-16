@@ -11,8 +11,9 @@
 //!
 //! Replies go straight onto the session's own outgoing channel, so sending
 //! one never takes the broker lock. The broker is only reached through
-//! `SharedBroker::with`, whose closures can't await, and the auth lock is
-//! always released before the broker lock is taken.
+//! `SharedBroker::with`, whose closures can't await. The auth service needs
+//! no lock of its own: its methods take `&self` and its user store does its
+//! own locking.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tracing::{error, info, warn};
@@ -132,7 +133,7 @@ pub struct Server {
     /// The broker every connection publishes and subscribes through.
     broker: SharedBroker,
     /// Users, passwords, tokens and topic permissions.
-    auth: Arc<RwLock<AuthService>>,
+    auth: Arc<AuthService>,
     /// Limits shared by every connection on this server.
     limiters: RateLimiters,
 }
@@ -147,7 +148,7 @@ impl Server {
     ///
     /// Returns:
     ///     A server ready to `listen` or `serve`.
-    pub fn new(broker: SharedBroker, auth: Arc<RwLock<AuthService>>) -> Self {
+    pub fn new(broker: SharedBroker, auth: Arc<AuthService>) -> Self {
         Self {
             broker,
             auth,
@@ -173,7 +174,7 @@ impl Server {
             .with_admin(&settings.username, &settings.password)
             .with_registration(settings.allow_registration)
             .with_default_role(registration_role(&settings.registration_role));
-        let auth = Arc::new(RwLock::new(AuthService::new(config).await));
+        let auth = Arc::new(AuthService::new(config).await);
         Self::new(broker, auth)
     }
 
@@ -546,8 +547,8 @@ impl Session {
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn register(&self, username: &str, password: &str) -> Result<Flow> {
         let limiter = &self.server.limiters.register_limiter;
-        if !limiter.try_acquire(&self.peer_ip).await {
-            let retry_after = limiter.retry_after(&self.peer_ip).await.unwrap_or(1);
+        if !limiter.try_acquire(&self.peer_ip) {
+            let retry_after = limiter.retry_after(&self.peer_ip).unwrap_or(1);
             warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, retry_after, "registration rate limited");
             self.reply(ServerMessage::RegisterResponse {
                 success: false,
@@ -556,10 +557,7 @@ impl Session {
             return Ok(Flow::Continue);
         }
 
-        let result = {
-            let auth = self.server.auth.read().await;
-            auth.register_user(username, password).await
-        };
+        let result = self.server.auth.register_user(username, password).await;
         let response = match result {
             Ok(()) => {
                 info!(client_id = %self.client_id, username, "registration successful");
@@ -603,9 +601,9 @@ impl Session {
     async fn login(&self, username: &str, password: &str) -> Result<Flow> {
         let limiters = &self.server.limiters;
         let pair_key = format!("{}|{username}", self.peer_ip);
-        let lockout = match limiters.ip_login_limiter.check_status(&self.peer_ip).await {
+        let lockout = match limiters.ip_login_limiter.check_status(&self.peer_ip) {
             LoginStatus::LockedOut { retry_after } => Some(retry_after),
-            _ => match limiters.login_limiter.check_status(&pair_key).await {
+            _ => match limiters.login_limiter.check_status(&pair_key) {
                 LoginStatus::LockedOut { retry_after } => Some(retry_after),
                 _ => None,
             },
@@ -618,24 +616,18 @@ impl Session {
             return Ok(Flow::Continue);
         }
 
-        let result = {
-            let auth = self.server.auth.read().await;
-            auth.login(username, password).await
-        };
+        let result = self.server.auth.login(username, password).await;
         match result {
             Ok(token) => {
                 info!(client_id = %self.client_id, username, "login successful");
-                limiters.login_limiter.record_success(&pair_key).await;
+                limiters.login_limiter.record_success(&pair_key);
                 self.reply(ServerMessage::LoginResponse { token })?;
             }
             Err(e) => {
                 warn!(client_id = %self.client_id, username, "login failed: {}", e);
                 if matches!(e, AuthError::InvalidCredentials) {
-                    limiters.login_limiter.record_failure(&pair_key).await;
-                    limiters
-                        .ip_login_limiter
-                        .record_failure(&self.peer_ip)
-                        .await;
+                    limiters.login_limiter.record_failure(&pair_key);
+                    limiters.ip_login_limiter.record_failure(&self.peer_ip);
                 }
                 self.reply_error("invalid credentials")?;
             }
@@ -660,7 +652,7 @@ impl Session {
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn authenticate(&self, token: &str) -> Result<Flow> {
-        let validated = self.server.auth.read().await.validate_token(token);
+        let validated = self.server.auth.validate_token(token);
         let claims = match validated {
             Ok(claims) => claims,
             Err(e) => {
@@ -708,13 +700,7 @@ impl Session {
         let Some(username) = self.require_user("subscribe")? else {
             return Ok(Flow::Close);
         };
-        let allowed = self
-            .server
-            .auth
-            .read()
-            .await
-            .can_subscribe(&username, topic)
-            .await;
+        let allowed = self.server.auth.can_subscribe(&username, topic).await;
         if !allowed {
             warn!(client_id = %self.client_id, username, topic, "subscribe denied");
             self.reply_error(format!("not authorized to subscribe to '{topic}'"))?;
@@ -783,25 +769,13 @@ impl Session {
         let Some(username) = self.require_user("publish")? else {
             return Ok(Flow::Close);
         };
-        let allowed = self
-            .server
-            .auth
-            .read()
-            .await
-            .can_publish(&username, topic)
-            .await;
+        let allowed = self.server.auth.can_publish(&username, topic).await;
         if !allowed {
             warn!(client_id = %self.client_id, username, topic, "publish denied");
             self.reply_error(format!("not authorized to publish to '{topic}'"))?;
             return Ok(Flow::Continue);
         }
-        if !self
-            .server
-            .limiters
-            .message_limiter
-            .try_acquire(&username)
-            .await
-        {
+        if !self.server.limiters.message_limiter.try_acquire(&username) {
             warn!(client_id = %self.client_id, username, "message rate limited");
             self.reply_error("Rate limited. Too many messages.")?;
             return Ok(Flow::Continue);
@@ -929,10 +903,10 @@ mod limiter_tests {
 
     /// Checks that a fresh message bucket survives the default prune but is
     /// dropped once its idle limit is zero.
-    #[tokio::test]
-    async fn pruning_forgets_idle_message_buckets() {
+    #[test]
+    fn pruning_forgets_idle_message_buckets() {
         let limiters = RateLimiters::default();
-        limiters.message_limiter.try_acquire("alice").await;
+        limiters.message_limiter.try_acquire("alice");
         assert_eq!(limiters.message_limiter.tracked_keys(), 1);
         assert_eq!(limiters.prune_idle(), 0);
         assert_eq!(limiters.message_limiter.prune_idle(Duration::ZERO), 1);

@@ -34,7 +34,7 @@ fn test_topic_unsubscribe() {
 /// Checks that a default broker starts with no topics, clients or pending messages.
 #[test]
 fn test_broker_new() {
-    let broker = Broker::default();
+    let (broker, _dir) = test_broker();
     assert!(broker.topics.is_empty());
     assert!(broker.clients.is_empty());
     assert!(broker.pending_acks.is_empty());
@@ -43,7 +43,7 @@ fn test_broker_new() {
 /// Checks that a registered client is stored by id and removed by `remove_client`.
 #[test]
 fn test_broker_register_and_remove_client() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let (tx, _) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -58,7 +58,7 @@ fn test_broker_register_and_remove_client() {
 /// Checks that subscribing creates the topic with the client in it and unsubscribing removes the client.
 #[test]
 fn test_broker_subscribe_and_unsubscribe() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let (tx, _) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -77,7 +77,7 @@ fn test_broker_subscribe_and_unsubscribe() {
 /// Checks that a QoS 0 publish reaches the subscriber with its topic, payload, id and QoS intact.
 #[test]
 fn test_broker_publish() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -108,7 +108,7 @@ fn test_broker_publish() {
 /// Checks that a QoS 1 publish is delivered, held in `pending_acks`, and removed once acknowledged.
 #[test]
 fn test_broker_publish_qos1_and_ack() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -144,7 +144,7 @@ fn test_broker_publish_qos1_and_ack() {
 /// Checks that an ACK for an unknown message id leaves `pending_acks` unchanged.
 #[test]
 fn test_broker_handle_ack_unknown_message_id() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let initial_pending_acks_count = broker.pending_acks.len();
 
     broker.handle_ack("unknown_message_id");
@@ -155,7 +155,7 @@ fn test_broker_handle_ack_unknown_message_id() {
 /// Checks that `cleanup_client` removes the client and its subscription.
 #[test]
 fn test_broker_cleanup_client() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let (tx, _) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -171,7 +171,7 @@ fn test_broker_cleanup_client() {
 /// Checks that publishing to a topic with no subscribers does not panic.
 #[test]
 fn test_publish_to_nonexistent_topic() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let message = crate::message::Message {
         topic: "nonexistent_topic".to_string(),
         payload: "hello".to_string(),
@@ -185,7 +185,7 @@ fn test_publish_to_nonexistent_topic() {
 /// Checks that publishing to a subscriber whose channel is closed does not panic.
 #[test]
 fn test_publish_to_client_with_closed_channel() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -209,7 +209,7 @@ fn test_publish_to_client_with_closed_channel() {
 fn test_broker_qos1_retry_mechanism() {
     let settings = Settings::default().broker;
     let step = settings.ack_timeout_ms as i64 + 1;
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -259,7 +259,8 @@ fn test_broker_qos1_retry_mechanism() {
 /// Checks that `SharedBroker` keeps working after a task panics while holding its lock.
 #[test]
 fn shared_broker_recovers_from_a_poisoned_lock() {
-    let shared = crate::SharedBroker::new(Broker::default());
+    let (broker, _dir) = test_broker();
+    let shared = crate::SharedBroker::new(broker);
     let poisoner = shared.clone();
     let result = std::thread::spawn(move || {
         poisoner.with(|_| panic!("simulated panic while holding the broker lock"))
@@ -290,7 +291,7 @@ fn received_ids(rx: &mut mpsc::UnboundedReceiver<WsMessage>) -> Vec<String> {
 /// Checks that only overdue messages are picked for resending and that a resend increments the retry count and reaches the subscriber.
 #[test]
 fn test_collect_retry_candidates_and_resend() {
-    let mut broker = Broker::default();
+    let (mut broker, _dir) = test_broker();
 
     let overdue_id = "overdue".to_string();
     let recent_id = "recent".to_string();
@@ -333,7 +334,7 @@ fn test_collect_retry_candidates_and_resend() {
     assert!(!to_resend.contains(&recent_id));
     assert!(to_drop.is_empty());
 
-    let mut broker2 = Broker::default();
+    let (mut broker2, _dir2) = test_broker();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
@@ -366,4 +367,22 @@ fn test_collect_retry_candidates_and_resend() {
     } else {
         panic!("Expected text message");
     }
+}
+
+/// Builds an empty broker whose store lives in a new temporary directory.
+///
+/// The directory is returned so the caller can keep it alive for as long
+/// as the broker uses it.
+///
+/// Returns:
+///     The broker and its temporary directory.
+fn test_broker() -> (Broker, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let persistence = popsub_persistence::Persistence::new(
+        dir.path().to_str().expect("temp path is not UTF-8"),
+        None,
+        None,
+    )
+    .expect("Failed to create persistence");
+    (Broker::new(persistence, Settings::default().broker), dir)
 }

@@ -36,13 +36,13 @@ Quick start (five minutes)
    cargo run -p popsub -- server
    ```
 
-3. Run the example client in another terminal:
+3. Run the client in another terminal:
 
    ```bash
    cargo run -p popsub -- client --url ws://127.0.0.1:8080
    ```
 
-The example client connects, logs in (to get a JWT), authenticates, subscribes to `chat`, and publishes a small message.
+The client logs in (to get a JWT), authenticates, subscribes to `chat`, publishes a message and prints it when it arrives. Pass `--username`, `--password` and `--topic` to use another account or topic.
 
 Configuration
 
@@ -114,14 +114,13 @@ Permissions and limits
 
 Examples and testing
 
-- A simple example client is at `crates/popsub/examples/simple_client.rs`.
 - Run the test suite with `cargo test --workspace`.
 - Run Clippy with `cargo clippy --workspace` and format with `cargo fmt`.
 
 Make targets
 
 - `make` lists every target.
-- `make demo` starts a server, runs the example client against it and stops. Use `make demo PORT=8090` if 8080 is taken.
+- `make demo` starts a server, runs the client against it and stops. Use `make demo PORT=8090` if 8080 is taken.
 - `make server`, `make client`, `make test`, `make lint` and `make ci` (the same checks GitHub Actions runs).
 - Add `JOBS=2` to any target if a full build runs out of memory.
 

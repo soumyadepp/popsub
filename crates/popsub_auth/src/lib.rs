@@ -72,7 +72,7 @@
 //!
 //!     let store = Arc::new(PostgresUserStore::new_with_migrations(pool).await.unwrap());
 //!     let config = AuthConfig::default();
-//!     let auth = AuthService::with_store_and_admin(config, store).await;
+//!     let auth = AuthService::with_store(config, store).await;
 //! }
 //! ```
 

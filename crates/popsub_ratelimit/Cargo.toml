@@ -12,5 +12,3 @@ dashmap = "6"
 # Utilities
 tracing = "0.1"
 
-[dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

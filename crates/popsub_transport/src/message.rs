@@ -6,11 +6,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The JWT claims type from `popsub_auth`, re-exported so the protocol module
-/// exposes the token contents next to the frames, and code that depends only on
-/// this crate can name it as `popsub_transport::Claims`.
-pub use popsub_auth::Claims;
-
 /// A frame sent by a client, tagged by its `type` field.
 ///
 /// Only `login`, `register` and `auth` are accepted before the connection has

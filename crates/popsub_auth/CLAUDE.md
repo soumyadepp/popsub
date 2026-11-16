@@ -22,7 +22,10 @@ Users, roles, password hashing, JWTs and topic permission patterns. The transpor
 ## Gotchas
 
 - The in-memory store is rebuilt on every start: self-registered users vanish on restart, and the admin is recreated from config.
-- `AuthService` sits behind a `tokio::sync::RwLock` in the transport, though its methods only need `&self`.
+- `AuthService` methods take `&self` and the store locks internally, so share it as `Arc<AuthService>`; don't wrap it in another lock.
+- There is one way to build it: `with_store(config, store)` (or `new(config)`, which uses an in-memory store). Both create the configured admin if it's missing.
+- `AuthConfig`'s `Debug` redacts the secret and admin password. Keep it that way if fields are added.
+- `refresh_token` checks the user still exists and is enabled; `validate_token` doesn't, because permission checks look the user up anyway.
 - The Postgres store compiles in CI (`--all-features`) but is never run against a database.
 - There is no protocol message to change roles; use `update_user_role` in code.
 

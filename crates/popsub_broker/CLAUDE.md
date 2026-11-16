@@ -21,8 +21,8 @@ The engine: topics and their subscriber sets, publishing, QoS 1 pending table an
 - `subscribe` replays the full stored history for the topic, as QoS 0 with new ids, every time.
 - `publish` writes to `sled` while holding the lock.
 - Topics are only created by `subscribe`. Publishing to an unknown topic still stores the message and logs "Topic not found".
-- `Broker::new` uses `Persistence::default()`, which panics if the store can't be opened. The binary avoids it by opening the store itself and calling `new_with_persistence`; prefer that everywhere.
-- `Broker::default` branches on `cfg!(test)` and uses `tempfile`, which is why `tempfile` is a runtime dependency. Prefer `new_with_persistence` with a temp dir in tests.
+- `Broker::new(persistence, settings)` is the only constructor. The caller opens the store, so failures are reported instead of panicking.
+- Tests build brokers with the `test_broker()` helper in `src/tests.rs`, which keeps its temporary directory alive alongside the broker.
 - `Broker::ACK_TIMEOUT` is only used by tests. `retry_overdue` reads `settings.ack_timeout_ms`, so the two can drift if the default changes.
 
 ## When changing delivery logic

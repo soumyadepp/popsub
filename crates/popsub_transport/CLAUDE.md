@@ -15,7 +15,7 @@ The WebSocket edge. Accepts connections, speaks the JSON protocol, runs register
 ## Invariants
 
 - `register`, `login` and `auth` are accepted before authentication. Anything else first gets `must authenticate first` and closes the connection, as does a failed `auth` or a client that is no longer registered. Permission denials and rate limits send an error and keep it open.
-- The auth lock is always released before the broker is touched, and the broker is only reached through `SharedBroker::with`.
+- The broker is only reached through `SharedBroker::with`. The auth service is a plain `Arc<AuthService>` with no lock of its own.
 - Replies go through `Session::reply`, never through the broker's client map.
 - Publish checks the topic permission before the rate limit, so denied publishes don't spend a user's allowance.
 - Failed logins are limited per `address|username` and per address; registration per address; publishing per username. See `docs/DESIGN.md` section 10.

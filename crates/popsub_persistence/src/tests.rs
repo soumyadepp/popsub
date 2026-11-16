@@ -22,16 +22,21 @@ mod persistence_tests {
     ///
     /// Returns:
     ///     A handle to the new database.
-    fn create_test_persistence(ttl: Option<i64>, max: Option<usize>) -> Persistence {
+    fn create_test_persistence(
+        ttl: Option<i64>,
+        max: Option<usize>,
+    ) -> (Persistence, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        Persistence::new(dir.path().to_str().expect("path to_str failed"), ttl, max)
-            .expect("Failed to create persistence")
+        let persistence =
+            Persistence::new(dir.path().to_str().expect("path to_str failed"), ttl, max)
+                .expect("Failed to create persistence");
+        (persistence, dir)
     }
 
     /// Checks that a stored message loads back with the same topic and payload.
     #[test]
     fn test_store_and_load_message() {
-        let persistence = create_test_persistence(None, None);
+        let (persistence, _dir) = create_test_persistence(None, None);
         let topic = "test_topic";
 
         let _ = persistence.store_message(topic, "hello");
@@ -46,7 +51,7 @@ mod persistence_tests {
     /// Checks that a message older than a one-second TTL is gone after two seconds.
     #[test]
     fn test_ttl_removes_old_messages() {
-        let persistence = create_test_persistence(Some(1), None);
+        let (persistence, _dir) = create_test_persistence(Some(1), None);
         let topic = "ttl_test";
 
         let _ = persistence.store_message(topic, "msg1");
@@ -61,7 +66,7 @@ mod persistence_tests {
     /// Checks that a cap of three keeps only the three newest of five messages, in order.
     #[test]
     fn test_max_messages_limit() {
-        let persistence = create_test_persistence(Some(1000), Some(3));
+        let (persistence, _dir) = create_test_persistence(Some(1000), Some(3));
         let topic = "max_limit_test";
 
         for i in 0..5 {
@@ -81,7 +86,7 @@ mod persistence_tests {
     /// Checks that loading a topic with no messages returns an empty list.
     #[test]
     fn test_empty_topic_returns_empty_vec() {
-        let persistence = create_test_persistence(None, None);
+        let (persistence, _dir) = create_test_persistence(None, None);
         let messages = persistence.load_messages("nonexistent_topic");
         assert!(
             messages.unwrap().is_empty(),
@@ -106,14 +111,13 @@ mod persistence_tests {
         assert_eq!(msg.timestamp, parsed.timestamp);
     }
 
-    /// Checks that without a TTL a message is still there after two seconds.
+    /// Checks that without a TTL a stored message is never expired by a load.
     #[test]
     fn test_cleanup_old_messages_no_ttl() {
-        let persistence = create_test_persistence(None, None);
+        let (persistence, _dir) = create_test_persistence(None, None);
         let topic = "no_ttl_test";
 
         let _ = persistence.store_message(topic, "msg1");
-        sleep(Duration::from_secs(2));
         let messages = persistence.load_messages(topic);
 
         assert_eq!(

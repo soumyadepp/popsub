@@ -10,5 +10,5 @@ Shared building blocks: the error type, the `Result` alias and logging setup. Ev
 ## Gotchas
 
 - `init` ignores `RUST_LOG`. Switching to `EnvFilter` would let operators change log levels without a rebuild.
-- `config` is pinned to 0.13 here but 0.15 in `popsub_config`, so `PopSubError::Config` can't wrap errors from the loader. Bump this to match when touching either.
+- `config` matches `popsub_config`'s version (0.15), so `PopSubError::Config` can wrap loader errors. Keep them in step.
 - Keep this crate free of domain logic. If something knows about topics, messages or sockets, it belongs elsewhere.

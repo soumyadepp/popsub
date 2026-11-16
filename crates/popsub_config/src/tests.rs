@@ -1,7 +1,10 @@
 //! Unit tests for settings defaults, the insecure-default checks and loading
 //! from environment variables.
 
-pub use super::settings::Settings;
+use std::path::Path;
+
+use crate::load_config_from;
+use crate::settings::Settings;
 
 /// Checks the default host, port, connection cap and message TTL.
 #[test]
@@ -52,10 +55,60 @@ fn multi_word_keys_load_from_double_underscore_variables() {
         ("SERVER__ALLOW_REGISTRATION".to_string(), "true".to_string()),
         ("SERVER_PORT".to_string(), "9100".to_string()),
     ]);
-    let settings = crate::load_config_with_env(Some(env)).expect("load failed");
+    let settings = load_config_from(Path::new("no/such/config"), Some(env)).expect("load failed");
 
     assert_eq!(settings.server.jwt_secret, "from-the-environment");
     assert_eq!(settings.broker.max_retries, 9);
     assert!(settings.server.allow_registration);
     assert_eq!(settings.server.port, 9100);
+}
+
+/// Checks that a config file overrides only the values it names and the rest keep their defaults.
+#[test]
+fn a_partial_file_overrides_only_what_it_names() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("popsub.toml");
+    std::fs::write(
+        &file,
+        r#"
+            [server]
+            host = "0.0.0.0"
+            jwt_secret = "file_secret"
+
+            [broker]
+            message_ttl_secs = 60
+        "#,
+    )
+    .expect("write config file");
+
+    let settings = load_config_from(&file, Some(Default::default())).expect("load failed");
+    let defaults = Settings::default();
+
+    assert_eq!(settings.server.host, "0.0.0.0");
+    assert_eq!(settings.server.jwt_secret, "file_secret");
+    assert_eq!(settings.broker.message_ttl_secs, 60);
+    assert_eq!(settings.server.port, defaults.server.port);
+    assert_eq!(settings.server.username, defaults.server.username);
+    assert_eq!(settings.broker.max_retries, defaults.broker.max_retries);
+}
+
+/// Checks that environment variables win over the config file.
+#[test]
+fn environment_overrides_the_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("popsub.toml");
+    std::fs::write(&file, "[server]\nport = 9000\n").expect("write config file");
+    let env = std::collections::HashMap::from([("SERVER_PORT".to_string(), "9200".to_string())]);
+
+    let settings = load_config_from(&file, Some(env)).expect("load failed");
+
+    assert_eq!(settings.server.port, 9200);
+}
+
+/// Checks that a value of the wrong type is reported instead of silently replaced by the default.
+#[test]
+fn wrong_types_are_errors() {
+    let env =
+        std::collections::HashMap::from([("SERVER_PORT".to_string(), "not-a-port".to_string())]);
+    assert!(load_config_from(Path::new("no/such/config"), Some(env)).is_err());
 }

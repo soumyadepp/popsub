@@ -27,17 +27,18 @@ Authentication and authorization module for PopSub.
 
 ## Usage
 
+All `AuthService` methods that touch the user store are `async`. The samples below run inside an async function that returns `Result<(), AuthError>`.
+
 ### Basic Setup
 
 ```rust
 use popsub_auth::{AuthService, AuthConfig, Role, TopicPermission};
 
-// Create auth service with configuration
 let config = AuthConfig::new("your_jwt_secret")
-    .with_expiration(24) // hours
+    .with_expiration(24)
     .with_admin("admin", "secure_password");
 
-let mut auth = AuthService::new(config);
+let auth = AuthService::new(config).await;
 ```
 
 ### Adding Users
@@ -45,51 +46,44 @@ let mut auth = AuthService::new(config);
 ```rust
 use popsub_auth::{Role, TopicPermission};
 
-// Add a user with specific topic permissions
 let role = Role::User {
     allowed_topics: vec![
-        TopicPermission::full_access("chat/#"),      // read + write
-        TopicPermission::read_only("sensors/+/temp"), // read only
+        TopicPermission::full_access("chat/#"),
+        TopicPermission::read_only("sensors/+/temp"),
     ],
 };
-auth.add_user("alice", "alice_password", role).unwrap();
+auth.add_user("alice", "alice_password", role).await?;
 
-// Or use the builder pattern
 use popsub_auth::service::UserBuilder;
 
 UserBuilder::new("bob", "bob_password")
     .allow_topic("notifications/#")
     .allow_subscribe("public/#")
-    .register(&mut auth)
-    .unwrap();
+    .register(&auth)
+    .await?;
 ```
 
 ### Authentication Flow
 
 ```rust
-// Login and get a token
-let token = auth.login("alice", "alice_password").unwrap();
+let token = auth.login("alice", "alice_password").await?;
 
-// Validate the token
-let claims = auth.validate_token(&token).unwrap();
+let claims = auth.validate_token(&token)?;
 println!("Authenticated user: {}", claims.sub);
 
-// Refresh token before expiry
-let new_token = auth.refresh_token(&token).unwrap();
+let new_token = auth.refresh_token(&token).await?;
 ```
 
 ### Authorization Checks
 
 ```rust
-// Check permissions
-assert!(auth.can_subscribe("alice", "chat/room1"));
-assert!(auth.can_publish("alice", "chat/room1"));
-assert!(auth.can_subscribe("alice", "sensors/living_room/temp"));
-assert!(!auth.can_publish("alice", "sensors/living_room/temp")); // read-only
+assert!(auth.can_subscribe("alice", "chat/room1").await);
+assert!(auth.can_publish("alice", "chat/room1").await);
+assert!(auth.can_subscribe("alice", "sensors/living_room/temp").await);
+assert!(!auth.can_publish("alice", "sensors/living_room/temp").await);
 
-// Or use authorization methods that return errors
-auth.authorize_subscribe("alice", "chat/room1")?;
-auth.authorize_publish("alice", "denied/topic")?; // Returns Err
+auth.authorize_subscribe("alice", "chat/room1").await?;
+assert!(auth.authorize_publish("alice", "denied/topic").await.is_err());
 ```
 
 ## Roles
@@ -109,8 +103,8 @@ Topic-specific permissions with granular control:
 ```rust
 let user_role = Role::User {
     allowed_topics: vec![
-        TopicPermission::new("chat/#", true, true),   // subscribe + publish
-        TopicPermission::new("sensors/#", true, false), // subscribe only
+        TopicPermission::new("chat/#", true, true),
+        TopicPermission::new("sensors/#", true, false),
     ],
 };
 ```
@@ -147,12 +141,8 @@ use popsub_auth::store::UserStore;
 use popsub_auth::service::{AuthConfig, AuthService};
 use std::sync::Arc;
 
-// Create your custom store
 let my_store: Arc<dyn UserStore> = Arc::new(MyDatabaseStore::new());
-
-// Use it with AuthService
-let config = AuthConfig::default();
-let auth_service = AuthService::with_store(config, my_store);
+let auth_service = AuthService::with_store(AuthConfig::default(), my_store).await;
 ```
 
 ### Implementing a Custom Store
@@ -222,7 +212,7 @@ impl UserStore for PostgresUserStore {
 
 1. Build with the feature: `cargo build -p popsub_auth --features postgres`.
 2. Create the store with `PostgresUserStore::new_with_migrations(pool)`, which creates the `users` table if it is missing. If you manage schema yourself, run `migrations/001_create_users_table.sql` and use `PostgresUserStore::new(pool)` instead.
-3. Pass the store to `AuthService::with_store_and_admin`.
+3. Pass the store to `AuthService::with_store(config, store).await`, which also creates the configured admin if it's missing.
 
 CI compiles this store (`--all-features`) but does not run it against a database, so test it against your own Postgres before relying on it.
 

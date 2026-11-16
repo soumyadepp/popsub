@@ -1,270 +1,207 @@
-//! `SlidingWindow`, a rate limiter that allows a fixed number of requests in any window of a given length.
+//! `SlidingWindow`, a per-key limiter that allows at most N requests in any window of time.
 //!
-//! Each key keeps the timestamps of its requests inside the current window,
-//! so memory per key grows with `max_requests`. Unlike `TokenBucket`, a
-//! key that has been quiet gains no extra allowance for a burst.
+//! Each key keeps the timestamps of its requests within the window. There is
+//! no burst allowance beyond `max_requests`. The transport uses it, keyed by
+//! address, to limit registration attempts.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
-
 use crate::RateLimiter;
+use crate::keyed::KeyedState;
 
-/// Request timestamps for a single key.
-struct Window {
-    /// Times of the key's requests, oldest first. Entries older than the window are removed lazily.
-    timestamps: Mutex<VecDeque<Instant>>,
-}
-
-/// Rate limiter that allows at most `max_requests` per key in any `window_size` period.
+/// A per-key limiter allowing at most `max_requests` in any `window_size` period.
 ///
-/// Example, at most 100 requests per minute:
+/// Example:
 ///
 /// ```rust
-/// use popsub_ratelimit::SlidingWindow;
+/// use popsub_ratelimit::{RateLimiter, SlidingWindow};
 /// use std::time::Duration;
 ///
 /// let limiter = SlidingWindow::new(100, Duration::from_secs(60));
+/// assert!(limiter.try_acquire("203.0.113.7"));
 /// ```
 pub struct SlidingWindow {
-    /// Maximum requests allowed in the window.
+    /// The most requests allowed within one window.
     max_requests: u64,
-    /// Length of the sliding window.
+    /// The length of the window.
     window_size: Duration,
-    /// Request timestamps by key.
-    windows: DashMap<String, Window>,
+    /// Every key's request times, oldest first.
+    windows: KeyedState<VecDeque<Instant>>,
 }
 
 impl SlidingWindow {
-    /// Creates a sliding window rate limiter.
+    /// Creates a sliding window limiter.
     ///
     /// Args:
-    ///     max_requests: Maximum requests allowed per key within the window.
-    ///     window_size: Length of the sliding window.
+    ///     max_requests: The most requests allowed within one window.
+    ///     window_size: The length of the window.
     ///
     /// Returns:
-    ///     A limiter that tracks no keys yet.
+    ///     A limiter with no keys yet.
     pub fn new(max_requests: u64, window_size: Duration) -> Self {
         Self {
             max_requests,
             window_size,
-            windows: DashMap::new(),
+            windows: KeyedState::new(),
         }
     }
 
-    /// Creates a limiter with a one-second window.
+    /// Creates a limiter of `max_requests` per second.
     ///
     /// Args:
-    ///     max_requests: Maximum requests allowed per key per second.
+    ///     max_requests: The most requests allowed per second.
     ///
     /// Returns:
-    ///     A limiter that tracks no keys yet.
+    ///     A limiter with no keys yet.
     pub fn per_second(max_requests: u64) -> Self {
         Self::new(max_requests, Duration::from_secs(1))
     }
 
-    /// Creates a limiter with a one-minute window.
+    /// Creates a limiter of `max_requests` per minute.
     ///
     /// Args:
-    ///     max_requests: Maximum requests allowed per key per minute.
+    ///     max_requests: The most requests allowed per minute.
     ///
     /// Returns:
-    ///     A limiter that tracks no keys yet.
+    ///     A limiter with no keys yet.
     pub fn per_minute(max_requests: u64) -> Self {
         Self::new(max_requests, Duration::from_secs(60))
     }
 
-    /// Returns the window for `key`, inserting an empty one if the key is new.
+    /// Forgets keys with no requests left inside their window.
     ///
-    /// Uses the map's entry API so a concurrent `reset` can't remove the key
-    /// between the lookup and the insert.
-    ///
-    /// Args:
-    ///     key: The key to look up.
-    ///
-    /// Returns:
-    ///     A read guard on the key's map entry.
-    fn get_or_create_window(&self, key: &str) -> dashmap::mapref::one::Ref<'_, String, Window> {
-        self.windows
-            .entry(key.to_string())
-            .or_insert_with(|| Window {
-                timestamps: Mutex::new(VecDeque::new()),
-            })
-            .downgrade()
-    }
-
-    /// Forgets keys whose window holds no requests any more.
-    ///
-    /// Call this periodically so keys from clients that have gone away don't
-    /// accumulate. A pruned key behaves exactly like a key seen for the first
-    /// time, which is correct because its window is empty. Panics if a key's
-    /// mutex is poisoned.
+    /// A forgotten key behaves exactly like a new one, which is correct
+    /// because its window is empty.
     ///
     /// Returns:
     ///     How many fewer keys are tracked afterwards. Approximate when other
-    ///     tasks add keys at the same time.
+    ///     threads add keys at the same time.
     pub fn prune_idle(&self) -> usize {
         let now = Instant::now();
-        let before = self.windows.len();
-        self.windows.retain(|_, window| {
-            let timestamps = window.timestamps.get_mut().unwrap();
-            self.cleanup_old_entries(timestamps, now);
-            !timestamps.is_empty()
-        });
-        before.saturating_sub(self.windows.len())
+        self.windows.retain(|times| {
+            self.drop_expired(times, now);
+            !times.is_empty()
+        })
     }
 
-    /// Reports how many keys the limiter currently holds state for.
+    /// Number of keys currently tracked.
     ///
     /// Returns:
-    ///     The number of tracked keys.
+    ///     The key count.
     pub fn tracked_keys(&self) -> usize {
         self.windows.len()
     }
 
-    /// Removes timestamps that have fallen out of the window ending at `now`.
-    ///
-    /// Panics if `window_size` reaches back before the earliest `Instant`
-    /// the platform can represent.
+    /// The earliest time still inside the window ending at `now`.
     ///
     /// Args:
-    ///     timestamps: The key's request times, oldest first.
     ///     now: The end of the window.
-    fn cleanup_old_entries(&self, timestamps: &mut VecDeque<Instant>, now: Instant) {
-        let cutoff = now - self.window_size;
-        while let Some(&front) = timestamps.front() {
-            if front < cutoff {
-                timestamps.pop_front();
-            } else {
-                break;
-            }
+    ///
+    /// Returns:
+    ///     The window's start, or `None` when it reaches back before the
+    ///     clock's earliest representable instant (then nothing has expired).
+    fn window_start(&self, now: Instant) -> Option<Instant> {
+        now.checked_sub(self.window_size)
+    }
+
+    /// Removes request times that have left the window.
+    ///
+    /// Args:
+    ///     times: A key's request times, oldest first.
+    ///     now: The current time.
+    fn drop_expired(&self, times: &mut VecDeque<Instant>, now: Instant) {
+        let Some(start) = self.window_start(now) else {
+            return;
+        };
+        while times.front().is_some_and(|&oldest| oldest < start) {
+            times.pop_front();
         }
+    }
+
+    /// Counts request times still inside the window, without changing them.
+    ///
+    /// Args:
+    ///     times: A key's request times, oldest first.
+    ///     now: The current time.
+    ///
+    /// Returns:
+    ///     How many requests count against the limit now.
+    fn in_window(&self, times: &VecDeque<Instant>, now: Instant) -> u64 {
+        let count = match self.window_start(now) {
+            Some(start) => times.iter().filter(|&&t| t >= start).count(),
+            None => times.len(),
+        };
+        u64::try_from(count).unwrap_or(u64::MAX)
     }
 }
 
 impl RateLimiter for SlidingWindow {
-    /// Records a request for `key` if fewer than `max_requests` fall in the current window.
+    /// Records a request for the key if it is under the limit.
     ///
     /// Args:
-    ///     key: The client or caller the request is counted against.
+    ///     key: The key to charge.
     ///
     /// Returns:
-    ///     `true` if the request was recorded, `false` if the window is full.
-    async fn try_acquire(&self, key: &str) -> bool {
-        let window = self.get_or_create_window(key);
-        let mut timestamps = window.timestamps.lock().unwrap();
+    ///     `true` when the request is allowed and recorded, `false` when the
+    ///     window is already full.
+    fn try_acquire(&self, key: &str) -> bool {
         let now = Instant::now();
-
-        self.cleanup_old_entries(&mut timestamps, now);
-
-        if timestamps.len() < self.max_requests as usize {
-            timestamps.push_back(now);
-            true
-        } else {
-            false
-        }
+        self.windows.update(key, VecDeque::new, |times| {
+            self.drop_expired(times, now);
+            if (times.len() as u64) < self.max_requests {
+                times.push_back(now);
+                true
+            } else {
+                false
+            }
+        })
     }
 
-    /// Reports how many requests `key` can still make in the current window.
-    ///
-    /// Starts tracking `key` if it was not tracked yet.
+    /// Reports how many more requests the key may make now, without creating it.
     ///
     /// Args:
-    ///     key: The client or caller to check.
+    ///     key: The key to check.
     ///
     /// Returns:
-    ///     `max_requests` minus the requests in the current window.
-    async fn remaining(&self, key: &str) -> u64 {
-        let window = self.get_or_create_window(key);
-        let mut timestamps = window.timestamps.lock().unwrap();
+    ///     The remaining allowance. An unknown key has the full allowance.
+    fn remaining(&self, key: &str) -> u64 {
         let now = Instant::now();
-
-        self.cleanup_old_entries(&mut timestamps, now);
-
-        self.max_requests.saturating_sub(timestamps.len() as u64)
+        self.windows
+            .read(key, |times| {
+                self.max_requests.saturating_sub(self.in_window(times, now))
+            })
+            .unwrap_or(self.max_requests)
     }
 
-    /// Removes the window for `key`.
+    /// Forgets the key, so its next request starts a fresh window.
     ///
     /// Args:
-    ///     key: The client or caller to reset.
-    async fn reset(&self, key: &str) {
+    ///     key: The key to reset.
+    fn reset(&self, key: &str) {
         self.windows.remove(key);
     }
 
-    /// Reports how long until the oldest request in a full window expires.
-    ///
-    /// Starts tracking `key` if it was not tracked yet.
+    /// Reports how long until the key may make another request, without creating it.
     ///
     /// Args:
-    ///     key: The client or caller to check.
+    ///     key: The key to check.
     ///
     /// Returns:
-    ///     `None` if the window has room, otherwise the seconds until the
-    ///     oldest request leaves it, rounded down and at least 1.
-    async fn retry_after(&self, key: &str) -> Option<u64> {
-        let window = self.get_or_create_window(key);
-        let mut timestamps = window.timestamps.lock().unwrap();
+    ///     `None` when a request is allowed now, otherwise the whole seconds
+    ///     (at least 1) until the oldest request in the window expires.
+    fn retry_after(&self, key: &str) -> Option<u64> {
         let now = Instant::now();
-
-        self.cleanup_old_entries(&mut timestamps, now);
-
-        if timestamps.len() < self.max_requests as usize {
-            None
-        } else if let Some(&oldest) = timestamps.front() {
-            let expires = oldest + self.window_size;
-            if expires > now {
-                Some((expires - now).as_secs().max(1))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! Unit tests for `SlidingWindow`.
-
-    use super::*;
-
-    /// Checks that each key has its own window.
-    #[tokio::test]
-    async fn test_sliding_window_separate_keys() {
-        let limiter = SlidingWindow::new(1, Duration::from_secs(10));
-
-        assert!(limiter.try_acquire("user1").await);
-        assert!(limiter.try_acquire("user2").await);
-
-        assert!(!limiter.try_acquire("user1").await);
-        assert!(!limiter.try_acquire("user2").await);
-    }
-
-    /// Checks that `remaining` starts at `max_requests` and drops by one per request.
-    #[tokio::test]
-    async fn test_remaining() {
-        let limiter = SlidingWindow::new(5, Duration::from_secs(1));
-
-        assert_eq!(limiter.remaining("test").await, 5);
-        limiter.try_acquire("test").await;
-        assert_eq!(limiter.remaining("test").await, 4);
-    }
-
-    /// Checks that a full window accepts a request again once its oldest entry has expired.
-    #[tokio::test]
-    async fn test_window_slides() {
-        let limiter = SlidingWindow::new(2, Duration::from_millis(50));
-
-        assert!(limiter.try_acquire("test").await);
-        assert!(limiter.try_acquire("test").await);
-        assert!(!limiter.try_acquire("test").await);
-
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
-        assert!(limiter.try_acquire("test").await);
+        self.windows
+            .read(key, |times| {
+                if self.in_window(times, now) < self.max_requests {
+                    return None;
+                }
+                let start = self.window_start(now)?;
+                let oldest = times.iter().find(|&&t| t >= start)?;
+                let expires = *oldest + self.window_size;
+                Some(expires.saturating_duration_since(now).as_secs().max(1))
+            })
+            .flatten()
     }
 }

@@ -1,5 +1,6 @@
 //! Unit tests that drive `AuthService` end to end: login, tokens, registration, roles and topic checks.
 
+use crate::error::AuthError;
 use crate::permission::TopicPermission;
 use crate::service::{AuthConfig, AuthService, UserBuilder};
 use crate::user::Role;
@@ -131,7 +132,7 @@ async fn test_token_refresh() {
     let auth = AuthService::new(config).await;
 
     let token = auth.login("admin", "password").await.unwrap();
-    let new_token = auth.refresh_token(&token).unwrap();
+    let new_token = auth.refresh_token(&token).await.unwrap();
 
     let claims = auth.validate_token(&new_token).unwrap();
     assert_eq!(claims.sub, "admin");
@@ -351,4 +352,55 @@ fn test_insecure_defaults_are_detected() {
 
     let custom = AuthConfig::new("a-long-random-secret").with_admin("admin", "not-the-default");
     assert!(custom.insecure_defaults().is_empty());
+}
+
+/// Checks that a disabled user can't refresh a token issued before they were disabled.
+#[tokio::test]
+async fn test_refresh_rejected_for_disabled_user() {
+    let auth = AuthService::new(AuthConfig::default()).await;
+    auth.add_user("leaver", "password123", Role::Admin)
+        .await
+        .unwrap();
+    let token = auth.login("leaver", "password123").await.unwrap();
+
+    let mut user = auth.get_user("leaver").await.unwrap().unwrap();
+    user.enabled = false;
+    auth.user_store.update_user(user).await.unwrap();
+
+    assert!(matches!(
+        auth.refresh_token(&token).await,
+        Err(AuthError::InvalidToken)
+    ));
+}
+
+/// Checks that an expired token is reported as `TokenExpired`, not a generic JWT error.
+#[test]
+fn test_expired_token_is_reported_as_expired() {
+    let jwt = crate::jwt::JwtService::new("a-test-secret", 0);
+    let mut claims = crate::jwt::Claims::new("someone", 0);
+    claims.exp = claims.iat.saturating_sub(3600);
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        jwt.encoding_key(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        jwt.validate_token(&token),
+        Err(AuthError::TokenExpired)
+    ));
+}
+
+/// Checks that formatting the service for logs never includes the JWT secret or admin password.
+#[tokio::test]
+async fn test_debug_output_redacts_secrets() {
+    let config =
+        AuthConfig::new("super-secret-signing-key").with_admin("admin", "hunter2-password");
+    let auth = AuthService::new(config).await;
+
+    let printed = format!("{auth:?}");
+
+    assert!(!printed.contains("super-secret-signing-key"), "{printed}");
+    assert!(!printed.contains("hunter2-password"), "{printed}");
 }
