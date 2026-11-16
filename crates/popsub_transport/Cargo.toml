@@ -22,3 +22,4 @@ popsub_ratelimit = { path = "../popsub_ratelimit" }
 popsub_utils = { path = "../popsub_utils" }
 
 [dev-dependencies]
+tempfile = "3.20.0"

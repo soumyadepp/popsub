@@ -1,17 +1,21 @@
 //! `MemoryStorage`, a backend that keeps logs and cursors in process memory.
 //!
-//! It is the reference implementation of the traits: tests and demos use it,
+//! It is the simplest implementation of the traits: tests and demos use it,
 //! and it serves as a pure replay buffer when nothing needs to survive a
 //! restart. It never writes anywhere, so it supports only
-//! `Durability::None` and reports itself as not persistent.
+//! `Durability::None` and reports itself as not persistent. The numbering,
+//! retry and retention rules live in `LogIndex` and the session rules in
+//! `SessionTable`, shared with `FileStorage`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 
 use crate::error::Result;
+use crate::index::LogIndex;
 use crate::record::{LogBounds, NewRecord, Record, Subscription};
+use crate::sessions::SessionTable;
 use crate::storage::{Capabilities, Durability, MessageLog, Retention, Storage, SubscriptionStore};
 
 /// What `MemoryStorage` reports from `capabilities`.
@@ -20,56 +24,6 @@ const CAPABILITIES: Capabilities = Capabilities {
     persistent: false,
 };
 
-/// One topic's records and the bookkeeping needed to append to it.
-#[derive(Debug, Default)]
-struct TopicLog {
-    /// Retained records, oldest first, with consecutive `seq` values.
-    records: VecDeque<Record>,
-    /// The highest `seq` ever appended, kept when records are trimmed.
-    last_seq: u64,
-    /// The highest `published_at_ms` ever appended, kept when records are trimmed.
-    last_published_at_ms: i64,
-    /// The total `Record::size` of `records`.
-    bytes: u64,
-    /// Maps `(publisher, message_id)` to `seq` for every retained record.
-    ids: HashMap<(String, String), u64>,
-}
-
-impl TopicLog {
-    /// Reports which sequence numbers this log holds.
-    ///
-    /// Returns:
-    ///     The bounds of the retained records.
-    fn bounds(&self) -> LogBounds {
-        LogBounds {
-            first_seq: self.records.front().map_or(self.last_seq + 1, |r| r.seq),
-            last_seq: self.last_seq,
-        }
-    }
-
-    /// Removes the oldest record and its id lookup.
-    ///
-    /// Returns:
-    ///     False when the log was already empty.
-    fn pop_oldest(&mut self) -> bool {
-        let Some(record) = self.records.pop_front() else {
-            return false;
-        };
-        self.bytes -= record.size();
-        self.ids.remove(&(record.publisher, record.message_id));
-        true
-    }
-}
-
-/// One session's last activity and its cursors.
-#[derive(Debug, Default)]
-struct Session {
-    /// When the session was last touched, 0 if never.
-    last_seen_ms: i64,
-    /// Maps each subscribed topic to its `acked_seq`.
-    cursors: HashMap<String, u64>,
-}
-
 /// A backend that keeps everything in memory and loses it when dropped.
 ///
 /// Logs and sessions each sit behind one mutex. Nothing awaits while holding
@@ -77,10 +31,10 @@ struct Session {
 /// data consistent before anything can panic.
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
-    /// Topic logs by topic name.
-    logs: Mutex<HashMap<String, TopicLog>>,
-    /// Sessions by session id.
-    sessions: Mutex<HashMap<String, Session>>,
+    /// Topic logs by topic name, each entry holding the whole record.
+    logs: Mutex<HashMap<String, LogIndex<Record>>>,
+    /// Sessions and their cursors.
+    sessions: Mutex<SessionTable>,
 }
 
 impl MemoryStorage {
@@ -96,7 +50,7 @@ impl MemoryStorage {
     ///
     /// Returns:
     ///     The guard over every topic log.
-    fn logs(&self) -> MutexGuard<'_, HashMap<String, TopicLog>> {
+    fn logs(&self) -> MutexGuard<'_, HashMap<String, LogIndex<Record>>> {
         self.logs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -104,7 +58,7 @@ impl MemoryStorage {
     ///
     /// Returns:
     ///     The guard over every session.
-    fn sessions(&self) -> MutexGuard<'_, HashMap<String, Session>> {
+    fn sessions(&self) -> MutexGuard<'_, SessionTable> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -133,22 +87,13 @@ impl MessageLog for MemoryStorage {
         CAPABILITIES.check(durability)?;
         let mut logs = self.logs();
         let log = logs.entry(topic.to_string()).or_default();
-        let key = (record.publisher.clone(), record.message_id.clone());
-        if let Some(&seq) = log.ids.get(&key) {
-            let first = log.bounds().first_seq;
-            let index = usize::try_from(seq - first).unwrap_or(usize::MAX);
-            if let Some(original) = log.records.get(index) {
-                return Ok(original.clone());
-            }
+        if let Some(original) = log.duplicate_of(&record) {
+            return Ok(original.value.clone());
         }
-        let seq = log.last_seq + 1;
-        let published_at_ms = record.published_at_ms.max(log.last_published_at_ms);
-        let stored = Record::from_new(topic, seq, record, published_at_ms);
-        log.bytes += stored.size();
-        log.last_seq = seq;
-        log.last_published_at_ms = published_at_ms;
-        log.ids.insert(key, seq);
-        log.records.push_back(stored.clone());
+        let slot = log.next_slot(&record);
+        let key = (record.publisher.clone(), record.message_id.clone());
+        let stored = Record::from_new(topic, slot.seq, record, slot.published_at_ms);
+        log.push(slot, stored.size(), key, stored.clone());
         Ok(stored)
     }
 
@@ -165,13 +110,9 @@ impl MessageLog for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn read(&self, topic: &str, from: u64, max: usize) -> Result<Vec<Record>> {
-        let logs = self.logs();
-        let Some(log) = logs.get(topic) else {
-            return Ok(Vec::new());
-        };
-        let first = log.bounds().first_seq;
-        let skip = usize::try_from(from.saturating_sub(first)).unwrap_or(usize::MAX);
-        Ok(log.records.iter().skip(skip).take(max).cloned().collect())
+        Ok(self.logs().get(topic).map_or_else(Vec::new, |log| {
+            log.range(from, max).map(|e| e.value.clone()).collect()
+        }))
     }
 
     /// Reports the topic's bounds.
@@ -188,11 +129,10 @@ impl MessageLog for MemoryStorage {
         Ok(self
             .logs()
             .get(topic)
-            .map_or(LogBounds::EMPTY, TopicLog::bounds))
+            .map_or(LogBounds::EMPTY, LogIndex::bounds))
     }
 
-    /// Binary searches the retained records by publish time, which never
-    /// decreases along the log.
+    /// Binary searches the retained records by publish time.
     ///
     /// Args:
     ///     topic: The topic to search.
@@ -204,15 +144,10 @@ impl MessageLog for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn seq_at(&self, topic: &str, time_ms: i64) -> Result<Option<u64>> {
-        let logs = self.logs();
-        let Some(log) = logs.get(topic) else {
-            return Ok(None);
-        };
-        let index = log.records.partition_point(|r| r.published_at_ms < time_ms);
-        Ok(log.records.get(index).map(|r| r.seq))
+        Ok(self.logs().get(topic).and_then(|log| log.seq_at(time_ms)))
     }
 
-    /// Pops records from the front while `Retention::must_trim` says so.
+    /// Drops records from the front while the policy says so.
     ///
     /// Args:
     ///     topic: The topic to trim.
@@ -225,23 +160,10 @@ impl MessageLog for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn trim(&self, topic: &str, policy: &Retention, now_ms: i64) -> Result<u64> {
-        let mut logs = self.logs();
-        let Some(log) = logs.get_mut(topic) else {
-            return Ok(0);
-        };
-        let mut removed = 0;
-        while let Some(oldest) = log.records.front()
-            && policy.must_trim(
-                log.records.len() as u64,
-                log.bytes,
-                oldest.published_at_ms,
-                now_ms,
-            )
-            && log.pop_oldest()
-        {
-            removed += 1;
-        }
-        Ok(removed)
+        Ok(self
+            .logs()
+            .get_mut(topic)
+            .map_or(0, |log| log.trim(policy, now_ms).len() as u64))
     }
 
     /// Lists the topics with a log.
@@ -271,21 +193,7 @@ impl SubscriptionStore for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn load(&self, session_id: &str) -> Result<Vec<Subscription>> {
-        let sessions = self.sessions();
-        let Some(session) = sessions.get(session_id) else {
-            return Ok(Vec::new());
-        };
-        let mut subscriptions: Vec<Subscription> = session
-            .cursors
-            .iter()
-            .map(|(topic, &acked_seq)| Subscription {
-                session_id: session_id.to_string(),
-                topic: topic.clone(),
-                acked_seq,
-            })
-            .collect();
-        subscriptions.sort_by(|a, b| a.topic.cmp(&b.topic));
-        Ok(subscriptions)
+        Ok(self.sessions().load(session_id))
     }
 
     /// Sets the cursor, creating the session if needed.
@@ -298,11 +206,7 @@ impl SubscriptionStore for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn subscribe(&self, session_id: &str, topic: &str, acked_seq: u64) -> Result<()> {
-        self.sessions()
-            .entry(session_id.to_string())
-            .or_default()
-            .cursors
-            .insert(topic.to_string(), acked_seq);
+        self.sessions().subscribe(session_id, topic, acked_seq);
         Ok(())
     }
 
@@ -315,9 +219,7 @@ impl SubscriptionStore for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn unsubscribe(&self, session_id: &str, topic: &str) -> Result<()> {
-        if let Some(session) = self.sessions().get_mut(session_id) {
-            session.cursors.remove(topic);
-        }
+        self.sessions().unsubscribe(session_id, topic);
         Ok(())
     }
 
@@ -331,11 +233,7 @@ impl SubscriptionStore for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn ack(&self, session_id: &str, topic: &str, seq: u64) -> Result<()> {
-        if let Some(session) = self.sessions().get_mut(session_id)
-            && let Some(cursor) = session.cursors.get_mut(topic)
-        {
-            *cursor = (*cursor).max(seq);
-        }
+        self.sessions().ack(session_id, topic, seq);
         Ok(())
     }
 
@@ -348,9 +246,7 @@ impl SubscriptionStore for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn touch(&self, session_id: &str, at_ms: i64) -> Result<()> {
-        let mut sessions = self.sessions();
-        let session = sessions.entry(session_id.to_string()).or_default();
-        session.last_seen_ms = session.last_seen_ms.max(at_ms);
+        self.sessions().touch(session_id, at_ms);
         Ok(())
     }
 
@@ -365,10 +261,7 @@ impl SubscriptionStore for MemoryStorage {
     /// Raises:
     ///     Never returns an error.
     async fn expire(&self, before_ms: i64) -> Result<u64> {
-        let mut sessions = self.sessions();
-        let before = sessions.len();
-        sessions.retain(|_, session| session.last_seen_ms >= before_ms);
-        Ok(before.saturating_sub(sessions.len()) as u64)
+        Ok(self.sessions().expire(before_ms))
     }
 }
 

@@ -104,8 +104,11 @@ impl Default for BrokerSettings {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
-    /// `popsub_storage::MemoryStorage`: history lives in the process and is
-    /// lost on restart.
+    /// `popsub_storage::FileStorage`: topic logs and sessions in the
+    /// `path` directory, kept across restarts.
+    File,
+    /// `popsub_storage::MemoryStorage`: history and sessions live in the
+    /// process and are lost on restart.
     Memory,
 }
 
@@ -115,6 +118,9 @@ pub enum StorageBackend {
 pub struct StorageSettings {
     /// Which backend holds topic logs.
     pub backend: StorageBackend,
+    /// The directory the `file` backend uses, relative to the working
+    /// directory unless absolute. Ignored by other backends.
+    pub path: String,
     /// How firmly each publish is stored before it counts as done. Startup
     /// fails if the backend can't provide it.
     pub durability: Durability,
@@ -126,15 +132,16 @@ pub struct StorageSettings {
 }
 
 impl Default for StorageSettings {
-    /// Builds the storage defaults: the memory backend, no durability, the
-    /// default retention, and sessions kept for a day.
+    /// Builds the storage defaults: the file backend in `pubsub_data`,
+    /// buffered durability, the default retention, and sessions kept for a day.
     ///
     /// Returns:
     ///     The default `[storage]` section.
     fn default() -> Self {
         Self {
-            backend: StorageBackend::Memory,
-            durability: Durability::None,
+            backend: StorageBackend::File,
+            path: "pubsub_data".to_string(),
+            durability: Durability::Buffered,
             retention: RetentionSettings::default(),
             session_expiry_secs: 86_400,
         }

@@ -16,8 +16,9 @@ max_retries = 5
 max_inflight = 100
 
 [storage]
-backend = "memory"
-durability = "none"
+backend = "file"
+path = "pubsub_data"
+durability = "buffered"
 session_expiry_secs = 86400
 
 [storage.retention]

@@ -1,6 +1,6 @@
 # popsub (binary)
 
-The CLI. Loads config, refuses to start on a non-loopback host while published default secrets are set (warns on localhost), opens the `[storage]` backend (`open_storage`), builds a `SharedBroker` (which refuses a durability the backend can't provide), spawns its retry and retention loops and runs `Server::from_settings(...).listen(...)` until Ctrl+C. Any startup failure (bad config, unsupported durability, port in use) is logged and the process exits with a failure status. Also has a `client` subcommand, the one demo client, which walks through login, auth, subscribe and publish using the transport's own message types.
+The CLI. Loads config, refuses to start on a non-loopback host while published default secrets are set (warns on localhost), opens the `[storage]` backend (`open_storage`: `FileStorage` in `storage.path`, or `MemoryStorage`), builds a `SharedBroker` (which refuses a durability the backend can't provide), spawns its retry and retention loops and runs `Server::from_settings(...).listen(...)` until Ctrl+C. Any startup failure (bad config, a data directory another server holds or damaged data, unsupported durability, port in use) is logged and the process exits with a failure status. Also has a `client` subcommand, the one demo client, which walks through login, auth, subscribe and publish using the transport's own message types.
 
 ## Structure
 

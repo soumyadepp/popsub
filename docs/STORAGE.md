@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Being implemented. Steps 1 (the `popsub_storage` crate), 2 (the broker on the log) and 3 (sessions and cursors) are done |
+| Status | Being implemented. Steps 1 to 4 are done (the storage crate, the broker on the log, sessions and cursors, the `file` backend) |
 | Owner | Soumyadeep Ghosh |
 | Replaces | `popsub_persistence` (the `sled` replay store) and the in-memory `pending_acks` table |
 | Related | `docs/DESIGN.md` sections 6, 7, 12 and 13 (phase 1) |
@@ -188,6 +188,18 @@ Replaces `sled`. One directory per topic, holding **segment files** of records:
 - **Durability:** `buffered` writes go to the OS page cache. `synced` uses **group commit**: appends wait on a shared `fsync` that runs every few milliseconds or when a batch fills, so throughput doesn't drop to one `fsync` per message.
 - **Subscriptions** live in a small append-only file of cursor updates, compacted when it grows past a threshold.
 - **Concurrency:** one writer task per topic owns that topic's active segment, which also gives the per-topic ordering in section 8.
+
+**As built** (step 4), where it differs from the above:
+
+- **No index files.** Opening scans every segment and keeps each retained record's location, publish time and size in memory. Startup reads all retained data once, and memory grows with the number of retained records, both bounded by retention.
+- **`head.json`** per topic records the first retained `seq` and the last `seq` and publish time. Trimming rewrites it (temporary file, then rename) before deleting segments, so trimmed records never come back and numbering continues even when everything was trimmed.
+- **Recovery** scans every segment. A bad frame at the end of the newest segment is cut off; one anywhere else, a record that doesn't decode, or a gap in `seq` stops the store from opening with the file and offset.
+- **No group commit yet.** Each `synced` append flushes its segment on its own. The broker appends one record at a time per topic anyway, so grouping would need it to batch publishes first.
+- **`none` behaves like `buffered`:** every append is written to the operating system.
+- **Sessions** are a write-ahead log of operations (`sessions.log`), written to the operating system but not flushed, and compacted into a snapshot once it holds four times more operations than live subscriptions (and at least 1000).
+- **Topics** live in `topics/t<name in hex>/`, so any name is a safe directory name. Names longer than 120 bytes are refused with `Unsupported`.
+- **The directory is locked** with an exclusive file lock on `LOCK`, so two servers can't share it.
+- **The crash test** kills a child process with `SIGKILL` while it appends with `synced` durability, four rounds in one directory, and checks every confirmed record. It proves recovery from interrupted writes; it can't simulate a power loss.
 
 ### 7.3 `postgres`
 

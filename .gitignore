@@ -17,6 +17,7 @@ snap.*
 db
 conf
 pubsub_db
+pubsub_data
 
 # log files
 *.log

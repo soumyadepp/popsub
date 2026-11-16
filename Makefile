@@ -3,7 +3,7 @@ PORT ?= 8080
 URL ?= ws://$(HOST):$(PORT)
 CRATE ?=
 JOBS ?=
-DATA_DIR ?= pubsub_db
+DATA_DIR ?= pubsub_data
 
 CARGO ?= cargo
 JOBS_FLAG := $(if $(JOBS),-j $(JOBS),)

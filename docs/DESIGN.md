@@ -52,7 +52,7 @@ This document describes how the system works today, where its guarantees hold an
 | `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | One writer task per topic that appends to the log, fans records out in `seq` order and replays history to subscribers; the synchronous `Broker` with subscriber sets and the QoS 1 pending table; all shared through `SharedBroker`. |
-| `popsub_storage` | Per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, an in-memory backend and the conformance suite every backend must pass (`docs/STORAGE.md`). |
+| `popsub_storage` | Per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite every backend must pass (`docs/STORAGE.md`). |
 | `popsub_persistence` | The old `sled` store. Nothing uses it any more; removed in step 6 of `docs/STORAGE.md`. |
 | `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
 | `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
@@ -161,7 +161,7 @@ The broker writes `message`, `truncated`, `subscribed` and `stalled` itself (`po
 | QoS 1, connected subscribers | At least once per subscriber, independently. Each subscriber's ACK clears only its own copy, and retries go only to subscribers that haven't acknowledged. After `max_retries` resends the subscription stalls and is told, rather than the record being dropped silently. |
 | QoS 1, ephemeral subscriber disconnects | Not at least once. Its subscriptions and windows are discarded. |
 | QoS 1, durable session disconnects and reconnects | At least once, provided it reconnects within `session_expiry_secs` and the records are still retained. Everything after its stored cursor is replayed. Records trimmed meanwhile are reported with `truncated`. |
-| QoS 1, broker restarts | Durable sessions resume from their stored cursors, if the backend is persistent. With the `memory` backend nothing survives a restart. |
+| QoS 1, broker restarts | With the `file` backend (the default), durable sessions resume from their stored cursors. Records are kept as firmly as `storage.durability` says: `buffered` survives a crash of the server, `synced` also a power loss. A cursor move is lost only to a power loss, which means resending records already acknowledged. With the `memory` backend nothing survives a restart. |
 | Ordering | Per topic, every subscriber receives new records in `seq` order, and a replay followed by live delivery has no gap or repeat. Retries are resent out of order. |
 | Duplicates | Possible (retries, and replays of records acknowledged after the cursor was last stored) and detectable: every delivery carries the record's `seq`, so consumers deduplicate by `(topic, seq)`. A publisher retrying with the same `message_id` doesn't create a second record. |
 | Retention | History beyond `storage.retention` is trimmed. A subscriber that asks for trimmed history is told with a `truncated` frame. With the `memory` backend, all history is lost on restart. |
@@ -170,10 +170,11 @@ The README and the portfolio both describe PopSub as at-least-once. That is only
 
 ## 7. Persistence
 
-The design is in `docs/STORAGE.md`; rollout steps 1 and 2 are done.
+The design is in `docs/STORAGE.md`; rollout steps 1 to 4 are done.
 
 - Each topic is an append-only log of records in a `popsub_storage::Storage` backend. A record keeps its topic, `seq`, message id, publisher, payload, QoS and publish time.
-- `storage.backend` picks the backend. Only `memory` exists so far, so history doesn't survive a restart; the `file` backend (step 4) will. Any `Storage` implementation can be used by building the server in code.
+- `storage.backend` picks the backend: `file` (the default) or `memory`. Any `Storage` implementation can be used by building the server in code.
+- The `file` backend keeps each topic in `storage.path/topics/t<topic in hex>/` as segment files of CRC-checked records, plus a session log. It takes an exclusive lock on the directory, so a second server pointed at it refuses to start. On startup it scans every segment, cuts off a half-written record at the end of a topic, and refuses to start if a record anywhere else is damaged. Details in `docs/STORAGE.md` section 7.2.
 - `storage.durability` is checked against the backend at startup and refused if the backend can't provide it.
 - `storage.retention` limits each topic by record count, age and bytes. Logs are trimmed after each publish and by the retention loop every minute.
 - `popsub_persistence` (the old `sled` store) is no longer used by anything and is removed in step 6.
@@ -204,8 +205,9 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
 | `broker.max_inflight` | `100` | Window of unacknowledged QoS 1 records per subscription |
-| `storage.backend` | `memory` | The binary. Only `memory` so far |
-| `storage.durability` | `none` | Topic writers. `none`, `buffered` or `synced`; refused at startup if the backend can't provide it |
+| `storage.backend` | `file` | The binary. `file` or `memory` |
+| `storage.path` | `pubsub_data` | The `file` backend's directory |
+| `storage.durability` | `buffered` | Topic writers. `none`, `buffered` or `synced`; refused at startup if the backend can't provide it |
 | `storage.session_expiry_secs` | `86400` | Session expiry loop. How long a durable session is kept after its last connection |
 | `storage.retention.max_messages` | `1000` | Trimming |
 | `storage.retention.max_age_secs` | `3600` | Trimming |
@@ -265,20 +267,22 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | Storage append fails | Nothing is delivered. A QoS 1 publisher gets `storage unavailable` and can retry; QoS 0 is logged and dropped. |
 | Storage read fails during a subscribe | The client gets an error and is not subscribed. It can subscribe again. |
 | A subscriber asks for history that was trimmed | It gets a `truncated` frame with the oldest available `seq`, then the rest. |
-| Broker process restarts | With the `memory` backend, all history and sessions are lost. With a persistent backend, sessions resume from their stored cursors. |
+| Broker process restarts | With the `file` backend, history and sessions are reopened and sessions resume from their stored cursors. With `memory`, all of it is lost. |
+| The server is killed mid-write | On the next start, the half-written record at the end of the topic's newest segment is cut off. Every publish that was confirmed is still there. |
+| A stored record is damaged anywhere else | The server refuses to start and names the file and offset, rather than serving data that failed its checksum. |
+| Disk full | Appends fail: QoS 1 publishers get `storage unavailable`, nothing is delivered, and the server keeps running. |
 | A cursor can't be stored | Logged. The cursor in memory still moves; after a reconnect the session may be sent records it already acknowledged. |
 | A task panics while holding the broker lock | The mutex is poisoned. The next `SharedBroker::with` logs it and carries on with the broker's state, so other connections keep working. |
 | `accept` fails, for example out of file descriptors | Logged, and the accept loop retries after 100 ms. |
-| The port is taken, or `storage.durability` is stronger than the backend provides | The binary logs the reason and exits with a failure status. |
+| The port is taken, another server holds `storage.path`, or `storage.durability` is stronger than the backend provides | The binary logs the reason and exits with a failure status. |
 
 ## 12. Known gaps, in priority order
 
-1. No durable storage backend yet: the only one, `memory`, loses history and sessions on restart (step 4 of `docs/STORAGE.md`).
-2. Unbounded per-client channels. Windows bound QoS 1 records per subscription, but QoS 0 records and replies to a slow reader still queue without limit.
-3. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
-4. Token expiry is only checked at `auth`.
-5. `max_connections` is ignored, and rate limits aren't configurable.
-6. No client libraries, release artefacts, health check or metrics.
+1. Unbounded per-client channels. Windows bound QoS 1 records per subscription, but QoS 0 records and replies to a slow reader still queue without limit.
+2. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
+3. Token expiry is only checked at `auth`.
+4. `max_connections` is ignored, and rate limits aren't configurable.
+5. No client libraries, release artefacts, health check or metrics.
 
 ## 13. Proposed direction
 
@@ -322,17 +326,17 @@ Replicate topic logs across three nodes with Raft (for example `openraft`). Only
   - `popsub_broker` checks seq order with eight concurrent publishers, that a subscriber joining with full replay while records are published gets every record exactly once, `truncated` frames, publisher retries delivered once, and retention. For QoS 1 it checks that ACKs and retries are per subscriber, that ACKs from other clients are ignored, stalling after `max_retries`, the window holding records back and catch-up from the log after ACKs, cursors only moving over contiguous ACKs, and a session resuming from its cursor after a reconnect and after the broker is rebuilt on the same storage, plus session takeover, clean start and expiry.
   - `popsub_transport` checks the exact JSON of every frame, that the broker's frames parse as `ServerMessage`, and drives a real server through publish confirmations, `from` replay, truncation, and a durable session that reconnects and gets back what it hadn't acknowledged.
 - CI runs `cargo fmt --check`, `cargo clippy -D warnings`, a build and the tests on every push and pull request to `main`. `make ci` runs the same locally.
-- Missing: restart recovery against a real persistent backend (the tests rebuild the broker on the same `MemoryStorage`; a true restart needs the `file` backend), and slow consumers that never read their socket.
+  - The `file` backend runs the same conformance suite with 256-byte segments, plus tests for torn writes, damaged segments, trimming across reopens, the directory lock and the session log. A crash test runs a child process that appends with `synced` durability, kills it at random points over four rounds, and checks every confirmed record is readable. A WebSocket test stops a whole server and starts a new one on the same directory, and a durable session resumes from its cursor.
+- Missing: slow consumers that never read their socket, and power-loss testing (killing a process doesn't lose what the operating system has buffered).
 
 ## 15. Why these choices
 
 - **WebSocket and JSON.** Works from browsers and every language without a custom client, at the cost of framing overhead and string-only payloads.
-- **One process and `sled`.** No external services to run, which suits demos, edge boxes and local development. The cost is no replication.
+- **One process and a directory of log files.** No external services to run, which suits demos, edge boxes and local development. The cost is no replication.
 - **A synchronous broker behind a lock.** The simplest correct starting point and easy to test without a runtime. Section 13 replaces it once contention matters.
 - **Why not Redis pub/sub or NATS?** For production use, one of those is usually the right answer. PopSub exists to understand the problem by building it, and to stay small enough to explain end to end.
 
 ## 16. Open questions
 
 - Is a per-topic task model enough, or do hot topics need sharding by subscriber?
-- Keep `sled`, or move to a plain append-only log file per topic, which would also make offsets and Raft simpler later?
 - Should payloads become bytes, with JSON as just one encoding?

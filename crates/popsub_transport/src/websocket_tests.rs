@@ -9,7 +9,7 @@ use crate::websocket::{RateLimiters, Server};
 use futures_util::{SinkExt, StreamExt};
 use popsub_broker::{Broker, LogSettings, SharedBroker, StartFrom};
 use popsub_config::Settings;
-use popsub_storage::MemoryStorage;
+use popsub_storage::{Durability, FileStorage, MemoryStorage, Storage};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -31,15 +31,47 @@ async fn start_server(
     settings: &Settings,
     limiters: RateLimiters,
 ) -> (std::net::SocketAddr, SharedBroker) {
+    let (addr, broker, _server) = start_server_on(
+        settings,
+        limiters,
+        Arc::new(MemoryStorage::new()),
+        Durability::None,
+    )
+    .await;
+    (addr, broker)
+}
+
+/// Starts a server on a free local port with the given storage.
+///
+/// Args:
+///     settings: The settings to configure the server's auth service and
+///         retention from.
+///     limiters: The rate limiters the server uses.
+///     storage: Where topic logs and sessions live.
+///     durability: The durability appends are stored at.
+///
+/// Returns:
+///     The address to connect to, the server's broker, and the task
+///     accepting connections, which the caller can abort to stop the server.
+async fn start_server_on(
+    settings: &Settings,
+    limiters: RateLimiters,
+    storage: Arc<dyn Storage>,
+    durability: Durability,
+) -> (
+    std::net::SocketAddr,
+    SharedBroker,
+    tokio::task::JoinHandle<()>,
+) {
     let broker = SharedBroker::new(
         Broker::new(settings.broker.clone()),
-        Arc::new(MemoryStorage::new()),
+        storage,
         LogSettings {
-            durability: settings.storage.durability,
+            durability,
             retention: settings.storage.retention.to_retention(),
         },
     )
-    .expect("memory storage accepts the default durability");
+    .expect("the backend accepts the requested durability");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
@@ -47,8 +79,8 @@ async fn start_server(
     let server = Server::from_settings(broker.clone(), &settings.server)
         .await
         .with_rate_limiters(limiters);
-    tokio::spawn(server.serve(listener));
-    (addr, broker)
+    let accepting = tokio::spawn(server.serve(listener));
+    (addr, broker, accepting)
 }
 
 /// Starts a server with default settings and limits and opens a TCP connection to it.
@@ -757,4 +789,86 @@ async fn wait_for_no_session(broker: &SharedBroker) -> bool {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     false
+}
+
+/// Checks that a durable session on the file backend resumes from its
+/// stored cursor after the whole server is stopped and a new one is started
+/// on the same data directory.
+#[tokio::test]
+async fn a_session_resumes_after_a_real_restart() {
+    let settings = Settings::default();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let storage = FileStorage::open(dir.path()).await.expect("open storage");
+    let (addr, broker, accepting) = start_server_on(
+        &settings,
+        RateLimiters::default(),
+        Arc::new(storage),
+        Durability::Synced,
+    )
+    .await;
+    let mut publisher = admin_connection(addr, &settings).await;
+    let (mut phone, _) = admin_session(addr, &settings, Some("phone")).await;
+    send_json(
+        &mut phone,
+        serde_json::json!({"type": "subscribe", "topic": "chat"}),
+    )
+    .await;
+    assert!(matches!(
+        next_frame(&mut phone).await,
+        ServerMessage::Subscribed(_)
+    ));
+    for payload in ["one", "two"] {
+        send_json(
+            &mut publisher,
+            serde_json::json!({"type": "publish", "topic": "chat", "payload": payload, "qos": 1}),
+        )
+        .await;
+        assert!(matches!(
+            next_frame(&mut publisher).await,
+            ServerMessage::Published { .. }
+        ));
+    }
+    assert_eq!(next_delivery(&mut phone).await.0, 1);
+    assert_eq!(next_delivery(&mut phone).await.0, 2);
+    send_json(
+        &mut phone,
+        serde_json::json!({"type": "ack", "topic": "chat", "seq": 1}),
+    )
+    .await;
+    settle(&mut phone, "settle-phone").await;
+    phone.close(None).await.expect("close");
+    publisher.close(None).await.expect("close");
+    drop((phone, publisher));
+    assert!(wait_for_no_clients(&broker).await);
+    accepting.abort();
+    drop(broker);
+
+    let mut reopened = None;
+    for _ in 0..200 {
+        match FileStorage::open(dir.path()).await {
+            Ok(storage) => {
+                reopened = Some(storage);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    let storage = reopened.expect("the old server released the data directory");
+    let (addr, _broker, _accepting) = start_server_on(
+        &settings,
+        RateLimiters::default(),
+        Arc::new(storage),
+        Durability::Synced,
+    )
+    .await;
+    let (mut phone, reply) = admin_session(addr, &settings, Some("phone")).await;
+    assert!(
+        matches!(&reply, ServerMessage::Authenticated { resumed, .. } if resumed.iter().any(|t| t == "chat")),
+        "{reply:?}"
+    );
+    match next_frame(&mut phone).await {
+        ServerMessage::Subscribed(s) => assert_eq!((s.replay_from, s.replay_to), (2, 2)),
+        other => panic!("expected subscribed, got {other:?}"),
+    }
+    assert_eq!(next_delivery(&mut phone).await, (2, "two".to_string()));
 }

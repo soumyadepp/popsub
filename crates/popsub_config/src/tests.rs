@@ -15,8 +15,9 @@ fn test_default_settings() {
     assert_eq!(settings.server.host, "127.0.0.1");
     assert_eq!(settings.server.port, 8080);
     assert_eq!(settings.broker.max_connections, 1000);
-    assert_eq!(settings.storage.backend, StorageBackend::Memory);
-    assert_eq!(settings.storage.durability, Durability::None);
+    assert_eq!(settings.storage.backend, StorageBackend::File);
+    assert_eq!(settings.storage.path, "pubsub_data");
+    assert_eq!(settings.storage.durability, Durability::Buffered);
     assert_eq!(settings.storage.retention.max_messages, 1000);
     assert_eq!(settings.storage.retention.max_age_secs, 3600);
     assert_eq!(settings.storage.session_expiry_secs, 86_400);
@@ -53,6 +54,7 @@ fn storage_settings_load_from_the_environment() {
     assert_eq!(settings.storage.retention.max_messages, 50);
     assert_eq!(settings.storage.retention.max_age_secs, 3600);
     assert_eq!(settings.storage.durability, Durability::None);
+    assert_eq!(settings.storage.backend, StorageBackend::Memory);
 }
 
 /// Checks that an unknown backend or durability name is an error.

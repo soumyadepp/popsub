@@ -1532,8 +1532,10 @@ name = "popsub_storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "crc32fast",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.12",
  "tokio",
 ]
@@ -1553,6 +1555,7 @@ dependencies = [
  "popsub_utils",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tracing",

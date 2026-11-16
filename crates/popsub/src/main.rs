@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::Parser;
 use popsub_broker::{Broker, LogSettings, SharedBroker, StartFrom};
 use popsub_config::{StorageBackend, StorageSettings, load_config};
-use popsub_storage::{MemoryStorage, Storage};
+use popsub_storage::{FileStorage, MemoryStorage, Storage};
 use popsub_transport::{ClientMessage, Server, ServerMessage};
 use tracing::{error, info, warn};
 
@@ -85,6 +85,8 @@ async fn main() -> ExitCode {
 ///     ConfigError::Type: When a setting from the file or the environment has
 ///         the wrong type, including an unknown backend or durability name.
 ///     String: When published default secrets are set and the host is not a loopback address.
+///     String: When the storage backend can't be opened, for example because
+///         another server is using its directory.
 ///     String: When `storage.durability` is stronger than the backend provides.
 ///     String: When `host:port` can't be bound, with the underlying I/O error.
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
@@ -104,7 +106,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let storage = open_storage(&config.storage);
+    let storage = open_storage(&config.storage).await?;
     let log = LogSettings {
         durability: config.storage.durability,
         retention: config.storage.retention.to_retention(),
@@ -140,11 +142,24 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returns:
 ///     The backend, ready to share.
-fn open_storage(settings: &StorageSettings) -> Arc<dyn Storage> {
+///
+/// Raises:
+///     String: When the `file` backend's directory can't be opened, for
+///         example because another server is using it, or holds damaged data.
+async fn open_storage(settings: &StorageSettings) -> Result<Arc<dyn Storage>, String> {
     match settings.backend {
+        StorageBackend::File => {
+            let storage = FileStorage::open(&settings.path)
+                .await
+                .map_err(|e| format!("can't open the message store in {}: {e}", settings.path))?;
+            info!(path = %settings.path, "file storage opened");
+            Ok(Arc::new(storage))
+        }
         StorageBackend::Memory => {
-            warn!("storage backend is memory: topic history is lost when the server stops");
-            Arc::new(MemoryStorage::new())
+            warn!(
+                "storage backend is memory: topic history and sessions are lost when the server stops"
+            );
+            Ok(Arc::new(MemoryStorage::new()))
         }
     }
 }

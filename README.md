@@ -15,7 +15,7 @@ What's in the workspace
 - `crates/popsub_transport`: WebSocket protocol handling, and enforcing auth, permissions and rate limits
 - `crates/popsub_auth`: users, roles, password hashing, JWTs and topic permissions
 - `crates/popsub_ratelimit`: token bucket, sliding window and login lockout limiters
-- `crates/popsub_storage`: topic logs, the storage traits, the in-memory backend and the conformance suite
+- `crates/popsub_storage`: topic logs, the storage traits, the file and in-memory backends and the conformance suite
 - `crates/popsub_persistence`: the old `sled` store, no longer used and due to be removed
 - `crates/popsub_client`: the server-side record of one connection (not a client library)
 - `crates/popsub_config`: config loader and settings
@@ -62,8 +62,9 @@ Configuration
   max_inflight = 100
 
   [storage]
-  backend = "memory"
-  durability = "none"
+  backend = "file"
+  path = "pubsub_data"
+  durability = "buffered"
   session_expiry_secs = 86400
 
   [storage.retention]
@@ -72,7 +73,9 @@ Configuration
   max_bytes = 67108864
   ```
 
-- `memory` is the only backend so far, so topic history is lost when the server stops. A file backend that survives restarts is planned (`docs/STORAGE.md`). The server refuses to start if `durability` is stronger than the backend can provide.
+- `backend = "file"` (the default) keeps topic history and durable sessions in the `path` directory, so they survive restarts. Only one server can use a directory at a time. `backend = "memory"` keeps everything in the process and loses it when the server stops.
+- `durability` is how firmly each publish is stored before it is confirmed: `buffered` (the default) survives the server crashing, `synced` also survives a power cut, at the cost of a disk flush per publish. The server refuses to start if the backend can't provide what you ask for.
+- `make reset-data` deletes `pubsub_data`.
 
 - The server refuses to listen on anything other than localhost while `jwt_secret` or the admin `password` still have their published default values. On localhost it starts with a warning.
 - Registration is off by default. Turn it on with `allow_registration = true` under `[server]`. `registration_role` decides what new users can do: `none` (the default, no topics until an admin grants them), `readonly` or `full`.

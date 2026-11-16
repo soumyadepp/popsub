@@ -36,7 +36,7 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
-| `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the memory backend and the conformance suite |
+| `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
 | `crates/popsub_persistence` | The old `sled` store. Nothing uses it; removed in step 6 of `docs/STORAGE.md` |
 | `crates/popsub_client` | `Client`, the server-side record of one connection (not a client library) |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
@@ -63,15 +63,16 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - **Storage I/O belongs in the topic writer**, never under the broker lock. Publishes and subscribes for a topic go through its writer so they are handled one at a time; don't add a path that appends or replays around it.
 - **New settings** go in `popsub_config/src/settings.rs` (the field and its struct's `Default`), `config/default.toml`, and section 9 of the design doc. Keys containing an underscore are set from the environment with a double underscore after the section (`SERVER__JWT_SECRET`).
 - **Security defaults stay closed.** Registration off, new users with no topics, published secrets refused on public addresses. Don't loosen these without a setting that defaults to the closed behaviour.
-- Don't commit generated or local files: `target/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.
+- Don't commit generated or local files: `target/`, `pubsub_data/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.
 
 ## Gotchas
 
 - Delivered records and `truncated` frames are serialised by the broker (`TopicFrame`), not by the transport. `ServerMessage` wraps the same structs; keep the test that parses one as the other.
 - A subscribe is answered by a `subscribed` frame from the broker, but a QoS 0 publish has no reply. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
 - Durable sessions are keyed by `session_key(username, session_id)`. Never key them by the client's `session_id` alone, or one user could attach to another's session.
-- QoS 1 is at-least-once per subscriber while connected, and across reconnects only for durable sessions whose records are still retained. With the `memory` backend nothing survives a restart. Don't describe it more strongly in docs or READMEs.
-- `broker.max_connections` is loaded but not used. The only storage backend is `memory`, so history is lost on restart until the `file` backend lands.
+- QoS 1 is at-least-once per subscriber while connected, and across reconnects only for durable sessions whose records are still retained. With the `file` backend (the default) sessions and history survive restarts; with `memory` nothing does. Don't describe it more strongly in docs or READMEs.
+- `broker.max_connections` is loaded but not used.
+- The `file` backend locks `storage.path` (`pubsub_data` by default). Two servers can't share a working directory: the second exits. Tests use a temporary directory or `MemoryStorage`, never `pubsub_data`.
 - The JWT secret default differs between code (`default_secret`), `config/default.toml` (`a_very_secret_key`) and the auth crate (`change_me_in_production`). All three are treated as published; the server refuses them on non-loopback hosts.
 - Rate limits key on the socket address. Behind a proxy every client shares one address.
 - There's no protocol message to grant topics, so self-registered users with the default `none` role can do nothing until their role is changed in code.
