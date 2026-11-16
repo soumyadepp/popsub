@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Being implemented. Step 1 of the rollout (the `popsub_storage` crate) is done |
+| Status | Being implemented. Steps 1 (the `popsub_storage` crate) and 2 (the broker on the log) are done |
 | Owner | Soumyadeep Ghosh |
 | Replaces | `popsub_persistence` (the `sled` replay store) and the in-memory `pending_acks` table |
 | Related | `docs/DESIGN.md` sections 6, 7, 12 and 13 (phase 1) |
@@ -300,7 +300,7 @@ max_inflight = 100
 | Failure | Behaviour |
 |---|---|
 | Append fails | QoS 1 publisher gets `{"type":"error","message":"storage unavailable"}` and no `published` frame, so it retries. QoS 0 is logged and dropped. |
-| Read fails during replay | Subscriber gets an error for that topic; the subscription is kept and the client can resubscribe. |
+| Read fails during replay | Subscriber gets an error for that topic and is not subscribed, so it never receives live records with a gap before them. It can subscribe again. |
 | Cursor update fails | Logged and retried in the background. The worst case is resending records the client already acknowledged, which at-least-once allows. |
 | `file` finds a corrupt record mid-segment | Startup fails with the segment and offset, rather than serving data that failed its checksum. A repair command can truncate at that point. |
 | Disk full | Appends fail as above. The server stays up and keeps delivering what is already stored. |
@@ -357,7 +357,7 @@ Moving appends out of the broker lock (into per-topic writers) is itself expecte
 Stacked pull requests, each merged on its own with tests:
 
 1. **`popsub_storage` crate:** types, traits, `memory` backend, conformance suite. Nothing uses it yet.
-2. **Broker on the log:** per-topic writers, `seq` on every record, tagged `message` delivery frames, `subscribe` with `from`, `truncated` frames. Ephemeral connections only. Protocol change, documented in the README and design doc.
+2. **Broker on the log:** per-topic writers, `seq` on every record, tagged `message` delivery frames, `subscribe` with `from`, `truncated` frames, the `[storage]` settings and the retention loop. Ephemeral connections only. Protocol change, documented in the README and design doc. Until step 4, the only backend is `memory`, so history no longer survives a restart.
 3. **Sessions and cursors:** `session_id` and `clean_start`, per-subscription in-flight windows, `ack` by `topic` and `seq`, `published` confirmations, `stalled` frames. Removes `pending_acks`. Tests for several subscribers, reconnects and acks from the wrong session.
 4. **`file` backend:** segments, index, recovery, group commit, crash test. Becomes the default.
 5. **`postgres` backend**, run against a real database in CI (a Postgres service container).

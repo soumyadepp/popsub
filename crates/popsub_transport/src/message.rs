@@ -1,9 +1,11 @@
 //! JSON frames exchanged between WebSocket clients and the server.
 //!
-//! Every frame is an object tagged by its `type` field. Delivered topic messages
-//! are the exception: the broker serialises its own `Message` directly, without a
-//! `type` field, so `ServerMessage::Message` is defined but not sent today.
+//! Every frame is an object tagged by its `type` field. Delivered records and
+//! `truncated` notices are written by the broker, which serialises its own
+//! `popsub_broker::TopicFrame` with the same tags; `ServerMessage` wraps the
+//! same structs, so clients parse every server frame through this one enum.
 
+use popsub_broker::{Delivery, StartFrom, Truncated};
 use serde::{Deserialize, Serialize};
 
 /// A frame sent by a client, tagged by its `type` field.
@@ -22,9 +24,15 @@ pub enum ClientMessage {
     /// Creates a user account, if registration is enabled on the server.
     #[serde(rename = "register")]
     Register { username: String, password: String },
-    /// Starts delivery of a topic's messages to this connection.
+    /// Starts delivery of a topic's messages to this connection, after
+    /// replaying the history `from` asks for. Without `from`, nothing is
+    /// replayed: `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`.
     #[serde(rename = "subscribe")]
-    Subscribe { topic: String },
+    Subscribe {
+        topic: String,
+        #[serde(default)]
+        from: StartFrom,
+    },
     /// Stops delivery of a topic's messages to this connection.
     #[serde(rename = "unsubscribe")]
     Unsubscribe { topic: String },
@@ -58,14 +66,11 @@ pub enum ServerMessage {
     /// A failed request, rate limit or authorization denial.
     #[serde(rename = "error")]
     Error { message: String },
-    /// A topic message in tagged form. Defined but not sent: deliveries use the
-    /// broker's untagged `Message` instead.
+    /// A record from a subscribed topic, live or replayed, with its `seq`.
     #[serde(rename = "message")]
-    Message {
-        topic: String,
-        payload: String,
-        timestamp: i64,
-        message_id: String,
-        qos: u8,
-    },
+    Message(Delivery),
+    /// Replay for a topic starts later than asked because older records were
+    /// trimmed. Sent before the first replayed record.
+    #[serde(rename = "truncated")]
+    Truncated(Truncated),
 }

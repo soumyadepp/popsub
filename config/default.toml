@@ -11,6 +11,14 @@ registration_role = "none"
 
 [broker]
 max_connections = 1000
-message_ttl_secs = 3600
 ack_timeout_ms = 5000
 max_retries = 5
+
+[storage]
+backend = "memory"
+durability = "none"
+
+[storage.retention]
+max_messages = 1000
+max_age_secs = 3600
+max_bytes = 67108864

@@ -1,5 +1,7 @@
 # popsub_persistence
 
+**Unused.** Nothing in the workspace depends on this crate since the broker moved onto `popsub_storage`. It is deleted in step 6 of `docs/STORAGE.md`; don't build on it.
+
 Stores recent messages per topic in an embedded `sled` database so new subscribers can be replayed history.
 
 ## Layout

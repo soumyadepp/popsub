@@ -1,6 +1,6 @@
 # popsub_storage
 
-The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered records, durable subscription cursors, the traits a backend implements, the in-memory backend, and the conformance suite. Nothing in the server uses it yet; the broker moves onto it in rollout step 2.
+The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered records, durable subscription cursors, the traits a backend implements, the in-memory backend, and the conformance suite. The broker's topic writers use it for every publish and replay, and `popsub_config` uses `Durability` and `Retention` for the `[storage]` settings.
 
 ## Files
 

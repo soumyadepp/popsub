@@ -1,6 +1,6 @@
 # PopSub: a small WebSocket pub/sub server in Rust
 
-PopSub is a small publish/subscribe server written in Rust, meant to be easy to run locally and to read end to end. It supports WebSocket clients, topic-based subscribe/publish, a small JSON protocol, a replay buffer for recent messages, and a QoS 1 option with acknowledgements and retries (at-least-once for a single subscriber that stays connected; see `docs/DESIGN.md` section 6).
+PopSub is a small publish/subscribe server written in Rust, meant to be easy to run locally and to read end to end. It supports WebSocket clients, topic-based subscribe/publish, a small JSON protocol, per-topic logs with sequence numbers that subscribers can replay from, and a QoS 1 option with acknowledgements and retries (at-least-once for a single subscriber that stays connected; see `docs/DESIGN.md` section 6).
 
 Why this exists
 
@@ -11,11 +11,12 @@ Why this exists
 What's in the workspace
 
 - `crates/popsub`: the CLI (subcommands `server` and `client`)
-- `crates/popsub_broker`: in-memory broker logic (topics, routing, retries)
+- `crates/popsub_broker`: broker logic (topic writers, routing, replay, retries)
 - `crates/popsub_transport`: WebSocket protocol handling, and enforcing auth, permissions and rate limits
 - `crates/popsub_auth`: users, roles, password hashing, JWTs and topic permissions
 - `crates/popsub_ratelimit`: token bucket, sliding window and login lockout limiters
-- `crates/popsub_persistence`: sled storage of recent messages per topic
+- `crates/popsub_storage`: topic logs, the storage traits, the in-memory backend and the conformance suite
+- `crates/popsub_persistence`: the old `sled` store, no longer used and due to be removed
 - `crates/popsub_client`: the server-side record of one connection (not a client library)
 - `crates/popsub_config`: config loader and settings
 - `crates/popsub_utils`: shared error type and logging
@@ -46,7 +47,7 @@ The client logs in (to get a JWT), authenticates, subscribes to `chat`, publishe
 
 Configuration
 
-- The loader reads `config/default.toml` if present, then environment variables, which win. Single-word keys use one underscore after the section (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need two (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`).
+- The loader reads `config/default.toml` if present, then environment variables, which win. Single-word keys use one underscore after the section (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need two (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`), and so do nested sections (`STORAGE__RETENTION__MAX_MESSAGES`).
 - Example `config/default.toml`:
 
   ```toml
@@ -56,9 +57,20 @@ Configuration
   jwt_secret = "a_very_secret_key"
 
   [broker]
-  max_connections = 1000
-  message_ttl_secs = 3600
+  ack_timeout_ms = 5000
+  max_retries = 5
+
+  [storage]
+  backend = "memory"
+  durability = "none"
+
+  [storage.retention]
+  max_messages = 1000
+  max_age_secs = 3600
+  max_bytes = 67108864
   ```
+
+- `memory` is the only backend so far, so topic history is lost when the server stops. A file backend that survives restarts is planned (`docs/STORAGE.md`). The server refuses to start if `durability` is stronger than the backend can provide.
 
 - The server refuses to listen on anything other than localhost while `jwt_secret` or the admin `password` still have their published default values. On localhost it starts with a warning.
 - Registration is off by default. Turn it on with `allow_registration = true` under `[server]`. `registration_role` decides what new users can do: `none` (the default, no topics until an admin grants them), `readonly` or `full`.
@@ -89,8 +101,11 @@ Protocol basics (short)
 
   ```json
   { "type": "subscribe", "topic": "chat" }
+  { "type": "subscribe", "topic": "chat", "from": { "last": 50 } }
   { "type": "unsubscribe", "topic": "chat" }
   ```
+
+  Without `from`, a subscriber gets only messages published after it subscribes. To replay history first, `from` can be `"new"`, `{ "last": N }`, `{ "since_ms": <unix ms> }` or `{ "seq": S }`. Replayed and live messages arrive in `seq` order with no gap or repeat between them. If some of the requested history was already trimmed, a `{ "type": "truncated", "topic": "chat", "first_available": 1300 }` frame comes first. There is no reply to a successful subscribe; a failure gets an `error` frame.
 
 - Publish:
 
@@ -99,6 +114,16 @@ Protocol basics (short)
 
   { "type": "publish", "topic": "critical", "payload": "Important", "message_id": "id-123", "qos": 1 }
   ```
+
+  Publishing the same `message_id` again from the same user (for example, retrying after a dropped connection) stores and delivers it once. When `message_id` is missing the server generates one.
+
+- Messages arrive as:
+
+  ```json
+  { "type": "message", "topic": "chat", "seq": 42, "message_id": "id-123", "payload": "Hello", "qos": 1, "published_at_ms": 1794800000000 }
+  ```
+
+  `seq` is the message's position in the topic, starting at 1. Use `(topic, seq)` to spot duplicates.
 
 - Acknowledge QoS=1 messages:
 

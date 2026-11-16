@@ -40,20 +40,20 @@ This document describes how the system works today, where its guarantees hold an
  popsub_broker      popsub_auth          popsub_ratelimit
  (topics, QoS 1)    (users, JWT, RBAC)   (token bucket, sliding window, lockouts)
         |
- popsub_persistence   popsub_client (per-connection record)
-        |
- popsub_utils (errors, logging)       popsub_config (settings loader)
+ popsub_client (per-connection record)   popsub_config (settings loader)
+        |                                        |
+ popsub_utils (errors, logging)          popsub_storage (topic logs, Storage traits, backends)
 ```
 
 | Crate | Responsibility |
 |---|---|
-| `popsub` | Binary. Parses the CLI, loads config, refuses published default secrets on public addresses, opens the message store, starts the broker, the retry loop and the WebSocket server, and exits with a failure status when any of that fails. Also contains a small demo client. |
+| `popsub` | Binary. Parses the CLI, loads config, refuses published default secrets on public addresses, opens the configured storage backend, starts the broker, the retry and retention loops and the WebSocket server, and exits with a failure status when any of that fails. Also contains a small demo client. |
 | `popsub_transport` | `Server` (shared state and the accept loop) and `Session` (one connection, one method per message type). Parses `ClientMessage` JSON, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls. |
 | `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
-| `popsub_broker` | The engine: topics, subscriber sets, publishing, QoS 1 pending table and retries, replay on subscribe. Synchronous API, shared through `SharedBroker`. |
-| `popsub_persistence` | `sled` store of recent messages per topic, with a TTL and a per-topic cap. |
-| `popsub_storage` | The storage layer proposed in `docs/STORAGE.md`: per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, an in-memory backend and the conformance suite every backend must pass. Not wired into the broker yet. |
+| `popsub_broker` | One writer task per topic that appends to the log, fans records out in `seq` order and replays history to subscribers; the synchronous `Broker` with subscriber sets and the QoS 1 pending table; all shared through `SharedBroker`. |
+| `popsub_storage` | Per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, an in-memory backend and the conformance suite every backend must pass (`docs/STORAGE.md`). |
+| `popsub_persistence` | The old `sled` store. Nothing uses it any more; removed in step 6 of `docs/STORAGE.md`. |
 | `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
 | `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
 | `popsub_utils` | `PopSubError`, the shared `Result` alias, and logging setup. |
@@ -63,18 +63,21 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 ### 3.2 Runtime
 
 ```
- socket --> Session (connection task) --SharedBroker::with--> Broker --> client channel (unbounded mpsc) --> send loop --> socket
-            |  replies go straight to the session's own channel           ^
-            |                                    retry loop (every 1s)    |
-            +--> AuthService (RwLock, released before the broker is used)  v
-                                                                         sled
+ socket --> Session (connection task) --publish/subscribe--> topic writer (one task per topic) --append/read--> Storage
+            |                                                      |
+            |                                                      +--SharedBroker::with--> Broker --> client channel --> send loop --> socket
+            |--SharedBroker::with (unsubscribe, ack, auth state)-->                          ^
+            |  replies go straight to the session's own channel          retry loop (1s) ---+
+            +--> AuthService                                              retention loop (60s) --> Storage
 ```
 
 - **Server.** Holds what every connection shares (broker, auth service, rate limiters) and runs the accept loop. A failed `accept` is logged and retried after 100 ms instead of stopping the server.
 - **Session.** One per socket, in its own task. Reads frames, parses JSON, and calls the method for the message type. Replies are queued on the session's own outgoing channel, so replying never takes the broker lock.
 - **Send loop.** One per socket. Drains the client's channel and writes frames. Whichever of the session and the send loop ends first removes the client from the broker.
+- **Topic writer.** One task per topic, started on first use. Every publish and subscribe for the topic is queued to it and handled one at a time: it appends to the topic log in storage without holding the broker lock, then takes the lock briefly to fan the record out. Subscribes replay history from the log and then add the subscriber, with no publish handled in between, so replay and live delivery never overlap or leave a gap.
 - **Broker.** A `SharedBroker`: the broker behind one `std::sync::Mutex`, reachable only through `with(|broker| ...)`. A closure can't await, so the lock is never held across an await point. If a task panics while holding it, the next caller logs the poisoning and carries on with the broker's state instead of panicking too.
 - **Retry loop.** `SharedBroker::run_retry_loop` wakes every second and runs one `Broker::retry_overdue` pass, which resends overdue QoS 1 messages and drops those out of retries.
+- **Retention loop.** `SharedBroker::run_retention_loop` trims every topic log to the retention limits once a minute, so quiet topics still age out. Publishing also trims the topic it appended to.
 - **Auth service.** A plain `Arc<AuthService>`. Its methods take `&self` and the user store locks internally, so it needs no lock of its own and can never be held together with the broker lock.
 - **Prune task.** Every minute, drops rate limiter entries for keys that have gone quiet. It stops when the server stops.
 
@@ -89,9 +92,9 @@ All frames are JSON text. Client messages are tagged with `type`.
 | `register` | `username`, `password` | Only when `server.allow_registration` is on. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`; passwords at least 8 characters. Allowed before `auth`. |
 | `login` | `username`, `password` | Checked against the user store (Argon2id). Returns a JWT. Rate limited, see section 10. |
 | `auth` | `token` | Must succeed before anything below is accepted. A bad token closes the connection. |
-| `subscribe` | `topic` | Requires subscribe permission for the topic. Creates the topic if needed and replays stored messages. |
+| `subscribe` | `topic`, optional `from` | Requires subscribe permission for the topic. `from` is `"new"` (the default: no replay), `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`. History is replayed before live delivery starts. No reply on success; an `error` if the history can't be read, in which case the client is not subscribed. |
 | `unsubscribe` | `topic` | |
-| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | Requires publish permission and is rate limited per user. Broker sets `timestamp` and generates `message_id` when missing. |
+| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | Requires publish permission and is rate limited per user. The broker sets the publish time and generates `message_id` when missing. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, a QoS 1 publisher gets `storage unavailable`. |
 | `ack` | `message_id` | Confirms a QoS 1 delivery. |
 
 ### 4.2 Server to client
@@ -102,9 +105,10 @@ All frames are JSON text. Client messages are tagged with `type`.
 | Login result | `{"type":"login_response","token":"..."}` |
 | Auth result | `{"type":"authenticated"}` |
 | Error | `{"type":"error","message":"..."}` |
-| Delivered message | `{"topic":"...","payload":"...","timestamp":0,"message_id":"...","qos":0}` |
+| Delivered message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
+| Trimmed history | `{"type":"truncated","topic":"...","first_available":1300}`, sent before a replay that starts later than asked |
 
-**Inconsistency to fix:** delivered messages are the broker's `Message` struct serialised directly, so they carry no `type` field. `ServerMessage::Message` exists in the transport crate but is never used. Clients currently have to detect deliveries by the absence of `type`. Section 12 proposes wrapping deliveries in `ServerMessage::Message`.
+The broker writes the last two itself (`popsub_broker::TopicFrame`). `ServerMessage::Message` and `ServerMessage::Truncated` wrap the same structs, and a test checks that what the broker writes parses as a `ServerMessage`. The publisher's username is stored but not sent to subscribers.
 
 ### 4.3 Session order
 
@@ -118,16 +122,20 @@ All frames are JSON text. Client messages are tagged with `type`.
 
 ### 5.1 Publish
 
-1. Transport parses the frame and builds a `Message`, using the client's `message_id` if given.
-2. Under the broker lock: set the timestamp, generate an id if missing, insert into `pending_acks` when `qos == 1`, write the topic and payload to `sled`, serialise, and push the frame into every subscriber's channel.
-3. If the topic has no subscribers the message is still stored, and a QoS 1 message still sits in `pending_acks` until the retry loop gives up on it.
+1. Transport checks permission and the rate limit, then builds a `NewRecord` with the publisher's username and the client's `message_id` if given.
+2. `SharedBroker::publish` sets the publish time, generates an id if missing, and queues the record to the topic's writer.
+3. The writer appends it to the topic log at the configured durability, without the broker lock. The log numbers it with the next `seq`, or returns the original record if this publisher already sent this id.
+4. If the record is new, the writer takes the broker lock, inserts it into `pending_acks` when `qos == 1`, and pushes a `message` frame into every subscriber's channel. Then it trims the log to the retention limits.
+5. If the topic has no subscribers the record is still stored, and a QoS 1 record still sits in `pending_acks` until the retry loop gives up on it.
 
 ### 5.2 Subscribe and replay
 
-1. Under the broker lock: add the client to the topic's subscriber set, creating the topic if needed.
-2. Load every stored message for the topic (after deleting expired ones) and push each to the client as QoS 0 with a fresh `message_id`.
+1. Transport checks permission and queues the subscribe to the topic's writer.
+2. The writer reads the log's bounds and resolves `from` to a starting `seq`. If part of the requested history was trimmed, it sends a `truncated` frame first.
+3. It reads the log from there to the current end in pages of 256 and sends each record with its original `seq`. Replayed records are not added to `pending_acks`.
+4. It adds the client to the topic's subscriber set. No publish to the topic is handled between steps 2 and 4, so the client's first live record is the one after the last replayed record.
 
-Replay happens on every subscribe, so a client that reconnects receives the whole retained history again.
+A subscribe without `from` replays nothing.
 
 ### 5.3 Acknowledgement and retry
 
@@ -138,32 +146,31 @@ Replay happens on every subscribe, so a client that reconnects receives the whol
 
 | | What the code guarantees today |
 |---|---|
-| QoS 0 | At most once, to subscribers connected at publish time. Plus replay of retained history on every subscribe. |
+| QoS 0 | At most once, to subscribers connected at publish time. Retained history is replayed only when the subscriber asks for it with `from`. |
 | QoS 1, one subscriber that stays connected | At least once, within `max_retries` attempts. |
 | QoS 1, several subscribers | Not at least once. The first ACK from any subscriber clears the message for all of them. Retries go to every subscriber, including those that already acknowledged. |
 | QoS 1, subscriber disconnects | Not at least once. The client record and its subscriptions are deleted on disconnect, and a reconnect gets a new identity. |
 | QoS 1, broker restarts | Not at least once. `pending_acks` lives only in memory. |
-| Ordering | Per publisher and topic, while the lock serialises everything. Retries and replays can arrive out of order. |
-| Duplicates | Possible and not detectable: replays get fresh ids, and retries reuse the id but go to everyone. |
+| Ordering | Per topic, every subscriber receives new records in `seq` order, and a replay followed by live delivery has no gap or repeat. Retries are resent out of order. |
+| Duplicates | Detectable: every delivery, replay and retry carries the record's `seq`, so consumers deduplicate by `(topic, seq)`. A publisher retrying with the same `message_id` doesn't create a second record. Retries still go to every subscriber. |
+| Retention | History beyond `storage.retention` is trimmed. A subscriber that asks for trimmed history is told with a `truncated` frame. With the `memory` backend, all history is lost on restart. |
 
 The README and the portfolio both describe PopSub as at-least-once. That is only accurate for the single-subscriber, always-connected case, and should be stated that way until the phase 1 work lands.
 
 ## 7. Persistence
 
-This section describes the current `sled` store. `docs/STORAGE.md` proposes replacing it.
+The design is in `docs/STORAGE.md`; rollout steps 1 and 2 are done.
 
-- One `sled` tree per topic. Key: 20-digit millisecond timestamp, underscore, UUID, so iteration is chronological. Value: JSON `{topic, payload, timestamp}`.
-- The message id and QoS level are not stored.
-- On write, if the tree exceeds `max_messages_per_topic`, the oldest keys are deleted.
-- On read, keys older than `ttl_seconds` are deleted first.
-- The binary opens the store at `pubsub_db` relative to the working directory, with the TTL from `broker.message_ttl_secs` and a cap of 1000 messages per topic. The path and cap aren't configurable. `sled` locks the directory, so a second server started from the same directory exits with an error instead of sharing it.
-- The broker never opens a store itself: `Broker::new` takes an open `Persistence`, so a store that can't be opened is an error the caller reports, not a panic.
-- `sled` 0.34 has been the stable line for years while its successor stays in alpha. It is fine for this scale, but it is a dependency risk worth tracking.
+- Each topic is an append-only log of records in a `popsub_storage::Storage` backend. A record keeps its topic, `seq`, message id, publisher, payload, QoS and publish time.
+- `storage.backend` picks the backend. Only `memory` exists so far, so history doesn't survive a restart; the `file` backend (step 4) will. Any `Storage` implementation can be used by building the server in code.
+- `storage.durability` is checked against the backend at startup and refused if the backend can't provide it.
+- `storage.retention` limits each topic by record count, age and bytes. Logs are trimmed after each publish and by the retention loop every minute.
+- `popsub_persistence` (the old `sled` store) is no longer used by anything and is removed in step 6.
 
 ## 8. Concurrency
 
-- Every operation takes the same `std::sync::Mutex`, through `SharedBroker::with`. Publishes, subscribes, ACKs, connects, disconnects and the retry loop all queue behind each other.
-- `sled` writes and full-history replays happen while the lock is held, so one slow disk write stalls every client.
+- Broker state (clients, subscriber sets, `pending_acks`) is behind one `std::sync::Mutex`, through `SharedBroker::with`. It is held only for short, non-blocking work: fan-out, subscriber changes, ACKs, connects, disconnects and retry passes.
+- Storage I/O happens in the topic writers, outside the lock. Each topic's publishes and subscribes are handled one at a time by its writer, so a long replay delays publishes to that topic only.
 - Each client's outbound channel is unbounded. A subscriber that reads slower than publishers write grows server memory without limit.
 - The lock is never held across an `.await`, which keeps the synchronous mutex safe inside Tokio.
 
@@ -171,7 +178,7 @@ This section describes the current `sled` store. `docs/STORAGE.md` proposes repl
 
 Sources, later ones winning: built-in defaults, `config/default.toml`, then environment variables.
 
-Environment variables name a section and a key. Keys made of one word take a single underscore (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need a double underscore after the section (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`), because a single underscore can't tell the section from the key.
+Environment variables name a section and a key. Keys made of one word take a single underscore (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need a double underscore after the section (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`), because a single underscore can't tell the section from the key. Nested sections use a double underscore at every level (`STORAGE__RETENTION__MAX_AGE_SECS`).
 
 | Key | Default | Used by |
 |---|---|---|
@@ -183,9 +190,13 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.allow_registration` | `false` | Auth |
 | `server.registration_role` | `none` | Auth. `none`, `readonly` or `full`; anything else means `none` |
 | `broker.max_connections` | `1000` | Nothing. Not enforced. |
-| `broker.message_ttl_secs` | `3600` | Message store TTL |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop |
+| `storage.backend` | `memory` | The binary. Only `memory` so far |
+| `storage.durability` | `none` | Topic writers. `none`, `buffered` or `synced`; refused at startup if the backend can't provide it |
+| `storage.retention.max_messages` | `1000` | Trimming |
+| `storage.retention.max_age_secs` | `3600` | Trimming |
+| `storage.retention.max_bytes` | `67108864` | Trimming. Counts message ids, publishers and payloads |
 
 Rate limits are set in code (`RateLimiters::default`), not in config.
 
@@ -230,30 +241,32 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 |---|---|
 | Subscriber socket drops | Send loop ends, client and subscriptions are removed. Pending QoS 1 messages for it are lost. |
 | Subscriber reads slowly | Its channel grows without bound until memory runs out. |
-| Publisher sends to a topic nobody subscribes to | Stored for replay. QoS 1 entry lingers until retries are exhausted. |
+| Publisher sends to a topic nobody subscribes to | Stored in the topic log. QoS 1 entry lingers until retries are exhausted. |
+| A publisher retries a message after a dropped connection | Same user and `message_id`: stored and delivered once, while the original is retained. |
 | Two publishers reuse a `message_id` | The second overwrites the first in `pending_acks`. |
 | Someone guesses a user's password | That address and username pair locks out after 5 failures; the address locks out after 20 across all usernames. The real user, from another address, is unaffected. |
 | A client floods publishes | Its user's token bucket empties and further publishes get an error until it refills. |
 | The server restarts | Self-registered users are lost with the in-memory store. The admin is recreated from config. |
-| `sled` write fails | Logged. The message is still delivered live. |
-| Broker process restarts | Retained history survives. In-flight QoS 1 state and all sessions are lost. |
+| Storage append fails | Nothing is delivered. A QoS 1 publisher gets `storage unavailable` and can retry; QoS 0 is logged and dropped. |
+| Storage read fails during a subscribe | The client gets an error and is not subscribed. It can subscribe again. |
+| A subscriber asks for history that was trimmed | It gets a `truncated` frame with the oldest available `seq`, then the rest. |
+| Broker process restarts | With the `memory` backend, all history is lost. In-flight QoS 1 state and all sessions are lost. |
 | A task panics while holding the broker lock | The mutex is poisoned. The next `SharedBroker::with` logs it and carries on with the broker's state, so other connections keep working. |
 | `accept` fails, for example out of file descriptors | Logged, and the accept loop retries after 100 ms. |
-| The port is taken, or another server holds the store | The binary logs the reason and exits with a failure status. |
+| The port is taken, or `storage.durability` is stronger than the backend provides | The binary logs the reason and exits with a failure status. |
 
 ## 12. Known gaps, in priority order
 
 1. ACK state is per message instead of per subscriber.
 2. No durable sessions or stable client identity.
-3. No resume from an offset. Replay resends all history with new ids.
+3. No resume from a stored cursor. Subscribers can replay from a `seq` or a time, but the server doesn't remember where they were (step 3 of `docs/STORAGE.md`).
 4. Unbounded per-client queues.
-5. One global lock, with disk I/O inside it.
-6. Publisher-chosen ids can collide.
-7. Delivered messages lack a `type` tag.
-8. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
-9. Token expiry is only checked at `auth`.
-10. `max_connections` is ignored, the storage path and per-topic cap are hard-coded, and rate limits aren't configurable.
-11. No client libraries, release artefacts, health check or metrics.
+5. `pending_acks` is keyed by message id alone, so two publishers using the same id overwrite each other's pending entry.
+6. No durable storage backend yet: the only one, `memory`, loses history on restart (step 4).
+7. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
+8. Token expiry is only checked at `auth`.
+9. `max_connections` is ignored, and rate limits aren't configurable.
+10. No client libraries, release artefacts, health check or metrics.
 
 ## 13. Proposed direction
 
@@ -283,7 +296,7 @@ Remaining:
 
 ### Phase 3: adoptable
 
-- Wrap deliveries in `ServerMessage::Message` and publish a versioned protocol spec.
+- Publish a versioned protocol spec.
 - JavaScript and Python client libraries with reconnection and ACK handling built in.
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.
@@ -295,9 +308,12 @@ Replicate topic logs across three nodes with Raft (for example `openraft`). Only
 
 ## 14. Testing
 
-- 97 tests on `main` across the crates: topic and broker unit tests, persistence round trips, config loading including environment variables, auth (registration rules, roles, wildcards, tokens, default secrets), rate limiters (including concurrent resets and pruning), and WebSocket tests that start a real server on a free port and drive registration, login, lockouts, auth and errors.
+- Every crate has unit tests; `make test` runs them all. The ones that pin down delivery:
+  - `popsub_storage` runs its 21-check conformance suite against `MemoryStorage`.
+  - `popsub_broker` checks seq order with eight concurrent publishers, that a subscriber joining with full replay while records are published gets every record exactly once, `truncated` frames, publisher retries delivered once, and retention on publish and in the background loop. Both concurrency tests fail if publishes and subscribes stop going through one writer per topic.
+  - `popsub_transport` checks the exact JSON of every frame, that the broker's frames parse as `ServerMessage`, and drives a real server through publish, `from` replay and truncation.
 - CI runs `cargo fmt --check`, `cargo clippy -D warnings`, a build and the tests on every push and pull request to `main`. `make ci` runs the same locally.
-- Missing: tests for QoS 1 with several subscribers, reconnection, restart recovery and slow consumers. These are the tests phase 1 should start with, written first and failing.
+- Missing: tests for QoS 1 with several subscribers, reconnection, restart recovery and slow consumers. Step 3 of `docs/STORAGE.md` adds the first two; restart recovery needs the `file` backend.
 
 ## 15. Why these choices
 

@@ -14,7 +14,9 @@ use std::path::Path;
 
 use config::{Config, ConfigError, Environment, File};
 
-pub use settings::{BrokerSettings, ServerSettings, Settings};
+pub use settings::{
+    BrokerSettings, RetentionSettings, ServerSettings, Settings, StorageBackend, StorageSettings,
+};
 
 /// Where `load_config` looks for the config file, relative to the working
 /// directory and without its `.toml` extension.
@@ -26,7 +28,8 @@ pub const DEFAULT_CONFIG_FILE: &str = "config/default";
 /// with one underscore (`SERVER_PORT`). Keys that contain an underscore need
 /// a double underscore after the section (`SERVER__JWT_SECRET`,
 /// `BROKER__MAX_RETRIES`), because a single underscore can't tell the
-/// section apart from the key. A missing file is fine.
+/// section apart from the key. Nested sections use a double underscore at
+/// every level (`STORAGE__RETENTION__MAX_MESSAGES`). A missing file is fine.
 ///
 /// Returns:
 ///     The merged settings.

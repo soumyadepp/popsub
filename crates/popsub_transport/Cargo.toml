@@ -17,9 +17,8 @@ popsub_auth = { path = "../popsub_auth" }
 popsub_broker = { path = "../popsub_broker" }
 popsub_client = { path = "../popsub_client" }
 popsub_config = { path = "../popsub_config" }
-popsub_persistence = { path = "../popsub_persistence" }
+popsub_storage = { path = "../popsub_storage" }
 popsub_ratelimit = { path = "../popsub_ratelimit" }
 popsub_utils = { path = "../popsub_utils" }
 
 [dev-dependencies]
-tempfile = "3.20.0"

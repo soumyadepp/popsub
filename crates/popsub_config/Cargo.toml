@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 config = "0.15.13"
 serde = { version = "1.0.219", features = ["derive"] }
+popsub_storage = { path = "../popsub_storage" }
 
 [dev-dependencies]
 tempfile = "3.20.0"

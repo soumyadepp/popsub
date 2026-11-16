@@ -35,16 +35,16 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_transport` | WebSocket server, JSON protocol, and enforcing auth, permissions and rate limits |
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
-| `crates/popsub_broker` | Topics, routing, QoS 1 retries, replay |
-| `crates/popsub_persistence` | `sled` storage of recent messages per topic (being replaced by `popsub_storage`) |
-| `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the memory backend and the conformance suite. Nothing uses it yet. |
+| `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
+| `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the memory backend and the conformance suite |
+| `crates/popsub_persistence` | The old `sled` store. Nothing uses it; removed in step 6 of `docs/STORAGE.md` |
 | `crates/popsub_client` | `Client`, the server-side record of one connection (not a client library) |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
 | `crates/popsub_utils` | `PopSubError`, `Result`, logging |
 
 Each crate has its own `CLAUDE.md` with its invariants and gotchas.
 
-Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then persistence and client, with config and utils at the bottom. Never make a lower crate depend on a higher one. The broker must not know about sockets or JSON protocol messages.
+Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then client and config, with storage and utils at the bottom. Never make a lower crate depend on a higher one. The broker must not know about sockets or JSON protocol messages.
 
 ## Conventions
 
@@ -59,16 +59,18 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 - **Protocol changes** touch `popsub_transport/src/message.rs`, the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change.
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.
-- **Reach the broker only through `SharedBroker::with`.** Its closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
+- **Reach the broker only through `SharedBroker::with`** (inside the broker crate, `BrokerCell::with`, which it wraps). The closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
+- **Storage I/O belongs in the topic writer**, never under the broker lock. Publishes and subscribes for a topic go through its writer so they are handled one at a time; don't add a path that appends or replays around it.
 - **New settings** go in `popsub_config/src/settings.rs` (the field and its struct's `Default`), `config/default.toml`, and section 9 of the design doc. Keys containing an underscore are set from the environment with a double underscore after the section (`SERVER__JWT_SECRET`).
 - **Security defaults stay closed.** Registration off, new users with no topics, published secrets refused on public addresses. Don't loosen these without a setting that defaults to the closed behaviour.
 - Don't commit generated or local files: `target/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.
 
 ## Gotchas
 
-- Delivered messages have no `type` field, unlike every other server frame. Clients detect them by its absence. See design doc section 4.2.
+- Delivered records and `truncated` frames are serialised by the broker (`TopicFrame`), not by the transport. `ServerMessage` wraps the same structs; keep the test that parses one as the other.
+- A subscribe has no success reply. Tests that need to know it has been handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
 - QoS 1 is only at-least-once for a single subscriber that stays connected. Don't describe it more strongly in docs or READMEs.
-- `broker.max_connections` is loaded but not used. The store path (`pubsub_db`) and per-topic cap are constants in the binary. Two servers can't share a working directory: the second exits because the store is locked.
+- `broker.max_connections` is loaded but not used. The only storage backend is `memory`, so history is lost on restart until the `file` backend lands.
 - The JWT secret default differs between code (`default_secret`), `config/default.toml` (`a_very_secret_key`) and the auth crate (`change_me_in_production`). All three are treated as published; the server refuses them on non-loopback hosts.
 - Rate limits key on the socket address. Behind a proxy every client shares one address.
 - There's no protocol message to grant topics, so self-registered users with the default `none` role can do nothing until their role is changed in code.

@@ -10,10 +10,11 @@
 //! registration and publishing are rate limited.
 //!
 //! Replies go straight onto the session's own outgoing channel, so sending
-//! one never takes the broker lock. The broker is only reached through
-//! `SharedBroker::with`, whose closures can't await. The auth service needs
-//! no lock of its own: its methods take `&self` and its user store does its
-//! own locking.
+//! one never takes the broker lock. Subscribe and publish are `async` calls
+//! on `SharedBroker`, which hands them to the topic's writer; everything else
+//! reaches the broker through `SharedBroker::with`, whose closures can't
+//! await. The auth service needs no lock of its own: its methods take
+//! `&self` and its user store does its own locking.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,11 +23,11 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
-use popsub_broker::SharedBroker;
-use popsub_broker::message::Message;
+use popsub_broker::{SharedBroker, StartFrom};
 use popsub_client::Client;
 use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
+use popsub_storage::NewRecord;
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -449,7 +450,7 @@ impl Session {
             }
             ClientMessage::Login { username, password } => self.login(&username, &password).await,
             ClientMessage::Auth { token } => self.authenticate(&token).await,
-            ClientMessage::Subscribe { topic } => self.subscribe(&topic).await,
+            ClientMessage::Subscribe { topic, from } => self.subscribe(&topic, from).await,
             ClientMessage::Unsubscribe { topic } => self.unsubscribe(&topic),
             ClientMessage::Publish {
                 topic,
@@ -683,11 +684,14 @@ impl Session {
     /// Subscribes the connection to a topic if its user may read it.
     ///
     /// A user without permission gets a `not authorized` error and stays
-    /// connected. Subscribing replays the topic's stored messages to the
-    /// client.
+    /// connected. The history `from` asks for is replayed first, preceded by
+    /// a `truncated` frame if some of it was already trimmed. If the history
+    /// can't be read, the client gets an error, is not subscribed, and may
+    /// try again. There is no reply frame on success.
     ///
     /// Args:
     ///     topic: The topic to subscribe to.
+    ///     from: Where replay starts.
     ///
     /// Returns:
     ///     `Flow::Close` when the client isn't authenticated, otherwise
@@ -696,7 +700,7 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    async fn subscribe(&self, topic: &str) -> Result<Flow> {
+    async fn subscribe(&self, topic: &str, from: StartFrom) -> Result<Flow> {
         let Some(username) = self.require_user("subscribe")? else {
             return Ok(Flow::Close);
         };
@@ -706,10 +710,29 @@ impl Session {
             self.reply_error(format!("not authorized to subscribe to '{topic}'"))?;
             return Ok(Flow::Continue);
         }
-        self.server
+        match self
+            .server
             .broker
-            .with(|broker| broker.subscribe(topic, self.client_id.clone()));
-        info!(client_id = %self.client_id, username, topic, "subscribed");
+            .subscribe(topic, &self.client_id, from)
+            .await
+        {
+            Ok(outcome) => {
+                info!(
+                    client_id = %self.client_id,
+                    username,
+                    topic,
+                    replayed = outcome.replayed,
+                    truncated = outcome.truncated,
+                    "subscribed"
+                );
+            }
+            Err(e) => {
+                error!(client_id = %self.client_id, username, topic, %e, "replay failed, not subscribed");
+                self.reply_error(format!(
+                    "can't read the history of '{topic}', not subscribed"
+                ))?;
+            }
+        }
         Ok(Flow::Continue)
     }
 
@@ -744,7 +767,11 @@ impl Session {
     /// The topic permission is checked before the rate limit, so a denied
     /// publish doesn't use up the user's allowance. Both a denied and a rate
     /// limited publish get an error and keep the connection open. The broker
-    /// sets the timestamp and generates an id when `message_id` is missing.
+    /// sets the publish time, generates an id when `message_id` is missing,
+    /// stores the record and delivers it. A repeated `message_id` from the
+    /// same user is stored and delivered once. If storage fails, a QoS 1
+    /// publisher gets a `storage unavailable` error so it can retry; a QoS 0
+    /// publish is logged and dropped, as QoS 0 promises nothing.
     ///
     /// Args:
     ///     topic: The topic to publish to.
@@ -780,15 +807,32 @@ impl Session {
             self.reply_error("Rate limited. Too many messages.")?;
             return Ok(Flow::Continue);
         }
-        let message = Message {
-            topic: topic.to_string(),
-            payload,
-            timestamp: 0,
+        let qos = qos.unwrap_or(0);
+        let record = NewRecord {
             message_id: message_id.unwrap_or_default(),
-            qos: qos.unwrap_or(0),
+            publisher: username.clone(),
+            payload,
+            qos,
+            published_at_ms: 0,
         };
-        self.server.broker.with(|broker| broker.publish(message));
-        info!(client_id = %self.client_id, username, topic, "published");
+        match self.server.broker.publish(topic, record).await {
+            Ok(published) => {
+                info!(
+                    client_id = %self.client_id,
+                    username,
+                    topic,
+                    seq = published.seq,
+                    duplicate = published.duplicate,
+                    "published"
+                );
+            }
+            Err(e) => {
+                error!(client_id = %self.client_id, username, topic, qos, %e, "publish not stored");
+                if qos == 1 {
+                    self.reply_error("storage unavailable")?;
+                }
+            }
+        }
         Ok(Flow::Continue)
     }
 

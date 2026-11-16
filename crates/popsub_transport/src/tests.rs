@@ -5,6 +5,7 @@
 //! by `websocket_tests.rs`, which drives a real server.
 
 use crate::message::{ClientMessage, ServerMessage};
+use popsub_broker::{Delivery, StartFrom, TopicFrame, Truncated};
 use serde_json::json;
 
 /// Parses a client frame from a JSON value.
@@ -95,4 +96,107 @@ fn server_frames_serialise_with_type_tags() {
     for (frame, expected) in cases {
         assert_eq!(serde_json::to_value(&frame).unwrap(), expected);
     }
+}
+
+/// Checks that `subscribe` without `from` means no replay, and that each
+/// `from` form parses.
+#[test]
+fn subscribe_from_forms_parse() {
+    let cases = [
+        (
+            json!({"type": "subscribe", "topic": "chat"}),
+            StartFrom::New,
+        ),
+        (
+            json!({"type": "subscribe", "topic": "chat", "from": "new"}),
+            StartFrom::New,
+        ),
+        (
+            json!({"type": "subscribe", "topic": "chat", "from": {"last": 50}}),
+            StartFrom::Last(50),
+        ),
+        (
+            json!({"type": "subscribe", "topic": "chat", "from": {"since_ms": 1794800000000_i64}}),
+            StartFrom::SinceMs(1_794_800_000_000),
+        ),
+        (
+            json!({"type": "subscribe", "topic": "chat", "from": {"seq": 1200}}),
+            StartFrom::Seq(1200),
+        ),
+    ];
+    for (value, expected) in cases {
+        match parse(value.clone()) {
+            ClientMessage::Subscribe { topic, from } => {
+                assert_eq!(topic, "chat");
+                assert_eq!(from, expected, "{value}");
+            }
+            other => panic!("expected subscribe, got {other:?}"),
+        }
+    }
+    assert!(
+        serde_json::from_value::<ClientMessage>(
+            json!({"type": "subscribe", "topic": "chat", "from": {"last": "all"}})
+        )
+        .is_err()
+    );
+}
+
+/// Builds the delivery used by the frame tests.
+///
+/// Returns:
+///     A QoS 1 delivery with seq 42.
+fn delivery() -> Delivery {
+    Delivery {
+        topic: "chat".to_string(),
+        seq: 42,
+        message_id: "m-1".to_string(),
+        payload: "hi".to_string(),
+        qos: 1,
+        published_at_ms: 1_794_800_000_000,
+    }
+}
+
+/// Checks the exact JSON of delivered records and truncation notices.
+#[test]
+fn topic_frames_serialise_with_type_tags() {
+    assert_eq!(
+        serde_json::to_value(ServerMessage::Message(delivery())).unwrap(),
+        json!({
+            "type": "message",
+            "topic": "chat",
+            "seq": 42,
+            "message_id": "m-1",
+            "payload": "hi",
+            "qos": 1,
+            "published_at_ms": 1794800000000_i64
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ServerMessage::Truncated(Truncated {
+            topic: "chat".to_string(),
+            first_available: 1300,
+        }))
+        .unwrap(),
+        json!({"type": "truncated", "topic": "chat", "first_available": 1300})
+    );
+}
+
+/// Checks that what the broker writes parses as the transport's
+/// `ServerMessage`, so the two definitions can't drift apart.
+#[test]
+fn broker_frames_parse_as_server_messages() {
+    let message = TopicFrame::Message(delivery());
+    let parsed: ServerMessage = serde_json::to_value(&message)
+        .and_then(serde_json::from_value)
+        .unwrap();
+    assert!(matches!(parsed, ServerMessage::Message(d) if d == delivery()));
+
+    let truncated = TopicFrame::Truncated(Truncated {
+        topic: "chat".to_string(),
+        first_available: 7,
+    });
+    let parsed: ServerMessage = serde_json::to_value(&truncated)
+        .and_then(serde_json::from_value)
+        .unwrap();
+    assert!(matches!(parsed, ServerMessage::Truncated(t) if t.first_available == 7));
 }
