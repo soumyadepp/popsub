@@ -1886,3 +1886,212 @@ async fn bad_admin_requests_are_refused() {
         assert_eq!(reply["code"], code, "{reply}");
     }
 }
+
+/// Starts a server on a free port, letting the test adjust it first.
+///
+/// Args:
+///     settings: The settings to configure the server from.
+///     configure: Changes to make to the server before it serves.
+///
+/// Returns:
+///     The address to connect to.
+async fn start_configured(
+    settings: &Settings,
+    configure: impl FnOnce(Server) -> Server,
+) -> std::net::SocketAddr {
+    let broker = SharedBroker::new(
+        Broker::new(settings.broker.clone()),
+        Arc::new(MemoryStorage::new()),
+        LogSettings {
+            durability: Durability::None,
+            retention: settings.storage.retention.to_retention(),
+            session_expiry: Duration::from_secs(settings.storage.session_expiry_secs),
+        },
+    )
+    .expect("memory storage accepts durability none");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = configure(Server::from_settings(broker, &settings.server).await);
+    tokio::spawn(server.serve(listener));
+    addr
+}
+
+/// Connects with an `X-Forwarded-For` header, as a proxy would.
+///
+/// Args:
+///     addr: The server's address.
+///     forwarded_for: The header's value.
+///
+/// Returns:
+///     The connection.
+async fn forwarded_connection(addr: std::net::SocketAddr, forwarded_for: &str) -> TestSocket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = "ws://localhost/".into_client_request().expect("request");
+    request.headers_mut().insert(
+        "x-forwarded-for",
+        forwarded_for.parse().expect("header value"),
+    );
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    tokio_tungstenite::client_async(request, stream)
+        .await
+        .expect("handshake")
+        .0
+}
+
+/// Rate limiters that lock an address out after two failed logins.
+///
+/// Returns:
+///     The limiters.
+fn two_strikes() -> RateLimiters {
+    RateLimiters::from_settings(&popsub_config::LimitSettings {
+        address_login_attempts: 2,
+        ..Default::default()
+    })
+}
+
+/// Fails two logins and then tries the right password, all from one connection.
+///
+/// Args:
+///     ws: The connection.
+///
+/// Returns:
+///     The reply to the third, correct login.
+async fn two_bad_logins_then_a_good_one(ws: &mut TestSocket) -> serde_json::Value {
+    for _ in 0..2 {
+        let reply = send_raw(
+            ws,
+            r#"{"type": "login", "username": "admin", "password": "wrong-password"}"#,
+        )
+        .await;
+        assert_eq!(reply["code"], "invalid_credentials", "{reply}");
+    }
+    send_raw(
+        ws,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await
+}
+
+/// Checks that behind a trusted proxy the login limits key on the forwarded
+/// address: locking out one client leaves another, through the same proxy, free.
+#[tokio::test]
+async fn trusted_proxies_key_limits_on_the_forwarded_address() {
+    let settings = Settings::default();
+    let proxies = crate::TrustedProxies::parse(&["127.0.0.1"]).expect("parse");
+    let addr = start_configured(&settings, |server| {
+        server
+            .with_rate_limiters(two_strikes())
+            .with_trusted_proxies(proxies)
+    })
+    .await;
+    let mut guesser = forwarded_connection(addr, "203.0.113.1").await;
+    let locked = two_bad_logins_then_a_good_one(&mut guesser).await;
+    assert_eq!(locked["code"], "locked_out", "{locked}");
+    let mut other = forwarded_connection(addr, "198.51.100.2, 127.0.0.1").await;
+    let login = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in", "{login}");
+}
+
+/// Checks that without trusted proxies the header is ignored: clients
+/// claiming different addresses from one socket address share its limits.
+#[tokio::test]
+async fn forwarded_addresses_from_untrusted_peers_are_ignored() {
+    let settings = Settings::default();
+    let addr = start_configured(&settings, |server| server.with_rate_limiters(two_strikes())).await;
+    let mut guesser = forwarded_connection(addr, "203.0.113.1").await;
+    two_bad_logins_then_a_good_one(&mut guesser).await;
+    let mut pretender = forwarded_connection(addr, "198.51.100.2").await;
+    let login = send_raw(
+        &mut pretender,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["code"], "locked_out", "{login}");
+}
+
+/// Checks that a connection over `broker.max_connections` is closed with
+/// `try_again_later`, and that a slot freed by a closed connection can be used again.
+#[tokio::test]
+async fn connections_over_the_limit_are_told_to_try_again_later() {
+    let mut settings = Settings::default();
+    settings.broker.max_connections = 2;
+    let addr = start_configured(&settings, |server| server).await;
+    let mut first = admin_connection(addr, &settings).await;
+    let _second = admin_connection(addr, &settings).await;
+    let mut third = raw_connection(addr).await;
+    assert_eq!(
+        next_close(&mut third, Duration::from_secs(2)).await,
+        (
+            CloseCode::TryAgainLater.code(),
+            "try_again_later".to_string()
+        )
+    );
+    first.close(None).await.expect("close");
+    drop(first);
+    let mut admitted = false;
+    for _ in 0..100 {
+        let mut retry = raw_connection(addr).await;
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            retry.send(WsMessage::Text(
+                r#"{"type": "login", "username": "admin", "password": "password"}"#.into(),
+            )),
+        )
+        .await;
+        if reply.is_ok()
+            && let Ok(Some(Ok(WsMessage::Text(text)))) =
+                tokio::time::timeout(Duration::from_secs(2), retry.next()).await
+            && text.contains("logged_in")
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(admitted, "a freed slot was never reused");
+}
+
+/// Checks that a socket that never sends a WebSocket handshake is dropped
+/// after the handshake timeout, so it can't hold a connection slot.
+#[tokio::test]
+async fn silent_sockets_are_dropped_after_the_handshake_timeout() {
+    use tokio::io::AsyncReadExt;
+    let settings = Settings::default();
+    let addr = start_configured(&settings, |server| {
+        server.with_handshake_timeout(Duration::from_millis(200))
+    })
+    .await;
+    let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(2), silent.read(&mut buffer))
+        .await
+        .expect("the server hung up within two seconds");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
+
+/// Checks that the `[limits]` settings reach the limiters, with values
+/// below 1 raised to 1 and idle times long enough for the longest lockout.
+#[test]
+fn rate_limits_come_from_the_settings() {
+    let limiters = RateLimiters::from_settings(&popsub_config::LimitSettings {
+        login_attempts: 0,
+        max_lockout_secs: 7200,
+        publish_per_second: 1,
+        publish_burst: 1200,
+        ..Default::default()
+    });
+    limiters.login_limiter.record_failure("a|b");
+    assert!(limiters.login_limiter.is_locked("a|b"));
+    assert_eq!(limiters.login_idle, Duration::from_secs(7200));
+    assert_eq!(limiters.message_idle, Duration::from_secs(1200));
+    assert_eq!(
+        RateLimiters::default().login_idle,
+        Duration::from_secs(3600)
+    );
+}

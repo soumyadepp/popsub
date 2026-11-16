@@ -76,10 +76,11 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - Every close the server starts must go through `Flow::Close(CloseCode)` (or `close_message` in the broker), never a bare drop, so clients get a code. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
 - Durable sessions are keyed by `session_key(username, session_id)`. Never key them by the client's `session_id` alone, or one user could attach to another's session.
 - QoS 1 is at-least-once per subscriber while connected, and across reconnects only for durable sessions whose records are still retained. With the `file` backend (the default) sessions and history survive restarts; with `memory` nothing does. Don't describe it more strongly in docs or READMEs.
-- `broker.max_connections` is loaded but not used.
+- `broker.max_connections` is enforced by the transport, counting from `accept`; connections over it are closed with `TryAgainLater` (1013). `0` means no limit. Tests that open many connections need a higher limit.
 - The `file` backend locks `storage.path` (`pubsub_data` by default). Two servers can't share a working directory: the second exits. Tests use a temporary directory or `MemoryStorage`, never `pubsub_data`.
 - The JWT secret default differs between code (`default_secret`), `config/default.toml` (`a_very_secret_key`) and the auth crate (`change_me_in_production`). All three are treated as published; the server refuses them on non-loopback hosts.
-- Rate limits key on the socket address. Behind a proxy every client shares one address.
+- Rate limits key on the client address: the socket peer, or, for peers listed in `server.trusted_proxies`, the rightmost untrusted `X-Forwarded-For` entry (`popsub_transport::proxy`). Never believe the header from a peer that isn't listed.
+- Rate limits come from the `[limits]` section through `RateLimiters::from_settings`; `RateLimiters::default` is the same values.
 - Accounts are managed with the admin requests (`create_user`, `grant`, `revoke`, `set_enabled` and so on), which only an enabled admin may send; `popsub users` sends them. They are handled in `popsub_transport/src/websocket/admin.rs`, which also ends live subscriptions a change no longer allows and closes disabled accounts with `AccountDisabled`. The last enabled admin can't be removed.
 - Locally, port 8080 is often taken by another dev server. Use `PORT=8090`.
 

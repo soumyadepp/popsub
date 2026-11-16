@@ -156,8 +156,36 @@ The settings you are most likely to change:
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
 | `server.max_payload_bytes` | 1 MiB | Largest publish |
+| `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
+| `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
+| `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
+
+## Running behind a proxy
+
+PopSub doesn't do TLS itself. Put a TLS-terminating proxy in front, and tell PopSub to believe the client address it forwards, or every client will share the proxy's address for rate limits:
+
+```toml
+[server]
+host = "127.0.0.1"
+trusted_proxies = ["127.0.0.1"]
+```
+
+With nginx on the same machine:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 120s;
+}
+```
+
+`proxy_read_timeout` must be longer than `server.heartbeat_secs`, or the proxy will cut quiet connections. Entries in `trusted_proxies` can be CIDR ranges (`10.0.0.0/8`) for a fleet of proxies. Only list proxies you run: a client reaching PopSub directly could otherwise claim any address.
 
 ## Managing users
 

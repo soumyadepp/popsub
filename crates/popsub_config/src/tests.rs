@@ -6,7 +6,7 @@ use std::path::Path;
 use popsub_storage::Durability;
 
 use crate::load_config_from;
-use crate::settings::{RetentionSettings, Settings, StorageBackend};
+use crate::settings::{LimitSettings, RetentionSettings, Settings, StorageBackend};
 
 /// Checks the default host, port, connection cap and storage settings.
 #[test]
@@ -175,4 +175,49 @@ fn wrong_types_are_errors() {
     let env =
         std::collections::HashMap::from([("SERVER_PORT".to_string(), "not-a-port".to_string())]);
     assert!(load_config_from(Path::new("no/such/config"), Some(env)).is_err());
+}
+
+/// Checks that the rate limits and trusted proxies load from the environment,
+/// with commas splitting the proxy list, and default to today's limits and no proxies.
+#[test]
+fn limits_and_trusted_proxies_load_from_the_environment() {
+    let defaults = load_config_from(Path::new("no/such/config"), Some(Default::default()))
+        .expect("load failed");
+    assert_eq!(defaults.limits, LimitSettings::default());
+    assert!(defaults.server.trusted_proxies.is_empty());
+
+    let env = std::collections::HashMap::from([
+        ("LIMITS__LOGIN_ATTEMPTS".to_string(), "3".to_string()),
+        ("LIMITS__PUBLISH_PER_SECOND".to_string(), "10".to_string()),
+        (
+            "SERVER__TRUSTED_PROXIES".to_string(),
+            "10.0.0.1,192.168.0.0/16".to_string(),
+        ),
+        ("BROKER__MAX_CONNECTIONS".to_string(), "20".to_string()),
+    ]);
+    let settings = load_config_from(Path::new("no/such/config"), Some(env)).expect("load failed");
+    assert_eq!(settings.limits.login_attempts, 3);
+    assert_eq!(settings.limits.publish_per_second, 10);
+    assert_eq!(settings.limits.publish_burst, 50);
+    assert_eq!(
+        settings.server.trusted_proxies,
+        vec!["10.0.0.1".to_string(), "192.168.0.0/16".to_string()]
+    );
+    assert_eq!(settings.broker.max_connections, 20);
+}
+
+/// Checks that the `[limits]` section and a proxy list load from a file.
+#[test]
+fn limits_and_trusted_proxies_load_from_a_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("popsub.toml");
+    std::fs::write(
+        &file,
+        "[server]\ntrusted_proxies = [\"::1\", \"10.0.0.0/8\"]\n\n[limits]\nregistrations_per_hour = 2\n",
+    )
+    .expect("write config");
+    let settings = load_config_from(&file, Some(Default::default())).expect("load failed");
+    assert_eq!(settings.server.trusted_proxies, vec!["::1", "10.0.0.0/8"]);
+    assert_eq!(settings.limits.registrations_per_hour, 2);
+    assert_eq!(settings.limits.login_attempts, 5);
 }

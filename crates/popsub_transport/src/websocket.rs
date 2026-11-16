@@ -26,7 +26,7 @@
 mod admin;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ use popsub_auth::{
     AuthConfig, AuthError, AuthService, DefaultUserRole, InMemoryUserStore, UserStore,
 };
 use popsub_broker::{SharedBroker, close_message, session_key};
-use popsub_config::ServerSettings;
+use popsub_config::{LimitSettings, ServerSettings};
 use popsub_connection::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
 use popsub_storage::{MAX_TOPIC_BYTES, NewRecord};
@@ -43,10 +43,13 @@ use popsub_utils::error::{PopSubError, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
-use tokio_tungstenite::accept_async_with_config;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tracing::{error, info, warn};
+use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::Message as WsMessage;
 use tungstenite::protocol::WebSocketConfig;
+
+use crate::proxy::TrustedProxies;
 
 use popsub_protocol::{
     ClientFrame, ClientMessage, CloseCode, ErrorCode, Limits, PROTOCOL_VERSION, RequestId,
@@ -69,6 +72,10 @@ const FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
 /// How long the server waits for the client's close reply after sending a
 /// close frame, before dropping the connection.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a new connection has to finish the WebSocket handshake. Without
+/// a limit, sockets that never send one would hold connection slots forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long before a connection's token expires the client is sent `auth_expiring`.
 const AUTH_EXPIRY_WARNING: Duration = Duration::from_secs(60);
@@ -121,66 +128,88 @@ pub struct RateLimiters {
     /// Published messages per authenticated user, shared by all of that
     /// user's connections.
     pub message_limiter: Arc<TokenBucket>,
+    /// How long a login limiter key may be idle before it is forgotten. At
+    /// least the longest lockout, so pruning never ends a lockout early.
+    pub login_idle: Duration,
+    /// How long a message bucket may be idle before it is forgotten. At
+    /// least the time a bucket takes to refill, so forgetting one changes
+    /// nothing.
+    pub message_idle: Duration,
 }
 
 /// How often the server's background task prunes idle rate limiter entries.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
-/// How long a login limiter key may be idle before it is forgotten. It matches
-/// the longest lockout, so pruning never ends a lockout early.
-const LOGIN_IDLE: Duration = Duration::from_secs(3600);
-/// How long a message bucket may be idle before it is forgotten. A bucket
-/// refills fully well within this time, so forgetting it changes nothing.
+/// The shortest time a message bucket is kept after its last use.
 const MESSAGE_IDLE: Duration = Duration::from_secs(600);
 
 impl RateLimiters {
+    /// Builds the limiters from the `[limits]` settings. Values below 1 are
+    /// treated as 1. Login lockouts double on each repeat, up to
+    /// `max_lockout_secs` (and never shorter than the first lockout).
+    ///
+    /// Args:
+    ///     settings: The `[limits]` section.
+    ///
+    /// Returns:
+    ///     The limiters.
+    pub fn from_settings(settings: &LimitSettings) -> Self {
+        let secs = |value: u64| Duration::from_secs(value.max(1));
+        let login_lockout = secs(settings.login_lockout_secs);
+        let address_lockout = secs(settings.address_lockout_secs);
+        let max_lockout = secs(settings.max_lockout_secs)
+            .max(login_lockout)
+            .max(address_lockout);
+        let lockouts = |attempts: u32, lockout: Duration| {
+            LoginRateLimiter::builder()
+                .max_attempts(attempts.max(1))
+                .lockout_duration(lockout)
+                .exponential_backoff(true)
+                .max_lockout_duration(max_lockout)
+                .build()
+        };
+        let rate = settings.publish_per_second.max(1);
+        let burst = settings.publish_burst.max(1);
+        let refill = Duration::from_secs(burst.div_ceil(rate));
+        Self {
+            login_limiter: Arc::new(lockouts(settings.login_attempts, login_lockout)),
+            ip_login_limiter: Arc::new(lockouts(settings.address_login_attempts, address_lockout)),
+            register_limiter: Arc::new(SlidingWindow::new(
+                settings.registrations_per_hour.max(1),
+                Duration::from_secs(3600),
+            )),
+            message_limiter: Arc::new(TokenBucket::new(rate, burst, Duration::from_secs(1))),
+            login_idle: max_lockout,
+            message_idle: MESSAGE_IDLE.max(refill),
+        }
+    }
+
     /// Removes entries for keys that have been quiet long enough to forget.
     ///
-    /// Login entries are kept for `LOGIN_IDLE` and message buckets for
-    /// `MESSAGE_IDLE`. The registration window drops entries whose attempts
+    /// Login entries are kept for `login_idle` and message buckets for
+    /// `message_idle`. The registration window drops entries whose attempts
     /// have all aged out of its own window.
     ///
     /// Returns:
     ///     The total number of entries removed across all four limiters.
     pub fn prune_idle(&self) -> usize {
-        self.login_limiter.prune_idle(LOGIN_IDLE)
-            + self.ip_login_limiter.prune_idle(LOGIN_IDLE)
+        self.login_limiter.prune_idle(self.login_idle)
+            + self.ip_login_limiter.prune_idle(self.login_idle)
             + self.register_limiter.prune_idle()
-            + self.message_limiter.prune_idle(MESSAGE_IDLE)
+            + self.message_limiter.prune_idle(self.message_idle)
     }
 }
 
 impl Default for RateLimiters {
-    /// Builds the limits the server uses unless it is given others.
-    ///
-    /// An address and username pair is locked out after 5 failed logins for
-    /// 5 minutes, and an address is locked out after 20 failed logins across
-    /// any usernames for 15 minutes. Both lockouts back off exponentially up to
-    /// 1 hour. An address may make 5 registration attempts per hour, and a user
-    /// may publish 100 messages per second with a burst of 50.
+    /// Builds the limits from the default `[limits]` settings: an address
+    /// and username pair is locked out after 5 failed logins for 5 minutes,
+    /// and an address after 20 across any usernames for 15 minutes, both
+    /// doubling up to an hour; 5 registration attempts per address per hour;
+    /// and 100 publishes a second per user with bursts of 50.
     ///
     /// Returns:
     ///     The default set of limiters.
     fn default() -> Self {
-        Self {
-            login_limiter: Arc::new(
-                LoginRateLimiter::builder()
-                    .max_attempts(5)
-                    .lockout_duration(Duration::from_secs(300))
-                    .exponential_backoff(true)
-                    .max_lockout_duration(Duration::from_secs(3600))
-                    .build(),
-            ),
-            ip_login_limiter: Arc::new(
-                LoginRateLimiter::builder()
-                    .max_attempts(20)
-                    .lockout_duration(Duration::from_secs(900))
-                    .exponential_backoff(true)
-                    .max_lockout_duration(Duration::from_secs(3600))
-                    .build(),
-            ),
-            register_limiter: Arc::new(SlidingWindow::new(5, Duration::from_secs(3600))),
-            message_limiter: Arc::new(TokenBucket::new(100, 50, Duration::from_secs(1))),
-        }
+        Self::from_settings(&LimitSettings::default())
     }
 }
 
@@ -203,10 +232,20 @@ pub struct Server {
     max_payload_bytes: usize,
     /// The byte budget of each connection's outgoing queue.
     queue_limits: QueueLimits,
+    /// Proxies whose `X-Forwarded-For` header is believed.
+    trusted_proxies: Arc<TrustedProxies>,
+    /// The most connections at once, or `None` for no limit.
+    max_connections: Option<usize>,
+    /// Connections open now, counted from `accept` until the connection's
+    /// task ends, shared by every clone.
+    open_connections: Arc<AtomicUsize>,
+    /// How long a new connection has to finish the WebSocket handshake.
+    handshake_timeout: Duration,
 }
 
 impl Server {
-    /// Creates a server with the default rate limits.
+    /// Creates a server with the default rate limits, the broker's
+    /// connection limit and no trusted proxies.
     ///
     /// Args:
     ///     broker: The broker every connection shares.
@@ -217,12 +256,16 @@ impl Server {
     ///     A server ready to `listen` or `serve`.
     pub fn new(broker: SharedBroker, auth: Arc<AuthService>) -> Self {
         Self {
-            broker,
             auth,
             limiters: RateLimiters::default(),
             heartbeat: Heartbeat::default(),
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             queue_limits: QueueLimits::default(),
+            trusted_proxies: Arc::new(TrustedProxies::default()),
+            max_connections: broker.max_connections(),
+            open_connections: Arc::new(AtomicUsize::new(0)),
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            broker,
         }
     }
 
@@ -247,7 +290,11 @@ impl Server {
     /// The JWT secret and expiry, the admin user, whether self-registration
     /// is allowed, the role new users get (see `registration_role`), the
     /// heartbeat, the payload limit and the outbound queue budget all come
-    /// from `settings`. Rate limits are the defaults. The admin from
+    /// from `settings`. Rate limits are the defaults; pass the `[limits]`
+    /// section through `RateLimiters::from_settings` and `with_rate_limiters`.
+    /// `server.trusted_proxies` isn't applied here, because an invalid entry
+    /// must stop startup: parse it with `TrustedProxies::parse` and pass it to
+    /// `with_trusted_proxies`. The admin from
     /// `settings` is added to the store only if no account with that name
     /// exists yet, so once it does, its password is changed through the
     /// store, not the settings.
@@ -288,6 +335,43 @@ impl Server {
     ///     The server with the new limits.
     pub fn with_rate_limiters(mut self, limiters: RateLimiters) -> Self {
         self.limiters = limiters;
+        self
+    }
+
+    /// Sets the proxies whose `X-Forwarded-For` header is believed, so rate
+    /// limits key on the client behind them.
+    ///
+    /// Args:
+    ///     proxies: The trusted proxies.
+    ///
+    /// Returns:
+    ///     The server with them trusted.
+    pub fn with_trusted_proxies(mut self, proxies: TrustedProxies) -> Self {
+        self.trusted_proxies = Arc::new(proxies);
+        self
+    }
+
+    /// Replaces the connection limit taken from the broker settings.
+    ///
+    /// Args:
+    ///     max_connections: The most connections at once, or `None` for no limit.
+    ///
+    /// Returns:
+    ///     The server with the new limit.
+    pub fn with_max_connections(mut self, max_connections: Option<usize>) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+
+    /// Replaces the default 10 second handshake timeout.
+    ///
+    /// Args:
+    ///     timeout: How long a new connection has to finish the WebSocket handshake.
+    ///
+    /// Returns:
+    ///     The server with the new timeout.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 
@@ -387,7 +471,9 @@ impl Server {
     /// entries every `PRUNE_INTERVAL` and is stopped when this future is
     /// dropped. A failed `accept` is logged and retried after
     /// `ACCEPT_BACKOFF` instead of stopping the server. Each connection runs
-    /// in its own task.
+    /// in its own task, holding a `ConnectionSlot` from `accept` until the
+    /// task ends; a connection accepted while the server is at its limit is
+    /// told so with `TryAgainLater` once its handshake is done.
     ///
     /// Args:
     ///     listener: The bound listener to accept connections from.
@@ -396,7 +482,9 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    tokio::spawn(self.clone().run_connection(stream, peer));
+                    let slot = ConnectionSlot::take(&self.open_connections);
+                    let over_limit = self.max_connections.is_some_and(|max| slot.before >= max);
+                    tokio::spawn(self.clone().run_connection(stream, peer, slot, over_limit));
                 }
                 Err(e) => {
                     warn!(%e, "accepting a connection failed");
@@ -422,18 +510,60 @@ impl Server {
     /// of the close code. The client is removed from the broker once, by whichever of
     /// this loop and the send loop finishes first.
     ///
+    /// The handshake must finish within the handshake timeout. Its
+    /// `X-Forwarded-For` headers are kept, and `TrustedProxies::client_address`
+    /// decides from them and the peer which address the rate limits key on.
+    /// A connection over the server's limit is closed with `TryAgainLater`
+    /// straight after the handshake. The header callback allows
+    /// `clippy::result_large_err` because tungstenite fixes its error type.
+    ///
     /// Args:
     ///     stream: The accepted TCP connection.
-    ///     peer: The connection's remote address, used for rate limit keys.
-    async fn run_connection(self, stream: TcpStream, peer: SocketAddr) {
-        let ws_stream = match accept_async_with_config(stream, Some(self.websocket_config())).await
-        {
-            Ok(ws) => ws,
-            Err(e) => {
+    ///     peer: The connection's remote address.
+    ///     _slot: This connection's place in the open connection count,
+    ///         released when the connection ends.
+    ///     over_limit: Whether the server was already at its connection
+    ///         limit when it was accepted.
+    async fn run_connection(
+        self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        _slot: ConnectionSlot,
+        over_limit: bool,
+    ) {
+        let mut forwarded_for = Vec::new();
+        #[allow(clippy::result_large_err)]
+        let keep_forwarded_for = |request: &Request, response: Response| {
+            forwarded_for.extend(
+                request
+                    .headers()
+                    .get_all("x-forwarded-for")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok().map(str::to_string)),
+            );
+            Ok::<Response, ErrorResponse>(response)
+        };
+        let handshake =
+            accept_hdr_async_with_config(stream, keep_forwarded_for, Some(self.websocket_config()));
+        let mut ws_stream = match tokio::time::timeout(self.handshake_timeout, handshake).await {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(e)) => {
                 warn!(%peer, %e, "WebSocket handshake failed");
                 return;
             }
+            Err(_) => {
+                warn!(%peer, "WebSocket handshake timed out");
+                return;
+            }
         };
+        let client_ip = self
+            .trusted_proxies
+            .client_address(peer.ip(), &forwarded_for);
+        if over_limit {
+            warn!(%peer, %client_ip, "at the connection limit, refusing a connection");
+            refuse(&mut ws_stream, CloseCode::TryAgainLater).await;
+            return;
+        }
         let (ws_sender, mut ws_receiver) = ws_stream.split();
         let (outbox, rx) = Outbox::channel(self.queue_limits);
         let client = Client::new(outbox.clone());
@@ -447,7 +577,7 @@ impl Server {
         let session = Session {
             server: self,
             client_id,
-            peer_ip: peer.ip().to_string(),
+            client_ip: client_ip.to_string(),
             outbox,
             auth: Mutex::new(AuthState::default()),
         };
@@ -526,6 +656,59 @@ async fn prune_forever(limiters: RateLimiters) {
             info!(pruned, "pruned idle rate limiter entries");
         }
     }
+}
+
+/// One connection's place in the server's open connection count, given back
+/// when dropped.
+struct ConnectionSlot {
+    /// The shared count.
+    open: Arc<AtomicUsize>,
+    /// How many connections were open before this one.
+    before: usize,
+}
+
+impl ConnectionSlot {
+    /// Counts a new connection.
+    ///
+    /// Args:
+    ///     open: The server's count of open connections.
+    ///
+    /// Returns:
+    ///     The slot, which records the count before it.
+    fn take(open: &Arc<AtomicUsize>) -> Self {
+        let before = open.fetch_add(1, Ordering::SeqCst);
+        Self {
+            open: open.clone(),
+            before,
+        }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    /// Gives the slot back.
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Closes a connection the server won't serve, with a close code, and waits
+/// up to `CLOSE_GRACE` for the client's close reply so it sees the code.
+///
+/// Args:
+///     ws: The connection, after its handshake.
+///     code: Why it is closed.
+async fn refuse(ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>, code: CloseCode) {
+    if ws.send(close_message(code)).await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(CLOSE_GRACE, async {
+        while let Some(Ok(frame)) = ws.next().await {
+            if frame.is_close() {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 /// Aborts a spawned task when dropped, tying the task's life to its owner.
@@ -671,8 +854,9 @@ struct Session {
     server: Server,
     /// This connection's id in the broker.
     client_id: String,
-    /// This connection's remote address, the key for login and registration limits.
-    peer_ip: String,
+    /// The client's address, the key for login and registration limits: the
+    /// socket's peer, or the address a trusted proxy forwarded for it.
+    client_ip: String,
     /// This connection's outgoing queue. Replies are queued here directly.
     outbox: Outbox,
     /// The session id and token expiry from `auth`.
@@ -960,9 +1144,9 @@ impl Session {
         password: &str,
     ) -> Result<Flow> {
         let limiter = &self.server.limiters.register_limiter;
-        if !limiter.try_acquire(&self.peer_ip) {
-            let retry_after = limiter.retry_after(&self.peer_ip).unwrap_or(1);
-            warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, retry_after, "registration rate limited");
+        if !limiter.try_acquire(&self.client_ip) {
+            let retry_after = limiter.retry_after(&self.client_ip).unwrap_or(1);
+            warn!(client_id = %self.client_id, client_ip = %self.client_ip, retry_after, "registration rate limited");
             self.fail(
                 id,
                 ErrorCode::RateLimited,
@@ -1012,8 +1196,8 @@ impl Session {
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn login(&self, id: Option<&RequestId>, username: &str, password: &str) -> Result<Flow> {
         let limiters = &self.server.limiters;
-        let pair_key = format!("{}|{username}", self.peer_ip);
-        let lockout = match limiters.ip_login_limiter.check_status(&self.peer_ip) {
+        let pair_key = format!("{}|{username}", self.client_ip);
+        let lockout = match limiters.ip_login_limiter.check_status(&self.client_ip) {
             LoginStatus::LockedOut { retry_after } => Some(retry_after),
             _ => match limiters.login_limiter.check_status(&pair_key) {
                 LoginStatus::LockedOut { retry_after } => Some(retry_after),
@@ -1021,7 +1205,7 @@ impl Session {
             },
         };
         if let Some(retry_after) = lockout {
-            warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, username, retry_after, "login rate limited");
+            warn!(client_id = %self.client_id, client_ip = %self.client_ip, username, retry_after, "login rate limited");
             self.fail(
                 id,
                 ErrorCode::LockedOut,
@@ -1040,7 +1224,7 @@ impl Session {
                 warn!(client_id = %self.client_id, username, "login failed: {}", e);
                 if matches!(e, AuthError::InvalidCredentials) {
                     limiters.login_limiter.record_failure(&pair_key);
-                    limiters.ip_login_limiter.record_failure(&self.peer_ip);
+                    limiters.ip_login_limiter.record_failure(&self.client_ip);
                 }
                 self.fail(
                     id,

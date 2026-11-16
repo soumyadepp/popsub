@@ -19,6 +19,8 @@ pub struct Settings {
     /// The `[storage]` section: which backend holds topic logs, how firmly
     /// appends are stored, and how much history is kept.
     pub storage: StorageSettings,
+    /// The `[limits]` section: rate limits on logins, registration and publishing.
+    pub limits: LimitSettings,
 }
 
 /// The `[server]` section of the configuration.
@@ -53,13 +55,21 @@ pub struct ServerSettings {
     /// sixteenth of this, deliveries wait and are caught up from the log;
     /// going over it closes the connection as a slow consumer.
     pub outbound_queue_bytes: usize,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as IP
+    /// addresses or CIDR ranges (`10.0.0.0/8`). Rate limits then key on the
+    /// client's address from that header instead of the proxy's. Empty (the
+    /// default) believes no one. From the environment, separate entries
+    /// with commas.
+    #[serde(deserialize_with = "list_or_commas")]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for ServerSettings {
     /// Builds the server defaults: loopback on port 8080, a published JWT
     /// secret and admin password (fine only for local development), 24 hour
     /// tokens, registration off, a ping every 30 seconds, a 90 second idle
-    /// timeout, 1 MiB payloads and a 16 MiB outbound queue per connection.
+    /// timeout, 1 MiB payloads, a 16 MiB outbound queue per connection and
+    /// no trusted proxies.
     ///
     /// Returns:
     ///     The default `[server]` section.
@@ -77,6 +87,7 @@ impl Default for ServerSettings {
             idle_timeout_secs: 90,
             max_payload_bytes: 1024 * 1024,
             outbound_queue_bytes: 16 * 1024 * 1024,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -85,7 +96,9 @@ impl Default for ServerSettings {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct BrokerSettings {
-    /// Intended cap on simultaneous connections. Not enforced yet.
+    /// The most connections the server holds at once, counted from the
+    /// moment a TCP connection is accepted. Connections over it are closed
+    /// with `try_again_later` (1013). 0 means no limit.
     pub max_connections: usize,
     /// How long to wait for a QoS 1 acknowledgement before resending, in milliseconds.
     pub ack_timeout_ms: u64,
@@ -127,6 +140,55 @@ pub enum StorageBackend {
     /// `popsub_storage::MemoryStorage`: history and sessions live in the
     /// process and are lost on restart.
     Memory,
+}
+
+/// The `[limits]` section of the configuration: rate limits on logins,
+/// registration and publishing.
+///
+/// Values below 1 are treated as 1, so a limit can be made strict but never
+/// turned off by accident.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct LimitSettings {
+    /// Failed logins allowed for one address and username pair before it is locked out.
+    pub login_attempts: u32,
+    /// How long that pair's first lockout lasts, in seconds.
+    pub login_lockout_secs: u64,
+    /// Failed logins allowed from one address, across all usernames, before
+    /// the address is locked out.
+    pub address_login_attempts: u32,
+    /// How long that address's first lockout lasts, in seconds.
+    pub address_lockout_secs: u64,
+    /// The longest a lockout grows to. Each repeat lockout doubles, up to this, in seconds.
+    pub max_lockout_secs: u64,
+    /// Registration attempts allowed from one address per hour, successful or not.
+    pub registrations_per_hour: u64,
+    /// Messages one user may publish per second, across all their connections.
+    pub publish_per_second: u64,
+    /// How many publishes a user may send at once before the per-second rate applies.
+    pub publish_burst: u64,
+}
+
+impl Default for LimitSettings {
+    /// Builds the default limits: 5 failed logins per address and username
+    /// (5 minute lockout), 20 per address (15 minutes), lockouts growing to
+    /// an hour, 5 registrations per address per hour, and 100 publishes per
+    /// second per user with bursts of 50.
+    ///
+    /// Returns:
+    ///     The default `[limits]` section.
+    fn default() -> Self {
+        Self {
+            login_attempts: 5,
+            login_lockout_secs: 300,
+            address_login_attempts: 20,
+            address_lockout_secs: 900,
+            max_lockout_secs: 3600,
+            registrations_per_hour: 5,
+            publish_per_second: 100,
+            publish_burst: 50,
+        }
+    }
 }
 
 /// The `[storage]` section of the configuration.
@@ -218,6 +280,41 @@ pub const KNOWN_DEFAULT_SECRETS: [&str; 3] = [
 
 /// The admin password that appears in PopSub's code and sample config.
 pub const DEFAULT_PASSWORD: &str = "password";
+
+/// Reads a list of strings written either as a list or, as environment
+/// variables must be, as one comma-separated string. Blank entries are dropped.
+///
+/// Args:
+///     deserializer: The value's deserializer.
+///
+/// Returns:
+///     The entries, trimmed.
+///
+/// Raises:
+///     D::Error: When the value is neither a string nor a list of strings.
+fn list_or_commas<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// The two ways the value may be written.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListOrCommas {
+        /// A list, as in a TOML file.
+        List(Vec<String>),
+        /// One comma-separated string, as in an environment variable.
+        Commas(String),
+    }
+    let entries = match ListOrCommas::deserialize(deserializer)? {
+        ListOrCommas::List(list) => list,
+        ListOrCommas::Commas(text) => text.split(',').map(str::to_string).collect(),
+    };
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect())
+}
 
 impl Settings {
     /// Lists settings still using values that ship with PopSub.

@@ -21,7 +21,9 @@ use popsub_config::{StorageBackend, StorageSettings, load_config};
 use popsub_protocol::CloseCode;
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
-use popsub_transport::{FileUserStore, InMemoryUserStore, Server, UserStore};
+use popsub_transport::{
+    FileUserStore, InMemoryUserStore, RateLimiters, Server, TrustedProxies, UserStore,
+};
 use tracing::{error, info, warn};
 
 /// How long a shutdown waits after sending every client a close frame, so
@@ -103,6 +105,7 @@ async fn main() -> ExitCode {
 /// the server refuses to start on a non-loopback host and only logs a warning
 /// for each such setting on `localhost` or a loopback address. Otherwise it
 /// opens the `[storage]` backend and the user store that goes with it,
+/// applies the `[limits]` rate limits and the trusted proxies,
 /// builds the broker (refusing a durability
 /// the backend can't provide), spawns the QoS 1 retry, retention and session
 /// expiry loops,
@@ -114,6 +117,7 @@ async fn main() -> ExitCode {
 ///     ConfigError::Type: When a setting from the file or the environment has
 ///         the wrong type, including an unknown backend or durability name.
 ///     String: When published default secrets are set and the host is not a loopback address.
+///     String: When an entry in `server.trusted_proxies` isn't an IP address or CIDR range.
 ///     String: When the storage backend can't be opened, for example because
 ///         another server is using its directory.
 ///     String: When `users.json` in the storage directory exists but can't be
@@ -155,7 +159,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(broker.clone().run_retention_loop());
     tokio::spawn(broker.clone().run_session_expiry_loop());
     let users = open_users(&config.storage)?;
-    let server = Server::from_settings_with_users(broker.clone(), &config.server, users).await;
+    let proxies = TrustedProxies::parse(&config.server.trusted_proxies)
+        .map_err(|e| format!("server.trusted_proxies: {e}"))?;
+    if !proxies.is_empty() {
+        info!(
+            proxies = config.server.trusted_proxies.len(),
+            "believing X-Forwarded-For from trusted proxies"
+        );
+    }
+    let server = Server::from_settings_with_users(broker.clone(), &config.server, users)
+        .await
+        .with_rate_limiters(RateLimiters::from_settings(&config.limits))
+        .with_trusted_proxies(proxies);
 
     tokio::select! {
         served = server.listen(&addr) => served.map_err(|e| format!("can't serve on {addr}: {e}"))?,

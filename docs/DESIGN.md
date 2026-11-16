@@ -163,6 +163,7 @@ All replies also carry the request's `id` when it had one. The broker writes `me
 | 1001 | `going_away` | The server is shutting down | Yes, with backoff |
 | 1009 | `message_too_big` | A frame was larger than twice `server.max_payload_bytes` plus 64 KiB | Yes, without resending that frame |
 | 1011 | `internal_error` | A handler failed unexpectedly | Yes, with backoff |
+| 1013 | `try_again_later` | The server is at `broker.max_connections` | Yes, with backoff |
 | 4001 | `auth_failed` | Bad or expired token, or a bad `session_id`, in `auth` | Only after logging in again |
 | 4002 | `unauthenticated` | A request before `auth` | Yes, and authenticate first |
 | 4003 | `session_taken_over` | Another connection authenticated with the same session | No |
@@ -259,7 +260,8 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.idle_timeout_secs` | `90` | Transport. How long a connection may send nothing before it is closed |
 | `server.outbound_queue_bytes` | `16777216` | Transport. The hard byte limit of each connection's outgoing queue; the soft limit is a sixteenth of it, at least 64 KiB |
 | `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
-| `broker.max_connections` | `1000` | Nothing. Not enforced. |
+| `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
+| `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
 | `broker.max_inflight` | `100` | Window of unacknowledged QoS 1 records per subscription |
@@ -271,7 +273,13 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `storage.retention.max_age_secs` | `3600` | Trimming |
 | `storage.retention.max_bytes` | `67108864` | Trimming. Counts message ids, publishers and payloads |
 
-Rate limits are set in code (`RateLimiters::default`), not in config.
+| `limits.login_attempts`, `limits.login_lockout_secs` | `5`, `300` | Failed logins per address and username before a lockout, and its first length |
+| `limits.address_login_attempts`, `limits.address_lockout_secs` | `20`, `900` | Failed logins per address across usernames before a lockout, and its first length |
+| `limits.max_lockout_secs` | `3600` | Each repeat lockout doubles, up to this |
+| `limits.registrations_per_hour` | `5` | Registration attempts per address, successful or not |
+| `limits.publish_per_second`, `limits.publish_burst` | `100`, `50` | Publishes per user, shared by all their connections |
+
+Every `limits` value below 1 is treated as 1, so a limit can't be switched off by setting it to 0.
 
 ## 10. Security
 
@@ -293,6 +301,8 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 
 **Limits**
 
+The defaults below are set in the `[limits]` section (section 9).
+
 | What | Key | Limit |
 |---|---|---|
 | Failed logins | address and username together | 5, then a lockout from 5 minutes that doubles up to an hour |
@@ -301,14 +311,15 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | Publishing | username, shared by all of a user's connections | 100 a second, bursts of 50 |
 
 - Keying failed logins by address and username together means someone guessing a password from one machine locks out only themselves.
-- Limits use the socket's address. Behind a reverse proxy every client shares the proxy's address, so put limits at the proxy too.
+- Limits use the client's address. By default that is the socket's peer, so behind a reverse proxy every client would share the proxy's address. List the proxies in `server.trusted_proxies` and, for connections from them only, the server reads `X-Forwarded-For` from the right, skipping trusted proxies; the first other address is the client. Addresses further left were written by the client and are ignored. A header from a peer that isn't listed is ignored entirely, so a client that reaches the server directly can't choose its own address. Only list proxies you run, and make sure they append to `X-Forwarded-For` rather than pass on what the client sent unchecked.
+- Every connection must finish its WebSocket handshake within 10 seconds, and at most `broker.max_connections` are open at once. Connections over the limit get `try_again_later` (1013).
 - Idle limiter entries are pruned every minute, so memory doesn't grow with every address or username ever tried.
 
 **Defaults and exposure**
 
 - The server refuses to listen on a non-loopback address while `jwt_secret` is one of the published defaults or the admin password is `password`. On localhost it starts and logs a warning. The auth library also warns when constructed with those values.
 - Taken usernames get a generic "registration failed", so registration can't be used to discover accounts.
-- No TLS in the process. Run it behind a TLS-terminating proxy.
+- No TLS in the process. Run it behind a TLS-terminating proxy, listed in `server.trusted_proxies`. The README shows an nginx setup.
 
 ## 11. Failure modes
 
@@ -339,14 +350,17 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | Disk full | Appends fail: QoS 1 publishers get `storage unavailable`, nothing is delivered, and the server keeps running. |
 | A cursor can't be stored | Logged. The cursor in memory still moves; after a reconnect the session may be sent records it already acknowledged. |
 | A task panics while holding the broker lock | The mutex is poisoned. The next `SharedBroker::with` logs it and carries on with the broker's state, so other connections keep working. |
+| More clients connect than `broker.max_connections` | Each one over the limit finishes its handshake and is closed with `try_again_later` (1013); clients reconnect with backoff. Connections already open are unaffected. |
+| A socket connects and never sends a WebSocket handshake | It is dropped after 10 seconds, so it can't hold a connection slot. |
+| A client sends a made-up `X-Forwarded-For` | Ignored unless its socket peer is a trusted proxy. Through a trusted proxy, only the address the proxy appended counts. |
 | `accept` fails, for example out of file descriptors | Logged, and the accept loop retries after 100 ms. |
 | The port is taken, another server holds `storage.path`, or `storage.durability` is stronger than the backend provides | The binary logs the reason and exits with a failure status. |
 
 ## 12. Known gaps, in priority order
 
-1. `max_connections` is ignored, and rate limits aren't configurable.
-2. No release artefacts, health check or metrics, and only a Rust client library.
-3. Changing a password doesn't revoke the account's outstanding tokens.
+1. No release artefacts, health check or metrics, and only a Rust client library.
+2. Changing a password doesn't revoke the account's outstanding tokens.
+3. The connection limit is server-wide: one address can open every connection. Put a per-address connection limit at the proxy.
 
 ## 13. Proposed direction
 
@@ -365,11 +379,11 @@ Done in #9 and #12: users and per-topic permissions, rate limits on logins, regi
 
 Done: admin requests and `popsub users` to create accounts, grant and revoke topics, and disable or delete accounts, with changes applied to live connections.
 
+Done: an enforced connection limit and handshake timeout, rate limits in the `[limits]` settings, `server.trusted_proxies` so limits key on the real client behind a proxy, and a documented nginx setup.
+
 Remaining:
 
-- Enforce a connection limit, and make rate limits configurable.
-- Trust a proxy's forwarded address when configured, so limits work behind one.
-- Document running behind a TLS proxy.
+- A per-address connection limit.
 
 ### Phase 3: adoptable
 
