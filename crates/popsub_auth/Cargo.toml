@@ -10,6 +10,7 @@ default = []
 postgres = ["sqlx/runtime-tokio", "sqlx/postgres"]
 
 [dependencies]
+popsub_utils = { path = "../popsub_utils" }
 # JWT handling
 jsonwebtoken = "9"
 chrono = { version = "0.4", features = ["serde"] }

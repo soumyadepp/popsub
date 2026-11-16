@@ -231,10 +231,15 @@ pub struct TelemetrySettings {
     /// The share of request traces to keep, from 0 to 1. A trace whose
     /// parent was sampled is always kept.
     pub sample_ratio: f64,
+    /// Whether usernames, client addresses and session ids are masked in
+    /// log lines, exported logs and traces. On by default; applies to the
+    /// console too, whether or not anything is exported.
+    pub mask_pii: bool,
 }
 
 impl Default for TelemetrySettings {
-    /// Builds the defaults: nothing exported, every trace kept once enabled.
+    /// Builds the defaults: nothing exported, every trace kept once enabled,
+    /// and personal data masked.
     ///
     /// Returns:
     ///     The default `[telemetry]` section.
@@ -242,6 +247,7 @@ impl Default for TelemetrySettings {
         Self {
             enabled: false,
             sample_ratio: 1.0,
+            mask_pii: true,
         }
     }
 }

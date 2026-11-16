@@ -25,6 +25,7 @@
 
 mod admin;
 
+use popsub_utils::pii::pii;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -585,14 +586,14 @@ impl Server {
                 Ok(Ok(Some(address))) => source = address,
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
-                    warn!(%peer, %e, "dropping a connection without a valid PROXY header");
+                    warn!(peer = %pii(peer), %e, "dropping a connection without a valid PROXY header");
                     metrics()
                         .connections_refused
                         .add(1, &attr("reason", "proxy_header"));
                     return;
                 }
                 Err(_) => {
-                    warn!(%peer, "PROXY header timed out");
+                    warn!(peer = %pii(peer), "PROXY header timed out");
                     metrics()
                         .connections_refused
                         .add(1, &attr("reason", "proxy_header"));
@@ -611,11 +612,11 @@ impl Server {
                     .await;
             }
             Ok(Err(e)) => {
-                warn!(%peer, %e, "TLS handshake failed");
+                warn!(peer = %pii(peer), %e, "TLS handshake failed");
                 metrics().connections_refused.add(1, &attr("reason", "tls"));
             }
             Err(_) => {
-                warn!(%peer, "TLS handshake timed out");
+                warn!(peer = %pii(peer), "TLS handshake timed out");
                 metrics().connections_refused.add(1, &attr("reason", "tls"));
             }
         }
@@ -683,14 +684,14 @@ impl Server {
         let mut ws_stream = match tokio::time::timeout_at(deadline, handshake).await {
             Ok(Ok(ws)) => ws,
             Ok(Err(e)) => {
-                warn!(%peer, %e, "WebSocket handshake failed");
+                warn!(peer = %pii(peer), %e, "WebSocket handshake failed");
                 metrics()
                     .connections_refused
                     .add(1, &attr("reason", "handshake"));
                 return;
             }
             Err(_) => {
-                warn!(%peer, "WebSocket handshake timed out");
+                warn!(peer = %pii(peer), "WebSocket handshake timed out");
                 metrics()
                     .connections_refused
                     .add(1, &attr("reason", "handshake"));
@@ -699,7 +700,7 @@ impl Server {
         };
         let client_ip = self.trusted_proxies.client_address(source, &forwarded_for);
         if over_limit {
-            warn!(%peer, %client_ip, "at the connection limit, refusing a connection");
+            warn!(peer = %pii(peer), client_ip = %pii(client_ip), "at the connection limit, refusing a connection");
             metrics()
                 .connections_refused
                 .add(1, &attr("reason", "server_limit"));
@@ -709,7 +710,7 @@ impl Server {
         let Some(_address_slot) =
             AddressSlot::take(&self.per_address, client_ip, self.max_per_address)
         else {
-            warn!(%peer, %client_ip, "address at its connection limit, refusing a connection");
+            warn!(peer = %pii(peer), client_ip = %pii(client_ip), "address at its connection limit, refusing a connection");
             metrics()
                 .connections_refused
                 .add(1, &attr("reason", "address_limit"));
@@ -1104,9 +1105,11 @@ impl Session {
             Err(err) => {
                 warn!(
                     client_id = %self.client_id,
-                    "invalid client frame: {} | {}",
-                    err,
-                    text.chars().take(100).collect::<String>()
+                    kind = ?err.classify(),
+                    line = err.line(),
+                    column = err.column(),
+                    bytes = text.len(),
+                    "invalid client frame"
                 );
                 let failed = self.fail(
                     salvage_request_id(&text).as_ref(),
@@ -1376,7 +1379,7 @@ impl Session {
         let limiter = &self.server.limiters.register_limiter;
         if !limiter.try_acquire(&self.client_ip) {
             let retry_after = limiter.retry_after(&self.client_ip).unwrap_or(1);
-            warn!(client_id = %self.client_id, client_ip = %self.client_ip, retry_after, "registration rate limited");
+            warn!(client_id = %self.client_id, client_ip = %pii(&self.client_ip), retry_after, "registration rate limited");
             self.fail(
                 id,
                 ErrorCode::RateLimited,
@@ -1387,11 +1390,11 @@ impl Session {
         }
         match self.server.auth.register_user(username, password).await {
             Ok(()) => {
-                info!(client_id = %self.client_id, username, "registration successful");
+                info!(client_id = %self.client_id, username = %pii(&username), "registration successful");
                 self.reply(id, ServerMessage::Registered {})?;
             }
             Err(e) => {
-                warn!(client_id = %self.client_id, username, "registration failed: {}", e);
+                warn!(client_id = %self.client_id, username = %pii(username), error = e.kind(), "registration failed");
                 self.fail(
                     id,
                     ErrorCode::RegistrationFailed,
@@ -1436,7 +1439,7 @@ impl Session {
         };
         if let Some(retry_after) = lockout {
             metrics().logins.add(1, &attr("outcome", "locked_out"));
-            warn!(client_id = %self.client_id, client_ip = %self.client_ip, username, retry_after, "login rate limited");
+            warn!(client_id = %self.client_id, client_ip = %pii(&self.client_ip), username = %pii(username), retry_after, "login rate limited");
             self.fail(
                 id,
                 ErrorCode::LockedOut,
@@ -1448,7 +1451,7 @@ impl Session {
         match self.server.auth.login(username, password).await {
             Ok(token) => {
                 metrics().logins.add(1, &attr("outcome", "success"));
-                info!(client_id = %self.client_id, username, "login successful");
+                info!(client_id = %self.client_id, username = %pii(&username), "login successful");
                 limiters.login_limiter.record_success(&pair_key);
                 self.reply(id, ServerMessage::LoggedIn { token })?;
             }
@@ -1456,7 +1459,7 @@ impl Session {
                 metrics()
                     .logins
                     .add(1, &attr("outcome", "invalid_credentials"));
-                warn!(client_id = %self.client_id, username, "login failed: {}", e);
+                warn!(client_id = %self.client_id, username = %pii(username), error = e.kind(), "login failed");
                 if matches!(e, AuthError::InvalidCredentials) {
                     limiters.login_limiter.record_failure(&pair_key);
                     limiters.ip_login_limiter.record_failure(&self.client_ip);
@@ -1541,7 +1544,7 @@ impl Session {
         match self.server.auth.get_user(&claims.sub).await {
             Ok(Some(user)) if user.enabled => {}
             Ok(_) => {
-                warn!(client_id = %self.client_id, username = %claims.sub, "token for a disabled or deleted account");
+                warn!(client_id = %self.client_id, username = %pii(&claims.sub), "token for a disabled or deleted account");
                 self.fail(
                     id,
                     ErrorCode::AuthFailed,
@@ -1602,7 +1605,7 @@ impl Session {
         self.auth_state().session_id = session_id.map(str::to_string);
         let limits = self.server.limits();
         let Some(session_id) = session_id else {
-            info!(client_id = %self.client_id, username, "authenticated successfully");
+            info!(client_id = %self.client_id, username = %pii(&username), "authenticated successfully");
             self.reply(
                 id,
                 ServerMessage::Authenticated {
@@ -1624,7 +1627,7 @@ impl Session {
         {
             Ok(stored) => stored,
             Err(e) => {
-                error!(client_id = %self.client_id, username, %e, "attaching a session failed");
+                error!(client_id = %self.client_id, username = %pii(&username), %e, "attaching a session failed");
                 self.fail(
                     id,
                     ErrorCode::SessionUnavailable,
@@ -1644,7 +1647,7 @@ impl Session {
             {
                 resumed.push(subscription.topic);
             } else {
-                warn!(client_id = %self.client_id, username, topic = %subscription.topic, "dropping a stored subscription the user may no longer read");
+                warn!(client_id = %self.client_id, username = %pii(&username), topic = %subscription.topic, "dropping a stored subscription the user may no longer read");
                 if let Err(e) = self
                     .server
                     .broker
@@ -1655,7 +1658,7 @@ impl Session {
                 }
             }
         }
-        info!(client_id = %self.client_id, username, session_id, clean_start, resumed = resumed.len(), "authenticated with a session");
+        info!(client_id = %self.client_id, username = %pii(&username), session_id = %pii(session_id), clean_start, resumed = resumed.len(), "authenticated with a session");
         self.reply(
             id,
             ServerMessage::Authenticated {
@@ -1712,7 +1715,7 @@ impl Session {
         exp_secs: usize,
     ) -> Result<Flow> {
         if token_user != current_user {
-            warn!(client_id = %self.client_id, current_user, token_user, "refusing a token for a different user");
+            warn!(client_id = %self.client_id, current_user = %pii(&current_user), token_user = %pii(&token_user), "refusing a token for a different user");
             self.fail(
                 id,
                 ErrorCode::AuthFailed,
@@ -1723,7 +1726,7 @@ impl Session {
         }
         self.set_token_expiry(exp_secs);
         let session_id = self.auth_state().session_id.clone();
-        info!(client_id = %self.client_id, current_user, "token refreshed");
+        info!(client_id = %self.client_id, current_user = %pii(&current_user), "token refreshed");
         self.reply(
             id,
             ServerMessage::Authenticated {
@@ -1774,7 +1777,7 @@ impl Session {
             return Ok(Flow::Continue);
         }
         if !self.server.auth.can_subscribe(&username, topic).await {
-            warn!(client_id = %self.client_id, username, topic, "subscribe denied");
+            warn!(client_id = %self.client_id, username = %pii(&username), topic, "subscribe denied");
             self.fail(
                 id,
                 ErrorCode::NotAuthorized,
@@ -1792,7 +1795,7 @@ impl Session {
             Ok(outcome) => {
                 info!(
                     client_id = %self.client_id,
-                    username,
+                    username = %pii(&username),
                     topic,
                     replay_from = outcome.replay_from,
                     replay_to = outcome.replay_to,
@@ -1802,7 +1805,7 @@ impl Session {
                 );
             }
             Err(e) => {
-                error!(client_id = %self.client_id, username, topic, %e, "replay failed, not subscribed");
+                error!(client_id = %self.client_id, username = %pii(&username), topic, %e, "replay failed, not subscribed");
                 self.fail(
                     id,
                     ErrorCode::StorageUnavailable,
@@ -1839,7 +1842,7 @@ impl Session {
             Err(flow) => return Ok(flow),
         };
         if let Err(e) = self.server.broker.unsubscribe(topic, &self.client_id).await {
-            error!(client_id = %self.client_id, username, topic, %e, "removing a stored subscription failed");
+            error!(client_id = %self.client_id, username = %pii(&username), topic, %e, "removing a stored subscription failed");
             self.fail(
                 id,
                 ErrorCode::StorageUnavailable,
@@ -1848,7 +1851,7 @@ impl Session {
             )?;
             return Ok(Flow::Continue);
         }
-        info!(client_id = %self.client_id, username, topic, "unsubscribed");
+        info!(client_id = %self.client_id, username = %pii(&username), topic, "unsubscribed");
         self.reply(
             id,
             ServerMessage::Unsubscribed {
@@ -1929,7 +1932,7 @@ impl Session {
             return Ok(Flow::Continue);
         }
         if !self.server.auth.can_publish(&username, topic).await {
-            warn!(client_id = %self.client_id, username, topic, "publish denied");
+            warn!(client_id = %self.client_id, username = %pii(&username), topic, "publish denied");
             self.fail(
                 id,
                 ErrorCode::NotAuthorized,
@@ -1941,7 +1944,7 @@ impl Session {
         let limiter = &self.server.limiters.message_limiter;
         if !limiter.try_acquire(&username) {
             let retry_after = limiter.retry_after(&username).unwrap_or(1);
-            warn!(client_id = %self.client_id, username, retry_after, "message rate limited");
+            warn!(client_id = %self.client_id, username = %pii(&username), retry_after, "message rate limited");
             self.fail(
                 id,
                 ErrorCode::RateLimited,
@@ -1962,7 +1965,7 @@ impl Session {
             Ok(published) => {
                 info!(
                     client_id = %self.client_id,
-                    username,
+                    username = %pii(&username),
                     topic,
                     seq = published.seq,
                     duplicate = published.duplicate,
@@ -1979,7 +1982,7 @@ impl Session {
                 }
             }
             Err(e) => {
-                error!(client_id = %self.client_id, username, topic, qos, %e, "publish not stored");
+                error!(client_id = %self.client_id, username = %pii(&username), topic, qos, %e, "publish not stored");
                 self.fail(
                     id,
                     ErrorCode::StorageUnavailable,
