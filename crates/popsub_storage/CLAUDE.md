@@ -15,7 +15,8 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
   - `topic.rs`: one topic's segment files, `head.json`, recovery and trimming.
   - `sessions.rs`: the session write-ahead log and its compaction.
   - `codec.rs`: the `length | crc32 | body` frame.
-  - `tests.rs`: the suite with 256-byte segments, recovery and damage tests, and the crash test.
+  - `tests.rs`: the suite with 256-byte segments, and the recovery and damage tests.
+- `tests/crash.rs`: the crash test, in its own test binary (see below).
 - `src/conformance.rs`: the `Fixture` trait, one public async check per rule, and the `conformance_tests!` macro. Compiled for this crate's tests and behind the `conformance` feature.
 
 ## Invariants
@@ -36,7 +37,7 @@ Implement `MessageLog`, `SubscriptionStore` and `Storage`, write a `Fixture` tha
 
 - `FileStorage` scans every segment on open and keeps each retained record's location in memory. Startup time and memory grow with retained data.
 - `synced` flushes once per append; there is no group commit.
-- The crash test re-runs this crate's test binary as a child (`crash_child`, gated by `POPSUB_CRASH_CHILD_DIR`). If you rename the test module, update the `--exact` path in `synced_appends_survive_the_writer_being_killed`.
+- The crash test re-runs its own test binary as a child (`crash_child`, gated by `POPSUB_CRASH_CHILD_DIR`). It must stay in a separate test binary: a spawned child briefly holds copies of the parent's file descriptors, including a store's lock file, and a test that reopens a store in that window finds the directory locked. CI hit exactly that when the crash test lived in `src/file/tests.rs`. Never spawn processes from the lib tests.
 
 ## Tests
 

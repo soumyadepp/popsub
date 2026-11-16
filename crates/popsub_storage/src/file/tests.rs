@@ -1,11 +1,11 @@
 //! Tests for `FileStorage`: the conformance suite, recovery from interrupted
 //! writes and damage, trimming across reopens, the directory lock, topic
-//! names, the session log, and a crash test that kills a writer process.
+//! names and the session log. The crash test that kills a writer process
+//! is in `tests/crash.rs`, a separate test binary; see there for why.
 
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::conformance::{Fixture, block_on};
 use crate::error::StorageError;
@@ -18,10 +18,6 @@ use crate::storage::{Durability, MessageLog, Retention, SubscriptionStore};
 /// Segment size used by most tests, small enough that a few records roll
 /// over to new segment files.
 const SMALL_SEGMENTS: FileOptions = FileOptions { segment_bytes: 256 };
-
-/// The environment variable that turns `crash_child` into the writer
-/// process of `synced_appends_survive_the_writer_being_killed`.
-const CRASH_CHILD_DIR: &str = "POPSUB_CRASH_CHILD_DIR";
 
 /// Opens a `FileStorage` in a temporary directory it owns. Opening it again
 /// reaches the same directory, which is how the suite checks persistence.
@@ -381,94 +377,5 @@ fn sessions_survive_reopening() {
         let storage = open(dir.path()).await;
         assert!(storage.load("s").await.expect("load").is_empty());
         assert_eq!(storage.load("kept").await.expect("load")[0].acked_seq, 4);
-    });
-}
-
-/// The writer process for the crash test. Does nothing unless started by
-/// that test with `CRASH_CHILD_DIR` set; then appends synced records to
-/// topic `t` forever, printing `confirmed <seq>` after each one returns.
-#[test]
-fn crash_child() {
-    let Ok(dir) = std::env::var(CRASH_CHILD_DIR) else {
-        return;
-    };
-    block_on(async move {
-        let storage = open(Path::new(&dir)).await;
-        let mut stdout = std::io::stdout();
-        let mut n = 0u64;
-        loop {
-            n += 1;
-            let stored = storage
-                .append(
-                    "t",
-                    record(&format!("c{n}-{}", std::process::id())),
-                    Durability::Synced,
-                )
-                .await
-                .expect("append");
-            writeln!(stdout, "confirmed {} {}", stored.seq, stored.payload).expect("stdout");
-            stdout.flush().expect("flush");
-        }
-    });
-}
-
-/// Checks that every append confirmed at `Durability::Synced` is readable
-/// after the writing process is killed at an arbitrary point, over several
-/// kill and restart rounds in the same directory.
-#[test]
-fn synced_appends_survive_the_writer_being_killed() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let exe = std::env::current_exe().expect("test binary");
-    let mut confirmed: Vec<(u64, String)> = Vec::new();
-    for round in 0..4u64 {
-        let jitter = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .subsec_nanos() as usize;
-        let stop_after = 15 + (jitter + round as usize * 37) % 60;
-        let mut child = Command::new(&exe)
-            .args([
-                "--exact",
-                "file::tests::crash_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CRASH_CHILD_DIR, dir.path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start the writer");
-        let stdout = child.stdout.take().expect("stdout");
-        let mut seen = 0;
-        for line in BufReader::new(stdout).lines() {
-            let line = line.expect("line");
-            let mut parts = line.split(' ');
-            if parts.next() != Some("confirmed") {
-                continue;
-            }
-            let seq = parts.next().and_then(|s| s.parse().ok()).expect("seq");
-            let payload = parts.next().expect("payload").to_string();
-            confirmed.push((seq, payload));
-            seen += 1;
-            if seen == stop_after {
-                break;
-            }
-        }
-        child.kill().expect("kill the writer");
-        child.wait().expect("reap the writer");
-        assert!(seen > 0, "the writer confirmed nothing in round {round}");
-    }
-    block_on(async move {
-        let storage = open(dir.path()).await;
-        let stored = storage.read("t", 0, usize::MAX).await.expect("read");
-        for (seq, payload) in &confirmed {
-            let record = stored
-                .iter()
-                .find(|r| r.seq == *seq)
-                .unwrap_or_else(|| panic!("confirmed seq {seq} is missing"));
-            assert_eq!(&record.payload, payload, "seq {seq}");
-        }
-        let all: Vec<u64> = stored.iter().map(|r| r.seq).collect();
-        assert_eq!(all, (1..=all.len() as u64).collect::<Vec<_>>());
     });
 }
