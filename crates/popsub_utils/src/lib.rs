@@ -1,10 +1,11 @@
 //! Shared building blocks for every PopSub crate: the `PopSubError` type, the
-//! `Result` alias and logging setup.
+//! `Result` alias, logging setup, and the OpenTelemetry metric instruments.
 //!
 //! This crate depends on no other PopSub crate and holds no domain logic.
 
 pub mod error;
 pub mod logging;
+pub mod metrics;
 
 #[cfg(test)]
 mod tests {

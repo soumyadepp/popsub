@@ -21,6 +21,8 @@ pub struct Settings {
     pub storage: StorageSettings,
     /// The `[limits]` section: rate limits on logins, registration and publishing.
     pub limits: LimitSettings,
+    /// The `[telemetry]` section: exporting metrics, traces and logs with OpenTelemetry.
+    pub telemetry: TelemetrySettings,
 }
 
 /// The `[server]` section of the configuration.
@@ -71,6 +73,9 @@ pub struct ServerSettings {
     /// header (version 1 or 2), as TCP load balancers send, giving the
     /// client's address. Off by default; needs `trusted_proxies`.
     pub proxy_protocol: bool,
+    /// Where to serve `/healthz` and `/readyz` over plain HTTP, such as
+    /// `127.0.0.1:9091`. Empty (the default) serves neither.
+    pub health_address: String,
     /// PEM file with the TLS certificate chain, leaf first. Set it with
     /// `tls_key` to serve `wss://`; both empty (the default) serves `ws://`.
     pub tls_cert: String,
@@ -83,8 +88,8 @@ impl Default for ServerSettings {
     /// secret and admin password (fine only for local development), 24 hour
     /// tokens, registration off, a ping every 30 seconds, a 90 second idle
     /// timeout, 1 MiB payloads, a 16 MiB outbound queue per connection, no
-    /// trusted proxies, no PROXY protocol, no per-address connection limit
-    /// and no TLS.
+    /// trusted proxies, no PROXY protocol, no per-address connection limit,
+    /// no TLS and no health endpoints.
     ///
     /// Returns:
     ///     The default `[server]` section.
@@ -105,6 +110,7 @@ impl Default for ServerSettings {
             trusted_proxies: Vec::new(),
             max_connections_per_address: 0,
             proxy_protocol: false,
+            health_address: String::new(),
             tls_cert: String::new(),
             tls_key: String::new(),
         }
@@ -206,6 +212,36 @@ impl Default for LimitSettings {
             registrations_per_hour: 5,
             publish_per_second: 100,
             publish_burst: 50,
+        }
+    }
+}
+
+/// The `[telemetry]` section: OpenTelemetry metrics, traces and logs,
+/// exported over OTLP (HTTP and protobuf).
+///
+/// Where they go is set with the standard OpenTelemetry environment
+/// variables, such as `OTEL_EXPORTER_OTLP_ENDPOINT` (default
+/// `http://localhost:4318`), `OTEL_SERVICE_NAME` and
+/// `OTEL_RESOURCE_ATTRIBUTES`.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct TelemetrySettings {
+    /// Whether to export anything. Off by default.
+    pub enabled: bool,
+    /// The share of request traces to keep, from 0 to 1. A trace whose
+    /// parent was sampled is always kept.
+    pub sample_ratio: f64,
+}
+
+impl Default for TelemetrySettings {
+    /// Builds the defaults: nothing exported, every trace kept once enabled.
+    ///
+    /// Returns:
+    ///     The default `[telemetry]` section.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_ratio: 1.0,
         }
     }
 }

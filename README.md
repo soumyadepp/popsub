@@ -160,10 +160,46 @@ The settings you are most likely to change:
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
 | `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
 | `server.max_connections_per_address` | `0` (no limit) | Connections one client address may hold. Set `trusted_proxies` first if you run behind a proxy |
+| `telemetry.enabled`, `telemetry.sample_ratio` | `false`, `1.0` | Export metrics, traces and logs over OTLP; see [Metrics, traces and logs](#metrics-traces-and-logs) |
+| `server.health_address` | none | Serve `/healthz` and `/readyz` here, such as `0.0.0.0:9091` |
 | `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
 | `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
+
+## Health checks
+
+Set `server.health_address` (say `0.0.0.0:9091`) and PopSub serves two endpoints over plain HTTP, apart from the WebSocket port:
+
+- `GET /healthz` answers 200 while the process is up. Use it for liveness.
+- `GET /readyz` answers 200 when PopSub should get traffic, and 503 with a reason while it is shutting down or while topic appends are failing (a full disk, say). Use it for readiness and load balancer health checks.
+
+PopSub shuts down cleanly on Ctrl+C or `SIGTERM` (what `docker stop` and Kubernetes send): readiness turns to 503 and every client is told `going_away` before the process exits.
+
+## Metrics, traces and logs
+
+PopSub exports all three with OpenTelemetry, over OTLP (HTTP and protobuf). It is off until you turn it on:
+
+```toml
+[telemetry]
+enabled = true
+sample_ratio = 1.0   # share of request traces kept
+```
+
+Where the data goes is set with the standard variables: `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4318`), `OTEL_SERVICE_NAME` (default `popsub`) and `OTEL_RESOURCE_ATTRIBUTES`. Point it at an OpenTelemetry Collector, which can forward to any backend, over TLS if needed; PopSub itself only sends plain `http://`. If nothing is listening, exports are dropped and the server carries on. Log lines still go to standard output either way.
+
+To look at everything on one machine:
+
+```bash
+docker run -p 3000:3000 -p 4318:4318 grafana/otel-lgtm
+TELEMETRY_ENABLED=true make server   # then open http://localhost:3000
+```
+
+What you get:
+
+- **Metrics** (every 60 seconds; `OTEL_METRIC_EXPORT_INTERVAL` in milliseconds changes it): connections (open, opened, refused and closed, with reasons), logins by outcome, error frames by code, messages published, delivered, redelivered and acknowledged, stalled subscriptions, messages in flight, topics, subscriptions, publish latency, and storage errors. The full list is in [`docs/DESIGN.md`](docs/DESIGN.md) section 3.3.
+- **Traces**: one span per client request (acknowledgements aside), named `popsub publish`, `popsub subscribe` and so on, marked as errors with the error code when the request fails.
+- **Logs**: the same events as the console, linked to the trace of the request they happened in.
 
 ## TLS
 

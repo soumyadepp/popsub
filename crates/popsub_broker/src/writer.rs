@@ -23,6 +23,8 @@
 //! The cost is that a long catch-up delays publishes to the same topic
 //! until it finishes. Other topics are unaffected.
 
+use crate::health::StorageHealth;
+use popsub_utils::metrics::{attr, metrics};
 use std::sync::Arc;
 
 use popsub_storage::{NewRecord, Result as StorageResult, Storage};
@@ -104,6 +106,8 @@ pub(crate) struct TopicWriter {
     storage: Arc<dyn Storage>,
     /// Durability for appends and the retention applied after each one.
     log: LogSettings,
+    /// Where each append's outcome is recorded, for readiness.
+    health: Arc<StorageHealth>,
     /// The log's `last_seq` as this writer last saw it, or `None` until it
     /// has been read or after a failed append, when it is read again.
     last_seq: Option<u64>,
@@ -123,6 +127,7 @@ impl TopicWriter {
     ///     broker: The broker to deliver through.
     ///     storage: Where the topic's log lives.
     ///     log: Durability and retention settings.
+    ///     health: Where append outcomes are recorded.
     ///
     /// Returns:
     ///     The sending side of the writer's queue.
@@ -131,6 +136,7 @@ impl TopicWriter {
         broker: BrokerCell,
         storage: Arc<dyn Storage>,
         log: LogSettings,
+        health: Arc<StorageHealth>,
     ) -> mpsc::UnboundedSender<Command> {
         let (tx, rx) = mpsc::unbounded_channel();
         let writer = TopicWriter {
@@ -138,6 +144,7 @@ impl TopicWriter {
             broker,
             storage,
             log,
+            health,
             last_seq: None,
             queue: tx.downgrade(),
         };
@@ -169,6 +176,7 @@ impl TopicWriter {
                 Command::CatchUp { client_id } => {
                     if let Err(e) = self.catch_up(&client_id).await {
                         warn!(topic = %self.topic, client = %client_id, %e, "catch-up failed");
+                        metrics().storage_errors.add(1, &attr("operation", "read"));
                     }
                 }
             }
@@ -208,6 +216,9 @@ impl TopicWriter {
                 .await
             {
                 warn!(topic = %update.topic, %e, "storing a cursor failed");
+                metrics()
+                    .storage_errors
+                    .add(1, &attr("operation", "cursor"));
             }
         }
     }
@@ -230,14 +241,23 @@ impl TopicWriter {
     ///         configured durability. `SharedBroker::new` checks this, so it
     ///         only happens with a backend that misreports its capabilities.
     async fn publish(&mut self, record: NewRecord) -> StorageResult<Published> {
+        let started = std::time::Instant::now();
+        let qos = i64::from(record.qos);
         let last_seq = self.last_seq().await?;
         let stored = match self
             .storage
             .append(&self.topic, record, self.log.durability)
             .await
         {
-            Ok(stored) => stored,
+            Ok(stored) => {
+                self.health.record_success();
+                stored
+            }
             Err(e) => {
+                self.health.record_failure();
+                metrics()
+                    .storage_errors
+                    .add(1, &attr("operation", "append"));
                 self.last_seq = None;
                 return Err(e);
             }
@@ -263,7 +283,12 @@ impl TopicWriter {
             .await
         {
             warn!(topic = %self.topic, %e, "trimming after publish failed");
+            metrics().storage_errors.add(1, &attr("operation", "trim"));
         }
+        metrics().published.add(1, &attr("qos", qos));
+        metrics()
+            .publish_duration
+            .record(started.elapsed().as_secs_f64(), &[]);
         Ok(published)
     }
 

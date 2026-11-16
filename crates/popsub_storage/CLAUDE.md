@@ -16,6 +16,7 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
   - `sessions.rs`: the session write-ahead log and its compaction.
   - `codec.rs`: the `length | crc32 | body` frame.
   - `tests.rs`: the suite with 256-byte segments, and the recovery and damage tests.
+- `src/faulty.rs`: `FaultyStorage`, a wrapper that fails appends while switched on and passes everything else through. For tests of what breaks when storage does.
 - `tests/crash.rs`: the crash test, in its own test binary (see below).
 - `src/conformance.rs`: the `Fixture` trait, one public async check per rule, and the `conformance_tests!` macro. Compiled for this crate's tests and behind the `conformance` feature.
 

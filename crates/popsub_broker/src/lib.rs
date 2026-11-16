@@ -13,13 +13,15 @@
 
 pub mod engine;
 mod frame;
+mod health;
 mod replay;
 pub mod shared;
 pub mod topic;
 mod writer;
 
-pub use engine::{AckOutcome, Broker, DeliverOutcome, RetryOutcome};
+pub use engine::{AckOutcome, Broker, BrokerStats, DeliverOutcome, RetryOutcome};
 pub use frame::close_message;
+pub use health::StorageHealth;
 pub use shared::{LogSettings, SharedBroker, session_key};
 pub use topic::CursorUpdate;
 pub use writer::{Published, SubscribeOutcome};

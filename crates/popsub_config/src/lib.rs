@@ -16,7 +16,7 @@ use config::{Config, ConfigError, Environment, File};
 
 pub use settings::{
     BrokerSettings, LimitSettings, RetentionSettings, ServerSettings, Settings, StorageBackend,
-    StorageSettings,
+    StorageSettings, TelemetrySettings,
 };
 
 /// Where `load_config` looks for the config file, relative to the working

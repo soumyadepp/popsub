@@ -2,28 +2,32 @@
 //!
 //! The `server` subcommand loads settings, opens the configured storage
 //! backend, builds the broker, spawns its QoS 1 retry, retention and session
-//! expiry loops and runs the WebSocket server until Ctrl+C. The `client`
+//! expiry loops, serves the health endpoints when configured, and runs the
+//! WebSocket server until Ctrl+C or `SIGTERM`. The `client`
 //! subcommand runs a short demo session (connect, subscribe, publish)
 //! against a running server with the SDK (`popsub_sdk`), for smoke tests.
 //! The `users` subcommands manage accounts on a running server (see `users`).
 //! Everything here is wiring; the protocol, routing and storage live in the
 //! transport, broker and storage crates.
 
+mod telemetry;
 mod users;
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+use telemetry::Telemetry;
 
 use clap::Parser;
 use popsub_broker::{Broker, LogSettings, SharedBroker};
-use popsub_config::{StorageBackend, StorageSettings, load_config};
+use popsub_config::{Settings, StorageBackend, StorageSettings, load_config};
 use popsub_protocol::CloseCode;
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
 use popsub_transport::{
-    FileUserStore, InMemoryUserStore, RateLimiters, Server, ServerTls, TrustedProxies, UserStore,
+    FileUserStore, Health, InMemoryUserStore, RateLimiters, Server, ServerTls, TrustedProxies,
+    UserStore,
 };
 use tracing::{error, info, warn};
 
@@ -66,34 +70,36 @@ enum Command {
     },
 }
 
-/// Parses the command line, starts logging (at `info`, or `warn` for
-/// `users` so its output stays readable) and runs the chosen subcommand.
+/// Parses the command line, starts logging and runs the chosen subcommand.
+///
+/// `server` sets up logging and telemetry from its settings (see
+/// `start_server`); `client` logs at `info`, and `users` at `warn` so its
+/// output stays readable.
 ///
 /// Returns:
 ///     Success when the subcommand finishes cleanly, failure (after logging
 ///     the error) when it fails, so scripts and process supervisors can tell.
 #[tokio::main]
 async fn main() -> ExitCode {
-    let command = Command::parse();
-    let level = match command {
-        Command::Users { .. } => "warn",
-        _ => "info",
-    };
-    popsub_utils::logging::init(level);
-
-    let result = match command {
-        Command::Server => run_server().await,
+    let result = match Command::parse() {
+        Command::Server => return start_server().await,
         Command::Client {
             url,
             username,
             password,
             topic,
             ca_cert,
-        } => run_client(&url, &username, &password, &topic, ca_cert.as_deref()).await,
+        } => {
+            popsub_utils::logging::init("info");
+            run_client(&url, &username, &password, &topic, ca_cert.as_deref()).await
+        }
         Command::Users {
             connection,
             command,
-        } => users::run(connection, command).await,
+        } => {
+            popsub_utils::logging::init("warn");
+            users::run(connection, command).await
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -104,7 +110,50 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Loads settings and runs the broker and WebSocket server until Ctrl+C.
+/// Loads settings, starts logging and telemetry from them, runs the server,
+/// and flushes telemetry before exiting.
+///
+/// Settings are loaded before logging starts, because `[telemetry]` decides
+/// how logging is set up; a settings error is printed to standard error.
+///
+/// Returns:
+///     Success when the server stopped cleanly, failure (after logging why) otherwise.
+async fn start_server() -> ExitCode {
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("can't load the configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let telemetry = match Telemetry::init(tracing::Level::INFO, &config.telemetry) {
+        Ok(telemetry) => telemetry,
+        Err(e) => {
+            popsub_utils::logging::init("info");
+            error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if config.telemetry.enabled {
+        info!(
+            sample_ratio = config.telemetry.sample_ratio,
+            "exporting OpenTelemetry metrics, traces and logs over OTLP"
+        );
+    }
+    let mut telemetry = telemetry;
+    let outcome = run_server(config, &mut telemetry).await;
+    if let Err(e) = &outcome {
+        error!("{e}");
+    }
+    tokio::task::block_in_place(|| telemetry.shutdown());
+    if outcome.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Runs the broker and WebSocket server until Ctrl+C or `SIGTERM`.
 ///
 /// If the JWT secret or admin password still has a published default value,
 /// the server refuses to start on a non-loopback host and only logs a warning
@@ -114,13 +163,16 @@ async fn main() -> ExitCode {
 /// builds the broker (refusing a durability
 /// the backend can't provide), spawns the QoS 1 retry, retention and session
 /// expiry loops,
-/// and serves on `host:port` until Ctrl+C arrives. On Ctrl+C every client is
-/// sent a `going_away` close frame before the process exits.
+/// serves `/healthz` and `/readyz` on `server.health_address` when set,
+/// and serves on `host:port` until Ctrl+C or `SIGTERM`. On either,
+/// `/readyz` turns to 503 and every client is sent a `going_away` close
+/// frame before the process exits.
+///
+/// Args:
+///     config: The loaded settings.
+///     telemetry: The telemetry providers, to register the broker's gauges with.
 ///
 /// Raises:
-///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
-///     ConfigError::Type: When a setting from the file or the environment has
-///         the wrong type, including an unknown backend or durability name.
 ///     String: When published default secrets are set and the host is not a loopback address.
 ///     String: When an entry in `server.trusted_proxies` isn't an IP address or CIDR range.
 ///     String: When `server.proxy_protocol` is on with no trusted proxies.
@@ -131,9 +183,12 @@ async fn main() -> ExitCode {
 ///     String: When `users.json` in the storage directory exists but can't be
 ///         read or parsed.
 ///     String: When `storage.durability` is stronger than the backend provides.
-///     String: When `host:port` can't be bound, with the underlying I/O error.
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config()?;
+///     String: When `host:port` or `server.health_address` can't be bound,
+///         with the underlying I/O error.
+async fn run_server(
+    config: Settings,
+    telemetry: &mut Telemetry,
+) -> Result<(), Box<dyn std::error::Error>> {
     let insecure = config.insecure_defaults();
     if !insecure.is_empty() {
         if !config.server.is_loopback() {
@@ -164,6 +219,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
     info!(backend = ?config.storage.backend, durability = ?log.durability, "storage opened");
+    telemetry.register_gauges(&broker);
     tokio::spawn(broker.clone().run_retry_loop());
     tokio::spawn(broker.clone().run_retention_loop());
     tokio::spawn(broker.clone().run_session_expiry_loop());
@@ -190,15 +246,65 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         server = server.with_tls(tls);
     }
 
+    let health = Health::new(broker.clone());
+    let _health_task = match config.server.health_address.as_str() {
+        "" => None,
+        health_addr => {
+            let listener = tokio::net::TcpListener::bind(health_addr)
+                .await
+                .map_err(|e| format!("can't serve health checks on {health_addr}: {e}"))?;
+            Some(AbortOnDrop(tokio::spawn(health.clone().serve(listener))))
+        }
+    };
+
     tokio::select! {
         served = server.listen(&addr) => served.map_err(|e| format!("can't serve on {addr}: {e}"))?,
-        _ = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
+            health.drain();
             let closed = broker.close_all(CloseCode::GoingAway);
-            info!(closed, "shutdown signal received, closing connections");
+            info!(signal, closed, "shutting down, closing connections");
             tokio::time::sleep(SHUTDOWN_GRACE).await;
         }
     }
     Ok(())
+}
+
+/// Aborts a spawned task when dropped, so it stops with `run_server`.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    /// Aborts the task.
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Waits for a request to shut down: Ctrl+C, or `SIGTERM` on Unix, which is
+/// what `docker stop` and Kubernetes send.
+///
+/// Returns:
+///     The signal's name, for the log.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            },
+            Err(e) => {
+                warn!(%e, "can't listen for SIGTERM; only Ctrl+C shuts down cleanly");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl+C"
+    }
 }
 
 /// Opens the storage backend the `[storage]` section names.

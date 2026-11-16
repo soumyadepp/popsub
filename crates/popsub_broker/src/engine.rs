@@ -20,6 +20,7 @@
 //! Methods that move a durable session's cursor return `CursorUpdate`s for
 //! the caller to write to the subscription store outside the lock.
 
+use popsub_utils::metrics::metrics;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -96,7 +97,42 @@ pub struct RetryOutcome {
     pub stalled: usize,
 }
 
+/// A snapshot of the broker's size, for gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BrokerStats {
+    /// Registered connections.
+    pub connections: u64,
+    /// Topics with a writer or subscribers.
+    pub topics: u64,
+    /// Live subscriptions across all connections.
+    pub subscriptions: u64,
+    /// QoS 1 records sent and not yet acknowledged.
+    pub in_flight: u64,
+}
+
 impl Broker {
+    /// Counts connections, topics, subscriptions and records in flight.
+    ///
+    /// Returns:
+    ///     The snapshot. It walks every subscription, so call it at
+    ///     metric-export intervals, not per message.
+    pub fn stats(&self) -> BrokerStats {
+        let mut stats = BrokerStats {
+            connections: self.clients.len() as u64,
+            topics: self.topics.len() as u64,
+            ..BrokerStats::default()
+        };
+        for topic in self.topics.values() {
+            stats.subscriptions += topic.subscribers.len() as u64;
+            stats.in_flight += topic
+                .subscribers
+                .values()
+                .map(|state| state.inflight.len() as u64)
+                .sum::<u64>();
+        }
+        stats
+    }
+
     /// Default ACK timeout of 5000 ms.
     ///
     /// Only tests read this. The retry loop uses `settings.ack_timeout_ms`,
@@ -451,6 +487,7 @@ impl Broker {
             debug!(client = %client_id, topic = %topic.name, seq, "ignored ACK for a record not in flight to this client");
             return AckOutcome::default();
         }
+        metrics().acknowledged.add(1, &[]);
         if state.stalled.take().is_some() {
             for pending in state.inflight.values_mut() {
                 pending.retries = 0;
@@ -539,6 +576,8 @@ impl Broker {
                 }
             }
         }
+        metrics().redelivered.add(outcome.resent as u64, &[]);
+        metrics().stalled.add(outcome.stalled as u64, &[]);
         outcome
     }
 }
@@ -585,6 +624,7 @@ fn send_one(
         return Offer::Closed;
     }
     state.next_seq = record.seq + 1;
+    metrics().delivered.add(1, &[]);
     if record.qos == 1 {
         state.inflight.insert(
             record.seq,

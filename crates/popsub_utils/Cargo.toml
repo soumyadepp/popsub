@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tracing = "0.1"
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
 tracing-subscriber = "0.3"
 thiserror = "1.0"
 serde_json = "1.0"

@@ -190,6 +190,33 @@ pub enum ClientMessage {
     },
 }
 
+impl ClientMessage {
+    /// The frame's `type` on the wire, for logs, metrics and trace names.
+    ///
+    /// Returns:
+    ///     The type, such as `publish` or `create_user`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ClientMessage::Auth { .. } => "auth",
+            ClientMessage::Login { .. } => "login",
+            ClientMessage::Register { .. } => "register",
+            ClientMessage::Subscribe { .. } => "subscribe",
+            ClientMessage::Unsubscribe { .. } => "unsubscribe",
+            ClientMessage::Publish { .. } => "publish",
+            ClientMessage::Ack { .. } => "ack",
+            ClientMessage::CreateUser { .. } => "create_user",
+            ClientMessage::GetUser { .. } => "get_user",
+            ClientMessage::ListUsers { .. } => "list_users",
+            ClientMessage::SetRole { .. } => "set_role",
+            ClientMessage::Grant { .. } => "grant",
+            ClientMessage::Revoke { .. } => "revoke",
+            ClientMessage::SetPassword { .. } => "set_password",
+            ClientMessage::SetEnabled { .. } => "set_enabled",
+            ClientMessage::DeleteUser { .. } => "delete_user",
+        }
+    }
+}
+
 /// What an account may do, as admins see and set it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

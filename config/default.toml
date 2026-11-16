@@ -15,6 +15,7 @@ outbound_queue_bytes = 16777216
 trusted_proxies = []
 max_connections_per_address = 0
 proxy_protocol = false
+health_address = ""
 tls_cert = ""
 tls_key = ""
 
@@ -44,3 +45,7 @@ max_lockout_secs = 3600
 registrations_per_hour = 5
 publish_per_second = 100
 publish_burst = 50
+
+[telemetry]
+enabled = false
+sample_ratio = 1.0
