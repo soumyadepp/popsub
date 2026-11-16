@@ -160,10 +160,20 @@ The settings you are most likely to change:
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
 | `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
 | `server.max_connections_per_address` | `0` (no limit) | Connections one client address may hold. Set `trusted_proxies` first if you run behind a proxy |
+| `server.health_address` | none | Serve `/healthz` and `/readyz` here, such as `0.0.0.0:9091` |
 | `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
 | `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
+
+## Health checks
+
+Set `server.health_address` (say `0.0.0.0:9091`) and PopSub serves two endpoints over plain HTTP, apart from the WebSocket port:
+
+- `GET /healthz` answers 200 while the process is up. Use it for liveness.
+- `GET /readyz` answers 200 when PopSub should get traffic, and 503 with a reason while it is shutting down or while topic appends are failing (a full disk, say). Use it for readiness and load balancer health checks.
+
+PopSub shuts down cleanly on Ctrl+C or `SIGTERM` (what `docker stop` and Kubernetes send): readiness turns to 503 and every client is told `going_away` before the process exits.
 
 ## TLS
 

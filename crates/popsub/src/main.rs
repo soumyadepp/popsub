@@ -2,7 +2,8 @@
 //!
 //! The `server` subcommand loads settings, opens the configured storage
 //! backend, builds the broker, spawns its QoS 1 retry, retention and session
-//! expiry loops and runs the WebSocket server until Ctrl+C. The `client`
+//! expiry loops, serves the health endpoints when configured, and runs the
+//! WebSocket server until Ctrl+C or `SIGTERM`. The `client`
 //! subcommand runs a short demo session (connect, subscribe, publish)
 //! against a running server with the SDK (`popsub_sdk`), for smoke tests.
 //! The `users` subcommands manage accounts on a running server (see `users`).
@@ -23,7 +24,8 @@ use popsub_protocol::CloseCode;
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
 use popsub_transport::{
-    FileUserStore, InMemoryUserStore, RateLimiters, Server, ServerTls, TrustedProxies, UserStore,
+    FileUserStore, Health, InMemoryUserStore, RateLimiters, Server, ServerTls, TrustedProxies,
+    UserStore,
 };
 use tracing::{error, info, warn};
 
@@ -104,7 +106,7 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Loads settings and runs the broker and WebSocket server until Ctrl+C.
+/// Loads settings and runs the broker and WebSocket server until Ctrl+C or `SIGTERM`.
 ///
 /// If the JWT secret or admin password still has a published default value,
 /// the server refuses to start on a non-loopback host and only logs a warning
@@ -114,8 +116,10 @@ async fn main() -> ExitCode {
 /// builds the broker (refusing a durability
 /// the backend can't provide), spawns the QoS 1 retry, retention and session
 /// expiry loops,
-/// and serves on `host:port` until Ctrl+C arrives. On Ctrl+C every client is
-/// sent a `going_away` close frame before the process exits.
+/// serves `/healthz` and `/readyz` on `server.health_address` when set,
+/// and serves on `host:port` until Ctrl+C or `SIGTERM`. On either,
+/// `/readyz` turns to 503 and every client is sent a `going_away` close
+/// frame before the process exits.
 ///
 /// Raises:
 ///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
@@ -131,7 +135,8 @@ async fn main() -> ExitCode {
 ///     String: When `users.json` in the storage directory exists but can't be
 ///         read or parsed.
 ///     String: When `storage.durability` is stronger than the backend provides.
-///     String: When `host:port` can't be bound, with the underlying I/O error.
+///     String: When `host:port` or `server.health_address` can't be bound,
+///         with the underlying I/O error.
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
     let insecure = config.insecure_defaults();
@@ -190,15 +195,65 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         server = server.with_tls(tls);
     }
 
+    let health = Health::new(broker.clone());
+    let _health_task = match config.server.health_address.as_str() {
+        "" => None,
+        health_addr => {
+            let listener = tokio::net::TcpListener::bind(health_addr)
+                .await
+                .map_err(|e| format!("can't serve health checks on {health_addr}: {e}"))?;
+            Some(AbortOnDrop(tokio::spawn(health.clone().serve(listener))))
+        }
+    };
+
     tokio::select! {
         served = server.listen(&addr) => served.map_err(|e| format!("can't serve on {addr}: {e}"))?,
-        _ = tokio::signal::ctrl_c() => {
+        signal = shutdown_signal() => {
+            health.drain();
             let closed = broker.close_all(CloseCode::GoingAway);
-            info!(closed, "shutdown signal received, closing connections");
+            info!(signal, closed, "shutting down, closing connections");
             tokio::time::sleep(SHUTDOWN_GRACE).await;
         }
     }
     Ok(())
+}
+
+/// Aborts a spawned task when dropped, so it stops with `run_server`.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    /// Aborts the task.
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Waits for a request to shut down: Ctrl+C, or `SIGTERM` on Unix, which is
+/// what `docker stop` and Kubernetes send.
+///
+/// Returns:
+///     The signal's name, for the log.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            },
+            Err(e) => {
+                warn!(%e, "can't listen for SIGTERM; only Ctrl+C shuts down cleanly");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl+C"
+    }
 }
 
 /// Opens the storage backend the `[storage]` section names.

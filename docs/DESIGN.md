@@ -83,6 +83,7 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 - **Retention loop.** `SharedBroker::run_retention_loop` trims every topic log to the retention limits once a minute, so quiet topics still age out. Publishing also trims the topic it appended to.
 - **Auth service.** A plain `Arc<AuthService>`. Its methods take `&self` and the user store locks internally, so it needs no lock of its own and can never be held together with the broker lock.
 - **Prune task.** Every minute, drops rate limiter entries for keys that have gone quiet. It stops when the server stops.
+- **Health endpoints.** With `server.health_address` set, a small HTTP server answers `GET /healthz` (liveness: 200 whenever the process can answer) and `GET /readyz` (readiness: 503 while shutting down, or for 30 seconds after a failed topic append unless one succeeds since). It is separate from the WebSocket listener so a load balancer or orchestrator can probe it without speaking the protocol. The 30 second window exists because a server marked not ready gets no traffic, so no new append could clear the failure.
 
 ## 4. Protocol
 
@@ -263,6 +264,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
 | `server.proxy_protocol` | `false` | Transport. Connections from `server.trusted_proxies` must start with a PROXY protocol header (version 1 or 2), whose address is the client's. Needs `server.trusted_proxies`, or startup stops |
 | `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
+| `server.health_address` | empty | The binary. Where to serve `/healthz` and `/readyz` over plain HTTP, such as `127.0.0.1:9091`; empty serves neither. A port that can't be bound stops startup |
 | `server.tls_cert`, `server.tls_key` | empty | The binary. PEM certificate chain (leaf first) and private key; with both set the server serves `wss://`. Setting only one, or files that can't be read or don't match, stops startup |
 | `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
@@ -334,7 +336,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | Subscriber socket drops | Send loop ends, client and subscriptions are removed. An ephemeral connection's unacknowledged records are lost; a durable session gets them again when it reconnects. |
 | A connection goes half-open (the client vanished without closing) | No pongs come back, and it is closed with `idle_timeout` after `server.idle_timeout_secs`, freeing its subscriptions and session. |
 | A token expires on a long connection | The client is warned with `auth_expiring`, then closed with `token_expired` unless it sent a fresh `auth`. |
-| The server is stopped with Ctrl+C | Every client is sent `going_away` before the process exits. |
+| The server is stopped with Ctrl+C or `SIGTERM` | `/readyz` turns to 503, every client is sent `going_away`, and the process exits half a second later. |
 | Subscriber reads slowly | Once its queue passes the soft limit, deliveries wait in the topic log and are sent as it catches up, in order. Server memory for it stays near the soft limit. If it falls behind retention, it gets `truncated`. |
 | Publisher sends to a topic nobody subscribes to | Stored in the topic log until retention trims it. |
 | A subscriber stops acknowledging | Its window fills and delivery to it pauses; after `max_retries` it gets `stalled`. Other subscribers are unaffected, and nothing is queued in memory for it. |
@@ -347,7 +349,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | An admin revokes a user's access while it is subscribed | The subscription is ended with an `unsubscribed` frame, and a durable session forgets it. |
 | An admin disables or deletes an account that is connected | Its connections are closed with `account_disabled`; it can't log in, and its tokens are refused at `auth`. |
 | The server restarts | With the `file` backend, accounts are read back from `users.json`. With `memory`, every account but the configured admin is lost. |
-| Storage append fails | Nothing is delivered. A QoS 1 publisher gets `storage unavailable` and can retry; QoS 0 is logged and dropped. |
+| Storage append fails | Nothing is delivered. A QoS 1 publisher gets `storage unavailable` and can retry; QoS 0 is logged and dropped. `/readyz` answers 503 until an append succeeds or 30 seconds pass. |
 | Storage read fails during a subscribe | The client gets an error and is not subscribed. It can subscribe again. |
 | A subscriber asks for history that was trimmed | It gets a `truncated` frame with the oldest available `seq`, then the rest. |
 | Broker process restarts | With the `file` backend, history and sessions are reopened and sessions resume from their stored cursors. With `memory`, all of it is lost. |

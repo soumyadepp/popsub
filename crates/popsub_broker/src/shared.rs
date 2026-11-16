@@ -17,6 +17,7 @@
 //! which combines the username with the client's session id, so one user
 //! can never attach to another user's session.
 
+use crate::health::StorageHealth;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -132,6 +133,8 @@ pub struct SharedBroker {
     log: LogSettings,
     /// One writer queue per topic used so far.
     writers: Arc<Mutex<Writers>>,
+    /// The outcomes of recent appends, for readiness.
+    health: Arc<StorageHealth>,
 }
 
 impl fmt::Debug for SharedBroker {
@@ -172,7 +175,19 @@ impl SharedBroker {
             storage,
             log,
             writers: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(StorageHealth::default()),
         })
+    }
+
+    /// Whether appends are failing, for the server's readiness check.
+    ///
+    /// Args:
+    ///     window: How long a failed append counts for, unless one succeeds after it.
+    ///
+    /// Returns:
+    ///     How long ago the last failure was, or `None` when storage isn't failing.
+    pub fn storage_failing(&self, window: Duration) -> Option<Duration> {
+        self.health.failing(window)
     }
 
     /// The window size subscriptions get, for the limits clients are told about.
@@ -547,7 +562,13 @@ impl SharedBroker {
         self.writers()
             .entry(topic.to_string())
             .or_insert_with(|| {
-                TopicWriter::spawn(topic, self.broker.clone(), self.storage.clone(), self.log)
+                TopicWriter::spawn(
+                    topic,
+                    self.broker.clone(),
+                    self.storage.clone(),
+                    self.log,
+                    self.health.clone(),
+                )
             })
             .clone()
     }

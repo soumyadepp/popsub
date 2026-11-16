@@ -13,6 +13,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 jsonwebtoken = "9.3.1"
 futures-util = "0.3.31"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tracing = "0.1.41"
 
 popsub_auth = { path = "../popsub_auth" }

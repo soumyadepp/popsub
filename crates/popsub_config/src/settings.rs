@@ -71,6 +71,9 @@ pub struct ServerSettings {
     /// header (version 1 or 2), as TCP load balancers send, giving the
     /// client's address. Off by default; needs `trusted_proxies`.
     pub proxy_protocol: bool,
+    /// Where to serve `/healthz` and `/readyz` over plain HTTP, such as
+    /// `127.0.0.1:9091`. Empty (the default) serves neither.
+    pub health_address: String,
     /// PEM file with the TLS certificate chain, leaf first. Set it with
     /// `tls_key` to serve `wss://`; both empty (the default) serves `ws://`.
     pub tls_cert: String,
@@ -83,8 +86,8 @@ impl Default for ServerSettings {
     /// secret and admin password (fine only for local development), 24 hour
     /// tokens, registration off, a ping every 30 seconds, a 90 second idle
     /// timeout, 1 MiB payloads, a 16 MiB outbound queue per connection, no
-    /// trusted proxies, no PROXY protocol, no per-address connection limit
-    /// and no TLS.
+    /// trusted proxies, no PROXY protocol, no per-address connection limit,
+    /// no TLS and no health endpoints.
     ///
     /// Returns:
     ///     The default `[server]` section.
@@ -105,6 +108,7 @@ impl Default for ServerSettings {
             trusted_proxies: Vec::new(),
             max_connections_per_address: 0,
             proxy_protocol: false,
+            health_address: String::new(),
             tls_cert: String::new(),
             tls_key: String::new(),
         }

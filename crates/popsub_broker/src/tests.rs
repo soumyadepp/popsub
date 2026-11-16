@@ -1196,3 +1196,35 @@ fn a_users_connections_can_be_listed_and_closed() {
     }
     assert_eq!(rx_bob.try_recv(), None);
 }
+
+/// Checks that failed appends mark storage as failing until one succeeds.
+#[tokio::test]
+async fn failed_appends_mark_storage_as_failing() {
+    let storage = popsub_storage::FaultyStorage::new(Arc::new(MemoryStorage::new()));
+    let broker = SharedBroker::new(
+        Broker::new(BrokerSettings::default()),
+        Arc::new(storage.clone()),
+        LogSettings {
+            durability: Durability::None,
+            retention: Retention::default(),
+            session_expiry: Duration::from_secs(60),
+        },
+    )
+    .expect("broker");
+    let window = Duration::from_secs(30);
+    assert_eq!(broker.storage_failing(window), None);
+    storage.set_failing(true);
+    assert!(
+        broker
+            .publish("orders", new_record("lost", 1))
+            .await
+            .is_err()
+    );
+    assert!(broker.storage_failing(window).is_some());
+    storage.set_failing(false);
+    broker
+        .publish("orders", new_record("kept", 1))
+        .await
+        .expect("publish");
+    assert_eq!(broker.storage_failing(window), None);
+}

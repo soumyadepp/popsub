@@ -23,6 +23,7 @@
 //! The cost is that a long catch-up delays publishes to the same topic
 //! until it finishes. Other topics are unaffected.
 
+use crate::health::StorageHealth;
 use std::sync::Arc;
 
 use popsub_storage::{NewRecord, Result as StorageResult, Storage};
@@ -104,6 +105,8 @@ pub(crate) struct TopicWriter {
     storage: Arc<dyn Storage>,
     /// Durability for appends and the retention applied after each one.
     log: LogSettings,
+    /// Where each append's outcome is recorded, for readiness.
+    health: Arc<StorageHealth>,
     /// The log's `last_seq` as this writer last saw it, or `None` until it
     /// has been read or after a failed append, when it is read again.
     last_seq: Option<u64>,
@@ -123,6 +126,7 @@ impl TopicWriter {
     ///     broker: The broker to deliver through.
     ///     storage: Where the topic's log lives.
     ///     log: Durability and retention settings.
+    ///     health: Where append outcomes are recorded.
     ///
     /// Returns:
     ///     The sending side of the writer's queue.
@@ -131,6 +135,7 @@ impl TopicWriter {
         broker: BrokerCell,
         storage: Arc<dyn Storage>,
         log: LogSettings,
+        health: Arc<StorageHealth>,
     ) -> mpsc::UnboundedSender<Command> {
         let (tx, rx) = mpsc::unbounded_channel();
         let writer = TopicWriter {
@@ -138,6 +143,7 @@ impl TopicWriter {
             broker,
             storage,
             log,
+            health,
             last_seq: None,
             queue: tx.downgrade(),
         };
@@ -236,8 +242,12 @@ impl TopicWriter {
             .append(&self.topic, record, self.log.durability)
             .await
         {
-            Ok(stored) => stored,
+            Ok(stored) => {
+                self.health.record_success();
+                stored
+            }
             Err(e) => {
+                self.health.record_failure();
                 self.last_seq = None;
                 return Err(e);
             }
