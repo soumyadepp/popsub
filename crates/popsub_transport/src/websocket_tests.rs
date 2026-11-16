@@ -981,6 +981,8 @@ async fn replies_echo_request_ids() {
     assert_eq!(auth["limits"]["session_expiry_secs"], 86_400);
     assert_eq!(auth["limits"]["heartbeat_secs"], 30);
     assert_eq!(auth["limits"]["idle_timeout_secs"], 90);
+    assert_eq!(auth["limits"]["max_payload_bytes"], 1_048_576);
+    assert_eq!(auth["limits"]["max_topic_bytes"], 120);
     let subscribed = send_raw(
         &mut ws,
         &serde_json::json!({"type": "subscribe", "id": 2, "topic": "chat"}).to_string(),
@@ -1337,4 +1339,76 @@ async fn start_server_with(
         .with_heartbeat(heartbeat);
     tokio::spawn(server.serve(listener));
     (addr, broker)
+}
+
+/// Checks that a payload at the limit is published, one byte over gets
+/// `payload_too_large`, and a frame far over the WebSocket limit closes the
+/// connection with `message_too_big`.
+#[tokio::test]
+async fn oversized_payloads_and_frames_are_refused() {
+    let mut settings = Settings::default();
+    settings.server.max_payload_bytes = 100;
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = admin_connection(addr, &settings).await;
+    let at_limit = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 1, "topic": "chat", "payload": "x".repeat(100), "qos": 1}).to_string(),
+    )
+    .await;
+    assert_eq!(at_limit["type"], "published");
+    let over = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 2, "topic": "chat", "payload": "x".repeat(101), "qos": 1}).to_string(),
+    )
+    .await;
+    assert_eq!(
+        (over["id"].clone(), over["code"].clone()),
+        (serde_json::json!(2), serde_json::json!("payload_too_large"))
+    );
+
+    let huge =
+        serde_json::json!({"type": "publish", "topic": "chat", "payload": "x".repeat(70_000)})
+            .to_string();
+    ws.send(WsMessage::Text(huge.into())).await.expect("send");
+    assert_eq!(
+        next_close(&mut ws, Duration::from_secs(2)).await,
+        (
+            CloseCode::MessageTooBig.code(),
+            "message_too_big".to_string()
+        )
+    );
+}
+
+/// Checks that invalid topic names get `invalid_topic` on subscribe and
+/// publish, and an over-long `message_id` gets `bad_request`, without
+/// closing the connection.
+#[tokio::test]
+async fn invalid_topics_and_message_ids_are_refused() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = admin_connection(addr, &settings).await;
+    let long_topic = "t".repeat(121);
+    for frame in [
+        serde_json::json!({"type": "subscribe", "id": 1, "topic": "metrics/#"}),
+        serde_json::json!({"type": "subscribe", "id": 2, "topic": "a/+/b"}),
+        serde_json::json!({"type": "publish", "id": 3, "topic": "", "payload": "x"}),
+        serde_json::json!({"type": "publish", "id": 4, "topic": long_topic, "payload": "x"}),
+    ] {
+        let reply = send_raw(&mut ws, &frame.to_string()).await;
+        assert_eq!(reply["code"], "invalid_topic", "{frame}");
+        assert_eq!(reply["id"], frame["id"]);
+    }
+    let long_id = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 5, "topic": "chat", "payload": "x", "message_id": "m".repeat(129)}).to_string(),
+    )
+    .await;
+    assert_eq!(long_id["code"], "bad_request");
+    let fine = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 6, "topic": "chat", "payload": "x", "qos": 1})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(fine["type"], "published");
 }

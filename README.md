@@ -89,9 +89,9 @@ Every failure is an `error` frame with a machine-readable `code`:
 { "type": "error", "id": 7, "code": "rate_limited", "message": "too many messages", "retry_after": 1 }
 ```
 
-When the server closes a connection it sends a WebSocket close code saying why: `1001` shutting down, `1011` internal error, `4001` auth failed, `4002` request before auth, `4003` session taken over by another connection (don't reconnect), `4004` token expired, `4005` idle timeout, `4006` unsupported protocol (don't reconnect), `4007` session store unavailable. The server pings every 30 seconds and closes a connection that sends nothing, not even a pong, for 90 seconds; WebSocket libraries answer pings by themselves.
+When the server closes a connection it sends a WebSocket close code saying why: `1001` shutting down, `1009` frame too large, `1011` internal error, `4001` auth failed, `4002` request before auth, `4003` session taken over by another connection (don't reconnect), `4004` token expired, `4005` idle timeout, `4006` unsupported protocol (don't reconnect), `4007` session store unavailable. The server pings every 30 seconds and closes a connection that sends nothing, not even a pong, for 90 seconds; WebSocket libraries answer pings by themselves.
 
-The error codes are `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable` and `internal`. A frame that isn't valid JSON or has an unknown `type` gets `bad_request` and the connection stays open.
+The error codes are `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic` and `internal`. A frame that isn't valid JSON or has an unknown `type` gets `bad_request` and the connection stays open.
 
 - Register, when the server allows it:
 
@@ -116,7 +116,7 @@ The error codes are `bad_request`, `unauthenticated`, `auth_failed`, `invalid_cr
   { "type": "auth", "token": "<jwt>", "protocol": 1, "session_id": "phone-1" }
   ```
 
-  The reply is `{ "type": "authenticated", "protocol": 1, "limits": { "max_inflight": 100, "session_expiry_secs": 86400, "heartbeat_secs": 30, "idle_timeout_secs": 90 } }`. `protocol` may be left out (it means 1); a version the server doesn't speak gets `unsupported_protocol` and the connection closes. A minute before the token expires the server sends `{ "type": "auth_expiring", "expires_at_ms": ... }`; send `auth` again with a fresh token for the same user to keep the connection, or it is closed with code `4004`. With a `session_id`, the connection holds a durable session of that user: its subscriptions and how far it has acknowledged are kept after it disconnects (for `session_expiry_secs`), and restored when it authenticates with the same `session_id` again. The reply then echoes the `session_id` and lists the restored topics in `resumed`. Add `"clean_start": true` to discard what was stored. Reconnecting with a session another connection still holds closes that connection with code `4003`.
+  The reply is `{ "type": "authenticated", "protocol": 1, "limits": { "max_inflight": 100, "session_expiry_secs": 86400, "heartbeat_secs": 30, "idle_timeout_secs": 90, "max_payload_bytes": 1048576, "max_topic_bytes": 120 } }`. `protocol` may be left out (it means 1); a version the server doesn't speak gets `unsupported_protocol` and the connection closes. A minute before the token expires the server sends `{ "type": "auth_expiring", "expires_at_ms": ... }`; send `auth` again with a fresh token for the same user to keep the connection, or it is closed with code `4004`. With a `session_id`, the connection holds a durable session of that user: its subscriptions and how far it has acknowledged are kept after it disconnects (for `session_expiry_secs`), and restored when it authenticates with the same `session_id` again. The reply then echoes the `session_id` and lists the restored topics in `resumed`. Add `"clean_start": true` to discard what was stored. Reconnecting with a session another connection still holds closes that connection with code `4003`.
 
 - Subscribe / Unsubscribe:
 
@@ -135,6 +135,8 @@ The error codes are `bad_request`, `unauthenticated`, `auth_failed`, `invalid_cr
 
   { "type": "publish", "topic": "critical", "payload": "Important", "message_id": "id-123", "qos": 1 }
   ```
+
+  Payloads are limited to `max_payload_bytes` (1 MiB by default, `server.max_payload_bytes`); a longer one gets `payload_too_large`. Topic names are 1 to 120 bytes with no control characters, `+` or `#` (those are kept for wildcard permissions), or the request gets `invalid_topic`. A `message_id` is 1 to 128 characters.
 
   A QoS 1 publish is confirmed with `{ "type": "published", "message_id": "id-123", "seq": 42 }` once it is stored. A QoS 0 publish gets no reply unless it fails; if storage fails, either QoS gets `storage_unavailable` and nothing was sent. Publishing the same `message_id` again from the same user (for example, retrying after a dropped connection) stores and delivers it once and gets the original `seq` back. When `message_id` is missing the server generates one.
 

@@ -16,6 +16,7 @@ fn test_default_settings() {
     assert_eq!(settings.server.port, 8080);
     assert_eq!(settings.server.heartbeat_secs, 30);
     assert_eq!(settings.server.idle_timeout_secs, 90);
+    assert_eq!(settings.server.max_payload_bytes, 1024 * 1024);
     assert_eq!(settings.broker.max_connections, 1000);
     assert_eq!(settings.storage.backend, StorageBackend::File);
     assert_eq!(settings.storage.path, "pubsub_data");

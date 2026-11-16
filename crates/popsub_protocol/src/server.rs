@@ -142,6 +142,11 @@ pub enum ErrorCode {
     UnsupportedProtocol,
     /// The message store couldn't be reached; retry later.
     StorageUnavailable,
+    /// The payload is longer than `Limits::max_payload_bytes`.
+    PayloadTooLarge,
+    /// The topic name is empty, longer than `Limits::max_topic_bytes`, or
+    /// has control characters or the wildcard characters `+` and `#`.
+    InvalidTopic,
     /// Anything else went wrong on the server.
     Internal,
 }
@@ -158,6 +163,10 @@ pub struct Limits {
     /// How long the server waits for anything from the client, a pong
     /// included, before closing with `CloseCode::IdleTimeout`, in seconds.
     pub idle_timeout_secs: u64,
+    /// The longest payload a publish may carry, in bytes.
+    pub max_payload_bytes: u64,
+    /// The longest topic name, in bytes.
+    pub max_topic_bytes: u64,
 }
 
 /// A record delivered to a subscriber, live or replayed.

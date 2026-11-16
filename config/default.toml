@@ -10,6 +10,7 @@ allow_registration = false
 registration_role = "none"
 heartbeat_secs = 30
 idle_timeout_secs = 90
+max_payload_bytes = 1048576
 
 [broker]
 max_connections = 1000

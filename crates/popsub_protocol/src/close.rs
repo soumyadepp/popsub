@@ -10,6 +10,9 @@
 pub enum CloseCode {
     /// 1001: the server is shutting down. Reconnect with backoff.
     GoingAway,
+    /// 1009: the client sent a frame larger than the server accepts. Reconnect,
+    /// but don't resend that frame.
+    MessageTooBig,
     /// 1011: the server hit an unexpected error. Reconnect with backoff.
     InternalError,
     /// 4001: the token or `session_id` in `auth` was rejected. Log in again
@@ -37,8 +40,9 @@ pub enum CloseCode {
 
 impl CloseCode {
     /// Every close code, for docs and tests.
-    pub const ALL: [CloseCode; 9] = [
+    pub const ALL: [CloseCode; 10] = [
         CloseCode::GoingAway,
+        CloseCode::MessageTooBig,
         CloseCode::InternalError,
         CloseCode::AuthFailed,
         CloseCode::Unauthenticated,
@@ -52,10 +56,11 @@ impl CloseCode {
     /// The numeric WebSocket close code.
     ///
     /// Returns:
-    ///     1001 or 1011 for the standard codes, 4001 to 4007 for PopSub's own.
+    ///     1001, 1009 or 1011 for the standard codes, 4001 to 4007 for PopSub's own.
     pub fn code(self) -> u16 {
         match self {
             CloseCode::GoingAway => 1001,
+            CloseCode::MessageTooBig => 1009,
             CloseCode::InternalError => 1011,
             CloseCode::AuthFailed => 4001,
             CloseCode::Unauthenticated => 4002,
@@ -74,6 +79,7 @@ impl CloseCode {
     pub fn reason(self) -> &'static str {
         match self {
             CloseCode::GoingAway => "going_away",
+            CloseCode::MessageTooBig => "message_too_big",
             CloseCode::InternalError => "internal_error",
             CloseCode::AuthFailed => "auth_failed",
             CloseCode::Unauthenticated => "unauthenticated",

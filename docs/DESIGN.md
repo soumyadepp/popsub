@@ -88,8 +88,10 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`).
 
 - **Request ids.** Any client frame may carry an `id`, a number or a string. The reply carries the same `id`. Frames the server sends on its own have none.
-- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
+- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
 - **Evolution.** Within a version, frames, fields and error codes are only added. Clients ignore fields and frame types they don't know, and treat an unknown error code like `internal`. Removing or changing anything needs a new version, named by the client in `auth`.
+
+Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`.
 
 ### 4.1 Client to server
 
@@ -100,7 +102,7 @@ All frames are JSON text, tagged with `type`. The types live in `popsub_protocol
 | `auth` | `token`, optional `protocol`, optional `session_id`, optional `clean_start` | `authenticated`. Must succeed before anything below is accepted. A bad token, an unsupported `protocol` or a bad `session_id` closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
 | `subscribe` | `topic`, optional `from` | `subscribed`, then history, then live records. Requires subscribe permission. `from` is `"resume"` (the default: one past a durable session's stored cursor, otherwise no replay), `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`. `storage_unavailable` if the log or session store can't be read, in which case the client is not subscribed. |
 | `unsubscribe` | `topic` | `unsubscribed`, even if the client wasn't subscribed. |
-| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. |
+| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
 | `ack` | `topic`, `seq` | None. Confirms one QoS 1 record delivered to this connection. Anything not in flight to this connection is ignored. |
 
 ### 4.2 Server to client
@@ -109,7 +111,7 @@ All frames are JSON text, tagged with `type`. The types live in `popsub_protocol
 |---|---|
 | Registered | `{"type":"registered"}` |
 | Logged in | `{"type":"logged_in","token":"..."}` |
-| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
+| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90,"max_payload_bytes":1048576,"max_topic_bytes":120}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
 | Auth expiring | `{"type":"auth_expiring","expires_at_ms":1794800000000}`, a minute before the token expires |
 | Subscribed | `{"type":"subscribed","topic":"...","replay_from":41,"replay_to":90}`. Records `replay_from` to `replay_to` are history; later ones are live. Also sent, without an `id`, for each subscription a session restores. |
 | Unsubscribed | `{"type":"unsubscribed","topic":"..."}` |
@@ -139,6 +141,7 @@ All replies also carry the request's `id` when it had one. The broker writes `me
 | Code | Reason | When | Reconnect? |
 |---|---|---|---|
 | 1001 | `going_away` | The server is shutting down | Yes, with backoff |
+| 1009 | `message_too_big` | A frame was larger than twice `server.max_payload_bytes` plus 64 KiB | Yes, without resending that frame |
 | 1011 | `internal_error` | A handler failed unexpectedly | Yes, with backoff |
 | 4001 | `auth_failed` | Bad or expired token, or a bad `session_id`, in `auth` | Only after logging in again |
 | 4002 | `unauthenticated` | A request before `auth` | Yes, and authenticate first |
@@ -232,6 +235,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.registration_role` | `none` | Auth. `none`, `readonly` or `full`; anything else means `none` |
 | `server.heartbeat_secs` | `30` | Transport. How often each connection is pinged |
 | `server.idle_timeout_secs` | `90` | Transport. How long a connection may send nothing before it is closed |
+| `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
 | `broker.max_connections` | `1000` | Nothing. Not enforced. |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
@@ -297,6 +301,7 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | Two publishers reuse a `message_id` | Two separate records; the idempotency key is scoped to the publisher. |
 | Someone guesses a user's password | That address and username pair locks out after 5 failures; the address locks out after 20 across all usernames. The real user, from another address, is unaffected. |
 | A client floods publishes | Its user's token bucket empties and further publishes get an error until it refills. |
+| A client sends a huge frame | Frames over twice `server.max_payload_bytes` plus 64 KiB are refused by the WebSocket layer before they are buffered, and the connection is closed with `message_too_big`. Smaller frames whose payload is over the limit get `payload_too_large`. |
 | The server restarts | Self-registered users are lost with the in-memory store. The admin is recreated from config. |
 | Storage append fails | Nothing is delivered. A QoS 1 publisher gets `storage unavailable` and can retry; QoS 0 is logged and dropped. |
 | Storage read fails during a subscribe | The client gets an error and is not subscribed. It can subscribe again. |
@@ -335,13 +340,13 @@ Done in #9 and #12: users and per-topic permissions, rate limits on logins, regi
 Remaining:
 
 - An admin message or CLI command to grant topics and manage users.
-- Enforce connection and message size limits, and make rate limits configurable.
+- Enforce a connection limit, and make rate limits configurable.
 - Trust a proxy's forwarded address when configured, so limits work behind one.
 - Document running behind a TLS proxy.
 
 ### Phase 3: adoptable
 
-- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Next: message and queue size limits, then a JSON Schema generated from the types for other languages.
+- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Also done: payload, frame, topic and message id limits. Next: a byte budget for each connection's outbound queue, then a JSON Schema generated from the types for other languages.
 - JavaScript and Python client libraries with reconnection and ACK handling built in.
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.
