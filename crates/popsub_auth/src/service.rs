@@ -66,14 +66,14 @@ pub fn validate_password(password: &str) -> Result<()> {
 /// `Default` uses published values for the secret and admin password, which
 /// `insecure_defaults` reports. Registration is off by default and new users
 /// get no topics.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthConfig {
     /// HMAC secret used to sign and verify tokens.
     pub jwt_secret: String,
     /// Lifetime of issued tokens, in hours.
     pub jwt_expiration_hours: u64,
     /// Username of the admin that `AuthService::new` and
-    /// `AuthService::with_store_and_admin` create when it does not exist.
+    /// `AuthService::with_store` create when it does not exist.
     pub default_admin_username: String,
     /// Password for that admin.
     pub default_admin_password: String,
@@ -93,6 +93,30 @@ pub enum DefaultUserRole {
     /// A `Role::User` with exactly these permissions. An empty list, the
     /// default, grants nothing.
     LimitedAccess(Vec<TopicPermission>),
+}
+
+impl std::fmt::Debug for AuthConfig {
+    /// Formats the config with the JWT secret and admin password redacted,
+    /// so logging the service never leaks them.
+    ///
+    /// Args:
+    ///     f: The formatter to write to.
+    ///
+    /// Returns:
+    ///     The formatter's result.
+    ///
+    /// Raises:
+    ///     std::fmt::Error: When the formatter fails to write.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("jwt_secret", &"<redacted>")
+            .field("jwt_expiration_hours", &self.jwt_expiration_hours)
+            .field("default_admin_username", &self.default_admin_username)
+            .field("default_admin_password", &"<redacted>")
+            .field("allow_registration", &self.allow_registration)
+            .field("default_user_role", &self.default_user_role)
+            .finish()
+    }
 }
 
 impl Default for AuthConfig {
@@ -244,74 +268,21 @@ impl std::fmt::Debug for AuthService {
 impl AuthService {
     /// Builds a service on a fresh in-memory store and adds the configured admin.
     ///
-    /// Logs a warning for each published default in `config`. If creating the
-    /// admin fails, the failure is logged and the service is still returned.
-    ///
     /// Args:
     ///     config: Secret, token lifetime, admin credentials and registration settings.
     ///
     /// Returns:
     ///     The service, holding only the admin account.
     pub async fn new(config: AuthConfig) -> Self {
-        config.warn_if_insecure();
-        let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
-        let user_store = Arc::new(InMemoryUserStore::new());
-
-        let service = Self {
-            jwt_service,
-            user_store,
-            config: config.clone(),
-        };
-
-        if let Err(e) = service
-            .add_user(
-                &config.default_admin_username,
-                &config.default_admin_password,
-                Role::Admin,
-            )
-            .await
-        {
-            warn!("Failed to create default admin: {}", e);
-        } else {
-            info!(
-                "Created default admin user: {}",
-                config.default_admin_username
-            );
-        }
-
-        service
-    }
-
-    /// Builds a service on an existing store without creating any users.
-    ///
-    /// The configured admin is not created, so the store must already hold an
-    /// admin or the caller must add one with `add_user`. Logs a warning for
-    /// each published default in `config`.
-    ///
-    /// Args:
-    ///     config: Secret, token lifetime and registration settings.
-    ///     store: The user store to read and write accounts in.
-    ///
-    /// Returns:
-    ///     The service.
-    pub fn with_store(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
-        config.warn_if_insecure();
-        let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
-
-        Self {
-            jwt_service,
-            user_store: store,
-            config,
-        }
+        Self::with_store(config, Arc::new(InMemoryUserStore::new())).await
     }
 
     /// Builds a service on an existing store and adds the configured admin if it is missing.
     ///
-    /// An existing account with the admin's username is left as it is, even if
-    /// its role or password differ from the config. If the existence check
-    /// fails, creation is attempted anyway. A failure to create the admin is
-    /// logged and the service is still returned. Logs a warning for each
-    /// published default in `config`.
+    /// Logs a warning for each published default in `config`. An existing
+    /// account with the admin's username is left as it is, even if its role or
+    /// password differ from the config. A failure to create the admin is
+    /// logged and the service is still returned.
     ///
     /// Args:
     ///     config: Secret, token lifetime, admin credentials and registration settings.
@@ -319,39 +290,34 @@ impl AuthService {
     ///
     /// Returns:
     ///     The service.
-    pub async fn with_store_and_admin(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
+    pub async fn with_store(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
         config.warn_if_insecure();
-        let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
-
         let service = Self {
-            jwt_service,
+            jwt_service: JwtService::new(&config.jwt_secret, config.jwt_expiration_hours),
             user_store: store,
-            config: config.clone(),
+            config,
         };
-
-        if !service
-            .user_exists(&config.default_admin_username)
-            .await
-            .unwrap_or(false)
-        {
-            if let Err(e) = service
-                .add_user(
-                    &config.default_admin_username,
-                    &config.default_admin_password,
-                    Role::Admin,
-                )
-                .await
-            {
-                warn!("Failed to create default admin: {}", e);
-            } else {
-                info!(
-                    "Created default admin user: {}",
-                    config.default_admin_username
-                );
-            }
-        }
-
+        service.ensure_admin().await;
         service
+    }
+
+    /// Creates the configured admin account unless one with that username exists.
+    ///
+    /// If the existence check fails, creation is attempted anyway. Failures
+    /// are logged rather than returned, so a store problem doesn't stop the
+    /// service from starting.
+    async fn ensure_admin(&self) {
+        let username = &self.config.default_admin_username;
+        if self.user_exists(username).await.unwrap_or(false) {
+            return;
+        }
+        match self
+            .add_user(username, &self.config.default_admin_password, Role::Admin)
+            .await
+        {
+            Ok(()) => info!("Created default admin user: {}", username),
+            Err(e) => warn!("Failed to create default admin: {}", e),
+        }
     }
 
     /// Exposes the JWT service so callers can sign or decode tokens directly.
@@ -612,16 +578,17 @@ impl AuthService {
     ///     The decoded claims.
     ///
     /// Raises:
-    ///     AuthError::JwtError: When the token is malformed, badly signed, or
-    ///         expired by more than the 60 second decode leeway.
-    ///     AuthError::TokenExpired: When it expired within that leeway.
+    ///     AuthError::TokenExpired: When the token has expired.
+    ///     AuthError::JwtError: When the token is malformed or badly signed.
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
         self.jwt_service.validate_token(token)
     }
 
     /// Issues a new token with a full lifetime for the holder of a still valid one.
     ///
-    /// The user store is not consulted, so removed or disabled users can refresh.
+    /// The user is looked up first, so an account that has been removed or
+    /// disabled since the token was issued can't keep itself alive by
+    /// refreshing.
     ///
     /// Args:
     ///     token: The token to refresh.
@@ -630,12 +597,16 @@ impl AuthService {
     ///     The new token, with the same subject and role claim.
     ///
     /// Raises:
-    ///     AuthError::JwtError: When the token is malformed, badly signed,
-    ///         expired by more than the 60 second decode leeway, or the new
-    ///         token cannot be signed.
-    ///     AuthError::TokenExpired: When it expired within that leeway.
-    pub fn refresh_token(&self, token: &str) -> Result<String> {
-        self.jwt_service.refresh_token(token)
+    ///     AuthError::TokenExpired: When the token has expired.
+    ///     AuthError::JwtError: When the token is malformed or badly signed,
+    ///         or the new token can't be signed.
+    ///     AuthError::InvalidToken: When the token's user no longer exists or is disabled.
+    pub async fn refresh_token(&self, token: &str) -> Result<String> {
+        let claims = self.jwt_service.validate_token(token)?;
+        match self.user_store.get_user(&claims.sub).await? {
+            Some(user) if user.enabled => self.jwt_service.refresh_token(token),
+            _ => Err(AuthError::InvalidToken),
+        }
     }
 
     /// Decides whether a user may subscribe to a topic, using the role in the store.

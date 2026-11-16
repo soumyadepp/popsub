@@ -11,8 +11,9 @@
 //!
 //! Replies go straight onto the session's own outgoing channel, so sending
 //! one never takes the broker lock. The broker is only reached through
-//! `SharedBroker::with`, whose closures can't await, and the auth lock is
-//! always released before the broker lock is taken.
+//! `SharedBroker::with`, whose closures can't await. The auth service needs
+//! no lock of its own: its methods take `&self` and its user store does its
+//! own locking.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tracing::{error, info, warn};
@@ -132,7 +133,7 @@ pub struct Server {
     /// The broker every connection publishes and subscribes through.
     broker: SharedBroker,
     /// Users, passwords, tokens and topic permissions.
-    auth: Arc<RwLock<AuthService>>,
+    auth: Arc<AuthService>,
     /// Limits shared by every connection on this server.
     limiters: RateLimiters,
 }
@@ -147,7 +148,7 @@ impl Server {
     ///
     /// Returns:
     ///     A server ready to `listen` or `serve`.
-    pub fn new(broker: SharedBroker, auth: Arc<RwLock<AuthService>>) -> Self {
+    pub fn new(broker: SharedBroker, auth: Arc<AuthService>) -> Self {
         Self {
             broker,
             auth,
@@ -173,7 +174,7 @@ impl Server {
             .with_admin(&settings.username, &settings.password)
             .with_registration(settings.allow_registration)
             .with_default_role(registration_role(&settings.registration_role));
-        let auth = Arc::new(RwLock::new(AuthService::new(config).await));
+        let auth = Arc::new(AuthService::new(config).await);
         Self::new(broker, auth)
     }
 
@@ -556,10 +557,7 @@ impl Session {
             return Ok(Flow::Continue);
         }
 
-        let result = {
-            let auth = self.server.auth.read().await;
-            auth.register_user(username, password).await
-        };
+        let result = self.server.auth.register_user(username, password).await;
         let response = match result {
             Ok(()) => {
                 info!(client_id = %self.client_id, username, "registration successful");
@@ -618,10 +616,7 @@ impl Session {
             return Ok(Flow::Continue);
         }
 
-        let result = {
-            let auth = self.server.auth.read().await;
-            auth.login(username, password).await
-        };
+        let result = self.server.auth.login(username, password).await;
         match result {
             Ok(token) => {
                 info!(client_id = %self.client_id, username, "login successful");
@@ -660,7 +655,7 @@ impl Session {
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn authenticate(&self, token: &str) -> Result<Flow> {
-        let validated = self.server.auth.read().await.validate_token(token);
+        let validated = self.server.auth.validate_token(token);
         let claims = match validated {
             Ok(claims) => claims,
             Err(e) => {
@@ -708,13 +703,7 @@ impl Session {
         let Some(username) = self.require_user("subscribe")? else {
             return Ok(Flow::Close);
         };
-        let allowed = self
-            .server
-            .auth
-            .read()
-            .await
-            .can_subscribe(&username, topic)
-            .await;
+        let allowed = self.server.auth.can_subscribe(&username, topic).await;
         if !allowed {
             warn!(client_id = %self.client_id, username, topic, "subscribe denied");
             self.reply_error(format!("not authorized to subscribe to '{topic}'"))?;
@@ -783,13 +772,7 @@ impl Session {
         let Some(username) = self.require_user("publish")? else {
             return Ok(Flow::Close);
         };
-        let allowed = self
-            .server
-            .auth
-            .read()
-            .await
-            .can_publish(&username, topic)
-            .await;
+        let allowed = self.server.auth.can_publish(&username, topic).await;
         if !allowed {
             warn!(client_id = %self.client_id, username, topic, "publish denied");
             self.reply_error(format!("not authorized to publish to '{topic}'"))?;

@@ -26,7 +26,7 @@
 //!
 //! let store = Arc::new(MyDatabaseStore);
 //! let config = AuthConfig::default();
-//! let auth_service = AuthService::with_store(config, store);
+//! let auth_service = AuthService::with_store(config, store).await;
 //! ```
 
 use std::collections::HashMap;
@@ -358,6 +358,26 @@ mod postgres_store {
     use sqlx::Row;
     use sqlx::postgres::PgPool;
 
+    /// The schema `run_migrations` creates, one statement per entry.
+    ///
+    /// Postgres refuses several commands in one prepared statement, which is
+    /// how `sqlx::query` sends SQL, so each statement is executed on its own.
+    const MIGRATION_STATEMENTS: [&str; 3] = [
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            username VARCHAR(255) PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            role_type VARCHAR(50) NOT NULL,
+            role_data JSONB,
+            enabled BOOLEAN NOT NULL DEFAULT true,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+        "CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled)",
+        "CREATE INDEX IF NOT EXISTS idx_users_role_type ON users(role_type)",
+    ];
+
     /// A `UserStore` backed by a PostgreSQL `users` table, available with the `postgres` feature.
     ///
     /// Roles are stored as a `role_type` string plus a JSONB `role_data`
@@ -412,26 +432,12 @@ mod postgres_store {
         /// Raises:
         ///     AuthError::Internal: When the statements fail.
         pub async fn run_migrations(&self) -> Result<()> {
-            sqlx::query(
-                r#"
-                CREATE TABLE IF NOT EXISTS users (
-                    username VARCHAR(255) PRIMARY KEY,
-                    password_hash TEXT NOT NULL,
-                    role_type VARCHAR(50) NOT NULL,
-                    role_data JSONB,
-                    enabled BOOLEAN NOT NULL DEFAULT true,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled);
-                CREATE INDEX IF NOT EXISTS idx_users_role_type ON users(role_type);
-                "#,
-            )
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AuthError::Internal(format!("Migration failed: {e}")))?;
-
+            for statement in MIGRATION_STATEMENTS {
+                sqlx::query(statement)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| AuthError::Internal(format!("Migration failed: {e}")))?;
+            }
             Ok(())
         }
 
@@ -525,8 +531,7 @@ mod postgres_store {
     impl UserStore for PostgresUserStore {
         /// Selects one row by username and turns it into a `User`.
         ///
-        /// `created_at` is not read from the row, so the returned user's
-        /// `created_at` is the time of this call.
+        /// `created_at` is read from the row as seconds since the UNIX epoch.
         ///
         /// Args:
         ///     username: The account to fetch.
@@ -540,7 +545,8 @@ mod postgres_store {
         async fn get_user(&self, username: &str) -> Result<Option<User>> {
             let row = sqlx::query(
                 r#"
-                SELECT username, password_hash, role_type, role_data, enabled
+                SELECT username, password_hash, role_type, role_data, enabled,
+                       EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at
                 FROM users
                 WHERE username = $1
                 "#,
@@ -561,6 +567,7 @@ mod postgres_store {
                     let role = Self::deserialize_role(&role_type, role_data)?;
                     let mut user = User::new(&username, password_hash, role);
                     user.enabled = enabled;
+                    user.created_at = row.get("created_at");
 
                     Ok(Some(user))
                 }
@@ -570,8 +577,8 @@ mod postgres_store {
 
         /// Inserts a row for the account. `created_at` is set by the database.
         ///
-        /// Duplicates are detected by looking for "duplicate key" or "unique"
-        /// in the database error text.
+        /// A duplicate username is detected from the database's unique
+        /// violation error code, not from the message text.
         ///
         /// Args:
         ///     user: The account to insert.
@@ -596,7 +603,9 @@ mod postgres_store {
             .execute(&self.pool)
             .await
             .map_err(|e| {
-                if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
+                if e.as_database_error()
+                    .is_some_and(|db| db.is_unique_violation())
+                {
                     AuthError::UserAlreadyExists(user.username.clone())
                 } else {
                     AuthError::Internal(format!("Database error: {e}"))

@@ -74,7 +74,7 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 - **Send loop.** One per socket. Drains the client's channel and writes frames. Whichever of the session and the send loop ends first removes the client from the broker.
 - **Broker.** A `SharedBroker`: the broker behind one `std::sync::Mutex`, reachable only through `with(|broker| ...)`. A closure can't await, so the lock is never held across an await point. If a task panics while holding it, the next caller logs the poisoning and carries on with the broker's state instead of panicking too.
 - **Retry loop.** `SharedBroker::run_retry_loop` wakes every second and runs one `Broker::retry_overdue` pass, which resends overdue QoS 1 messages and drops those out of retries.
-- **Auth service.** An `Arc<tokio::sync::RwLock<AuthService>>`. Handlers release it before touching the broker, so the two locks are never held together.
+- **Auth service.** A plain `Arc<AuthService>`. Its methods take `&self` and the user store locks internally, so it needs no lock of its own and can never be held together with the broker lock.
 - **Prune task.** Every minute, drops rate limiter entries for keys that have gone quiet. It stops when the server stops.
 
 ## 4. Protocol
@@ -198,7 +198,8 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 
 **Tokens**
 
-- HS256 JWTs signed with `server.jwt_secret`, carrying the username, expiry and role. Refreshing keeps the role.
+- HS256 JWTs signed with `server.jwt_secret`, carrying the username, expiry and role. Refreshing keeps the role, and refuses users who have since been removed or disabled.
+- Logging the auth service or its config never prints the secret or the admin password.
 - Expiry is checked once, at `auth`. A long-lived connection outlives its token.
 
 **Limits**

@@ -9,8 +9,8 @@ pub enum AuthError {
     #[error("invalid credentials")]
     InvalidCredentials,
 
-    /// The token is malformed or its signature does not verify. Not produced
-    /// inside this crate today; decode failures surface as `JwtError`.
+    /// The token verifies but can't be honoured, because its user has been
+    /// removed or disabled. Returned by `AuthService::refresh_token`.
     #[error("invalid or expired token")]
     InvalidToken,
 

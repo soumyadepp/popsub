@@ -6,16 +6,16 @@ Loads `Settings` for the server and broker.
 
 1. Read `config/default.toml` relative to the working directory, if it exists.
 2. Overlay environment variables. One-word keys take one underscore after the section (`SERVER_PORT`); keys containing an underscore take two (`SERVER__JWT_SECRET`, `BROKER__MAX_RETRIES`). Both forms are read.
-3. Deserialise into `PartialSettings`, where every field is optional, then fill gaps from `Settings::default()`.
+3. Deserialise straight into `Settings`. Every settings struct is `#[serde(default)]`, so anything neither source sets comes from that struct's `Default`. A value of the wrong type is an error, not a silent fallback.
+
+`load_config()` reads `config/default.toml` and the process environment. `load_config_from(path, env)` takes both explicitly, which is what tests use.
 
 ## Adding a setting
 
 Update all of these together:
 
-- the field in `ServerSettings` or `BrokerSettings`
-- the matching `Option` field in the `Partial` struct
-- `Settings::default()`
-- the merge in `load_config` in `src/lib.rs`
+- the field in `ServerSettings` or `BrokerSettings`, with a one-line docstring
+- that struct's `Default` impl
 - `config/default.toml` at the repo root
 - the table in `docs/DESIGN.md` section 9
 
@@ -23,7 +23,6 @@ Update all of these together:
 
 - `jwt_secret` defaults to `default_secret` here but `a_very_secret_key` in `config/default.toml`. `Settings::insecure_defaults` reports either, and the binary refuses them on non-loopback hosts.
 - `server.allow_registration` (default false) and `server.registration_role` (`none`, `readonly` or `full`, default `none`) are passed to the auth crate by the transport.
-- `load_config_with_env` takes the environment as a map so tests don't touch process variables.
+- Tests pass `Some(HashMap::new())` (or their own map) as the environment so variables set on the machine running the tests can't leak in.
 - `max_connections` is loaded but nothing reads it yet. `message_ttl_secs` sets the message store's TTL.
-- Because the file path is relative, tests that load config change the working directory to a temp dir and restore it afterwards. Tests that do this can't run in parallel with each other safely.
 - This crate uses the `config` crate at 0.15 while `popsub_utils` uses 0.13. Align them before relying on `PopSubError::Config`.

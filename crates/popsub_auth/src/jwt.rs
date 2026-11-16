@@ -158,13 +158,17 @@ impl JwtService {
     ///     The decoded claims.
     ///
     /// Raises:
-    ///     AuthError::JwtError: When the token is malformed, its signature does
-    ///         not match the secret, or its `exp` is more than the 60 second
-    ///         decode leeway in the past.
-    ///     AuthError::TokenExpired: When `exp` has passed but is still within
-    ///         that leeway.
+    ///     AuthError::TokenExpired: When the token's `exp` has passed.
+    ///     AuthError::JwtError: When the token is malformed or its signature
+    ///         does not match the secret.
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
-        let token_data = decode::<Claims>(token, &self.decoding_key, &self.validation)?;
+        let token_data =
+            decode::<Claims>(token, &self.decoding_key, &self.validation).map_err(|e| {
+                match e.kind() {
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+                    _ => AuthError::JwtError(e),
+                }
+            })?;
 
         if token_data.claims.is_expired() {
             return Err(AuthError::TokenExpired);

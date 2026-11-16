@@ -59,7 +59,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - **Protocol changes** touch `popsub_transport/src/message.rs`, the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change.
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.
 - **Reach the broker only through `SharedBroker::with`.** Its closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
-- **New settings** go in `popsub_config/src/settings.rs` (both the full and `Partial` structs), the defaults, the merge in `load_config`, `config/default.toml`, and section 9 of the design doc. Keys containing an underscore are set from the environment with a double underscore after the section (`SERVER__JWT_SECRET`).
+- **New settings** go in `popsub_config/src/settings.rs` (the field and its struct's `Default`), `config/default.toml`, and section 9 of the design doc. Keys containing an underscore are set from the environment with a double underscore after the section (`SERVER__JWT_SECRET`).
 - **Security defaults stay closed.** Registration off, new users with no topics, published secrets refused on public addresses. Don't loosen these without a setting that defaults to the closed behaviour.
 - Don't commit generated or local files: `target/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.
 
