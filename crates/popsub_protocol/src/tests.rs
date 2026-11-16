@@ -6,8 +6,9 @@
 use serde_json::{Value, json};
 
 use crate::{
-    ClientFrame, ClientMessage, CloseCode, Delivery, ErrorCode, Limits, RequestId, ServerFrame,
-    ServerMessage, Stalled, StartFrom, Subscribed, Truncated,
+    Access, ClientFrame, ClientMessage, CloseCode, Delivery, ErrorCode, Limits, RequestId,
+    RoleKind, RoleSpec, ServerFrame, ServerMessage, Stalled, StartFrom, Subscribed, TopicGrant,
+    Truncated, UserInfo,
 };
 
 /// Parses a client frame, failing the test if it doesn't parse.
@@ -362,6 +363,9 @@ fn error_codes_are_snake_case() {
         (ErrorCode::StorageUnavailable, "storage_unavailable"),
         (ErrorCode::PayloadTooLarge, "payload_too_large"),
         (ErrorCode::InvalidTopic, "invalid_topic"),
+        (ErrorCode::Forbidden, "forbidden"),
+        (ErrorCode::UserNotFound, "user_not_found"),
+        (ErrorCode::UserExists, "user_exists"),
         (ErrorCode::Internal, "internal"),
     ];
     for (code, name) in names {
@@ -391,6 +395,7 @@ fn close_codes_are_stable_and_say_whether_to_reconnect() {
             (4006, "unsupported_protocol", false),
             (4007, "session_unavailable", true),
             (4008, "slow_consumer", true),
+            (4009, "account_disabled", false),
         ]
     );
     for code in CloseCode::ALL {
@@ -468,4 +473,78 @@ fn frames_validate_against_the_schemas() {
     ] {
         assert!(!server.is_valid(&bad), "{bad}");
     }
+}
+
+/// Checks the exact JSON of the admin requests and replies.
+#[test]
+fn admin_frames_have_the_documented_shape() {
+    let role = RoleSpec {
+        kind: RoleKind::User,
+        topics: vec![TopicGrant {
+            pattern: "orders/#".to_string(),
+            access: Access::Both,
+        }],
+    };
+    assert_eq!(
+        parse(json!({"type": "create_user", "id": 1, "username": "alice", "password": "pw", "role": {"kind": "user", "topics": [{"pattern": "orders/#", "access": "both"}]}})).message,
+        ClientMessage::CreateUser {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+            role: role.clone(),
+        }
+    );
+    assert_eq!(
+        parse(json!({"type": "set_role", "username": "bob", "role": {"kind": "admin"}})).message,
+        ClientMessage::SetRole {
+            username: "bob".to_string(),
+            role: RoleSpec {
+                kind: RoleKind::Admin,
+                topics: Vec::new(),
+            },
+        }
+    );
+    assert_eq!(
+        parse(
+            json!({"type": "grant", "username": "bob", "pattern": "news/+", "access": "subscribe"})
+        )
+        .message,
+        ClientMessage::Grant {
+            username: "bob".to_string(),
+            pattern: "news/+".to_string(),
+            access: Access::Subscribe,
+        }
+    );
+    assert_eq!(
+        parse(json!({"type": "list_users"})).message,
+        ClientMessage::ListUsers {}
+    );
+    let info = UserInfo {
+        username: "alice".to_string(),
+        role,
+        enabled: true,
+        created_at_ms: 5,
+    };
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            Some(RequestId::Number(1)),
+            ServerMessage::User { user: info.clone() }
+        )),
+        json!({"type": "user", "id": 1, "user": {"username": "alice", "role": {"kind": "user", "topics": [{"pattern": "orders/#", "access": "both"}]}, "enabled": true, "created_at_ms": 5}})
+    );
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            None,
+            ServerMessage::Users { users: vec![info] }
+        ))["users"][0]["username"],
+        json!("alice")
+    );
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            None,
+            ServerMessage::UserDeleted {
+                username: "alice".to_string()
+            }
+        )),
+        json!({"type": "user_deleted", "username": "alice"})
+    );
 }

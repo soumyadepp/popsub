@@ -89,7 +89,7 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`). A JSON Schema generated from those types is in `docs/protocol/` for SDKs in other languages; CI fails if it falls out of date.
 
 - **Request ids.** Any client frame may carry an `id`, a number or a string. The reply carries the same `id`. Frames the server sends on its own have none.
-- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
+- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
 - **Evolution.** Within a version, frames, fields and error codes are only added. Clients ignore fields and frame types they don't know, and treat an unknown error code like `internal`. Removing or changing anything needs a new version, named by the client in `auth`.
 
 Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`.
@@ -106,6 +106,22 @@ Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend'
 | `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
 | `ack` | `topic`, `seq` | None. Confirms one QoS 1 record delivered to this connection. Anything not in flight to this connection is ignored. |
 
+The admin requests below need an enabled admin; anyone else gets `forbidden`. A `role` is `{"kind": "admin" | "user" | "readonly", "topics": [{"pattern": "orders/#", "access": "subscribe" | "publish" | "both"}]}`, where `topics` may be left out, is ignored for `admin`, and allows only `subscribe` for `readonly`. Patterns are 1 to 120 bytes with no control characters and no empty levels; `+` must be a whole level and `#` the whole last level. An invalid name, password, pattern or role gets `bad_request`, a missing account `user_not_found`, and a taken name `user_exists`. The last enabled admin can't be disabled, deleted or demoted (`bad_request`), so a server always keeps one.
+
+| `type` | Fields | Reply |
+|---|---|---|
+| `create_user` | `username`, `password`, `role` | `user`. Same username and password rules as `register`. |
+| `get_user` | `username` | `user` |
+| `list_users` | none | `users`, sorted by name |
+| `set_role` | `username`, `role` | `user`. Replaces the role and its grants. |
+| `grant` | `username`, `pattern`, `access` | `user`. Adds the grant, replacing one for exactly that pattern. Refused for admins, and for publishing on a `readonly` account. |
+| `revoke` | `username`, `pattern` | `user`. Removes the grant for exactly that pattern; `bad_request` if there is none. |
+| `set_password` | `username`, `password` | `user`. Tokens already issued stay valid until they expire. |
+| `set_enabled` | `username`, `enabled` | `user` |
+| `delete_user` | `username` | `user_deleted` |
+
+Changes take effect on live connections at once. After `set_role`, `grant` or `revoke`, each of the account's subscriptions its role no longer allows is ended: the connection gets `unsubscribed` with no `id`, and a durable session forgets it. Disabling or deleting an account closes its connections with `account_disabled` (4009), and its tokens are refused at `auth` from then on.
+
 ### 4.2 Server to client
 
 | Frame | Shape |
@@ -115,7 +131,10 @@ Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend'
 | Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90,"max_payload_bytes":1048576,"max_topic_bytes":120}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
 | Auth expiring | `{"type":"auth_expiring","expires_at_ms":1794800000000}`, a minute before the token expires |
 | Subscribed | `{"type":"subscribed","topic":"...","replay_from":41,"replay_to":90}`. Records `replay_from` to `replay_to` are history; later ones are live. Also sent, without an `id`, for each subscription a session restores. |
-| Unsubscribed | `{"type":"unsubscribed","topic":"..."}` |
+| Unsubscribed | `{"type":"unsubscribed","topic":"..."}`. Also sent, without an `id`, when an admin change ends a subscription the user may no longer read. |
+| User | `{"type":"user","user":{"username":"...","role":{"kind":"user","topics":[...]},"enabled":true,"created_at_ms":1794800000000}}`, the reply to most admin requests. No password hash. |
+| Users | `{"type":"users","users":[...]}`, the same objects |
+| User deleted | `{"type":"user_deleted","username":"..."}` |
 | Published | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
 | Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
 | Truncated | `{"type":"truncated","topic":"...","first_available":1300}`, before records that start later than the subscriber expected |
@@ -152,6 +171,7 @@ All replies also carry the request's `id` when it had one. The broker writes `me
 | 4006 | `unsupported_protocol` | `auth` named a protocol version the server doesn't speak | No |
 | 4007 | `session_unavailable` | The session store couldn't be reached during `auth` | Yes, with backoff |
 | 4008 | `slow_consumer` | The client's outgoing queue passed `server.outbound_queue_bytes` | Yes; a durable session resumes from its cursor |
+| 4009 | `account_disabled` | An admin disabled or deleted the account, or `auth` presented a token for such an account | No |
 
 The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the last column.
 
@@ -260,14 +280,16 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 - Users live in a `UserStore`. With the `file` storage backend (the default) that is `users.json` in the storage directory: rewritten atomically on every change, readable by its owner only, and kept across restarts. With the `memory` backend accounts are lost on restart. A Postgres store exists behind the `postgres` feature. The admin from `server.username` and `server.password` is added only if no account with that name exists, so once it does, the settings no longer change its password.
 - The admin from `server.username` and `server.password` is created at startup with full access.
 - Roles: `Admin` (everything), `User` with a list of topic patterns that each allow subscribe, publish or both, and `ReadOnly` with subscribe-only patterns. Patterns use `+` for one level and `#` for the rest. `*` is not special.
-- Permissions are looked up from the store on every subscribe and publish, so disabling a user or changing their role takes effect immediately, without waiting for the token to expire.
-- Self-registration is off by default. When on, new users get the role named by `server.registration_role`, which defaults to no topics.
+- Permissions are looked up from the store on every subscribe and publish, so disabling a user or changing their role takes effect immediately, without waiting for the token to expire. An admin change also ends the account's live subscriptions it no longer allows, and disabling or deleting an account closes its connections and refuses its tokens at `auth`.
+- Admins manage accounts with the admin requests (section 4.1) or `popsub users`, which sends them. The last enabled admin can't be disabled, deleted or demoted.
+- Self-registration is off by default. When on, new users get the role named by `server.registration_role`, which defaults to no topics, until an admin grants them some.
 
 **Tokens**
 
 - HS256 JWTs signed with `server.jwt_secret`, carrying the username, expiry and role. Refreshing keeps the role, and refuses users who have since been removed or disabled.
 - Logging the auth service or its config never prints the secret or the admin password.
-- Expiry is checked once, at `auth`. A long-lived connection outlives its token.
+- Expiry is enforced on each connection: it is warned a minute before and closed at `exp` unless it sends a fresh `auth` (section 4.4).
+- Changing a password doesn't revoke tokens already issued; they stay valid until they expire. Disable the account to cut it off at once.
 
 **Limits**
 
@@ -305,6 +327,8 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | Someone guesses a user's password | That address and username pair locks out after 5 failures; the address locks out after 20 across all usernames. The real user, from another address, is unaffected. |
 | A client floods publishes | Its user's token bucket empties and further publishes get an error until it refills. |
 | A client sends a huge frame | Frames over twice `server.max_payload_bytes` plus 64 KiB are refused by the WebSocket layer before they are buffered, and the connection is closed with `message_too_big`. Smaller frames whose payload is over the limit get `payload_too_large`. |
+| An admin revokes a user's access while it is subscribed | The subscription is ended with an `unsubscribed` frame, and a durable session forgets it. |
+| An admin disables or deletes an account that is connected | Its connections are closed with `account_disabled`; it can't log in, and its tokens are refused at `auth`. |
 | The server restarts | With the `file` backend, accounts are read back from `users.json`. With `memory`, every account but the configured admin is lost. |
 | Storage append fails | Nothing is delivered. A QoS 1 publisher gets `storage unavailable` and can retry; QoS 0 is logged and dropped. |
 | Storage read fails during a subscribe | The client gets an error and is not subscribed. It can subscribe again. |
@@ -320,9 +344,9 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 
 ## 12. Known gaps, in priority order
 
-1. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
-2. `max_connections` is ignored, and rate limits aren't configurable.
-3. No client libraries, release artefacts, health check or metrics.
+1. `max_connections` is ignored, and rate limits aren't configurable.
+2. No release artefacts, health check or metrics, and only a Rust client library.
+3. Changing a password doesn't revoke the account's outstanding tokens.
 
 ## 13. Proposed direction
 
@@ -339,9 +363,10 @@ The storage proposal in `docs/STORAGE.md` covers most of this phase: per-topic l
 
 Done in #9 and #12: users and per-topic permissions, rate limits on logins, registration and publishing, registration off by default, and refusal of published defaults on public addresses.
 
+Done: admin requests and `popsub users` to create accounts, grant and revoke topics, and disable or delete accounts, with changes applied to live connections.
+
 Remaining:
 
-- An admin message or CLI command to grant topics and manage users.
 - Enforce a connection limit, and make rate limits configurable.
 - Trust a proxy's forwarded address when configured, so limits work behind one.
 - Document running behind a TLS proxy.

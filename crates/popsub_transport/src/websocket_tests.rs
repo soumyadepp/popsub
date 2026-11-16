@@ -1522,3 +1522,367 @@ async fn accounts_survive_a_restart_with_a_users_file() {
     .await;
     assert_eq!(login["type"], "logged_in");
 }
+
+/// Logs in and authenticates as a user over a new connection.
+///
+/// Args:
+///     addr: The server's address.
+///     username: The account.
+///     password: Its password.
+///
+/// Returns:
+///     The authenticated connection and the token it used.
+async fn user_connection(
+    addr: std::net::SocketAddr,
+    username: &str,
+    password: &str,
+) -> (TestSocket, String) {
+    let mut ws = raw_connection(addr).await;
+    let login = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "login", "username": username, "password": password})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in", "{login}");
+    let token = login["token"].as_str().expect("a token").to_string();
+    let reply = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "auth", "token": token}).to_string(),
+    )
+    .await;
+    assert_eq!(reply["type"], "authenticated", "{reply}");
+    (ws, token)
+}
+
+/// Sends a request as JSON and returns the reply, failing the test if it
+/// doesn't echo the request's id.
+///
+/// Args:
+///     ws: The connection.
+///     request: The request, which must carry an `id`.
+///
+/// Returns:
+///     The reply.
+async fn request(ws: &mut TestSocket, request: serde_json::Value) -> serde_json::Value {
+    let id = request["id"].clone();
+    let reply = send_raw(ws, &request.to_string()).await;
+    assert_eq!(reply["id"], id, "{reply}");
+    reply
+}
+
+/// Checks that an admin can create an account that can then log in, and
+/// that the account can only use topics once they are granted.
+#[tokio::test]
+async fn admins_create_accounts_and_grant_topics() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    let created = request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "frank", "password": "frank-password", "role": {"kind": "user"}}),
+    )
+    .await;
+    assert_eq!(created["type"], "user", "{created}");
+    assert_eq!(created["user"]["username"], "frank");
+    assert_eq!(created["user"]["enabled"], true);
+    assert_eq!(created["user"]["role"], serde_json::json!({"kind": "user"}));
+
+    let (mut frank, _) = user_connection(addr, "frank", "frank-password").await;
+    let denied = request(
+        &mut frank,
+        serde_json::json!({"type": "publish", "id": 1, "topic": "orders", "payload": "x", "qos": 1}),
+    )
+    .await;
+    assert_eq!(denied["code"], "not_authorized", "{denied}");
+
+    let granted = request(
+        &mut admin,
+        serde_json::json!({"type": "grant", "id": 2, "username": "frank", "pattern": "orders/#", "access": "publish"}),
+    )
+    .await;
+    assert_eq!(
+        granted["user"]["role"]["topics"],
+        serde_json::json!([{"pattern": "orders/#", "access": "publish"}])
+    );
+    let published = request(
+        &mut frank,
+        serde_json::json!({"type": "publish", "id": 2, "topic": "orders", "payload": "x", "qos": 1}),
+    )
+    .await;
+    assert_eq!(published["type"], "published", "{published}");
+
+    let listed = request(
+        &mut admin,
+        serde_json::json!({"type": "list_users", "id": 3}),
+    )
+    .await;
+    let names: Vec<&str> = listed["users"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|u| u["username"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(names, vec!["admin", "frank"]);
+}
+
+/// Checks that admin requests from anyone but an admin are refused with
+/// `forbidden` and change nothing.
+#[tokio::test]
+async fn admin_requests_need_an_admin() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "erin", "password": "erin-password", "role": {"kind": "user", "topics": [{"pattern": "#", "access": "both"}]}}),
+    )
+    .await;
+    let (mut erin, _) = user_connection(addr, "erin", "erin-password").await;
+    for (n, attempt) in [
+        serde_json::json!({"type": "list_users"}),
+        serde_json::json!({"type": "set_role", "username": "erin", "role": {"kind": "admin"}}),
+        serde_json::json!({"type": "delete_user", "username": "admin"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut attempt = attempt;
+        attempt["id"] = serde_json::json!(n);
+        let reply = request(&mut erin, attempt).await;
+        assert_eq!(reply["code"], "forbidden", "{reply}");
+    }
+    let erin_now = request(
+        &mut admin,
+        serde_json::json!({"type": "get_user", "id": 2, "username": "erin"}),
+    )
+    .await;
+    assert_eq!(erin_now["user"]["role"]["kind"], "user");
+}
+
+/// Checks that revoking a grant ends the user's live subscription to it
+/// with an `unsubscribed` frame that carries no id, and that later
+/// messages on the topic don't reach it.
+#[tokio::test]
+async fn revoking_a_grant_ends_live_subscriptions() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "gina", "password": "gina-password", "role": {"kind": "readonly", "topics": [{"pattern": "news/#", "access": "subscribe"}, {"pattern": "own/#", "access": "subscribe"}]}}),
+    )
+    .await;
+    let (mut gina, _) = user_connection(addr, "gina", "gina-password").await;
+    let subscribed = request(
+        &mut gina,
+        serde_json::json!({"type": "subscribe", "id": 1, "topic": "news/today"}),
+    )
+    .await;
+    assert_eq!(subscribed["type"], "subscribed", "{subscribed}");
+
+    let revoked = request(
+        &mut admin,
+        serde_json::json!({"type": "revoke", "id": 2, "username": "gina", "pattern": "news/#"}),
+    )
+    .await;
+    assert_eq!(revoked["type"], "user", "{revoked}");
+    let notice: serde_json::Value =
+        serde_json::from_str(&next_text(&mut gina).await).expect("JSON");
+    assert_eq!(
+        notice,
+        serde_json::json!({"type": "unsubscribed", "topic": "news/today"})
+    );
+
+    send_json(
+        &mut admin,
+        serde_json::json!({"type": "publish", "topic": "news/today", "payload": "missed"}),
+    )
+    .await;
+    let again = request(
+        &mut gina,
+        serde_json::json!({"type": "subscribe", "id": 3, "topic": "news/today"}),
+    )
+    .await;
+    assert_eq!(again["code"], "not_authorized", "{again}");
+    let missing = request(
+        &mut admin,
+        serde_json::json!({"type": "revoke", "id": 4, "username": "gina", "pattern": "news/#"}),
+    )
+    .await;
+    assert_eq!(missing["code"], "bad_request", "{missing}");
+}
+
+/// Checks that disabling an account closes its connections with
+/// `account_disabled`, refuses its password and its outstanding token, and
+/// that enabling it again restores access.
+#[tokio::test]
+async fn disabling_an_account_closes_it_and_keeps_it_out() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "hank", "password": "hank-password", "role": {"kind": "user"}}),
+    )
+    .await;
+    let (mut hank, token) = user_connection(addr, "hank", "hank-password").await;
+    let disabled = request(
+        &mut admin,
+        serde_json::json!({"type": "set_enabled", "id": 2, "username": "hank", "enabled": false}),
+    )
+    .await;
+    assert_eq!(disabled["user"]["enabled"], false, "{disabled}");
+    assert_eq!(
+        next_close(&mut hank, Duration::from_secs(2)).await,
+        (
+            CloseCode::AccountDisabled.code(),
+            "account_disabled".to_string()
+        )
+    );
+
+    let mut retry = raw_connection(addr).await;
+    let login = send_raw(
+        &mut retry,
+        r#"{"type": "login", "username": "hank", "password": "hank-password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "error", "{login}");
+    let reauth = send_raw(
+        &mut retry,
+        &serde_json::json!({"type": "auth", "token": token}).to_string(),
+    )
+    .await;
+    assert_eq!(reauth["code"], "auth_failed", "{reauth}");
+    assert_eq!(
+        next_close(&mut retry, Duration::from_secs(2)).await.0,
+        CloseCode::AccountDisabled.code()
+    );
+
+    request(
+        &mut admin,
+        serde_json::json!({"type": "set_enabled", "id": 3, "username": "hank", "enabled": true}),
+    )
+    .await;
+    user_connection(addr, "hank", "hank-password").await;
+}
+
+/// Checks that deleting an account closes its connections and removes it,
+/// and that deleting or reading a missing account gets `user_not_found`.
+#[tokio::test]
+async fn deleting_an_account_removes_it() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "ivan", "password": "ivan-password", "role": {"kind": "user"}}),
+    )
+    .await;
+    let (mut ivan, _) = user_connection(addr, "ivan", "ivan-password").await;
+    let deleted = request(
+        &mut admin,
+        serde_json::json!({"type": "delete_user", "id": 2, "username": "ivan"}),
+    )
+    .await;
+    assert_eq!(
+        deleted,
+        serde_json::json!({"type": "user_deleted", "id": 2, "username": "ivan"})
+    );
+    assert_eq!(
+        next_close(&mut ivan, Duration::from_secs(2)).await.0,
+        CloseCode::AccountDisabled.code()
+    );
+    for (id, kind) in [(3, "get_user"), (4, "delete_user"), (5, "set_password")] {
+        let reply = request(
+            &mut admin,
+            serde_json::json!({"type": kind, "id": id, "username": "ivan", "password": "new-password"}),
+        )
+        .await;
+        assert_eq!(reply["code"], "user_not_found", "{reply}");
+    }
+}
+
+/// Checks that the last enabled admin can't be disabled, deleted or
+/// demoted, and that it can once there is another admin.
+#[tokio::test]
+async fn the_last_admin_is_kept() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    for (id, attempt) in [
+        serde_json::json!({"type": "set_enabled", "username": "admin", "enabled": false}),
+        serde_json::json!({"type": "delete_user", "username": "admin"}),
+        serde_json::json!({"type": "set_role", "username": "admin", "role": {"kind": "user"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut attempt = attempt;
+        attempt["id"] = serde_json::json!(id);
+        let reply = request(&mut admin, attempt).await;
+        assert_eq!(reply["code"], "bad_request", "{reply}");
+    }
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 10, "username": "judy", "password": "judy-password", "role": {"kind": "admin"}}),
+    )
+    .await;
+    let demoted = request(
+        &mut admin,
+        serde_json::json!({"type": "set_role", "id": 11, "username": "admin", "role": {"kind": "readonly"}}),
+    )
+    .await;
+    assert_eq!(demoted["user"]["role"]["kind"], "readonly", "{demoted}");
+    let after = request(
+        &mut admin,
+        serde_json::json!({"type": "list_users", "id": 12}),
+    )
+    .await;
+    assert_eq!(after["code"], "forbidden", "{after}");
+}
+
+/// Checks the input errors: invalid usernames, passwords and patterns get
+/// `bad_request`, and an existing name gets `user_exists`.
+#[tokio::test]
+async fn bad_admin_requests_are_refused() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    let cases = [
+        (
+            serde_json::json!({"type": "create_user", "username": "admin", "password": "another-password", "role": {"kind": "user"}}),
+            "user_exists",
+        ),
+        (
+            serde_json::json!({"type": "create_user", "username": "a b", "password": "a-fine-password", "role": {"kind": "user"}}),
+            "bad_request",
+        ),
+        (
+            serde_json::json!({"type": "create_user", "username": "kim", "password": "x", "role": {"kind": "user"}}),
+            "bad_request",
+        ),
+        (
+            serde_json::json!({"type": "create_user", "username": "kim", "password": "a-fine-password", "role": {"kind": "user", "topics": [{"pattern": "a/#/b", "access": "both"}]}}),
+            "bad_request",
+        ),
+        (
+            serde_json::json!({"type": "create_user", "username": "kim", "password": "a-fine-password", "role": {"kind": "readonly", "topics": [{"pattern": "a", "access": "publish"}]}}),
+            "bad_request",
+        ),
+        (
+            serde_json::json!({"type": "grant", "username": "admin", "pattern": "a", "access": "both"}),
+            "bad_request",
+        ),
+        (
+            serde_json::json!({"type": "grant", "username": "nobody", "pattern": "a", "access": "both"}),
+            "user_not_found",
+        ),
+    ];
+    for (id, (attempt, code)) in cases.into_iter().enumerate() {
+        let mut attempt = attempt;
+        attempt["id"] = serde_json::json!(id);
+        let reply = request(&mut admin, attempt).await;
+        assert_eq!(reply["code"], code, "{reply}");
+    }
+}

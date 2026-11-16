@@ -54,6 +54,11 @@
       "code": 4008,
       "reason": "slow_consumer",
       "should_reconnect": true
+    },
+    {
+      "code": 4009,
+      "reason": "account_disabled",
+      "should_reconnect": false
     }
   ],
   "description": "WebSocket close codes a PopSub server sends, with whether a client should reconnect on its own.",

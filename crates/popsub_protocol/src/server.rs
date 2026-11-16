@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::RequestId;
+use crate::client::RoleSpec;
 
 /// A server frame: the `id` of the request it answers, if any, and the frame.
 ///
@@ -76,7 +77,9 @@ pub enum ServerMessage {
     /// A subscription started. Records `replay_from` to `replay_to` are
     /// history; later ones are live.
     Subscribed(Subscribed),
-    /// The connection no longer receives the topic.
+    /// The connection no longer receives the topic. Sent in reply to
+    /// `unsubscribe`, and also without an `id` when an admin's change to the
+    /// account ended a subscription it no longer allows.
     Unsubscribed {
         /// The topic.
         topic: String,
@@ -102,6 +105,21 @@ pub enum ServerMessage {
     /// A QoS 1 record ran out of retries; delivery on the topic is paused
     /// until the client acknowledges something or subscribes again.
     Stalled(Stalled),
+    /// An account, as it stands after an admin request.
+    User {
+        /// The account.
+        user: UserInfo,
+    },
+    /// Every account, sorted by username.
+    Users {
+        /// The accounts.
+        users: Vec<UserInfo>,
+    },
+    /// An account was deleted.
+    UserDeleted {
+        /// The account.
+        username: String,
+    },
     /// A request failed.
     Error {
         /// What went wrong, for programs.
@@ -152,6 +170,26 @@ pub enum ErrorCode {
     InvalidTopic,
     /// Anything else went wrong on the server.
     Internal,
+    /// The request needs an admin account.
+    Forbidden,
+    /// No account has that username.
+    UserNotFound,
+    /// An account with that username already exists.
+    UserExists,
+}
+
+/// An account, as admins see it. Never includes the password or its hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UserInfo {
+    /// The username.
+    pub username: String,
+    /// What it may do.
+    pub role: RoleSpec,
+    /// Whether it may log in and use topics.
+    pub enabled: bool,
+    /// When it was created, in milliseconds since the Unix epoch.
+    pub created_at_ms: i64,
 }
 
 /// Limits the server advertises in `authenticated`.

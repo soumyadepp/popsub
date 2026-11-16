@@ -192,6 +192,30 @@ impl SharedBroker {
         self.log.session_expiry
     }
 
+    /// Closes every connection authenticated as a user, for example when an
+    /// admin disables or deletes the account.
+    ///
+    /// Args:
+    ///     username: The user.
+    ///     code: Why, usually `CloseCode::AccountDisabled`.
+    ///
+    /// Returns:
+    ///     How many open connections were closed.
+    pub fn close_user(&self, username: &str, code: CloseCode) -> usize {
+        self.with(|broker| {
+            broker
+                .clients
+                .values()
+                .filter(|client| client.username.as_deref() == Some(username))
+                .filter(|client| {
+                    let open = client.sender.closing().is_none();
+                    client.sender.close(code);
+                    open
+                })
+                .count()
+        })
+    }
+
     /// Closes every connected client's outgoing queue, for a graceful shutdown.
     ///
     /// Each send loop writes what is already queued, then a close frame with

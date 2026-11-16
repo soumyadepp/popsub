@@ -3,9 +3,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use popsub_protocol::{CloseCode, StartFrom, Subscribed};
+use popsub_protocol::{ClientMessage, CloseCode, ServerMessage, StartFrom, Subscribed};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::admin::Admin;
 use crate::config::ClientConfig;
 use crate::driver::{Command, Driver, Published};
 use crate::error::Error;
@@ -194,6 +195,36 @@ impl Client {
             payload: payload.into(),
             confirm: Some((uuid::Uuid::new_v4().to_string(), reply)),
         })?;
+        self.wait(outcome).await
+    }
+
+    /// The admin requests: creating accounts, granting and revoking topics,
+    /// disabling and deleting accounts. They need the client to be logged
+    /// in as an admin.
+    ///
+    /// Returns:
+    ///     A handle that sends them through this client.
+    pub fn admin(&self) -> Admin<'_> {
+        Admin::new(self)
+    }
+
+    /// Sends a request and waits for its reply, without queueing it while
+    /// disconnected or resending it after a reconnect.
+    ///
+    /// Args:
+    ///     message: The request.
+    ///
+    /// Returns:
+    ///     The reply.
+    ///
+    /// Raises:
+    ///     Error::Server: When the reply is an `error` frame.
+    ///     Error::Connect: When disconnected, or the connection dropped first.
+    ///     Error::Timeout: When no reply arrived in time.
+    ///     Error::Closed: When the client has stopped.
+    pub(crate) async fn request(&self, message: ClientMessage) -> Result<ServerMessage, Error> {
+        let (reply, outcome) = oneshot::channel();
+        self.command(Command::Request { message, reply })?;
         self.wait(outcome).await
     }
 

@@ -1,5 +1,25 @@
 {
   "$defs": {
+    "Access": {
+      "description": "What a topic grant allows.",
+      "oneOf": [
+        {
+          "const": "subscribe",
+          "description": "Subscribing only.",
+          "type": "string"
+        },
+        {
+          "const": "publish",
+          "description": "Publishing only.",
+          "type": "string"
+        },
+        {
+          "const": "both",
+          "description": "Both.",
+          "type": "string"
+        }
+      ]
+    },
     "Delivery": {
       "description": "A record delivered to a subscriber, live or replayed.",
       "properties": {
@@ -121,6 +141,21 @@
           "const": "internal",
           "description": "Anything else went wrong on the server.",
           "type": "string"
+        },
+        {
+          "const": "forbidden",
+          "description": "The request needs an admin account.",
+          "type": "string"
+        },
+        {
+          "const": "user_not_found",
+          "description": "No account has that username.",
+          "type": "string"
+        },
+        {
+          "const": "user_exists",
+          "description": "An account with that username already exists.",
+          "type": "string"
         }
       ]
     },
@@ -189,6 +224,46 @@
       ],
       "description": "The id a client attaches to a request, echoed in the reply.\n\nEither a number or a string, and given back in the same form."
     },
+    "RoleKind": {
+      "description": "The kinds of account.",
+      "oneOf": [
+        {
+          "const": "admin",
+          "description": "May use every topic and the admin requests.",
+          "type": "string"
+        },
+        {
+          "const": "user",
+          "description": "May use the topics its grants allow.",
+          "type": "string"
+        },
+        {
+          "const": "readonly",
+          "description": "May subscribe to the topics its grants allow, and never publish.",
+          "type": "string"
+        }
+      ]
+    },
+    "RoleSpec": {
+      "description": "What an account may do, as admins see and set it.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/RoleKind",
+          "description": "The kind of account."
+        },
+        "topics": {
+          "description": "The topic patterns it may use. Ignored for `admin`, which may use\nevery topic; every grant of a `readonly` account is `subscribe`.",
+          "items": {
+            "$ref": "#/$defs/TopicGrant"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
     "Stalled": {
       "description": "Tells a subscriber that a QoS 1 record ran out of retries.",
       "properties": {
@@ -236,6 +311,24 @@
       ],
       "type": "object"
     },
+    "TopicGrant": {
+      "description": "One topic pattern and what it allows.",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/Access",
+          "description": "What it allows."
+        },
+        "pattern": {
+          "description": "The pattern, with `+` for one level and a trailing `#` for the rest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "access"
+      ],
+      "type": "object"
+    },
     "Truncated": {
       "description": "Tells a subscriber that records it expected were trimmed.",
       "properties": {
@@ -253,6 +346,35 @@
       "required": [
         "topic",
         "first_available"
+      ],
+      "type": "object"
+    },
+    "UserInfo": {
+      "description": "An account, as admins see it. Never includes the password or its hash.",
+      "properties": {
+        "created_at_ms": {
+          "description": "When it was created, in milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "enabled": {
+          "description": "Whether it may log in and use topics.",
+          "type": "boolean"
+        },
+        "role": {
+          "$ref": "#/$defs/RoleSpec",
+          "description": "What it may do."
+        },
+        "username": {
+          "description": "The username.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "username",
+        "role",
+        "enabled",
+        "created_at_ms"
       ],
       "type": "object"
     }
@@ -346,7 +468,7 @@
       "type": "object"
     },
     {
-      "description": "The connection no longer receives the topic.",
+      "description": "The connection no longer receives the topic. Sent in reply to\n`unsubscribe`, and also without an `id` when an admin's change to the\naccount ended a subscription it no longer allows.",
       "properties": {
         "topic": {
           "description": "The topic.",
@@ -446,6 +568,63 @@
       },
       "required": [
         "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "An account, as it stands after an admin request.",
+      "properties": {
+        "type": {
+          "const": "user",
+          "type": "string"
+        },
+        "user": {
+          "$ref": "#/$defs/UserInfo",
+          "description": "The account."
+        }
+      },
+      "required": [
+        "type",
+        "user"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Every account, sorted by username.",
+      "properties": {
+        "type": {
+          "const": "users",
+          "type": "string"
+        },
+        "users": {
+          "description": "The accounts.",
+          "items": {
+            "$ref": "#/$defs/UserInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "users"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "An account was deleted.",
+      "properties": {
+        "type": {
+          "const": "user_deleted",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username"
       ],
       "type": "object"
     },

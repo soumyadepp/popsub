@@ -159,6 +159,60 @@ pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
     false
 }
 
+/// The longest topic pattern a grant may hold, in bytes. Matches the longest
+/// topic name the server accepts.
+pub const MAX_PATTERN_BYTES: usize = 120;
+
+/// Checks that a topic pattern is well formed before it is granted.
+///
+/// A pattern is 1 to `MAX_PATTERN_BYTES` bytes with no control characters.
+/// Split on `/`, every level is non-empty except that `+` may stand for
+/// exactly one level and `#` may only be the whole last level.
+///
+/// Args:
+///     pattern: The pattern.
+///
+/// Raises:
+///     AuthError::PermissionDenied: When it breaks a rule, saying which.
+///
+/// Example:
+///
+/// ```
+/// use popsub_auth::permission::validate_pattern;
+///
+/// assert!(validate_pattern("orders/#").is_ok());
+/// assert!(validate_pattern("sensors/+/temp").is_ok());
+/// assert!(validate_pattern("orders/#/more").is_err());
+/// assert!(validate_pattern("a+b").is_err());
+/// ```
+pub fn validate_pattern(pattern: &str) -> crate::error::Result<()> {
+    let refuse = |why: &str| {
+        Err(crate::error::AuthError::PermissionDenied(format!(
+            "topic pattern '{pattern}' is invalid: {why}"
+        )))
+    };
+    if pattern.is_empty() || pattern.len() > MAX_PATTERN_BYTES {
+        return refuse(&format!("it must be 1 to {MAX_PATTERN_BYTES} bytes"));
+    }
+    if pattern.chars().any(char::is_control) {
+        return refuse("it has control characters");
+    }
+    let levels: Vec<&str> = pattern.split('/').collect();
+    for (index, level) in levels.iter().enumerate() {
+        let last = index + 1 == levels.len();
+        if level.is_empty() {
+            return refuse("a level is empty");
+        }
+        if level.contains('#') && (*level != "#" || !last) {
+            return refuse("'#' may only be the whole last level");
+        }
+        if level.contains('+') && *level != "+" {
+            return refuse("'+' must be a whole level");
+        }
+    }
+    Ok(())
+}
+
 /// Stateless helpers that decide subscribe and publish access from a permission list.
 ///
 /// Access is granted when any entry both matches the topic and has the

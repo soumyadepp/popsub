@@ -16,6 +16,12 @@
 //! any duplicate in `AckMode::Auto`) is acknowledged again, so a lost ack
 //! can't stall the subscription.
 //!
+//! When the server ends a subscription on its own (an admin revoked the
+//! user's access), it sends `unsubscribed` with no id. The driver then
+//! drops the topic, which ends its `Subscription`, and reports
+//! `Event::Unsubscribed`. Every unsubscribe the driver sends carries an id,
+//! so its reply is never mistaken for that.
+//!
 //! While a subscription's buffer is full the driver waits, which stops it
 //! reading the socket; the server then paces delivery for this connection.
 
@@ -110,6 +116,15 @@ pub(crate) enum Command {
         /// The message's `seq`.
         seq: u64,
     },
+    /// Send a request that is neither a subscribe, a publish nor an ack
+    /// (the admin requests), and report its reply. Never queued while
+    /// disconnected and never resent, because it may not be safe to repeat.
+    Request {
+        /// The request.
+        message: ClientMessage,
+        /// Where the reply goes; an `error` frame arrives as `Error::Server`.
+        reply: oneshot::Sender<Result<ServerMessage, Error>>,
+    },
     /// Close the connection and stop.
     Close,
 }
@@ -183,6 +198,11 @@ enum Pending {
     Publish {
         /// Where the outcome goes.
         reply: oneshot::Sender<Result<Published, Error>>,
+    },
+    /// A request from `Command::Request`.
+    Request {
+        /// Where the reply goes.
+        reply: oneshot::Sender<Result<ServerMessage, Error>>,
     },
     /// A login to refresh the token on the current connection.
     Relogin,
@@ -299,6 +319,7 @@ impl Driver {
                     match self.serve(socket, resumed).await {
                         Ending::Stop => break None,
                         Ending::Lost(code) => {
+                            self.fail_requests();
                             let reconnecting = self.should_reconnect(code);
                             let _ = self.events.send(Event::Disconnected { code, reconnecting });
                             if !reconnecting {
@@ -377,6 +398,39 @@ impl Driver {
                 },
             }
         }
+    }
+
+    /// Fails every `Command::Request` still waiting when a connection is
+    /// lost. The server may or may not have carried it out.
+    fn fail_requests(&mut self) {
+        let waiting: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| matches!(pending, Pending::Request { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            if let Some(Pending::Request { reply }) = self.pending.remove(&id) {
+                let _ = reply.send(Err(Error::Connect(
+                    "the connection dropped before the reply; the request may or may not have been carried out".to_string(),
+                )));
+            }
+        }
+    }
+
+    /// Takes a request id for a frame the driver sends on its own.
+    ///
+    /// An unsubscribe always gets one, so its `unsubscribed` reply can't be
+    /// mistaken for the server ending the subscription, which it announces
+    /// with no id.
+    ///
+    /// Args:
+    ///     message: The frame.
+    ///
+    /// Returns:
+    ///     An id for an unsubscribe, otherwise `None`.
+    fn quiet_id(&mut self, message: &ClientMessage) -> Option<u64> {
+        matches!(message, ClientMessage::Unsubscribe { .. }).then(|| self.take_id())
     }
 
     /// Takes a request id.
@@ -592,7 +646,8 @@ impl Driver {
             send(socket, Some(id), message).await?;
         }
         while let Some(message) = self.offline.pop_front() {
-            send(socket, None, message).await?;
+            let id = self.quiet_id(&message);
+            send(socket, id, message).await?;
         }
         Ok(())
     }
@@ -635,6 +690,11 @@ impl Driver {
                 if let Some(entry) = self.topics.get_mut(&topic) {
                     entry.acked.insert(seq);
                 }
+            }
+            Command::Request { reply, .. } => {
+                let _ = reply.send(Err(Error::Connect(
+                    "not connected; this request isn't queued while disconnected".to_string(),
+                )));
             }
             Command::Close => {}
         }
@@ -770,7 +830,8 @@ impl Driver {
             }
             Command::Forget { topic, generation } => {
                 if self.forget(&topic, generation) {
-                    send(socket, None, ClientMessage::Unsubscribe { topic }).await?;
+                    let id = self.take_id();
+                    send(socket, Some(id), ClientMessage::Unsubscribe { topic }).await?;
                 }
                 Ok(())
             }
@@ -785,7 +846,8 @@ impl Driver {
                 }
                 None => {
                     while let Some(message) = self.offline.pop_front() {
-                        send(socket, None, message).await?;
+                        let id = self.quiet_id(&message);
+                        send(socket, id, message).await?;
                     }
                     Ok(())
                 }
@@ -795,6 +857,11 @@ impl Driver {
                     entry.acked.insert(seq);
                 }
                 send(socket, None, ClientMessage::Ack { topic, seq }).await
+            }
+            Command::Request { message, reply } => {
+                let id = self.take_id();
+                self.pending.insert(id, Pending::Request { reply });
+                send(socket, Some(id), message).await
             }
             Command::Close => Ok(()),
         }
@@ -813,6 +880,26 @@ impl Driver {
             Some(RequestId::Number(id)) => self.pending.remove(id).map(|p| (*id, p)),
             _ => None,
         };
+        let pending = match pending {
+            Some((_, Pending::Request { reply })) => {
+                let outcome = match frame.message {
+                    ServerMessage::Error {
+                        code,
+                        message,
+                        retry_after,
+                    } => Err(Error::Server {
+                        code,
+                        message,
+                        retry_after,
+                    }),
+                    other => Ok(other),
+                };
+                let _ = reply.send(outcome);
+                return Ok(());
+            }
+            other => other,
+        };
+        let unprompted = frame.id.is_none();
         match frame.message {
             ServerMessage::Message(delivery) => self.deliver(socket, delivery).await?,
             ServerMessage::Subscribed(subscribed) => {
@@ -824,9 +911,12 @@ impl Driver {
                     let _ = waiter.send(Ok(subscribed));
                 }
             }
-            ServerMessage::Unsubscribed { .. } => {
+            ServerMessage::Unsubscribed { topic } => {
                 if let Some((_, Pending::Unsubscribe { reply })) = pending {
                     let _ = reply.send(Ok(()));
+                } else if unprompted && self.topics.remove(&topic).is_some() {
+                    warn!(topic, "the server ended a subscription");
+                    let _ = self.events.send(Event::Unsubscribed { topic });
                 }
             }
             ServerMessage::Published { message_id, seq } => {
@@ -889,7 +979,10 @@ impl Driver {
                 message,
                 retry_after,
             } => self.on_error(pending, code, message, retry_after),
-            ServerMessage::Registered {} => {}
+            ServerMessage::Registered {}
+            | ServerMessage::User { .. }
+            | ServerMessage::Users { .. }
+            | ServerMessage::UserDeleted { .. } => {}
         }
         Ok(())
     }
@@ -925,6 +1018,9 @@ impl Driver {
             }
             Some((id, Pending::Publish { reply })) => {
                 self.unconfirmed.remove(&id);
+                let _ = reply.send(Err(error));
+            }
+            Some((_, Pending::Request { reply })) => {
                 let _ = reply.send(Err(error));
             }
             Some((_, Pending::Relogin | Pending::Reauth)) | None => {
@@ -985,7 +1081,8 @@ impl Driver {
             acker,
         };
         if buffer.send(message).await.is_err() && self.forget(&name, generation) {
-            send(socket, None, ClientMessage::Unsubscribe { topic: name }).await?;
+            let id = self.take_id();
+            send(socket, Some(id), ClientMessage::Unsubscribe { topic: name }).await?;
         }
         Ok(())
     }
@@ -1005,6 +1102,9 @@ impl Driver {
                     let _ = reply.send(Err(Error::Closed(code)));
                 }
                 Pending::Publish { reply } => {
+                    let _ = reply.send(Err(Error::Closed(code)));
+                }
+                Pending::Request { reply } => {
                     let _ = reply.send(Err(Error::Closed(code)));
                 }
                 Pending::Subscribe { .. } | Pending::Relogin | Pending::Reauth => {}
@@ -1036,6 +1136,9 @@ fn fail_command(command: Command, code: Option<CloseCode>) {
             confirm: Some((_, reply)),
             ..
         } => {
+            let _ = reply.send(Err(Error::Closed(code)));
+        }
+        Command::Request { reply, .. } => {
             let _ = reply.send(Err(Error::Closed(code)));
         }
         _ => {}

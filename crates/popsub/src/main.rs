@@ -5,8 +5,11 @@
 //! expiry loops and runs the WebSocket server until Ctrl+C. The `client`
 //! subcommand runs a short demo session (connect, subscribe, publish)
 //! against a running server with the SDK (`popsub_sdk`), for smoke tests.
+//! The `users` subcommands manage accounts on a running server (see `users`).
 //! Everything here is wiring; the protocol, routing and storage live in the
 //! transport, broker and storage crates.
+
+mod users;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -46,19 +49,33 @@ enum Command {
         #[arg(long, default_value = "chat")]
         topic: String,
     },
+    /// Manage accounts on a running server, as an admin
+    Users {
+        /// Where to connect and who to log in as
+        #[command(flatten)]
+        connection: users::Connection,
+        /// The action
+        #[command(subcommand)]
+        command: users::UsersCommand,
+    },
 }
 
-/// Starts logging at a fixed `info` level, parses the command line and runs
-/// the chosen subcommand.
+/// Parses the command line, starts logging (at `info`, or `warn` for
+/// `users` so its output stays readable) and runs the chosen subcommand.
 ///
 /// Returns:
 ///     Success when the subcommand finishes cleanly, failure (after logging
 ///     the error) when it fails, so scripts and process supervisors can tell.
 #[tokio::main]
 async fn main() -> ExitCode {
-    popsub_utils::logging::init("info");
+    let command = Command::parse();
+    let level = match command {
+        Command::Users { .. } => "warn",
+        _ => "info",
+    };
+    popsub_utils::logging::init(level);
 
-    let result = match Command::parse() {
+    let result = match command {
         Command::Server => run_server().await,
         Command::Client {
             url,
@@ -66,6 +83,10 @@ async fn main() -> ExitCode {
             password,
             topic,
         } => run_client(&url, &username, &password, &topic).await,
+        Command::Users {
+            connection,
+            command,
+        } => users::run(connection, command).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

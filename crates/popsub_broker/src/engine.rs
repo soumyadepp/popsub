@@ -182,6 +182,32 @@ impl Broker {
             .map(|c| c.id.clone())
     }
 
+    /// Lists every live subscription of a user's connections.
+    ///
+    /// Args:
+    ///     username: The user.
+    ///
+    /// Returns:
+    ///     Each `(client id, topic)` pair, in no particular order.
+    pub fn subscriptions_of_user(&self, username: &str) -> Vec<(SubscriberId, String)> {
+        let clients: Vec<&SubscriberId> = self
+            .clients
+            .values()
+            .filter(|c| c.username.as_deref() == Some(username))
+            .map(|c| &c.id)
+            .collect();
+        self.topics
+            .values()
+            .flat_map(|topic| {
+                clients
+                    .iter()
+                    .filter(|id| topic.subscribers.contains_key(**id))
+                    .map(|id| ((*id).clone(), topic.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Lists the storage keys of every connected durable session.
     ///
     /// Returns:

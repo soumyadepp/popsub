@@ -87,7 +87,7 @@ pub mod user;
 pub use error::AuthError;
 pub use file_store::FileUserStore;
 pub use jwt::{Claims, JwtService};
-pub use permission::{PermissionChecker, TopicPermission};
+pub use permission::{MAX_PATTERN_BYTES, PermissionChecker, TopicPermission, validate_pattern};
 pub use service::{AuthConfig, AuthService, DefaultUserRole};
 pub use store::{InMemoryUserStore, UserStore};
 pub use user::{Role, User};
