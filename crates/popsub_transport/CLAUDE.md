@@ -5,10 +5,12 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 ## Files
 
 - `src/websocket.rs`:
-  - `Server`: what every connection shares (a `SharedBroker`, the auth service, `RateLimiters`). Build with `Server::new`, `Server::from_settings` (users in memory) or `Server::from_settings_with_users` (any `UserStore`, such as `FileUserStore`), swap limits with `with_rate_limiters`, then `listen(addr)` or `serve(listener)`.
+  - `Server`: what every connection shares (a `SharedBroker`, the auth service, `RateLimiters`). Build with `Server::new`, `Server::from_settings` (users in memory) or `Server::from_settings_with_users` (any `UserStore`, such as `FileUserStore`), swap limits with `with_rate_limiters`, trust proxies with `with_trusted_proxies`, then `listen(addr)` or `serve(listener)`.
   - `Session`: one connection. `handle` dispatches a `ClientFrame` to one method per message type, passing the request `id`; `require_user` is the single "is this connection logged in" check; `reply(id, ...)` and `fail(id, code, ...)` queue frames on the session's own channel.
-  - `RateLimiters` and its defaults, `Heartbeat` (`with_heartbeat`), the prune task, `registration_role` and `registration_error_message`.
+  - `RateLimiters` (`from_settings` builds it from `[limits]`; `default` is the same values), `Heartbeat` (`with_heartbeat`), the prune task, `registration_role` and `registration_error_message`.
   - `run_connection`: the per-connection loop. It selects over client frames (`Session::on_frame`), the heartbeat tick, the token expiry warning and the token expiry, and ends with a `Flow`: `Continue`, `Close(CloseCode)` (send a close frame, wait up to `CLOSE_GRACE` for the reply) or `Stop` (no close frame).
+- `src/tls.rs`: `ServerTls`, the certificate and key from PEM (`from_pem_files`, `from_pem`), on rustls with `ring` and an explicit provider.
+- `src/proxy.rs`: `TrustedProxies`, parsed from `server.trusted_proxies` (addresses and CIDR ranges, IPv4-mapped addresses matching IPv4 entries), `client_address`, which walks `X-Forwarded-For` from the right past trusted hops, and `read_proxy_header`, which reads one PROXY protocol header (version 1 or 2) and nothing after it.
 - `src/websocket/admin.rs`: the admin requests. `Session::admin` checks the caller is an enabled admin in the store (not just the token's role claim), then `run_admin` carries the request out. `role_spec` and `role_from_spec` convert between `Role` and the protocol's `RoleSpec`. `keep_an_admin` refuses to disable, delete or demote the last enabled admin. `end_disallowed_subscriptions` unsubscribes the account's live subscriptions it can no longer read and sends each connection `unsubscribed` with no id; disabling or deleting calls `SharedBroker::close_user` with `AccountDisabled`.
 - `src/websocket_tests.rs`: starts a real server on port 0 with `MemoryStorage` and drives it with `tokio-tungstenite`. `settle` waits until the server has handled a connection's earlier frames.
 
@@ -26,6 +28,8 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 - Registration errors go through `registration_error_message`, which hides whether a username is taken.
 - Topic names are checked by `valid_topic` on subscribe and publish (1 to `MAX_TOPIC_BYTES`, no control characters, `+` or `#`). Publishes check the topic, payload size and `message_id` length before permissions and the rate limit.
 - Each connection gets an `Outbox` with `queue_limits` (from `server.outbound_queue_bytes`). The send loop writes `Outgoing::Frame`s and stops after an `Outgoing::Close`; the connection loop also ends when the `Outbox` starts closing from elsewhere, and then does the close handshake.
+- `serve` hands each socket to `open_connection`, which reads a PROXY header first when `with_proxy_protocol` is on and the peer is trusted (its address becomes the connection's `source`, which `X-Forwarded-For` starts from), then does the TLS handshake when the server has `with_tls`, then `run_connection`, which is generic over the stream. The TLS and WebSocket handshakes share one deadline.
+- `serve` takes a `ConnectionSlot` per accepted socket, held until its task ends; a connection accepted at the limit (`max_connections`, from the broker settings) is handshaken and closed with `TryAgainLater`. After the handshake an `AddressSlot` counts it against its client address (`server.max_connections_per_address`), refusing it the same way when the address is full. The handshake has `HANDSHAKE_TIMEOUT` (10 s, `with_handshake_timeout` in tests) to finish, and keeps the `X-Forwarded-For` headers for `TrustedProxies::client_address`.
 - Connections are accepted with `websocket_config`, which caps a frame at twice the payload limit plus `FRAME_OVERHEAD_BYTES`; a larger frame closes the connection with `MessageTooBig`.
 - `auth` looks the token's user up in the store and refuses a disabled or deleted account with `auth_failed`, closing with `AccountDisabled`.
 - A repeat `auth` on an authenticated connection only refreshes the token (`refresh_token`), and only for the same user.
@@ -35,7 +39,7 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 
 - `message`, `truncated`, `subscribed` and `stalled` frames are written by the broker, not by `Session::reply`. The matching `ServerMessage` variants wrap the broker's structs so clients parse everything through one enum.
 - Session ids are checked by `valid_session_id` (1 to 128 characters, no control characters) before anything is attached.
-- Limits use the socket address, so behind a proxy every client shares one.
+- Limits key on `Session::client_ip`: the socket peer, or the forwarded address when the peer is in `TrustedProxies`. Only headers from trusted peers are read.
 
 ## Tests
 

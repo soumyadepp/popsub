@@ -19,12 +19,13 @@ The Rust client library. `Client` keeps a connection to a PopSub server and hand
 - Confirmed publishes stay in `unconfirmed` until `published` arrives and are resent with the same request id and `message_id`, so the server stores them once.
 - The driver holds only a weak handle on its own command queue (for `Message::ack`), so it stops when every `Client` and `Subscription` is dropped.
 - An `unsubscribed` with no id means the server ended the subscription (an admin revoked access): the topic is dropped, ending its `Subscription`, and `Event::Unsubscribed` is sent. So every unsubscribe the driver sends carries an id; never send one without.
+- `wss://` goes through `tls_connector`: rustls with `ring`, the public web roots from `webpki-roots`, plus `ClientConfig::add_root_certificates_pem`. Always pass explicit providers to rustls (`builder_with_provider`); never rely on a process-wide default, which panics if two crypto backends end up compiled in.
 - Close codes decide reconnection: `CloseCode::should_reconnect`, except that `TokenExpired` reconnects only with password credentials.
 - A full subscription buffer blocks the driver, which stops reading the socket; the server's backpressure then paces this connection. That is deliberate.
 
 ## Gaps
 
-- `ws://` only. `wss://` needs a TLS feature on `tokio-tungstenite`; until then, run the client next to the server or behind a TLS-terminating proxy.
+- No client certificates (mutual TLS) yet.
 - No metrics hooks yet; use `Client::events`.
 
 ## Tests

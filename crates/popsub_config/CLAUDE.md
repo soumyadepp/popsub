@@ -14,7 +14,7 @@ Loads `Settings` for the server and broker.
 
 Update all of these together:
 
-- the field in `ServerSettings`, `BrokerSettings`, `StorageSettings` or `RetentionSettings`, with a one-line docstring
+- the field in `ServerSettings`, `BrokerSettings`, `StorageSettings`, `RetentionSettings` or `LimitSettings`, with a one-line docstring
 - that struct's `Default` impl
 - `config/default.toml` at the repo root
 - the table in `docs/DESIGN.md` section 9
@@ -24,7 +24,10 @@ Update all of these together:
 - `jwt_secret` defaults to `default_secret` here but `a_very_secret_key` in `config/default.toml`. `Settings::insecure_defaults` reports either, and the binary refuses them on non-loopback hosts.
 - `server.allow_registration` (default false) and `server.registration_role` (`none`, `readonly` or `full`, default `none`) are passed to the auth crate by the transport.
 - Tests pass `Some(HashMap::new())` (or their own map) as the environment so variables set on the machine running the tests can't leak in.
-- `max_connections` is loaded but nothing reads it yet.
+- `broker.max_connections` is enforced by the transport through `SharedBroker::max_connections`; `0` means no limit.
+- `[limits]` (`LimitSettings`) holds the rate limits; the transport builds its limiters from it with `RateLimiters::from_settings`, which raises values below 1 to 1.
+- `server.proxy_protocol` only takes effect with `server.trusted_proxies`; the binary refuses to start with it on and the list empty.
+- `server.trusted_proxies` reads either a list (TOML) or one comma-separated string (the environment) through `list_or_commas`. Don't switch the environment source to `try_parsing` to get lists: it would turn secrets such as `1e5` into numbers.
 - `server.heartbeat_secs` and `server.idle_timeout_secs` set the transport's `Heartbeat`; values below 1 are treated as 1. `server.max_payload_bytes` sets the publish payload limit and, through it, the WebSocket frame limit. `server.outbound_queue_bytes` is each connection's hard outgoing queue limit; the soft limit is derived from it.
 - `broker.max_inflight` sizes each subscription's window of unacknowledged QoS 1 records; values below 1 behave as 1. `storage.session_expiry_secs` is how long a durable session outlives its last connection.
 - `[storage]` defaults to the `file` backend in `pubsub_data` with `buffered` durability. It uses typed enums: `backend` is a `StorageBackend` and `durability` is `popsub_storage::Durability`, so an unknown name is a load error. Retention limits are plain numbers (0 keeps nothing) and `RetentionSettings::to_retention` turns them into the policy the backends apply.

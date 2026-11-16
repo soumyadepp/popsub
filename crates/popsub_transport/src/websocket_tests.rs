@@ -1886,3 +1886,438 @@ async fn bad_admin_requests_are_refused() {
         assert_eq!(reply["code"], code, "{reply}");
     }
 }
+
+/// Starts a server on a free port, letting the test adjust it first.
+///
+/// Args:
+///     settings: The settings to configure the server from.
+///     configure: Changes to make to the server before it serves.
+///
+/// Returns:
+///     The address to connect to.
+async fn start_configured(
+    settings: &Settings,
+    configure: impl FnOnce(Server) -> Server,
+) -> std::net::SocketAddr {
+    let broker = SharedBroker::new(
+        Broker::new(settings.broker.clone()),
+        Arc::new(MemoryStorage::new()),
+        LogSettings {
+            durability: Durability::None,
+            retention: settings.storage.retention.to_retention(),
+            session_expiry: Duration::from_secs(settings.storage.session_expiry_secs),
+        },
+    )
+    .expect("memory storage accepts durability none");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = configure(Server::from_settings(broker, &settings.server).await);
+    tokio::spawn(server.serve(listener));
+    addr
+}
+
+/// Connects with an `X-Forwarded-For` header, as a proxy would.
+///
+/// Args:
+///     addr: The server's address.
+///     forwarded_for: The header's value.
+///
+/// Returns:
+///     The connection.
+async fn forwarded_connection(addr: std::net::SocketAddr, forwarded_for: &str) -> TestSocket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = "ws://localhost/".into_client_request().expect("request");
+    request.headers_mut().insert(
+        "x-forwarded-for",
+        forwarded_for.parse().expect("header value"),
+    );
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    tokio_tungstenite::client_async(request, stream)
+        .await
+        .expect("handshake")
+        .0
+}
+
+/// Rate limiters that lock an address out after two failed logins.
+///
+/// Returns:
+///     The limiters.
+fn two_strikes() -> RateLimiters {
+    RateLimiters::from_settings(&popsub_config::LimitSettings {
+        address_login_attempts: 2,
+        ..Default::default()
+    })
+}
+
+/// Fails two logins and then tries the right password, all from one connection.
+///
+/// Args:
+///     ws: The connection.
+///
+/// Returns:
+///     The reply to the third, correct login.
+async fn two_bad_logins_then_a_good_one(ws: &mut TestSocket) -> serde_json::Value {
+    for _ in 0..2 {
+        let reply = send_raw(
+            ws,
+            r#"{"type": "login", "username": "admin", "password": "wrong-password"}"#,
+        )
+        .await;
+        assert_eq!(reply["code"], "invalid_credentials", "{reply}");
+    }
+    send_raw(
+        ws,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await
+}
+
+/// Checks that behind a trusted proxy the login limits key on the forwarded
+/// address: locking out one client leaves another, through the same proxy, free.
+#[tokio::test]
+async fn trusted_proxies_key_limits_on_the_forwarded_address() {
+    let settings = Settings::default();
+    let proxies = crate::TrustedProxies::parse(&["127.0.0.1"]).expect("parse");
+    let addr = start_configured(&settings, |server| {
+        server
+            .with_rate_limiters(two_strikes())
+            .with_trusted_proxies(proxies)
+    })
+    .await;
+    let mut guesser = forwarded_connection(addr, "203.0.113.1").await;
+    let locked = two_bad_logins_then_a_good_one(&mut guesser).await;
+    assert_eq!(locked["code"], "locked_out", "{locked}");
+    let mut other = forwarded_connection(addr, "198.51.100.2, 127.0.0.1").await;
+    let login = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in", "{login}");
+}
+
+/// Checks that without trusted proxies the header is ignored: clients
+/// claiming different addresses from one socket address share its limits.
+#[tokio::test]
+async fn forwarded_addresses_from_untrusted_peers_are_ignored() {
+    let settings = Settings::default();
+    let addr = start_configured(&settings, |server| server.with_rate_limiters(two_strikes())).await;
+    let mut guesser = forwarded_connection(addr, "203.0.113.1").await;
+    two_bad_logins_then_a_good_one(&mut guesser).await;
+    let mut pretender = forwarded_connection(addr, "198.51.100.2").await;
+    let login = send_raw(
+        &mut pretender,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["code"], "locked_out", "{login}");
+}
+
+/// Checks that a connection over `broker.max_connections` is closed with
+/// `try_again_later`, and that a slot freed by a closed connection can be used again.
+#[tokio::test]
+async fn connections_over_the_limit_are_told_to_try_again_later() {
+    let mut settings = Settings::default();
+    settings.broker.max_connections = 2;
+    let addr = start_configured(&settings, |server| server).await;
+    let mut first = admin_connection(addr, &settings).await;
+    let _second = admin_connection(addr, &settings).await;
+    let mut third = raw_connection(addr).await;
+    assert_eq!(
+        next_close(&mut third, Duration::from_secs(2)).await,
+        (
+            CloseCode::TryAgainLater.code(),
+            "try_again_later".to_string()
+        )
+    );
+    first.close(None).await.expect("close");
+    drop(first);
+    let mut admitted = false;
+    for _ in 0..100 {
+        let mut retry = raw_connection(addr).await;
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            retry.send(WsMessage::Text(
+                r#"{"type": "login", "username": "admin", "password": "password"}"#.into(),
+            )),
+        )
+        .await;
+        if reply.is_ok()
+            && let Ok(Some(Ok(WsMessage::Text(text)))) =
+                tokio::time::timeout(Duration::from_secs(2), retry.next()).await
+            && text.contains("logged_in")
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(admitted, "a freed slot was never reused");
+}
+
+/// Checks that a socket that never sends a WebSocket handshake is dropped
+/// after the handshake timeout, so it can't hold a connection slot.
+#[tokio::test]
+async fn silent_sockets_are_dropped_after_the_handshake_timeout() {
+    use tokio::io::AsyncReadExt;
+    let settings = Settings::default();
+    let addr = start_configured(&settings, |server| {
+        server.with_handshake_timeout(Duration::from_millis(200))
+    })
+    .await;
+    let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(2), silent.read(&mut buffer))
+        .await
+        .expect("the server hung up within two seconds");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
+
+/// Checks that the `[limits]` settings reach the limiters, with values
+/// below 1 raised to 1 and idle times long enough for the longest lockout.
+#[test]
+fn rate_limits_come_from_the_settings() {
+    let limiters = RateLimiters::from_settings(&popsub_config::LimitSettings {
+        login_attempts: 0,
+        max_lockout_secs: 7200,
+        publish_per_second: 1,
+        publish_burst: 1200,
+        ..Default::default()
+    });
+    limiters.login_limiter.record_failure("a|b");
+    assert!(limiters.login_limiter.is_locked("a|b"));
+    assert_eq!(limiters.login_idle, Duration::from_secs(7200));
+    assert_eq!(limiters.message_idle, Duration::from_secs(1200));
+    assert_eq!(
+        RateLimiters::default().login_idle,
+        Duration::from_secs(3600)
+    );
+}
+
+/// Checks that one client address can't hold more than
+/// `server.max_connections_per_address` connections, while others still can,
+/// and that the count is per forwarded address behind a trusted proxy.
+#[tokio::test]
+async fn one_address_cannot_take_every_connection() {
+    let mut settings = Settings::default();
+    settings.server.max_connections_per_address = 2;
+    let proxies = crate::TrustedProxies::parse(&["127.0.0.1"]).expect("parse");
+    let addr = start_configured(&settings, |server| server.with_trusted_proxies(proxies)).await;
+    let mut first = forwarded_connection(addr, "203.0.113.1").await;
+    let _second = forwarded_connection(addr, "203.0.113.1").await;
+    let mut third = forwarded_connection(addr, "203.0.113.1").await;
+    assert_eq!(
+        next_close(&mut third, Duration::from_secs(2)).await.0,
+        CloseCode::TryAgainLater.code()
+    );
+    let mut elsewhere = forwarded_connection(addr, "198.51.100.2").await;
+    let login = send_raw(
+        &mut elsewhere,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in", "{login}");
+    first.close(None).await.expect("close");
+    drop(first);
+    let mut admitted = false;
+    for _ in 0..100 {
+        let mut retry = forwarded_connection(addr, "203.0.113.1").await;
+        let sent = retry
+            .send(WsMessage::Text(
+                r#"{"type": "login", "username": "admin", "password": "password"}"#.into(),
+            ))
+            .await;
+        if sent.is_ok()
+            && let Ok(Some(Ok(WsMessage::Text(text)))) =
+                tokio::time::timeout(Duration::from_secs(2), retry.next()).await
+            && text.contains("logged_in")
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(admitted, "the address's freed slot was never reused");
+}
+
+/// A self-signed certificate for `127.0.0.1`, as PEM.
+///
+/// Returns:
+///     The certificate and its private key.
+fn self_signed() -> (String, String) {
+    let generated =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("certificate");
+    (generated.cert.pem(), generated.key_pair.serialize_pem())
+}
+
+/// Opens a `wss://` connection that trusts one certificate.
+///
+/// Args:
+///     addr: The server's address.
+///     trusted: The certificate to trust, as PEM.
+///
+/// Returns:
+///     The connection, or the error from the TLS or WebSocket handshake.
+async fn tls_connection(
+    addr: std::net::SocketAddr,
+    trusted: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls::pki_types::CertificateDer::pem_slice_iter(trusted.as_bytes()) {
+        roots.add(certificate.expect("PEM")).expect("root");
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").expect("name");
+    let tls = connector
+        .connect(name, stream)
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio_tungstenite::client_async(format!("wss://{addr}/"), tls)
+        .await
+        .map(|(ws, _)| ws)
+        .map_err(|e| e.to_string())
+}
+
+/// Checks that a server with a certificate serves `wss://`: a client that
+/// trusts it logs in, one that doesn't fails the handshake, and a plain
+/// `ws://` client is refused.
+#[tokio::test]
+async fn tls_servers_serve_wss_only() {
+    let settings = Settings::default();
+    let (cert, key) = self_signed();
+    let tls = crate::ServerTls::from_pem(cert.as_bytes(), key.as_bytes()).expect("tls");
+    let addr = start_configured(&settings, |server| server.with_tls(tls)).await;
+
+    let mut ws = tls_connection(addr, &cert).await.expect("wss handshake");
+    ws.send(WsMessage::Text(
+        r#"{"type": "login", "username": "admin", "password": "password"}"#.into(),
+    ))
+    .await
+    .expect("send");
+    let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("a reply")
+        .expect("open")
+        .expect("read");
+    assert!(reply.to_text().expect("text").contains("logged_in"));
+
+    let (other_cert, _) = self_signed();
+    assert!(tls_connection(addr, &other_cert).await.is_err());
+
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let plain = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async("ws://localhost/", stream),
+    )
+    .await
+    .expect("the server answers a plain client in time");
+    assert!(plain.is_err(), "a plain ws:// client was served");
+}
+
+/// Checks that a certificate without its key, or with another key, is refused.
+#[test]
+fn mismatched_tls_material_is_refused() {
+    let (cert, key) = self_signed();
+    let (_, other_key) = self_signed();
+    assert!(crate::ServerTls::from_pem(cert.as_bytes(), key.as_bytes()).is_ok());
+    assert!(crate::ServerTls::from_pem(cert.as_bytes(), other_key.as_bytes()).is_err());
+    assert!(crate::ServerTls::from_pem(b"", key.as_bytes()).is_err());
+    assert!(crate::ServerTls::from_pem(cert.as_bytes(), b"").is_err());
+}
+
+/// Connects, sends a PROXY protocol header, then does the WebSocket handshake.
+///
+/// Args:
+///     addr: The server's address.
+///     header: The PROXY header bytes.
+///
+/// Returns:
+///     The connection, or the handshake error.
+async fn proxied_connection(
+    addr: std::net::SocketAddr,
+    header: &[u8],
+) -> Result<TestSocket, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(header).await.expect("write the header");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async("ws://localhost/", stream),
+    )
+    .await
+    .expect("the server answers in time")
+    .map(|(ws, _)| ws)
+    .map_err(|e| e.to_string())
+}
+
+/// A version 2 PROXY header for an IPv4 client.
+///
+/// Args:
+///     client: The client's address.
+///
+/// Returns:
+///     The header bytes.
+fn proxy_v2(client: std::net::Ipv4Addr) -> Vec<u8> {
+    let mut header = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    header.extend([0x21, 0x11, 0, 12]);
+    header.extend(client.octets());
+    header.extend([127, 0, 0, 1, 0xc8, 0x22, 0x1f, 0x90]);
+    header
+}
+
+/// Checks that with `proxy_protocol` on, the login limits key on the
+/// address from the PROXY header (version 1 or 2), and that a trusted peer
+/// sending no header is dropped.
+#[tokio::test]
+async fn proxy_protocol_headers_give_the_client_address() {
+    let mut settings = Settings::default();
+    settings.server.proxy_protocol = true;
+    let proxies = crate::TrustedProxies::parse(&["127.0.0.1"]).expect("parse");
+    let addr = start_configured(&settings, |server| {
+        server
+            .with_rate_limiters(two_strikes())
+            .with_trusted_proxies(proxies)
+    })
+    .await;
+    let mut guesser = proxied_connection(addr, b"PROXY TCP4 203.0.113.1 127.0.0.1 51234 8080\r\n")
+        .await
+        .expect("v1 handshake");
+    let locked = two_bad_logins_then_a_good_one(&mut guesser).await;
+    assert_eq!(locked["code"], "locked_out", "{locked}");
+
+    let mut same = proxied_connection(addr, &proxy_v2("203.0.113.1".parse().expect("ip")))
+        .await
+        .expect("v2 handshake");
+    let login = send_raw(
+        &mut same,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["code"], "locked_out", "{login}");
+
+    let mut other = proxied_connection(addr, &proxy_v2("198.51.100.2".parse().expect("ip")))
+        .await
+        .expect("v2 handshake");
+    let login = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in", "{login}");
+
+    assert!(proxied_connection(addr, b"").await.is_err());
+}

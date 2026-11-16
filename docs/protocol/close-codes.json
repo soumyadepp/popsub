@@ -16,6 +16,11 @@
       "should_reconnect": true
     },
     {
+      "code": 1013,
+      "reason": "try_again_later",
+      "should_reconnect": true
+    },
+    {
       "code": 4001,
       "reason": "auth_failed",
       "should_reconnect": false

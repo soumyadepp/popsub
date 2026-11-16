@@ -12,6 +12,11 @@ heartbeat_secs = 30
 idle_timeout_secs = 90
 max_payload_bytes = 1048576
 outbound_queue_bytes = 16777216
+trusted_proxies = []
+max_connections_per_address = 0
+proxy_protocol = false
+tls_cert = ""
+tls_key = ""
 
 [broker]
 max_connections = 1000
@@ -29,3 +34,13 @@ session_expiry_secs = 86400
 max_messages = 1000
 max_age_secs = 3600
 max_bytes = 67108864
+
+[limits]
+login_attempts = 5
+login_lockout_secs = 300
+address_login_attempts = 20
+address_lockout_secs = 900
+max_lockout_secs = 3600
+registrations_per_hour = 5
+publish_per_second = 100
+publish_burst = 50

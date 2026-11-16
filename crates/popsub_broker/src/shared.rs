@@ -183,6 +183,14 @@ impl SharedBroker {
         self.with(|broker| broker.max_inflight())
     }
 
+    /// The connection limit from the broker settings, which the transport enforces.
+    ///
+    /// Returns:
+    ///     The most connections at once, or `None` for no limit.
+    pub fn max_connections(&self) -> Option<usize> {
+        self.with(|broker| broker.max_connections())
+    }
+
     /// How long a durable session outlives its last connection, for the
     /// limits clients are told about.
     ///

@@ -387,6 +387,7 @@ fn close_codes_are_stable_and_say_whether_to_reconnect() {
             (1001, "going_away", true),
             (1009, "message_too_big", true),
             (1011, "internal_error", true),
+            (1013, "try_again_later", true),
             (4001, "auth_failed", false),
             (4002, "unauthenticated", true),
             (4003, "session_taken_over", false),

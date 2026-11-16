@@ -15,6 +15,8 @@ pub enum CloseCode {
     MessageTooBig,
     /// 1011: the server hit an unexpected error. Reconnect with backoff.
     InternalError,
+    /// 1013: the server is at its connection limit. Reconnect with backoff.
+    TryAgainLater,
     /// 4001: the token or `session_id` in `auth` was rejected. Log in again
     /// (or fix the session id) before reconnecting.
     AuthFailed,
@@ -46,10 +48,11 @@ pub enum CloseCode {
 
 impl CloseCode {
     /// Every close code, for docs and tests.
-    pub const ALL: [CloseCode; 12] = [
+    pub const ALL: [CloseCode; 13] = [
         CloseCode::GoingAway,
         CloseCode::MessageTooBig,
         CloseCode::InternalError,
+        CloseCode::TryAgainLater,
         CloseCode::AuthFailed,
         CloseCode::Unauthenticated,
         CloseCode::SessionTakenOver,
@@ -64,12 +67,13 @@ impl CloseCode {
     /// The numeric WebSocket close code.
     ///
     /// Returns:
-    ///     1001, 1009 or 1011 for the standard codes, 4001 to 4009 for PopSub's own.
+    ///     1001, 1009, 1011 or 1013 for the standard codes, 4001 to 4009 for PopSub's own.
     pub fn code(self) -> u16 {
         match self {
             CloseCode::GoingAway => 1001,
             CloseCode::MessageTooBig => 1009,
             CloseCode::InternalError => 1011,
+            CloseCode::TryAgainLater => 1013,
             CloseCode::AuthFailed => 4001,
             CloseCode::Unauthenticated => 4002,
             CloseCode::SessionTakenOver => 4003,
@@ -91,6 +95,7 @@ impl CloseCode {
             CloseCode::GoingAway => "going_away",
             CloseCode::MessageTooBig => "message_too_big",
             CloseCode::InternalError => "internal_error",
+            CloseCode::TryAgainLater => "try_again_later",
             CloseCode::AuthFailed => "auth_failed",
             CloseCode::Unauthenticated => "unauthenticated",
             CloseCode::SessionTakenOver => "session_taken_over",

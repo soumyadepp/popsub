@@ -9,6 +9,8 @@ serde_json = "1.0.140"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-tungstenite = "0.28.0"
 tungstenite = "0.28.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 jsonwebtoken = "9.3.1"
 futures-util = "0.3.31"
 tracing = "0.1.41"
@@ -23,4 +25,5 @@ popsub_ratelimit = { path = "../popsub_ratelimit" }
 popsub_utils = { path = "../popsub_utils" }
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile = "3.20.0"

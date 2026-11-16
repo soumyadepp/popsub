@@ -139,7 +139,7 @@ Where to find the full protocol:
 | Duplicates | Possible, and always detectable by `(topic, seq)`. The Rust client drops them for you. |
 | Retention | Each topic keeps `max_messages`, `max_age_secs` and `max_bytes` of history. A subscriber that asks for trimmed history is told with a `truncated` frame. |
 
-PopSub is a single process. There is no clustering or replication, and no TLS in the process: run it behind a TLS-terminating proxy. For a production system that needs those today, use NATS or Redis Streams. PopSub is small enough to read end to end, and its guarantees are written down precisely.
+PopSub is a single process. There is no clustering or replication. For a production system that needs those today, use NATS or Redis Streams. PopSub is small enough to read end to end, and its guarantees are written down precisely.
 
 ## Configuration
 
@@ -156,8 +156,55 @@ The settings you are most likely to change:
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
 | `server.max_payload_bytes` | 1 MiB | Largest publish |
+| `server.proxy_protocol` | `false` | Read PROXY protocol headers from trusted TCP load balancers |
+| `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
+| `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
+| `server.max_connections_per_address` | `0` (no limit) | Connections one client address may hold. Set `trusted_proxies` first if you run behind a proxy |
+| `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
+| `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
+
+## TLS
+
+Point PopSub at a certificate and key and it serves `wss://`:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 443
+tls_cert = "/etc/popsub/fullchain.pem"
+tls_key = "/etc/popsub/privkey.pem"
+```
+
+The files are read at startup, so a renewed certificate takes a restart. Clients connect to `wss://your-host`; the Rust client trusts the public web roots, and `ClientConfig::add_root_certificates_pem` (or `--ca-cert` on the CLI) adds your own, such as a self-signed one for development.
+
+## Running behind a proxy
+
+A proxy is optional. It is useful when you want certificates renewed without restarts, to share port 443 with other services, or to filter traffic before it reaches PopSub. If you use one, tell PopSub to believe the client address it forwards, or every client will share the proxy's address for rate limits:
+
+```toml
+[server]
+host = "127.0.0.1"
+trusted_proxies = ["127.0.0.1"]
+```
+
+With nginx on the same machine:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 120s;
+}
+```
+
+A TCP load balancer (such as AWS's Network Load Balancer, or HAProxy in TCP mode) can't add `X-Forwarded-For`. Turn on its PROXY protocol option, list it in `trusted_proxies`, and set `proxy_protocol = true`: PopSub then reads the client's address from the header it sends. Every connection from a listed proxy must carry one; connections from anywhere else are served as usual.
+
+Once the proxy is trusted, you can also cap connections per client with `server.max_connections_per_address`. `proxy_read_timeout` must be longer than `server.heartbeat_secs`, or the proxy will cut quiet connections. Entries in `trusted_proxies` can be CIDR ranges (`10.0.0.0/8`) for a fleet of proxies. Only list proxies you run: a client reaching PopSub directly could otherwise claim any address.
 
 ## Managing users
 

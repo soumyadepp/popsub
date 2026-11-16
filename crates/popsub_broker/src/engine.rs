@@ -157,6 +157,14 @@ impl Broker {
         self.settings.max_inflight.max(1)
     }
 
+    /// The connection limit, as configured. The transport enforces it.
+    ///
+    /// Returns:
+    ///     The most connections at once, or `None` for no limit (a setting of 0).
+    pub fn max_connections(&self) -> Option<usize> {
+        Some(self.settings.max_connections).filter(|max| *max > 0)
+    }
+
     /// Returns the durable session a registered client holds.
     ///
     /// Args:

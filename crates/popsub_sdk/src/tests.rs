@@ -38,6 +38,25 @@ impl TestServer {
     /// Returns:
     ///     The running server.
     async fn start(settings: &Settings, storage: Arc<dyn Storage>, port: u16) -> TestServer {
+        Self::start_with(settings, storage, port, None).await
+    }
+
+    /// Starts a server on a port, serving `wss://` when given a certificate.
+    ///
+    /// Args:
+    ///     settings: Its settings.
+    ///     storage: Where it keeps topic logs and sessions.
+    ///     port: The port, or 0 for any free one.
+    ///     tls: The certificate and key, if any.
+    ///
+    /// Returns:
+    ///     The running server.
+    async fn start_with(
+        settings: &Settings,
+        storage: Arc<dyn Storage>,
+        port: u16,
+        tls: Option<popsub_transport::ServerTls>,
+    ) -> TestServer {
         let broker = SharedBroker::new(
             Broker::new(settings.broker.clone()),
             storage,
@@ -52,7 +71,10 @@ impl TestServer {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("address");
-        let server = Server::from_settings(broker.clone(), &settings.server).await;
+        let mut server = Server::from_settings(broker.clone(), &settings.server).await;
+        if let Some(tls) = tls {
+            server = server.with_tls(tls);
+        }
         let accepting = tokio::spawn(server.serve(listener));
         TestServer {
             addr,
@@ -597,4 +619,59 @@ async fn resubscribing_after_a_drop_keeps_the_new_subscription() {
     while let Ok(event) = events.try_recv() {
         assert!(!matches!(event, Event::Unsubscribed { .. }), "{event:?}");
     }
+}
+
+/// Checks that the client connects over `wss://` to a server whose
+/// self-signed certificate it was told to trust, and publishes and receives.
+#[tokio::test]
+async fn wss_works_with_an_added_root_certificate() {
+    let generated =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("certificate");
+    let cert = generated.cert.pem();
+    let tls = popsub_transport::ServerTls::from_pem(
+        cert.as_bytes(),
+        generated.key_pair.serialize_pem().as_bytes(),
+    )
+    .expect("tls");
+    let server = TestServer::start_with(
+        &Settings::default(),
+        Arc::new(MemoryStorage::new()),
+        0,
+        Some(tls),
+    )
+    .await;
+    let config = ClientConfig::new(
+        format!("wss://{}", server.addr),
+        Credentials::password("admin", "password"),
+    )
+    .add_root_certificates_pem(cert.as_bytes())
+    .expect("root");
+    let client = Client::connect(config).await.expect("connect over wss");
+    let mut chat = client
+        .subscribe("chat", StartFrom::New)
+        .await
+        .expect("subscribe");
+    client
+        .publish_confirmed("chat", "over tls")
+        .await
+        .expect("publish");
+    assert_eq!(next(&mut chat).await.payload, "over tls");
+
+    let untrusting = ClientConfig::new(
+        format!("wss://{}", server.addr),
+        Credentials::password("admin", "password"),
+    )
+    .reconnect(ReconnectPolicy {
+        max_attempts: Some(0),
+        ..ReconnectPolicy::default()
+    });
+    match Client::connect(untrusting).await {
+        Err(Error::Connect(reason)) => assert!(reason.contains("certificate"), "{reason}"),
+        other => panic!("expected a certificate failure, got {other:?}"),
+    }
+    assert!(matches!(
+        ClientConfig::new("wss://x", Credentials::Token("t".to_string()))
+            .add_root_certificates_pem(b"not a certificate"),
+        Err(Error::Config(_))
+    ));
 }
