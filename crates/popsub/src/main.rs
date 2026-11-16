@@ -7,12 +7,20 @@
 //! protocol, routing and storage live in the transport, broker and
 //! persistence crates.
 
+use std::process::ExitCode;
+
 use clap::Parser;
-use popsub_broker::engine::Broker;
+use popsub_broker::{Broker, SharedBroker};
 use popsub_config::load_config;
-use popsub_transport::websocket::start_websocket_server;
-use std::sync::{Arc, Mutex};
+use popsub_persistence::Persistence;
+use popsub_transport::Server;
 use tracing::{error, info, warn};
+
+/// Where the server keeps its message history, relative to the working directory.
+const DATA_DIR: &str = "pubsub_db";
+
+/// The most messages kept per topic for replay to new subscribers.
+const MAX_MESSAGES_PER_TOPIC: usize = 1000;
 
 /// Runs the PopSub WebSocket broker or a demo client against it.
 #[derive(Parser)]
@@ -31,24 +39,22 @@ enum Command {
 /// Starts logging at a fixed `info` level, parses the command line and runs
 /// the chosen subcommand.
 ///
-/// A failing subcommand is logged with `error!` and the process still exits
-/// with status 0.
+/// Returns:
+///     Success when the subcommand finishes cleanly, failure (after logging
+///     the error) when it fails, so scripts and process supervisors can tell.
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     popsub_utils::logging::init("info");
 
-    let cmd = Command::parse();
-
-    match cmd {
-        Command::Server => {
-            if let Err(e) = run_server().await {
-                error!("Server failed: {}", e);
-            }
-        }
-        Command::Client { url } => {
-            if let Err(e) = run_client(&url).await {
-                error!("Client failed: {}", e);
-            }
+    let result = match Command::parse() {
+        Command::Server => run_server().await,
+        Command::Client { url } => run_client(&url).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            error!("{e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -58,17 +64,17 @@ async fn main() {
 /// If the JWT secret or admin password still has a published default value,
 /// the server refuses to start on a non-loopback host and only logs a warning
 /// for each such setting on `localhost` or a loopback address. Otherwise it
-/// builds the broker from the broker settings, spawns the QoS 1 retry loop,
-/// and serves on `host:port` until the server future finishes or Ctrl+C
-/// arrives. Both of those end the function with `Ok`.
-///
-/// Returns:
-///     Unit once the server stops or a shutdown signal is received.
+/// opens the message store in `DATA_DIR` (keeping messages for
+/// `broker.message_ttl_secs`), builds the broker, spawns the QoS 1 retry
+/// loop, and serves on `host:port` until Ctrl+C arrives.
 ///
 /// Raises:
 ///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
 ///     ConfigError::Type: When a setting from the file or the environment has the wrong type.
 ///     String: When published default secrets are set and the host is not a loopback address.
+///     String: When the message store in `DATA_DIR` can't be opened, usually
+///         because another server running from the same directory holds its lock.
+///     String: When `host:port` can't be bound, with the underlying I/O error.
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
     let insecure = config.insecure_defaults();
@@ -86,19 +92,20 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let broker = Arc::new(Mutex::new(Broker::new(config.broker.clone())));
-
-    tokio::spawn(Broker::start_retry_loop(broker.clone()));
+    let ttl = i64::try_from(config.broker.message_ttl_secs).unwrap_or(i64::MAX);
+    let persistence = Persistence::new(DATA_DIR, Some(ttl), Some(MAX_MESSAGES_PER_TOPIC))
+        .map_err(|e| format!("can't open the message store in {DATA_DIR}: {e}. Is another PopSub server running from this directory?"))?;
+    let broker = SharedBroker::new(Broker::new_with_persistence(
+        persistence,
+        config.broker.clone(),
+    ));
+    tokio::spawn(broker.clone().run_retry_loop());
+    let server = Server::from_settings(broker, &config.server).await;
 
     tokio::select! {
-        _ = start_websocket_server(addr, broker, config.clone()) => {
-            error!("WebSocket server exited unexpectedly.");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutdown signal received. Exiting gracefully.");
-        }
+        served = server.listen(&addr) => served.map_err(|e| format!("can't serve on {addr}: {e}"))?,
+        _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
     }
-
     Ok(())
 }
 

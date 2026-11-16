@@ -24,6 +24,6 @@ Update all of these together:
 - `jwt_secret` defaults to `default_secret` here but `a_very_secret_key` in `config/default.toml`. `Settings::insecure_defaults` reports either, and the binary refuses them on non-loopback hosts.
 - `server.allow_registration` (default false) and `server.registration_role` (`none`, `readonly` or `full`, default `none`) are passed to the auth crate by the transport.
 - `load_config_with_env` takes the environment as a map so tests don't touch process variables.
-- `max_connections` and `message_ttl_secs` are loaded but nothing reads them yet.
+- `max_connections` is loaded but nothing reads it yet. `message_ttl_secs` sets the message store's TTL.
 - Because the file path is relative, tests that load config change the working directory to a temp dir and restore it afterwards. Tests that do this can't run in parallel with each other safely.
 - This crate uses the `config` crate at 0.15 while `popsub_utils` uses 0.13. Align them before relying on `PopSubError::Config`.

@@ -58,7 +58,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 - **Protocol changes** touch `popsub_transport/src/message.rs`, the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change.
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.
-- **Never hold the broker lock across an `.await`.** It is a `std::sync::Mutex` shared by every task.
+- **Reach the broker only through `SharedBroker::with`.** Its closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
 - **New settings** go in `popsub_config/src/settings.rs` (both the full and `Partial` structs), the defaults, the merge in `load_config`, `config/default.toml`, and section 9 of the design doc. Keys containing an underscore are set from the environment with a double underscore after the section (`SERVER__JWT_SECRET`).
 - **Security defaults stay closed.** Registration off, new users with no topics, published secrets refused on public addresses. Don't loosen these without a setting that defaults to the closed behaviour.
 - Don't commit generated or local files: `target/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.
@@ -67,7 +67,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 - Delivered messages have no `type` field, unlike every other server frame. Clients detect them by its absence. See design doc section 4.2.
 - QoS 1 is only at-least-once for a single subscriber that stays connected. Don't describe it more strongly in docs or READMEs.
-- `broker.max_connections` and `broker.message_ttl_secs` are loaded but not used. Persistence uses `Persistence::default()` with a hard-coded `pubsub_db` path.
+- `broker.max_connections` is loaded but not used. The store path (`pubsub_db`) and per-topic cap are constants in the binary. Two servers can't share a working directory: the second exits because the store is locked.
 - The JWT secret default differs between code (`default_secret`), `config/default.toml` (`a_very_secret_key`) and the auth crate (`change_me_in_production`). All three are treated as published; the server refuses them on non-loopback hosts.
 - Rate limits key on the socket address. Behind a proxy every client shares one address.
 - There's no protocol message to grant topics, so self-registered users with the default `none` role can do nothing until their role is changed in code.

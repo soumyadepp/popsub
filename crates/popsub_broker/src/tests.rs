@@ -205,98 +205,86 @@ fn test_publish_to_client_with_closed_channel() {
 }
 
 /// Checks that an unacknowledged QoS 1 message is resent `max_retries` times, then dropped, and that a late ACK for it is ignored.
-#[tokio::test]
-async fn test_broker_qos1_retry_mechanism() {
-    let broker_arc = std::sync::Arc::new(std::sync::Mutex::new(Broker::default()));
+#[test]
+fn test_broker_qos1_retry_mechanism() {
+    let settings = Settings::default().broker;
+    let step = settings.ack_timeout_ms as i64 + 1;
+    let mut broker = Broker::default();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
     let client = Client::new(tx);
     let client_id = client.id.clone();
-
-    {
-        let mut broker = broker_arc.lock().unwrap();
-        broker.register_client(client);
-        broker.subscribe("test_topic", client_id.clone());
-    }
+    broker.register_client(client);
+    broker.subscribe("test_topic", client_id);
 
     let message_id = "retry_message_id".to_string();
-    let message = crate::message::Message {
+    broker.publish(crate::message::Message {
         topic: "test_topic".to_string(),
         payload: "retry_payload".to_string(),
         timestamp: 0,
         message_id: message_id.clone(),
         qos: 1,
-    };
+    });
+    let sent_at = broker.pending_acks[&message_id].sent_at;
+    assert_eq!(received_ids(&mut rx), vec![message_id.clone()]);
 
-    {
-        let mut broker = broker_arc.lock().unwrap();
-        broker.publish(message.clone());
+    assert_eq!(broker.retry_overdue(sent_at).resent, 0);
+    for attempt in 1..=settings.max_retries {
+        let outcome = broker.retry_overdue(sent_at + step * attempt as i64);
+        assert_eq!(
+            outcome,
+            crate::RetryOutcome {
+                resent: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(received_ids(&mut rx), vec![message_id.clone()]);
+        assert_eq!(broker.pending_acks[&message_id].retries, attempt);
     }
 
-    assert!(
-        broker_arc
-            .lock()
-            .unwrap()
-            .pending_acks
-            .contains_key(&message_id)
-    );
-
-    let received_msg = rx.recv().await.unwrap();
-    if let WsMessage::Text(text) = received_msg {
-        let received_message: crate::message::Message = serde_json::from_str(&text).unwrap();
-        assert_eq!(received_message.message_id, message_id);
-        assert_eq!(received_message.qos, 1);
-    } else {
-        panic!("Expected a text message");
-    }
-
-    for i in 0..Settings::default().broker.max_retries {
-        tokio::time::sleep(tokio::time::Duration::from_millis(5100)).await;
-        tokio::spawn(Broker::start_retry_loop(broker_arc.clone()));
-
-        let re_sent_msg = rx.recv().await.unwrap();
-        if let WsMessage::Text(text) = re_sent_msg {
-            let re_sent_message: crate::message::Message = serde_json::from_str(&text).unwrap();
-            assert_eq!(re_sent_message.message_id, message_id);
-            assert_eq!(re_sent_message.qos, 1);
-            assert_eq!(
-                broker_arc
-                    .lock()
-                    .unwrap()
-                    .pending_acks
-                    .get(&message_id)
-                    .unwrap()
-                    .retries,
-                i + 1
-            );
-        } else {
-            panic!("Expected a text message on re-send");
+    let last = sent_at + step * (settings.max_retries as i64 + 1);
+    assert_eq!(
+        broker.retry_overdue(last),
+        crate::RetryOutcome {
+            resent: 0,
+            dropped: 1
         }
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(5100)).await;
-    tokio::spawn(Broker::start_retry_loop(broker_arc.clone()));
-
-    assert!(rx.try_recv().is_err());
-
-    assert!(
-        !broker_arc
-            .lock()
-            .unwrap()
-            .pending_acks
-            .contains_key(&message_id)
     );
+    assert!(received_ids(&mut rx).is_empty());
+    assert!(!broker.pending_acks.contains_key(&message_id));
 
-    {
-        let mut broker = broker_arc.lock().unwrap();
-        broker.handle_ack(&message_id);
+    broker.handle_ack(&message_id);
+    assert!(!broker.pending_acks.contains_key(&message_id));
+}
+
+/// Checks that `SharedBroker` keeps working after a task panics while holding its lock.
+#[test]
+fn shared_broker_recovers_from_a_poisoned_lock() {
+    let shared = crate::SharedBroker::new(Broker::default());
+    let poisoner = shared.clone();
+    let result = std::thread::spawn(move || {
+        poisoner.with(|_| panic!("simulated panic while holding the broker lock"))
+    })
+    .join();
+    assert!(result.is_err());
+
+    shared.with(|broker| broker.subscribe("after_panic", "client".to_string()));
+    assert!(shared.with(|broker| broker.topics.contains_key("after_panic")));
+}
+
+/// Drains every frame already queued on a test client's channel and returns their message ids.
+///
+/// Args:
+///     rx: The receiving end of the client's channel.
+///
+/// Returns:
+///     The `message_id` of each queued message, in order.
+fn received_ids(rx: &mut mpsc::UnboundedReceiver<WsMessage>) -> Vec<String> {
+    let mut ids = Vec::new();
+    while let Ok(WsMessage::Text(text)) = rx.try_recv() {
+        let message: crate::message::Message = serde_json::from_str(&text).unwrap();
+        ids.push(message.message_id);
     }
-    assert!(
-        !broker_arc
-            .lock()
-            .unwrap()
-            .pending_acks
-            .contains_key(&message_id)
-    );
+    ids
 }
 
 /// Checks that only overdue messages are picked for resending and that a resend increments the retry count and reaches the subscriber.
