@@ -36,6 +36,8 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_transport` | WebSocket server, and enforcing auth, permissions and rate limits |
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
 | `crates/popsub_sdk` | The Rust client library: reconnection, durable sessions, acknowledgements, deduplication. The CLI's `client` uses it |
+| `crates/popsub_scenarios` | The client scenario suite (`popsub-scenarios`), its scenario server and driver plumbing, and the Rust client's driver (`popsub-sdk-driver`) |
+| `clients/` | Client libraries in other languages. `clients/README.md` is the behaviour every client must have; `clients/DRIVER.md` is the protocol their scenario drivers speak |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
 | `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
@@ -66,6 +68,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.
 - **Reach the broker only through `SharedBroker::with`** (inside the broker crate, `BrokerCell::with`, which it wraps). The closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
 - **Storage I/O belongs in the topic writer**, never under the broker lock. Publishes and subscribes for a topic go through its writer so they are handled one at a time; don't add a path that appends or replays around it.
+- **Client behaviour changes** (anything in `clients/README.md`) need a scenario in `crates/popsub_scenarios/src/scenarios.rs` that fails without them, and every client library and driver updated so `make scenarios` passes for each. Run a new scenario against a deliberately broken client once to see it fail.
 - **New settings** go in `popsub_config/src/settings.rs` (the field and its struct's `Default`), `config/default.toml`, and section 9 of the design doc. Keys containing an underscore are set from the environment with a double underscore after the section (`SERVER__JWT_SECRET`).
 - **Security defaults stay closed.** Registration off, new users with no topics, published secrets refused on public addresses. Don't loosen these without a setting that defaults to the closed behaviour.
 - Don't commit generated or local files: `target/`, `pubsub_data/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.

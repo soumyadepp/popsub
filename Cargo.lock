@@ -1820,6 +1820,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "popsub_scenarios"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "popsub_auth",
+ "popsub_broker",
+ "popsub_config",
+ "popsub_protocol",
+ "popsub_sdk",
+ "popsub_storage",
+ "popsub_transport",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "popsub_sdk"
 version = "0.1.0"
 dependencies = [

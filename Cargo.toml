@@ -8,6 +8,7 @@ members = [
 	"crates/popsub_protocol",
 	"crates/popsub_ratelimit",
 	"crates/popsub_sdk",
+	"crates/popsub_scenarios",
 	"crates/popsub_storage",
 	"crates/popsub_transport",
 	"crates/popsub_utils",

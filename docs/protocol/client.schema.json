@@ -349,6 +349,19 @@
       "type": "object"
     },
     {
+      "description": "Asks the server to answer with `pong`, so a client that can't see\nWebSocket pings (a browser) can tell the connection is still alive.\nAccepted before `auth` too.",
+      "properties": {
+        "type": {
+          "const": "ping",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
       "description": "Admin only. Creates an account. Answered with `user`.",
       "properties": {
         "password": {

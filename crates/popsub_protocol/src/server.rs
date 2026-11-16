@@ -58,6 +58,8 @@ pub enum ServerMessage {
     },
     /// The account from a `register` was created.
     Registered {},
+    /// The answer to `ping`.
+    Pong {},
     /// An `auth` was accepted. On an already authenticated connection,
     /// `auth` with a new token for the same user only refreshes the token,
     /// and the reply's `resumed` is empty.

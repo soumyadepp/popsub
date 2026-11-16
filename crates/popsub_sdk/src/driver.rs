@@ -995,6 +995,7 @@ impl Driver {
                 retry_after,
             } => self.on_error(pending, code, message, retry_after),
             ServerMessage::Registered {}
+            | ServerMessage::Pong {}
             | ServerMessage::User { .. }
             | ServerMessage::Users { .. }
             | ServerMessage::UserDeleted { .. } => {}

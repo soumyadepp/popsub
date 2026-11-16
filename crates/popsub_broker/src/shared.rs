@@ -180,6 +180,23 @@ impl SharedBroker {
         })
     }
 
+    /// The last `seq` stored on a topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     The last `seq`, 0 for a topic with no records yet.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log can't be read.
+    pub async fn last_seq(&self, topic: &str) -> StorageResult<u64> {
+        self.storage
+            .bounds(topic)
+            .await
+            .map(|bounds| bounds.last_seq)
+    }
+
     /// A snapshot of the broker's size, for gauges.
     ///
     /// Returns:

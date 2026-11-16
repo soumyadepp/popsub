@@ -133,6 +133,7 @@ Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend'
 | `unsubscribe` | `topic` | `unsubscribed`, even if the client wasn't subscribed. |
 | `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
 | `ack` | `topic`, `seq` | None. Confirms one QoS 1 record delivered to this connection. Anything not in flight to this connection is ignored. |
+| `ping` | none | `pong`. Accepted before `auth`. For clients that can't see WebSocket pings (browsers) to check the connection is alive; it also counts as activity for the idle timeout. |
 
 The admin requests below need an enabled admin; anyone else gets `forbidden`. A `role` is `{"kind": "admin" | "user" | "readonly", "topics": [{"pattern": "orders/#", "access": "subscribe" | "publish" | "both"}]}`, where `topics` may be left out, is ignored for `admin`, and allows only `subscribe` for `readonly`. Patterns are 1 to 120 bytes with no control characters and no empty levels; `+` must be a whole level and `#` the whole last level. An invalid name, password, pattern or role gets `bad_request`, a missing account `user_not_found`, and a taken name `user_exists`. The last enabled admin can't be disabled, deleted or demoted (`bad_request`), so a server always keeps one.
 
@@ -155,6 +156,7 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 | Frame | Shape |
 |---|---|
 | Registered | `{"type":"registered"}` |
+| Pong | `{"type":"pong"}`, the answer to `ping` |
 | Logged in | `{"type":"logged_in","token":"..."}` |
 | Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90,"max_payload_bytes":1048576,"max_topic_bytes":120}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
 | Auth expiring | `{"type":"auth_expiring","expires_at_ms":1794800000000}`, a minute before the token expires |
@@ -438,7 +440,7 @@ Done: a per-address connection limit, `server.max_connections_per_address`, off 
   - payload, frame, topic and message id limits
   - a byte budget for each connection's outbound queue, with slow subscribers caught up from the log
   - a JSON Schema in `docs/protocol/`, generated from the types and checked in CI
-- Done: the Rust client library, `popsub_sdk`. Next: TypeScript (types generated from `docs/protocol/`), then Python, held to one shared scenario suite against a real server.
+- Done: the Rust client library, `popsub_sdk`, and the shared client scenario suite (`popsub_scenarios`, `clients/DRIVER.md`) it passes. Next: TypeScript, Python and Go clients under `clients/`, each passing the same suite.
 - Done: TLS in the server (`server.tls_cert`, `server.tls_key`) and `wss://` in `popsub_sdk`, with extra trusted roots for private CAs. Not done: reloading a renewed certificate without a restart, and client certificates.
 - Release binaries, a Docker image and crates.io packages.
 - Done: `/healthz` and `/readyz`, and OpenTelemetry metrics, traces and logs over OTLP (section 3.3).

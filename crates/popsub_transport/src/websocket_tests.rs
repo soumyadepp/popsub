@@ -2321,3 +2321,17 @@ async fn proxy_protocol_headers_give_the_client_address() {
 
     assert!(proxied_connection(addr, b"").await.is_err());
 }
+
+/// Checks that `ping` is answered with `pong` carrying its id, before and
+/// after authenticating, and that the connection stays open.
+#[tokio::test]
+async fn pings_are_answered_before_and_after_auth() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = raw_connection(addr).await;
+    let early = send_raw(&mut ws, r#"{"type": "ping", "id": "a"}"#).await;
+    assert_eq!(early, serde_json::json!({"type": "pong", "id": "a"}));
+    let mut admin = admin_connection(addr, &settings).await;
+    let late = send_raw(&mut admin, r#"{"type": "ping", "id": 2}"#).await;
+    assert_eq!(late, serde_json::json!({"type": "pong", "id": 2}));
+}

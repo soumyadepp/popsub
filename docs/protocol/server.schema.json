@@ -415,6 +415,19 @@
       "type": "object"
     },
     {
+      "description": "The answer to `ping`.",
+      "properties": {
+        "type": {
+          "const": "pong",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
       "description": "An `auth` was accepted. On an already authenticated connection,\n`auth` with a new token for the same user only refreshes the token,\nand the reply's `resumed` is empty.",
       "properties": {
         "limits": {
