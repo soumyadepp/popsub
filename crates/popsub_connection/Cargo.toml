@@ -1,5 +1,5 @@
 [package]
-name = "popsub_client"
+name = "popsub_connection"
 version = "0.1.0"
 edition = "2024"
 

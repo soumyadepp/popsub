@@ -35,10 +35,11 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_protocol` | Every frame type, error codes and `PROTOCOL_VERSION`. Depends only on `serde` |
 | `crates/popsub_transport` | WebSocket server, and enforcing auth, permissions and rate limits |
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
+| `crates/popsub_sdk` | The Rust client library: reconnection, durable sessions, acknowledgements, deduplication. The CLI's `client` uses it |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
 | `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
-| `crates/popsub_client` | `Client`, the server-side record of one connection (not a client library) |
+| `crates/popsub_connection` | `Client` and `Outbox`: the server's record of one connected socket and its outgoing queue |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
 | `crates/popsub_utils` | `PopSubError`, `Result`, logging |
 
@@ -57,7 +58,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 ## Rules for changes
 
-- **Protocol changes** touch `popsub_protocol` (types and its wire tests), the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change. Within a protocol version only add frames, fields and error codes; anything else needs a new `PROTOCOL_VERSION`.
+- **Protocol changes** touch `popsub_protocol` (types and its wire tests), section 4 of `docs/DESIGN.md`, the WebSocket tests, the regenerated `docs/protocol/` schema, and the README's example session if it shows the changed frames, in the same change. Within a protocol version only add frames, fields and error codes; anything else needs a new `PROTOCOL_VERSION`.
 - **After changing any protocol type, run `make schema`** and commit the regenerated `docs/protocol/*.json`. CI's schema check fails otherwise.
 - **Every failure a client sees is an `error` frame with an `ErrorCode`.** Don't send free-text-only errors, and echo the request's `id` in every reply.
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.

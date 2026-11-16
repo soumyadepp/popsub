@@ -2,11 +2,11 @@
 //!
 //! The `server` subcommand loads settings, opens the configured storage
 //! backend, builds the broker, spawns its QoS 1 retry, retention and session
-//! expiry loops and
-//! runs the WebSocket server until Ctrl+C. The `client` subcommand runs a
-//! short demo session (login, auth, subscribe, publish) against a running
-//! server, for smoke tests. Everything here is wiring; the protocol, routing
-//! and storage live in the transport, broker and storage crates.
+//! expiry loops and runs the WebSocket server until Ctrl+C. The `client`
+//! subcommand runs a short demo session (connect, subscribe, publish)
+//! against a running server with the SDK (`popsub_sdk`), for smoke tests.
+//! Everything here is wiring; the protocol, routing and storage live in the
+//! transport, broker and storage crates.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -15,9 +15,10 @@ use std::time::Duration;
 use clap::Parser;
 use popsub_broker::{Broker, LogSettings, SharedBroker};
 use popsub_config::{StorageBackend, StorageSettings, load_config};
-use popsub_protocol::{CloseCode, PROTOCOL_VERSION, StartFrom};
+use popsub_protocol::CloseCode;
+use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
-use popsub_transport::{ClientMessage, Server, ServerMessage};
+use popsub_transport::Server;
 use tracing::{error, info, warn};
 
 /// How long a shutdown waits after sending every client a close frame, so
@@ -171,14 +172,13 @@ async fn open_storage(settings: &StorageSettings) -> Result<Arc<dyn Storage>, St
     }
 }
 
-/// Runs a short session against a PopSub server and prints each reply.
+/// Runs a short session against a PopSub server with the SDK and prints
+/// what happens.
 ///
-/// Logs in, authenticates with the returned token, subscribes to `topic`
-/// and waits for the `subscribed` reply, publishes `Hello from popsub client`
-/// to it at QoS 0, and prints the delivered message with its `seq`. Frames are built from the transport's own message
-/// types, so the client always speaks the current protocol. The defaults
-/// match the default server settings; pass `--username` and `--password` for
-/// any other account.
+/// Connects (logging in and authenticating), subscribes to `topic`,
+/// publishes `Hello from popsub client` to it with confirmation, and prints
+/// the delivered message with its `seq`. The defaults match the default
+/// server settings; pass `--username` and `--password` for any other account.
 ///
 /// Args:
 ///     url: WebSocket URL of the server, such as `ws://127.0.0.1:8080`.
@@ -187,139 +187,33 @@ async fn open_storage(settings: &StorageSettings) -> Result<Arc<dyn Storage>, St
 ///     topic: The topic to subscribe and publish to.
 ///
 /// Raises:
-///     tungstenite::Error: When the connection can't be opened or drops.
-///     serde_json::Error: When a frame can't be encoded or decoded.
-///     String: When login, auth or subscribe is refused, or the server closes
-///         the connection before replying.
+///     popsub_sdk::Error: When connecting, subscribing or publishing fails.
+///     String: When the subscription ends before the message arrives.
 async fn run_client(
     url: &str,
     username: &str,
     password: &str,
     topic: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut ws, _response) = tokio_tungstenite::connect_async(url).await?;
-
-    let reply = request(
-        &mut ws,
-        &ClientMessage::Login {
-            username: username.to_string(),
-            password: password.to_string(),
-        },
-    )
-    .await?;
-    let ServerMessage::LoggedIn { token } = reply else {
-        return Err(format!("login refused: {reply:?}").into());
-    };
+    let config = ClientConfig::new(url, Credentials::password(username, password))
+        .request_timeout(Duration::from_secs(10));
+    let client = Client::connect(config).await?;
     println!("Logged in as {username}");
-
-    let reply = request(
-        &mut ws,
-        &ClientMessage::Auth {
-            token,
-            protocol: Some(PROTOCOL_VERSION),
-            session_id: None,
-            clean_start: false,
-        },
-    )
-    .await?;
-    if !matches!(reply, ServerMessage::Authenticated { .. }) {
-        return Err(format!("auth refused: {reply:?}").into());
-    }
     println!("Authenticated");
-
-    let reply = request(
-        &mut ws,
-        &ClientMessage::Subscribe {
-            topic: topic.to_string(),
-            from: StartFrom::New,
-        },
-    )
-    .await?;
-    if !matches!(reply, ServerMessage::Subscribed(_)) {
-        return Err(format!("subscribe refused: {reply:?}").into());
-    }
+    let mut subscription = client.subscribe(topic, StartFrom::New).await?;
     println!("Subscribed to {topic}");
-
-    send(
-        &mut ws,
-        &ClientMessage::Publish {
-            topic: topic.to_string(),
-            payload: "Hello from popsub client".to_string(),
-            message_id: None,
-            qos: Some(0),
-        },
-    )
-    .await?;
-    let delivered: ServerMessage = serde_json::from_str(&next_text(&mut ws).await?)?;
-    let ServerMessage::Message(delivery) = delivered else {
-        return Err(format!("publish refused: {delivered:?}").into());
-    };
+    let stored = client
+        .publish_confirmed(topic, "Hello from popsub client")
+        .await?;
+    println!("Published as seq {}", stored.seq);
+    let message = subscription
+        .next()
+        .await
+        .ok_or("the subscription ended before the message arrived")?;
     println!(
         "Received on {topic} (seq {}): {}",
-        delivery.seq, delivery.payload
+        message.seq, message.payload
     );
+    client.close();
     Ok(())
-}
-
-/// The client side of a WebSocket connection, as returned by `connect_async`.
-type Socket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// Sends one protocol frame.
-///
-/// Args:
-///     ws: The connection to send on.
-///     msg: The frame to send.
-///
-/// Raises:
-///     serde_json::Error: When the frame can't be encoded.
-///     tungstenite::Error: When the connection drops.
-async fn send(ws: &mut Socket, msg: &ClientMessage) -> Result<(), Box<dyn std::error::Error>> {
-    use futures_util::SinkExt;
-    let text = serde_json::to_string(msg)?;
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
-        .await?;
-    Ok(())
-}
-
-/// Waits for the next text frame, skipping pings and other control frames.
-///
-/// Args:
-///     ws: The connection to read from.
-///
-/// Returns:
-///     The frame's text.
-///
-/// Raises:
-///     tungstenite::Error: When the connection drops.
-///     String: When the server closes the connection first.
-async fn next_text(ws: &mut Socket) -> Result<String, Box<dyn std::error::Error>> {
-    use futures_util::StreamExt;
-    while let Some(frame) = ws.next().await {
-        if let tokio_tungstenite::tungstenite::Message::Text(text) = frame? {
-            return Ok(text.to_string());
-        }
-    }
-    Err("the server closed the connection".into())
-}
-
-/// Sends a frame and decodes the server's reply.
-///
-/// Args:
-///     ws: The connection to use.
-///     msg: The frame to send.
-///
-/// Returns:
-///     The server's reply.
-///
-/// Raises:
-///     serde_json::Error: When a frame can't be encoded or decoded.
-///     tungstenite::Error: When the connection drops.
-///     String: When the server closes the connection before replying.
-async fn request(
-    ws: &mut Socket,
-    msg: &ClientMessage,
-) -> Result<ServerMessage, Box<dyn std::error::Error>> {
-    send(ws, msg).await?;
-    Ok(serde_json::from_str(&next_text(ws).await?)?)
 }

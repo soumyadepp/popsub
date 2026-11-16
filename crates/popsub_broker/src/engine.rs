@@ -23,8 +23,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use popsub_client::{Client, Outbox};
 use popsub_config::settings::BrokerSettings;
+use popsub_connection::{Client, Outbox};
 use popsub_storage::Record;
 use tracing::{debug, info, warn};
 
