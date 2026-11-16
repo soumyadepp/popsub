@@ -41,12 +41,13 @@ use popsub_connection::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
 use popsub_storage::{MAX_TOPIC_BYTES, NewRecord};
 use popsub_utils::error::{PopSubError, Result};
+use popsub_utils::metrics::{attr, metrics};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::accept_hdr_async_with_config;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, info_span, warn};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::Message as WsMessage;
 use tungstenite::protocol::WebSocketConfig;
@@ -585,10 +586,16 @@ impl Server {
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
                     warn!(%peer, %e, "dropping a connection without a valid PROXY header");
+                    metrics()
+                        .connections_refused
+                        .add(1, &attr("reason", "proxy_header"));
                     return;
                 }
                 Err(_) => {
                     warn!(%peer, "PROXY header timed out");
+                    metrics()
+                        .connections_refused
+                        .add(1, &attr("reason", "proxy_header"));
                     return;
                 }
             }
@@ -603,8 +610,14 @@ impl Server {
                 self.run_connection(stream, peer, source, slot, over_limit, deadline)
                     .await;
             }
-            Ok(Err(e)) => warn!(%peer, %e, "TLS handshake failed"),
-            Err(_) => warn!(%peer, "TLS handshake timed out"),
+            Ok(Err(e)) => {
+                warn!(%peer, %e, "TLS handshake failed");
+                metrics().connections_refused.add(1, &attr("reason", "tls"));
+            }
+            Err(_) => {
+                warn!(%peer, "TLS handshake timed out");
+                metrics().connections_refused.add(1, &attr("reason", "tls"));
+            }
         }
     }
 
@@ -671,16 +684,25 @@ impl Server {
             Ok(Ok(ws)) => ws,
             Ok(Err(e)) => {
                 warn!(%peer, %e, "WebSocket handshake failed");
+                metrics()
+                    .connections_refused
+                    .add(1, &attr("reason", "handshake"));
                 return;
             }
             Err(_) => {
                 warn!(%peer, "WebSocket handshake timed out");
+                metrics()
+                    .connections_refused
+                    .add(1, &attr("reason", "handshake"));
                 return;
             }
         };
         let client_ip = self.trusted_proxies.client_address(source, &forwarded_for);
         if over_limit {
             warn!(%peer, %client_ip, "at the connection limit, refusing a connection");
+            metrics()
+                .connections_refused
+                .add(1, &attr("reason", "server_limit"));
             refuse(&mut ws_stream, CloseCode::TryAgainLater).await;
             return;
         }
@@ -688,9 +710,13 @@ impl Server {
             AddressSlot::take(&self.per_address, client_ip, self.max_per_address)
         else {
             warn!(%peer, %client_ip, "address at its connection limit, refusing a connection");
+            metrics()
+                .connections_refused
+                .add(1, &attr("reason", "address_limit"));
             refuse(&mut ws_stream, CloseCode::TryAgainLater).await;
             return;
         };
+        metrics().connections_opened.add(1, &[]);
         let (ws_sender, mut ws_receiver) = ws_stream.split();
         let (outbox, rx) = Outbox::channel(self.queue_limits);
         let client = Client::new(outbox.clone());
@@ -755,6 +781,11 @@ impl Server {
                 }
             }
         };
+        let reason = match ending {
+            Flow::Close(code) => code.reason(),
+            _ => "client",
+        };
+        metrics().connections_closed.add(1, &attr("reason", reason));
         if let Flow::Close(code) = ending {
             session.outbox.close(code);
             let _ = tokio::time::timeout(CLOSE_GRACE, async {
@@ -1090,7 +1121,22 @@ impl Session {
                 };
             }
         };
-        match self.handle(parsed).await {
+        let outcome = if matches!(parsed.message, ClientMessage::Ack { .. }) {
+            self.handle(parsed).await
+        } else {
+            let kind = parsed.message.kind();
+            let span = info_span!(
+                "popsub.request",
+                otel.name = format!("popsub {kind}"),
+                otel.kind = "server",
+                otel.status_code = tracing::field::Empty,
+                popsub.request.type = kind,
+                popsub.client.id = %self.client_id,
+                error.type = tracing::field::Empty,
+            );
+            self.handle(parsed).instrument(span).await
+        };
+        match outcome {
             Ok(flow) => flow,
             Err(e) => {
                 error!(client_id = %self.client_id, "error handling message: {}", e);
@@ -1240,6 +1286,10 @@ impl Session {
         message: impl Into<String>,
         retry_after: Option<u64>,
     ) -> Result<()> {
+        metrics().errors.add(1, &attr("code", code.as_str()));
+        let span = tracing::Span::current();
+        span.record("otel.status_code", "ERROR");
+        span.record("error.type", code.as_str());
         self.reply(
             id,
             ServerMessage::Error {
@@ -1385,6 +1435,7 @@ impl Session {
             },
         };
         if let Some(retry_after) = lockout {
+            metrics().logins.add(1, &attr("outcome", "locked_out"));
             warn!(client_id = %self.client_id, client_ip = %self.client_ip, username, retry_after, "login rate limited");
             self.fail(
                 id,
@@ -1396,11 +1447,15 @@ impl Session {
         }
         match self.server.auth.login(username, password).await {
             Ok(token) => {
+                metrics().logins.add(1, &attr("outcome", "success"));
                 info!(client_id = %self.client_id, username, "login successful");
                 limiters.login_limiter.record_success(&pair_key);
                 self.reply(id, ServerMessage::LoggedIn { token })?;
             }
             Err(e) => {
+                metrics()
+                    .logins
+                    .add(1, &attr("outcome", "invalid_credentials"));
                 warn!(client_id = %self.client_id, username, "login failed: {}", e);
                 if matches!(e, AuthError::InvalidCredentials) {
                     limiters.login_limiter.record_failure(&pair_key);

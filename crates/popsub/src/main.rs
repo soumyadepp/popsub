@@ -10,16 +10,18 @@
 //! Everything here is wiring; the protocol, routing and storage live in the
 //! transport, broker and storage crates.
 
+mod telemetry;
 mod users;
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+use telemetry::Telemetry;
 
 use clap::Parser;
 use popsub_broker::{Broker, LogSettings, SharedBroker};
-use popsub_config::{StorageBackend, StorageSettings, load_config};
+use popsub_config::{Settings, StorageBackend, StorageSettings, load_config};
 use popsub_protocol::CloseCode;
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
@@ -68,34 +70,36 @@ enum Command {
     },
 }
 
-/// Parses the command line, starts logging (at `info`, or `warn` for
-/// `users` so its output stays readable) and runs the chosen subcommand.
+/// Parses the command line, starts logging and runs the chosen subcommand.
+///
+/// `server` sets up logging and telemetry from its settings (see
+/// `start_server`); `client` logs at `info`, and `users` at `warn` so its
+/// output stays readable.
 ///
 /// Returns:
 ///     Success when the subcommand finishes cleanly, failure (after logging
 ///     the error) when it fails, so scripts and process supervisors can tell.
 #[tokio::main]
 async fn main() -> ExitCode {
-    let command = Command::parse();
-    let level = match command {
-        Command::Users { .. } => "warn",
-        _ => "info",
-    };
-    popsub_utils::logging::init(level);
-
-    let result = match command {
-        Command::Server => run_server().await,
+    let result = match Command::parse() {
+        Command::Server => return start_server().await,
         Command::Client {
             url,
             username,
             password,
             topic,
             ca_cert,
-        } => run_client(&url, &username, &password, &topic, ca_cert.as_deref()).await,
+        } => {
+            popsub_utils::logging::init("info");
+            run_client(&url, &username, &password, &topic, ca_cert.as_deref()).await
+        }
         Command::Users {
             connection,
             command,
-        } => users::run(connection, command).await,
+        } => {
+            popsub_utils::logging::init("warn");
+            users::run(connection, command).await
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -106,7 +110,50 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Loads settings and runs the broker and WebSocket server until Ctrl+C or `SIGTERM`.
+/// Loads settings, starts logging and telemetry from them, runs the server,
+/// and flushes telemetry before exiting.
+///
+/// Settings are loaded before logging starts, because `[telemetry]` decides
+/// how logging is set up; a settings error is printed to standard error.
+///
+/// Returns:
+///     Success when the server stopped cleanly, failure (after logging why) otherwise.
+async fn start_server() -> ExitCode {
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("can't load the configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let telemetry = match Telemetry::init(tracing::Level::INFO, &config.telemetry) {
+        Ok(telemetry) => telemetry,
+        Err(e) => {
+            popsub_utils::logging::init("info");
+            error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if config.telemetry.enabled {
+        info!(
+            sample_ratio = config.telemetry.sample_ratio,
+            "exporting OpenTelemetry metrics, traces and logs over OTLP"
+        );
+    }
+    let mut telemetry = telemetry;
+    let outcome = run_server(config, &mut telemetry).await;
+    if let Err(e) = &outcome {
+        error!("{e}");
+    }
+    tokio::task::block_in_place(|| telemetry.shutdown());
+    if outcome.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Runs the broker and WebSocket server until Ctrl+C or `SIGTERM`.
 ///
 /// If the JWT secret or admin password still has a published default value,
 /// the server refuses to start on a non-loopback host and only logs a warning
@@ -121,10 +168,11 @@ async fn main() -> ExitCode {
 /// `/readyz` turns to 503 and every client is sent a `going_away` close
 /// frame before the process exits.
 ///
+/// Args:
+///     config: The loaded settings.
+///     telemetry: The telemetry providers, to register the broker's gauges with.
+///
 /// Raises:
-///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
-///     ConfigError::Type: When a setting from the file or the environment has
-///         the wrong type, including an unknown backend or durability name.
 ///     String: When published default secrets are set and the host is not a loopback address.
 ///     String: When an entry in `server.trusted_proxies` isn't an IP address or CIDR range.
 ///     String: When `server.proxy_protocol` is on with no trusted proxies.
@@ -137,8 +185,10 @@ async fn main() -> ExitCode {
 ///     String: When `storage.durability` is stronger than the backend provides.
 ///     String: When `host:port` or `server.health_address` can't be bound,
 ///         with the underlying I/O error.
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config()?;
+async fn run_server(
+    config: Settings,
+    telemetry: &mut Telemetry,
+) -> Result<(), Box<dyn std::error::Error>> {
     let insecure = config.insecure_defaults();
     if !insecure.is_empty() {
         if !config.server.is_loopback() {
@@ -169,6 +219,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
     info!(backend = ?config.storage.backend, durability = ?log.durability, "storage opened");
+    telemetry.register_gauges(&broker);
     tokio::spawn(broker.clone().run_retry_loop());
     tokio::spawn(broker.clone().run_retention_loop());
     tokio::spawn(broker.clone().run_session_expiry_loop());

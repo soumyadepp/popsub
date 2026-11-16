@@ -19,7 +19,7 @@ pub mod shared;
 pub mod topic;
 mod writer;
 
-pub use engine::{AckOutcome, Broker, DeliverOutcome, RetryOutcome};
+pub use engine::{AckOutcome, Broker, BrokerStats, DeliverOutcome, RetryOutcome};
 pub use frame::close_message;
 pub use health::StorageHealth;
 pub use shared::{LogSettings, SharedBroker, session_key};

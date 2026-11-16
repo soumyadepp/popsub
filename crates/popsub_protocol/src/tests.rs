@@ -549,3 +549,39 @@ fn admin_frames_have_the_documented_shape() {
         json!({"type": "user_deleted", "username": "alice"})
     );
 }
+
+/// Checks that `ErrorCode::as_str` and `ClientMessage::kind` match the wire format.
+#[test]
+fn names_match_the_wire() {
+    for code in [
+        ErrorCode::BadRequest,
+        ErrorCode::Unauthenticated,
+        ErrorCode::AuthFailed,
+        ErrorCode::InvalidCredentials,
+        ErrorCode::LockedOut,
+        ErrorCode::RateLimited,
+        ErrorCode::NotAuthorized,
+        ErrorCode::RegistrationFailed,
+        ErrorCode::InvalidSessionId,
+        ErrorCode::SessionUnavailable,
+        ErrorCode::UnsupportedProtocol,
+        ErrorCode::StorageUnavailable,
+        ErrorCode::PayloadTooLarge,
+        ErrorCode::InvalidTopic,
+        ErrorCode::Internal,
+        ErrorCode::Forbidden,
+        ErrorCode::UserNotFound,
+        ErrorCode::UserExists,
+    ] {
+        assert_eq!(json!(code), json!(code.as_str()));
+    }
+    for frame in [
+        json!({"type": "publish", "topic": "t", "payload": "p"}),
+        json!({"type": "create_user", "username": "a", "password": "p", "role": {"kind": "user"}}),
+        json!({"type": "list_users"}),
+        json!({"type": "ack", "topic": "t", "seq": 1}),
+    ] {
+        let kind = frame["type"].as_str().expect("type").to_string();
+        assert_eq!(parse(frame).message.kind(), kind);
+    }
+}

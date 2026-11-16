@@ -13,6 +13,7 @@ popsub_connection = { path = "../popsub_connection" }
 popsub_config = { path = "../popsub_config" }
 popsub_protocol = { path = "../popsub_protocol" }
 popsub_storage = { path = "../popsub_storage" }
+popsub_utils = { path = "../popsub_utils" }
 tokio = { version = "1.46.1", features = ["full"] }
 tungstenite = "0.28.0"
 tracing = "0.1"

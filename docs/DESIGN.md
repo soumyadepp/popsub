@@ -85,6 +85,33 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 - **Prune task.** Every minute, drops rate limiter entries for keys that have gone quiet. It stops when the server stops.
 - **Health endpoints.** With `server.health_address` set, a small HTTP server answers `GET /healthz` (liveness: 200 whenever the process can answer) and `GET /readyz` (readiness: 503 while shutting down, or for 30 seconds after a failed topic append unless one succeeds since). It is separate from the WebSocket listener so a load balancer or orchestrator can probe it without speaking the protocol. The 30 second window exists because a server marked not ready gets no traffic, so no new append could clear the failure.
 
+### 3.3 Observability
+
+With `[telemetry] enabled`, the binary exports metrics, traces and logs with OpenTelemetry over OTLP (HTTP and protobuf, plain `http://` only), to `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4318`). Transport and broker record through the OpenTelemetry API only; the binary installs the SDK (`crates/popsub/src/telemetry.rs`). With telemetry off every instrument is a no-op. Failed exports are dropped, never retried into the server's own work.
+
+Metrics, all under the `popsub` instrumentation scope. Counters are cumulative; attributes in brackets.
+
+| Name | Kind | What it counts |
+|---|---|---|
+| `popsub.connections` | gauge | Connections registered after their handshakes |
+| `popsub.connections.opened` | counter | Connections admitted |
+| `popsub.connections.refused` | counter | Connections turned away [`reason`: `server_limit`, `address_limit`, `handshake`, `tls`, `proxy_header`] |
+| `popsub.connections.closed` | counter | Connections ended [`reason`: a close code's reason, or `client`] |
+| `popsub.logins` | counter | Login attempts [`outcome`: `success`, `invalid_credentials`, `locked_out`] |
+| `popsub.errors` | counter | Error frames sent [`code`] |
+| `popsub.messages.published` | counter | New records stored, retries of stored ones excluded [`qos`] |
+| `popsub.messages.delivered` | counter | Records sent to subscribers, live or caught up, retries excluded |
+| `popsub.messages.redelivered` | counter | QoS 1 records resent after the acknowledgement timeout |
+| `popsub.messages.acknowledged` | counter | QoS 1 acknowledgements accepted |
+| `popsub.messages.in_flight` | gauge | QoS 1 records sent and not yet acknowledged |
+| `popsub.subscriptions` | gauge | Live subscriptions |
+| `popsub.subscriptions.stalled` | counter | Subscriptions paused after running out of retries |
+| `popsub.topics` | gauge | Topics with a writer or subscribers |
+| `popsub.publish.duration` | histogram, seconds | Append, fan-out and trim in the topic writer |
+| `popsub.storage.errors` | counter | Failed storage operations [`operation`: `append`, `trim`, `cursor`, `read`] |
+
+Gauges are read from `SharedBroker::stats` at each export (every 60 seconds by default). Traces: one span per client request except `ack`, named `popsub <type>`, with `popsub.request.type`, `popsub.client.id`, and on failure `otel.status_code = ERROR` and `error.type` set to the error code; sampled by `telemetry.sample_ratio`, always kept when the parent was. Logs: every event at `info` and above, linked to the current span's trace, except events from the exporter's own HTTP stack.
+
 ## 4. Protocol
 
 All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`). A JSON Schema generated from those types is in `docs/protocol/` for SDKs in other languages; CI fails if it falls out of date.
@@ -264,6 +291,8 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
 | `server.proxy_protocol` | `false` | Transport. Connections from `server.trusted_proxies` must start with a PROXY protocol header (version 1 or 2), whose address is the client's. Needs `server.trusted_proxies`, or startup stops |
 | `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
+| `telemetry.enabled` | `false` | The binary. Export metrics, traces and logs over OTLP; destination and resource from the standard `OTEL_*` variables |
+| `telemetry.sample_ratio` | `1.0` | The binary. Share of request traces kept, 0 to 1; a value outside that stops startup |
 | `server.health_address` | empty | The binary. Where to serve `/healthz` and `/readyz` over plain HTTP, such as `127.0.0.1:9091`; empty serves neither. A port that can't be bound stops startup |
 | `server.tls_cert`, `server.tls_key` | empty | The binary. PEM certificate chain (leaf first) and private key; with both set the server serves `wss://`. Setting only one, or files that can't be read or don't match, stops startup |
 | `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
@@ -368,7 +397,7 @@ The defaults below are set in the `[limits]` section (section 9).
 
 ## 12. Known gaps, in priority order
 
-1. No release artefacts, health check or metrics, and only a Rust client library.
+1. No release artefacts, and only a Rust client library.
 2. Changing a password doesn't revoke the account's outstanding tokens.
 
 ## 13. Proposed direction
@@ -403,7 +432,7 @@ Done: a per-address connection limit, `server.max_connections_per_address`, off 
 - Done: the Rust client library, `popsub_sdk`. Next: TypeScript (types generated from `docs/protocol/`), then Python, held to one shared scenario suite against a real server.
 - Done: TLS in the server (`server.tls_cert`, `server.tls_key`) and `wss://` in `popsub_sdk`, with extra trusted roots for private CAs. Not done: reloading a renewed certificate without a restart, and client certificates.
 - Release binaries, a Docker image and crates.io packages.
-- `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.
+- Done: `/healthz` and `/readyz`, and OpenTelemetry metrics, traces and logs over OTLP (section 3.3).
 - Published benchmarks against NATS and Redis pub/sub, including where PopSub loses.
 
 ### Later: clustering

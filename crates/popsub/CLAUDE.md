@@ -5,6 +5,7 @@ The CLI. Loads config, refuses to start on a non-loopback host while published d
 ## Structure
 
 - `src/main.rs`: `Command` enum (`server`, `client`, `users`), `run_server`, `open_storage`, `open_users`, `run_client`.
+- `src/telemetry.rs`: `Telemetry`. `init` sets up console logging and, with `[telemetry] enabled`, the OTLP trace, metric and log exporters, and installs the meter provider globally; `register_gauges` adds the gauges read from `SharedBroker::stats`; `shutdown` flushes.
 - `src/users.rs`: the `users` subcommands (`list`, `show`, `add`, `grant`, `revoke`, `role`, `passwd`, `disable`, `enable`, `delete`), parsing `--topic PATTERN[:ACCESS]`, and printing accounts.
 
 ## Rules
@@ -13,7 +14,9 @@ The CLI. Loads config, refuses to start on a non-loopback host while published d
 - `client` and `users` take `--ca-cert` to trust a PEM certificate for `wss://` (`trust`).
 - `run_client` uses `popsub_sdk`, so protocol changes reach it through the SDK. Don't write WebSocket or JSON frame code here.
 - The client defaults to `admin` / `password`, which match only the default settings; `--username` and `--password` override them. It is a demo; the client library is `popsub_sdk`.
-- Logging is initialised at `info`, or `warn` for `users` so its output stays readable. `RUST_LOG` is not read yet.
+- `server` loads its settings before logging starts (`start_server`), because `[telemetry]` decides how logging is set up; a settings error goes to standard error. `client` logs at `info` and `users` at `warn`. `RUST_LOG` is not read yet.
+- `Telemetry::init` must run before anything records a metric: `popsub_utils::metrics` binds its instruments to the global provider on first use, and ones made earlier stay no-ops.
+- Keep `opentelemetry-otlp` without its TLS features: `reqwest-rustls` brings in aws-lc, a C build. TLS to a vendor belongs in a collector.
 - Passwords for `users` never come from a positional argument. The admin's comes from `--password`, `POPSUB_PASSWORD` or a prompt; a new one from `POPSUB_NEW_PASSWORD` or a prompt that asks twice.
 - `users` connects with `max_attempts: Some(0)`, so a server that is down fails at once instead of retrying.
 

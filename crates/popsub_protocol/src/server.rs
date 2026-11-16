@@ -178,6 +178,35 @@ pub enum ErrorCode {
     UserExists,
 }
 
+impl ErrorCode {
+    /// The code as it appears on the wire.
+    ///
+    /// Returns:
+    ///     The snake_case code, such as `rate_limited`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::BadRequest => "bad_request",
+            ErrorCode::Unauthenticated => "unauthenticated",
+            ErrorCode::AuthFailed => "auth_failed",
+            ErrorCode::InvalidCredentials => "invalid_credentials",
+            ErrorCode::LockedOut => "locked_out",
+            ErrorCode::RateLimited => "rate_limited",
+            ErrorCode::NotAuthorized => "not_authorized",
+            ErrorCode::RegistrationFailed => "registration_failed",
+            ErrorCode::InvalidSessionId => "invalid_session_id",
+            ErrorCode::SessionUnavailable => "session_unavailable",
+            ErrorCode::UnsupportedProtocol => "unsupported_protocol",
+            ErrorCode::StorageUnavailable => "storage_unavailable",
+            ErrorCode::PayloadTooLarge => "payload_too_large",
+            ErrorCode::InvalidTopic => "invalid_topic",
+            ErrorCode::Internal => "internal",
+            ErrorCode::Forbidden => "forbidden",
+            ErrorCode::UserNotFound => "user_not_found",
+            ErrorCode::UserExists => "user_exists",
+        }
+    }
+}
+
 /// An account, as admins see it. Never includes the password or its hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

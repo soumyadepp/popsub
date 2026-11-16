@@ -17,6 +17,7 @@
 //! which combines the username with the client's session id, so one user
 //! can never attach to another user's session.
 
+use crate::engine::BrokerStats;
 use crate::health::StorageHealth;
 use std::collections::HashMap;
 use std::fmt;
@@ -177,6 +178,14 @@ impl SharedBroker {
             writers: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(StorageHealth::default()),
         })
+    }
+
+    /// A snapshot of the broker's size, for gauges.
+    ///
+    /// Returns:
+    ///     Connections, topics, subscriptions and records in flight.
+    pub fn stats(&self) -> BrokerStats {
+        self.with(|broker| broker.stats())
     }
 
     /// Whether appends are failing, for the server's readiness check.

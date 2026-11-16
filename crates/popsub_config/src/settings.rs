@@ -21,6 +21,8 @@ pub struct Settings {
     pub storage: StorageSettings,
     /// The `[limits]` section: rate limits on logins, registration and publishing.
     pub limits: LimitSettings,
+    /// The `[telemetry]` section: exporting metrics, traces and logs with OpenTelemetry.
+    pub telemetry: TelemetrySettings,
 }
 
 /// The `[server]` section of the configuration.
@@ -210,6 +212,36 @@ impl Default for LimitSettings {
             registrations_per_hour: 5,
             publish_per_second: 100,
             publish_burst: 50,
+        }
+    }
+}
+
+/// The `[telemetry]` section: OpenTelemetry metrics, traces and logs,
+/// exported over OTLP (HTTP and protobuf).
+///
+/// Where they go is set with the standard OpenTelemetry environment
+/// variables, such as `OTEL_EXPORTER_OTLP_ENDPOINT` (default
+/// `http://localhost:4318`), `OTEL_SERVICE_NAME` and
+/// `OTEL_RESOURCE_ATTRIBUTES`.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct TelemetrySettings {
+    /// Whether to export anything. Off by default.
+    pub enabled: bool,
+    /// The share of request traces to keep, from 0 to 1. A trace whose
+    /// parent was sampled is always kept.
+    pub sample_ratio: f64,
+}
+
+impl Default for TelemetrySettings {
+    /// Builds the defaults: nothing exported, every trace kept once enabled.
+    ///
+    /// Returns:
+    ///     The default `[telemetry]` section.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_ratio: 1.0,
         }
     }
 }

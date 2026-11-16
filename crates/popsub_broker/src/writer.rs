@@ -24,6 +24,7 @@
 //! until it finishes. Other topics are unaffected.
 
 use crate::health::StorageHealth;
+use popsub_utils::metrics::{attr, metrics};
 use std::sync::Arc;
 
 use popsub_storage::{NewRecord, Result as StorageResult, Storage};
@@ -175,6 +176,7 @@ impl TopicWriter {
                 Command::CatchUp { client_id } => {
                     if let Err(e) = self.catch_up(&client_id).await {
                         warn!(topic = %self.topic, client = %client_id, %e, "catch-up failed");
+                        metrics().storage_errors.add(1, &attr("operation", "read"));
                     }
                 }
             }
@@ -214,6 +216,9 @@ impl TopicWriter {
                 .await
             {
                 warn!(topic = %update.topic, %e, "storing a cursor failed");
+                metrics()
+                    .storage_errors
+                    .add(1, &attr("operation", "cursor"));
             }
         }
     }
@@ -236,6 +241,8 @@ impl TopicWriter {
     ///         configured durability. `SharedBroker::new` checks this, so it
     ///         only happens with a backend that misreports its capabilities.
     async fn publish(&mut self, record: NewRecord) -> StorageResult<Published> {
+        let started = std::time::Instant::now();
+        let qos = i64::from(record.qos);
         let last_seq = self.last_seq().await?;
         let stored = match self
             .storage
@@ -248,6 +255,9 @@ impl TopicWriter {
             }
             Err(e) => {
                 self.health.record_failure();
+                metrics()
+                    .storage_errors
+                    .add(1, &attr("operation", "append"));
                 self.last_seq = None;
                 return Err(e);
             }
@@ -273,7 +283,12 @@ impl TopicWriter {
             .await
         {
             warn!(topic = %self.topic, %e, "trimming after publish failed");
+            metrics().storage_errors.add(1, &attr("operation", "trim"));
         }
+        metrics().published.add(1, &attr("qos", qos));
+        metrics()
+            .publish_duration
+            .record(started.elapsed().as_secs_f64(), &[]);
         Ok(published)
     }
 

@@ -1228,3 +1228,31 @@ async fn failed_appends_mark_storage_as_failing() {
         .expect("publish");
     assert_eq!(broker.storage_failing(window), None);
 }
+
+/// Checks that `stats` counts connections, topics, subscriptions and the
+/// QoS 1 records in flight, and that an ack takes one out.
+#[tokio::test]
+async fn stats_count_the_brokers_state() {
+    let broker = shared(Retention::default());
+    let (client_id, _rx) = broker.with(connect);
+    broker
+        .subscribe("orders", &client_id, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    broker
+        .publish("orders", new_record("one", 1))
+        .await
+        .expect("publish");
+    let stats = broker.stats();
+    assert_eq!(
+        (
+            stats.connections,
+            stats.topics,
+            stats.subscriptions,
+            stats.in_flight
+        ),
+        (1, 1, 1, 1)
+    );
+    assert!(broker.ack(&client_id, "orders", 1).await);
+    assert_eq!(broker.stats().in_flight, 0);
+}

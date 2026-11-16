@@ -29,5 +29,7 @@ popsub_ratelimit = { path = "../popsub_ratelimit" }
 popsub_utils = { path = "../popsub_utils" }
 
 [dev-dependencies]
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile = "3.20.0"

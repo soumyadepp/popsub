@@ -41,7 +41,7 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
 | `crates/popsub_connection` | `Client` and `Outbox`: the server's record of one connected socket and its outgoing queue |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
-| `crates/popsub_utils` | `PopSubError`, `Result`, logging |
+| `crates/popsub_utils` | `PopSubError`, `Result`, logging, and every OpenTelemetry metric instrument (`metrics`) |
 
 Each crate has its own `CLAUDE.md` with its invariants and gotchas.
 
@@ -54,6 +54,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - Unit tests live in a `tests.rs` module per crate, wired with `#[cfg(test)] mod tests;`. Transport has `websocket_tests.rs` for tests that start a real server on a free port via `portpicker`.
 - Errors go through `popsub_utils::error::PopSubError`. Don't add `unwrap()` on paths that handle client input.
 - Log with `tracing` and structured fields (`client_id = %id`), not `println!`. The CLI client in `crates/popsub` is the exception.
+- Record metrics through `popsub_utils::metrics::metrics()`, and add any new instrument there and to the table in section 3.3 of `docs/DESIGN.md`. Library crates use only the OpenTelemetry API, never the SDK.
 - Keep doc comments (`//!` and `///`) accurate when behaviour changes. Several describe guarantees the code doesn't fully meet; fix the comment or the code, never leave them disagreeing.
 
 ## Rules for changes
