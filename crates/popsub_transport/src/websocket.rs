@@ -29,7 +29,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
+use popsub_auth::{
+    AuthConfig, AuthError, AuthService, DefaultUserRole, InMemoryUserStore, UserStore,
+};
 use popsub_broker::{SharedBroker, close_message, session_key};
 use popsub_config::ServerSettings;
 use popsub_connection::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
@@ -222,12 +224,10 @@ impl Server {
         }
     }
 
-    /// Creates a server whose auth service is configured from the `[server]` settings.
+    /// Creates a server configured from the `[server]` settings, with users
+    /// kept in memory (lost on restart).
     ///
-    /// The JWT secret and expiry, the admin user, whether self-registration
-    /// is allowed, the role new users get (see `registration_role`), the
-    /// heartbeat, the payload limit and the outbound queue budget all come
-    /// from `settings`. Rate limits are the defaults.
+    /// See `from_settings_with_users` for what comes from `settings`.
     ///
     /// Args:
     ///     broker: The broker every connection shares.
@@ -236,12 +236,38 @@ impl Server {
     /// Returns:
     ///     A server ready to `listen` or `serve`.
     pub async fn from_settings(broker: SharedBroker, settings: &ServerSettings) -> Self {
+        Self::from_settings_with_users(broker, settings, Arc::new(InMemoryUserStore::new())).await
+    }
+
+    /// Creates a server configured from the `[server]` settings, with users
+    /// kept in the given store.
+    ///
+    /// The JWT secret and expiry, the admin user, whether self-registration
+    /// is allowed, the role new users get (see `registration_role`), the
+    /// heartbeat, the payload limit and the outbound queue budget all come
+    /// from `settings`. Rate limits are the defaults. The admin from
+    /// `settings` is added to the store only if no account with that name
+    /// exists yet, so once it does, its password is changed through the
+    /// store, not the settings.
+    ///
+    /// Args:
+    ///     broker: The broker every connection shares.
+    ///     settings: The `[server]` section of the loaded configuration.
+    ///     users: Where accounts live, such as a `FileUserStore`.
+    ///
+    /// Returns:
+    ///     A server ready to `listen` or `serve`.
+    pub async fn from_settings_with_users(
+        broker: SharedBroker,
+        settings: &ServerSettings,
+        users: Arc<dyn UserStore>,
+    ) -> Self {
         let config = AuthConfig::new(&settings.jwt_secret)
             .with_expiration(settings.jwt_expiration_hours)
             .with_admin(&settings.username, &settings.password)
             .with_registration(settings.allow_registration)
             .with_default_role(registration_role(&settings.registration_role));
-        let auth = Arc::new(AuthService::new(config).await);
+        let auth = Arc::new(AuthService::with_store(config, users).await);
         Self::new(broker, auth)
             .with_heartbeat(Heartbeat {
                 interval: Duration::from_secs(settings.heartbeat_secs.max(1)),

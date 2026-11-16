@@ -1,6 +1,7 @@
 //! The `UserStore` trait, its in-memory and PostgreSQL implementations, and Argon2 password hashing.
 //!
 //! `InMemoryUserStore` is the default and loses every account on restart.
+//! `FileUserStore` (in `file_store`) keeps accounts in a JSON file.
 //! `PostgresUserStore` is compiled only with the `postgres` feature. Any other
 //! backend can be plugged into `AuthService::with_store` by implementing
 //! [`UserStore`].

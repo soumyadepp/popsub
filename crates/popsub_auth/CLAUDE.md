@@ -8,6 +8,7 @@ Users, roles, password hashing, JWTs and topic permission patterns. The transpor
 - `src/jwt.rs`: `Claims` and `JwtService` (HS256 issue, validate, refresh).
 - `src/permission.rs`: `TopicPermission` and `topic_matches_pattern`, the MQTT-style matcher.
 - `src/store.rs`: the `UserStore` trait, `InMemoryUserStore`, password hashing with Argon2id, and `PostgresUserStore` behind the `postgres` feature.
+- `src/file_store.rs`: `FileUserStore`, accounts in one JSON file (`{"version": 1, "users": [...]}`). Every change is applied to a copy, written to a temporary file, flushed and renamed into place, and only then applied in memory. The file is mode 0600 on Unix. The binary uses it as `users.json` in the storage directory.
 - `src/user.rs`: `User` and `Role` (`Admin`, `User` with topic permissions, `ReadOnly`).
 - `src/error.rs`: `AuthError`.
 

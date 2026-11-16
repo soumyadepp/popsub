@@ -18,7 +18,7 @@ use popsub_config::{StorageBackend, StorageSettings, load_config};
 use popsub_protocol::CloseCode;
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
-use popsub_transport::Server;
+use popsub_transport::{FileUserStore, InMemoryUserStore, Server, UserStore};
 use tracing::{error, info, warn};
 
 /// How long a shutdown waits after sending every client a close frame, so
@@ -81,7 +81,8 @@ async fn main() -> ExitCode {
 /// If the JWT secret or admin password still has a published default value,
 /// the server refuses to start on a non-loopback host and only logs a warning
 /// for each such setting on `localhost` or a loopback address. Otherwise it
-/// opens the `[storage]` backend, builds the broker (refusing a durability
+/// opens the `[storage]` backend and the user store that goes with it,
+/// builds the broker (refusing a durability
 /// the backend can't provide), spawns the QoS 1 retry, retention and session
 /// expiry loops,
 /// and serves on `host:port` until Ctrl+C arrives. On Ctrl+C every client is
@@ -94,6 +95,8 @@ async fn main() -> ExitCode {
 ///     String: When published default secrets are set and the host is not a loopback address.
 ///     String: When the storage backend can't be opened, for example because
 ///         another server is using its directory.
+///     String: When `users.json` in the storage directory exists but can't be
+///         read or parsed.
 ///     String: When `storage.durability` is stronger than the backend provides.
 ///     String: When `host:port` can't be bound, with the underlying I/O error.
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,7 +133,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(broker.clone().run_retry_loop());
     tokio::spawn(broker.clone().run_retention_loop());
     tokio::spawn(broker.clone().run_session_expiry_loop());
-    let server = Server::from_settings(broker.clone(), &config.server).await;
+    let users = open_users(&config.storage)?;
+    let server = Server::from_settings_with_users(broker.clone(), &config.server, users).await;
 
     tokio::select! {
         served = server.listen(&addr) => served.map_err(|e| format!("can't serve on {addr}: {e}"))?,
@@ -168,6 +172,39 @@ async fn open_storage(settings: &StorageSettings) -> Result<Arc<dyn Storage>, St
                 "storage backend is memory: topic history and sessions are lost when the server stops"
             );
             Ok(Arc::new(MemoryStorage::new()))
+        }
+    }
+}
+
+/// Opens the user store that goes with the `[storage]` backend.
+///
+/// With the `file` backend, accounts live in `users.json` in the storage
+/// directory and survive restarts; the directory's lock (taken when the
+/// storage opened) also keeps other servers away from it. With the `memory`
+/// backend they live in memory and are lost on restart.
+///
+/// Args:
+///     settings: The `[storage]` section.
+///
+/// Returns:
+///     The user store.
+///
+/// Raises:
+///     String: When `users.json` exists but can't be read or parsed.
+fn open_users(settings: &StorageSettings) -> Result<Arc<dyn UserStore>, String> {
+    match settings.backend {
+        StorageBackend::File => {
+            let path = std::path::Path::new(&settings.path).join("users.json");
+            let store = FileUserStore::open(&path)
+                .map_err(|e| format!("can't open the user store: {e}"))?;
+            info!(path = %path.display(), "user store opened");
+            Ok(Arc::new(store))
+        }
+        StorageBackend::Memory => {
+            warn!(
+                "users are kept in memory: accounts created while running are lost when the server stops"
+            );
+            Ok(Arc::new(InMemoryUserStore::new()))
         }
     }
 }

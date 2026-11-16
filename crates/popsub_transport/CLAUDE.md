@@ -5,7 +5,7 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 ## Files
 
 - `src/websocket.rs`:
-  - `Server`: what every connection shares (a `SharedBroker`, the auth service, `RateLimiters`). Build with `Server::new` or `Server::from_settings`, swap limits with `with_rate_limiters`, then `listen(addr)` or `serve(listener)`.
+  - `Server`: what every connection shares (a `SharedBroker`, the auth service, `RateLimiters`). Build with `Server::new`, `Server::from_settings` (users in memory) or `Server::from_settings_with_users` (any `UserStore`, such as `FileUserStore`), swap limits with `with_rate_limiters`, then `listen(addr)` or `serve(listener)`.
   - `Session`: one connection. `handle` dispatches a `ClientFrame` to one method per message type, passing the request `id`; `require_user` is the single "is this connection logged in" check; `reply(id, ...)` and `fail(id, code, ...)` queue frames on the session's own channel.
   - `RateLimiters` and its defaults, `Heartbeat` (`with_heartbeat`), the prune task, `registration_role` and `registration_error_message`.
   - `run_connection`: the per-connection loop. It selects over client frames (`Session::on_frame`), the heartbeat tick, the token expiry warning and the token expiry, and ends with a `Flow`: `Continue`, `Close(CloseCode)` (send a close frame, wait up to `CLOSE_GRACE` for the reply) or `Stop` (no close frame).

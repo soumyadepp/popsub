@@ -151,7 +151,7 @@ The settings you are most likely to change:
 | `server.host`, `server.port` | `127.0.0.1`, `8080` | Where to listen |
 | `server.jwt_secret`, `server.password` | published defaults | Change both before listening anywhere but `localhost`; the server refuses to start otherwise |
 | `server.allow_registration` | `false` | Let clients create accounts; `server.registration_role` decides what they may use |
-| `storage.backend` | `file` | `file` keeps history and sessions in `storage.path` (`pubsub_data`); `memory` loses them on restart |
+| `storage.backend` | `file` | `file` keeps history, sessions and user accounts in `storage.path` (`pubsub_data`); `memory` loses them on restart |
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
 | `server.max_payload_bytes` | 1 MiB | Largest publish |

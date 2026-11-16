@@ -1473,3 +1473,52 @@ async fn a_slow_reader_is_caught_up_from_the_log_without_unbounded_queueing() {
     }
     assert_eq!(seqs, (1..=3_000).collect::<Vec<_>>());
 }
+
+/// Checks that an account registered on one server can log in on a new
+/// server using the same users file, as after a restart.
+#[tokio::test]
+async fn accounts_survive_a_restart_with_a_users_file() {
+    let mut settings = Settings::default();
+    settings.server.allow_registration = true;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("users.json");
+    let start = |settings: Settings, path: std::path::PathBuf| async move {
+        let broker = SharedBroker::new(
+            Broker::new(settings.broker.clone()),
+            Arc::new(MemoryStorage::new()),
+            LogSettings {
+                durability: Durability::None,
+                retention: settings.storage.retention.to_retention(),
+                session_expiry: Duration::from_secs(60),
+            },
+        )
+        .expect("broker");
+        let users = Arc::new(crate::FileUserStore::open(&path).expect("users file"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = Server::from_settings_with_users(broker, &settings.server, users).await;
+        (addr, tokio::spawn(server.serve(listener)))
+    };
+
+    let (addr, first) = start(settings.clone(), path.clone()).await;
+    let mut ws = raw_connection(addr).await;
+    let registered = send_raw(
+        &mut ws,
+        r#"{"type": "register", "username": "dana", "password": "dana-password"}"#,
+    )
+    .await;
+    assert_eq!(registered["type"], "registered");
+    first.abort();
+    drop(ws);
+
+    let (addr, _second) = start(settings, path).await;
+    let mut ws = raw_connection(addr).await;
+    let login = send_raw(
+        &mut ws,
+        r#"{"type": "login", "username": "dana", "password": "dana-password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in");
+}
