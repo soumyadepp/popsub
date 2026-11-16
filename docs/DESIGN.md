@@ -43,6 +43,8 @@ This document describes how the system works today, where its guarantees hold an
  popsub_client (per-connection record)   popsub_config (settings loader)
         |                                        |
  popsub_utils (errors, logging)          popsub_storage (topic logs, Storage traits, backends)
+
+ popsub_protocol (every frame type; used by transport, broker, binary and client SDKs)
 ```
 
 | Crate | Responsibility |
@@ -52,6 +54,7 @@ This document describes how the system works today, where its guarantees hold an
 | `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | One writer task per topic that appends to the log, fans records out in `seq` order and replays history to subscribers; the synchronous `Broker` with subscriber sets and the QoS 1 pending table; all shared through `SharedBroker`. |
+| `popsub_protocol` | Every frame clients and the server exchange, the error codes and `PROTOCOL_VERSION`. Depends only on `serde`, so client SDKs can use it. |
 | `popsub_storage` | Per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite every backend must pass (`docs/STORAGE.md`). |
 | `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
 | `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
@@ -82,41 +85,46 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 
 ## 4. Protocol
 
-All frames are JSON text. Client messages are tagged with `type`.
+All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`).
+
+- **Request ids.** Any client frame may carry an `id`, a number or a string. The reply carries the same `id`. Frames the server sends on its own have none.
+- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
+- **Evolution.** Within a version, frames, fields and error codes are only added. Clients ignore fields and frame types they don't know, and treat an unknown error code like `internal`. Removing or changing anything needs a new version, named by the client in `auth`.
 
 ### 4.1 Client to server
 
-| `type` | Fields | Notes |
+| `type` | Fields | Reply |
 |---|---|---|
-| `register` | `username`, `password` | Only when `server.allow_registration` is on. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`; passwords at least 8 characters. Allowed before `auth`. |
-| `login` | `username`, `password` | Checked against the user store (Argon2id). Returns a JWT. Rate limited, see section 10. |
-| `auth` | `token`, optional `session_id`, optional `clean_start` | Must succeed before anything below is accepted. A bad token closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
-| `subscribe` | `topic`, optional `from` | Requires subscribe permission for the topic. `from` is `"resume"` (the default: one past a durable session's stored cursor, otherwise no replay), `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`. Answered with `subscribed`, then history, then live records. An `error` if the log or session store can't be read, in which case the client is not subscribed. |
-| `unsubscribe` | `topic` | |
-| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | Requires publish permission and is rate limited per user. The broker sets the publish time and generates `message_id` when missing. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, a QoS 1 publisher gets `storage unavailable`. |
-| `ack` | `topic`, `seq` | Confirms one QoS 1 record delivered to this connection. Anything not in flight to this connection is ignored. |
+| `register` | `username`, `password` | `registered`. Only when `server.allow_registration` is on. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`; passwords at least 8 characters. Allowed before `auth`. |
+| `login` | `username`, `password` | `logged_in` with a JWT. Checked against the user store (Argon2id). Rate limited, see section 10. |
+| `auth` | `token`, optional `protocol`, optional `session_id`, optional `clean_start` | `authenticated`. Must succeed before anything below is accepted. A bad token, an unsupported `protocol` or a bad `session_id` closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
+| `subscribe` | `topic`, optional `from` | `subscribed`, then history, then live records. Requires subscribe permission. `from` is `"resume"` (the default: one past a durable session's stored cursor, otherwise no replay), `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`. `storage_unavailable` if the log or session store can't be read, in which case the client is not subscribed. |
+| `unsubscribe` | `topic` | `unsubscribed`, even if the client wasn't subscribed. |
+| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. |
+| `ack` | `topic`, `seq` | None. Confirms one QoS 1 record delivered to this connection. Anything not in flight to this connection is ignored. |
 
 ### 4.2 Server to client
 
 | Frame | Shape |
 |---|---|
-| Register result | `{"type":"register_response","success":true,"message":"..."}` |
-| Login result | `{"type":"login_response","token":"..."}` |
-| Auth result | `{"type":"authenticated"}`, or with a session `{"type":"authenticated","session_id":"phone-1","resumed":["chat"]}` |
-| Publish confirmation | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
-| Subscribe result | `{"type":"subscribed","topic":"...","replay_from":41,"replay_to":90}`. Records `replay_from` to `replay_to` are history; later ones are live. Also sent for each subscription a session restores. |
-| Stalled subscription | `{"type":"stalled","topic":"...","seq":42}`, when a record runs out of retries |
-| Error | `{"type":"error","message":"..."}` |
-| Delivered message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
-| Trimmed history | `{"type":"truncated","topic":"...","first_available":1300}`, sent before a replay that starts later than asked |
+| Registered | `{"type":"registered"}` |
+| Logged in | `{"type":"logged_in","token":"..."}` |
+| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
+| Subscribed | `{"type":"subscribed","topic":"...","replay_from":41,"replay_to":90}`. Records `replay_from` to `replay_to` are history; later ones are live. Also sent, without an `id`, for each subscription a session restores. |
+| Unsubscribed | `{"type":"unsubscribed","topic":"..."}` |
+| Published | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
+| Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
+| Truncated | `{"type":"truncated","topic":"...","first_available":1300}`, before records that start later than the subscriber expected |
+| Stalled | `{"type":"stalled","topic":"...","seq":42}`, when a record runs out of retries |
+| Error | `{"type":"error","code":"not_authorized","message":"..."}`, plus `retry_after` for limits |
 
-The broker writes `message`, `truncated`, `subscribed` and `stalled` itself (`popsub_broker::TopicFrame`). The matching `ServerMessage` variants wrap the same structs, and a test checks that what the broker writes parses as a `ServerMessage`. The publisher's username is stored but not sent to subscribers.
+All replies also carry the request's `id` when it had one. The broker writes `message`, `truncated`, `stalled` and `subscribed` itself, using the same `popsub_protocol` types as the transport. The publisher's username is stored but not sent to subscribers.
 
 ### 4.3 Session order
 
 1. Connect.
 2. Optionally `register`. The connection stays open whatever the result.
-3. `login`. Wrong credentials or a lockout produce an error and the connection stays open.
+3. `login`. Wrong credentials or a lockout produce an error and the connection stays open. Malformed frames get `bad_request` and the connection stays open too.
 4. `auth` with the token. Failure closes the connection.
 5. Any other request. Sending one before successful `auth` produces an error and closes the connection. A permission denial or a publish rate limit produces an error and the connection stays open.
 
@@ -308,7 +316,7 @@ Remaining:
 
 ### Phase 3: adoptable
 
-- Publish a versioned protocol spec.
+- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Next: close codes, heartbeats and re-auth, then message and queue size limits, then a JSON Schema generated from the types for other languages.
 - JavaScript and Python client libraries with reconnection and ACK handling built in.
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.

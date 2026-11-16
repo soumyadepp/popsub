@@ -9,7 +9,7 @@ Topic writers, the broker engine, replay, per-subscriber acknowledgement and dur
 - `src/engine.rs`: `Broker`, synchronous: clients, subscriptions, `deliver`, `send_records`, `skip_to`, `ack`, `retry_overdue` (resends per subscription, stalls after `max_retries`), session lookups.
 - `src/topic.rs`: `Topic` and each subscription's `DeliveryState` (`next_seq`, the in-flight window, stall, and the derived `cursor`), plus `CursorUpdate`.
 - `src/replay.rs`: `plan`, which turns a `StartFrom` and the log's bounds into a starting `seq` and whether to report a truncation. Pure, unit tested.
-- `src/frame.rs`: the frames the broker writes (`Delivery`, `Truncated`, `Subscribed`, `Stalled`, wrapped in `TopicFrame`) and `StartFrom`.
+- `src/frame.rs`: `delivery` (a stored record as a `message` frame) and `to_ws`. The frame types themselves come from `popsub_protocol`.
 - `src/tests.rs`: unit tests with `mpsc` channels as fake clients and `MemoryStorage` as the log and session store.
 
 ## Contract
@@ -20,7 +20,7 @@ Topic writers, the broker engine, replay, per-subscriber acknowledgement and dur
 - ACKs are per subscription: only a record in that connection's window is accepted. `acks_are_per_subscriber` and `retries_go_only_to_the_subscriber_that_has_not_acked` guard this.
 - The cursor is derived (one below the oldest in-flight record, or below `next_seq`); never store it separately in memory.
 - Sessions are keyed by `session_key(username, session_id)`, so one user can't reach another's.
-- The broker serialises its own frames and must not depend on transport types. The transport's `ServerMessage` wraps the same structs; transport tests check they still match.
+- The broker writes `popsub_protocol::ServerFrame`s and must not depend on transport types. `subscribed` carries the subscribe request's `id`; everything else it sends is an event with none.
 
 ## Current behaviour to keep in mind
 

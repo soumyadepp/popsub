@@ -30,7 +30,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 use tungstenite::protocol::Message as WsMessage;
 
-use crate::frame::{Delivery, Stalled, TopicFrame};
+use popsub_protocol::{ServerFrame, ServerMessage, Stalled};
+
+use crate::frame::{delivery, to_ws};
 use crate::topic::{CursorUpdate, DeliveryState, InFlight, SubscriberId, Topic};
 
 /// The broker: connected clients and topic subscriptions with their delivery state.
@@ -123,6 +125,14 @@ impl Broker {
         self.clients.get(client_id).map(|c| c.sender.clone())
     }
 
+    /// The window size subscriptions get, as configured.
+    ///
+    /// Returns:
+    ///     The most unacknowledged QoS 1 records per subscription, at least 1.
+    pub fn max_inflight(&self) -> usize {
+        self.settings.max_inflight.max(1)
+    }
+
     /// Returns the durable session a registered client holds.
     ///
     /// Args:
@@ -167,8 +177,8 @@ impl Broker {
     ///
     /// Returns:
     ///     False when the client isn't registered or its channel is closed.
-    pub fn send_frame(&self, client_id: &str, frame: &TopicFrame) -> bool {
-        let (Some(client), Some(ws)) = (self.clients.get(client_id), frame.to_ws()) else {
+    pub fn send_frame(&self, client_id: &str, frame: &ServerFrame) -> bool {
+        let (Some(client), Some(ws)) = (self.clients.get(client_id), to_ws(frame)) else {
             return false;
         };
         client.sender.send(ws).is_ok()
@@ -420,18 +430,18 @@ impl Broker {
                         state.stalled = Some(seq);
                         outcome.stalled += 1;
                         warn!(client = %client_id, topic = %topic.name, seq, "subscription stalled after max retries");
-                        let frame = TopicFrame::Stalled(Stalled {
+                        let frame = ServerFrame::event(ServerMessage::Stalled(Stalled {
                             topic: topic.name.clone(),
                             seq,
-                        });
-                        if let Some(ws) = frame.to_ws() {
+                        }));
+                        if let Some(ws) = to_ws(&frame) {
                             let _ = client.sender.send(ws);
                         }
                         break;
                     }
                     pending.retries += 1;
                     pending.sent_at = now_ms;
-                    if let Some(ws) = TopicFrame::Message(Delivery::from(&pending.record)).to_ws() {
+                    if let Some(ws) = to_ws(&delivery(&pending.record)) {
                         let _ = client.sender.send(ws);
                     }
                     outcome.resent += 1;
@@ -467,7 +477,7 @@ fn send_one(
     if state.next_seq != record.seq || !state.has_room(max_inflight) {
         return false;
     }
-    let Some(ws) = TopicFrame::Message(Delivery::from(record)).to_ws() else {
+    let Some(ws) = to_ws(&delivery(record)) else {
         return false;
     };
     if sender.send(ws).is_err() {

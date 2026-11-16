@@ -1,20 +1,17 @@
 //! WebSocket transport for PopSub: the JSON protocol and the server that speaks it.
 //!
-//! `message` defines the frames clients and the server exchange, and `websocket`
-//! accepts connections, enforces authentication, topic permissions and rate
-//! limits, and turns requests into broker calls. The auth types are re-exported
-//! here so the binary can configure users and permissions through this crate
-//! without depending on `popsub_auth` directly.
+//! The frames themselves are defined in `popsub_protocol` and re-exported
+//! here. `websocket` accepts connections, enforces authentication, topic
+//! permissions and rate limits, and turns requests into broker calls. The
+//! auth types are re-exported here so the binary can configure users and
+//! permissions through this crate without depending on `popsub_auth` directly.
 
-pub mod message;
 pub mod websocket;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod websocket_tests;
 
-pub use message::{ClientMessage, ServerMessage};
+pub use popsub_protocol::{ClientFrame, ClientMessage, ServerFrame, ServerMessage};
 pub use websocket::{RateLimiters, Server, registration_role};
 
 pub use popsub_auth::service::UserBuilder;

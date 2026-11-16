@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use popsub_broker::{Broker, LogSettings, SharedBroker, StartFrom};
+use popsub_broker::{Broker, LogSettings, SharedBroker};
 use popsub_config::{StorageBackend, StorageSettings, load_config};
+use popsub_protocol::{PROTOCOL_VERSION, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
 use popsub_transport::{ClientMessage, Server, ServerMessage};
 use tracing::{error, info, warn};
@@ -110,6 +111,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let log = LogSettings {
         durability: config.storage.durability,
         retention: config.storage.retention.to_retention(),
+        session_expiry: Duration::from_secs(config.storage.session_expiry_secs),
     };
     let broker =
         SharedBroker::new(Broker::new(config.broker.clone()), storage, log).map_err(|e| {
@@ -121,11 +123,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     info!(backend = ?config.storage.backend, durability = ?log.durability, "storage opened");
     tokio::spawn(broker.clone().run_retry_loop());
     tokio::spawn(broker.clone().run_retention_loop());
-    tokio::spawn(
-        broker
-            .clone()
-            .run_session_expiry_loop(Duration::from_secs(config.storage.session_expiry_secs)),
-    );
+    tokio::spawn(broker.clone().run_session_expiry_loop());
     let server = Server::from_settings(broker, &config.server).await;
 
     tokio::select! {
@@ -200,7 +198,7 @@ async fn run_client(
         },
     )
     .await?;
-    let ServerMessage::LoginResponse { token } = reply else {
+    let ServerMessage::LoggedIn { token } = reply else {
         return Err(format!("login refused: {reply:?}").into());
     };
     println!("Logged in as {username}");
@@ -209,6 +207,7 @@ async fn run_client(
         &mut ws,
         &ClientMessage::Auth {
             token,
+            protocol: Some(PROTOCOL_VERSION),
             session_id: None,
             clean_start: false,
         },

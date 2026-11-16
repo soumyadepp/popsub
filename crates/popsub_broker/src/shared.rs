@@ -31,8 +31,8 @@ use tungstenite::protocol::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::engine::Broker;
-use crate::frame::StartFrom;
 use crate::writer::{Command, Published, SubscribeOutcome, TopicWriter};
+use popsub_protocol::{Limits, RequestId, StartFrom};
 
 /// How often `run_retry_loop` looks for overdue QoS 1 records.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -68,13 +68,16 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// How firmly appends are stored and how much history each topic keeps.
+/// How firmly appends are stored, how much history each topic keeps, and
+/// how long durable sessions last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogSettings {
     /// The durability every append is stored at.
     pub durability: Durability,
     /// The limits applied after each append and by the retention loop.
     pub retention: Retention,
+    /// How long a durable session is kept after its last connection.
+    pub session_expiry: Duration,
 }
 
 /// The broker behind its mutex, the only way any code locks it.
@@ -173,6 +176,17 @@ impl SharedBroker {
         })
     }
 
+    /// The limits clients are told about in `authenticated`.
+    ///
+    /// Returns:
+    ///     The window size and the session expiry.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            max_inflight: self.with(|broker| broker.max_inflight()) as u64,
+            session_expiry_secs: self.log.session_expiry.as_secs(),
+        }
+    }
+
     /// Runs `f` with exclusive access to the broker and returns its result.
     ///
     /// See `BrokerCell::with` for how a poisoned lock is handled.
@@ -225,6 +239,7 @@ impl SharedBroker {
     ///     topic: The topic to subscribe to.
     ///     client_id: The registered client subscribing.
     ///     from: Where replay starts.
+    ///     request_id: The subscribe request's id, echoed in `subscribed`.
     ///
     /// Returns:
     ///     The replay range and whether the subscription was added.
@@ -239,6 +254,7 @@ impl SharedBroker {
         topic: &str,
         client_id: &str,
         from: StartFrom,
+        request_id: Option<RequestId>,
     ) -> StorageResult<SubscribeOutcome> {
         let from = match from {
             StartFrom::Resume => self.resume_point(topic, client_id).await?,
@@ -247,6 +263,7 @@ impl SharedBroker {
         self.request(topic, |reply| Command::Subscribe {
             client_id: client_id.to_string(),
             from,
+            request_id: request_id.clone(),
             reply,
         })
         .await
@@ -515,18 +532,17 @@ impl SharedBroker {
         }
     }
 
-    /// Expires durable sessions not seen for `expiry`, every `SESSION_EXPIRY_INTERVAL`, forever.
+    /// Expires durable sessions not seen for `LogSettings::session_expiry`,
+    /// every `SESSION_EXPIRY_INTERVAL`, forever.
     ///
     /// Connected sessions are touched first, so a long-lived connection never
     /// loses its session. Spawn it as a background task.
-    ///
-    /// Args:
-    ///     expiry: How long a session is kept after its last connection ends.
-    pub async fn run_session_expiry_loop(self, expiry: Duration) {
+    pub async fn run_session_expiry_loop(self) {
         let mut ticker = tokio::time::interval(SESSION_EXPIRY_INTERVAL);
         loop {
             ticker.tick().await;
-            self.expire_sessions(now_ms(), expiry).await;
+            self.expire_sessions(now_ms(), self.log.session_expiry)
+                .await;
         }
     }
 

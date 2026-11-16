@@ -1375,6 +1375,7 @@ dependencies = [
  "popsub_broker",
  "popsub_client",
  "popsub_config",
+ "popsub_protocol",
  "popsub_storage",
  "popsub_transport",
  "popsub_utils",
@@ -1410,6 +1411,7 @@ dependencies = [
  "chrono",
  "popsub_client",
  "popsub_config",
+ "popsub_protocol",
  "popsub_storage",
  "serde",
  "serde_json",
@@ -1436,6 +1438,14 @@ dependencies = [
  "popsub_storage",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "popsub_protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1469,6 +1479,7 @@ dependencies = [
  "popsub_broker",
  "popsub_client",
  "popsub_config",
+ "popsub_protocol",
  "popsub_ratelimit",
  "popsub_storage",
  "popsub_utils",

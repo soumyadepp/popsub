@@ -4,11 +4,11 @@
 //! Each test gets its own server, broker and in-memory storage, configured
 //! from `Settings::default()` unless it says otherwise.
 
-use crate::message::{ClientMessage, ServerMessage};
 use crate::websocket::{RateLimiters, Server};
 use futures_util::{SinkExt, StreamExt};
-use popsub_broker::{Broker, LogSettings, SharedBroker, StartFrom};
+use popsub_broker::{Broker, LogSettings, SharedBroker};
 use popsub_config::Settings;
+use popsub_protocol::{ClientMessage, ErrorCode, ServerMessage, StartFrom};
 use popsub_storage::{Durability, FileStorage, MemoryStorage, Storage};
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +69,7 @@ async fn start_server_on(
         LogSettings {
             durability,
             retention: settings.storage.retention.to_retention(),
+            session_expiry: Duration::from_secs(settings.storage.session_expiry_secs),
         },
     )
     .expect("the backend accepts the requested durability");
@@ -148,12 +149,13 @@ async fn test_login_success() {
     });
 
     let token = match server_msg {
-        ServerMessage::LoginResponse { token } => token,
-        _ => panic!("Expected LoginResponse, got {server_msg:?}"),
+        ServerMessage::LoggedIn { token } => token,
+        _ => panic!("Expected LoggedIn, got {server_msg:?}"),
     };
 
     let auth_msg = ClientMessage::Auth {
         token,
+        protocol: None,
         session_id: None,
         clean_start: false,
     };
@@ -211,7 +213,8 @@ async fn test_login_failure() {
     });
 
     match server_msg {
-        ServerMessage::Error { message } => {
+        ServerMessage::Error { code, message, .. } => {
+            assert_eq!(code, ErrorCode::InvalidCredentials);
             assert_eq!(message, "invalid credentials");
         }
         _ => panic!("Expected Error, got {server_msg:?}"),
@@ -229,6 +232,7 @@ async fn test_auth_failure_invalid_token() {
 
     let auth_msg = ClientMessage::Auth {
         token: "invalid.token.here".to_string(),
+        protocol: None,
         session_id: None,
         clean_start: false,
     };
@@ -250,7 +254,8 @@ async fn test_auth_failure_invalid_token() {
     });
 
     match server_msg {
-        ServerMessage::Error { message } => {
+        ServerMessage::Error { code, message, .. } => {
+            assert_eq!(code, ErrorCode::AuthFailed);
             assert_eq!(message, "authentication failed");
         }
         _ => panic!("Expected Error, got {server_msg:?}"),
@@ -288,7 +293,8 @@ async fn test_action_before_auth_fails() {
     });
 
     match server_msg {
-        ServerMessage::Error { message } => {
+        ServerMessage::Error { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Unauthenticated);
             assert_eq!(message, "must authenticate first");
         }
         _ => panic!("Expected Error, got {server_msg:?}"),
@@ -355,11 +361,11 @@ async fn registration_is_disabled_by_default() {
     .await;
 
     match response {
-        ServerMessage::RegisterResponse { success, message } => {
-            assert!(!success);
+        ServerMessage::Error { code, message, .. } => {
+            assert_eq!(code, ErrorCode::RegistrationFailed);
             assert_eq!(message, "user registration is disabled");
         }
-        other => panic!("Expected RegisterResponse, got {other:?}"),
+        other => panic!("Expected a registration error, got {other:?}"),
     }
 }
 
@@ -391,7 +397,14 @@ async fn locking_out_one_username_leaves_others_usable() {
     )
     .await;
     assert!(
-        matches!(&locked, ServerMessage::Error { message } if message.starts_with("Too many login attempts")),
+        matches!(
+            &locked,
+            ServerMessage::Error {
+                code: ErrorCode::LockedOut,
+                retry_after: Some(_),
+                ..
+            }
+        ),
         "expected a lockout, got {locked:?}"
     );
 
@@ -404,7 +417,7 @@ async fn locking_out_one_username_leaves_others_usable() {
     )
     .await;
     assert!(
-        matches!(admin, ServerMessage::LoginResponse { .. }),
+        matches!(admin, ServerMessage::LoggedIn { .. }),
         "admin should still log in, got {admin:?}"
     );
 }
@@ -437,7 +450,7 @@ async fn denied_publishes_do_not_spend_the_rate_limit() {
         },
     )
     .await;
-    let ServerMessage::LoginResponse { token } = send_and_receive(
+    let ServerMessage::LoggedIn { token } = send_and_receive(
         &mut ws_stream,
         &ClientMessage::Login {
             username: credentials.0,
@@ -452,6 +465,7 @@ async fn denied_publishes_do_not_spend_the_rate_limit() {
         &mut ws_stream,
         &ClientMessage::Auth {
             token,
+            protocol: None,
             session_id: None,
             clean_start: false,
         },
@@ -470,7 +484,13 @@ async fn denied_publishes_do_not_spend_the_rate_limit() {
         )
         .await;
         assert!(
-            matches!(&reply, ServerMessage::Error { message } if message.starts_with("not authorized")),
+            matches!(
+                &reply,
+                ServerMessage::Error {
+                    code: ErrorCode::NotAuthorized,
+                    ..
+                }
+            ),
             "expected a permission error, got {reply:?}"
         );
     }
@@ -510,7 +530,7 @@ async fn admin_session(
     let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
         .await
         .expect("WebSocket handshake failed");
-    let ServerMessage::LoginResponse { token } = send_and_receive(
+    let ServerMessage::LoggedIn { token } = send_and_receive(
         &mut ws,
         &ClientMessage::Login {
             username: settings.server.username.clone(),
@@ -525,6 +545,7 @@ async fn admin_session(
         &mut ws,
         &ClientMessage::Auth {
             token,
+            protocol: None,
             session_id: session_id.map(str::to_string),
             clean_start: false,
         },
@@ -684,7 +705,7 @@ async fn subscribers_replay_the_history_they_ask_for() {
     assert_eq!(next_delivery(&mut everything).await.0, 3);
 
     let subscribed = broker
-        .subscribe("chat", "not-a-client", StartFrom::New)
+        .subscribe("chat", "not-a-client", StartFrom::New, None)
         .await
         .expect("subscribe");
     assert!(!subscribed.added);
@@ -724,7 +745,7 @@ async fn a_session_resumes_after_reconnecting() {
 
     let (mut phone, reply) = admin_session(addr, &settings, Some("phone")).await;
     assert!(
-        matches!(&reply, ServerMessage::Authenticated { session_id: Some(id), resumed } if id == "phone" && resumed.is_empty()),
+        matches!(&reply, ServerMessage::Authenticated { session_id: Some(id), resumed, .. } if id == "phone" && resumed.is_empty()),
         "{reply:?}"
     );
     send_json(
@@ -871,4 +892,139 @@ async fn a_session_resumes_after_a_real_restart() {
         other => panic!("expected subscribed, got {other:?}"),
     }
     assert_eq!(next_delivery(&mut phone).await, (2, "two".to_string()));
+}
+
+/// Sends raw text and reads the reply as JSON, so tests can check ids and
+/// error codes exactly as a client sees them.
+///
+/// Args:
+///     ws: The connection.
+///     text: The frame to send, which need not be valid.
+///
+/// Returns:
+///     The reply as JSON.
+async fn send_raw(ws: &mut TestSocket, text: &str) -> serde_json::Value {
+    ws.send(WsMessage::Text(text.to_string().into()))
+        .await
+        .expect("send");
+    let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("no reply within two seconds")
+        .expect("connection closed")
+        .expect("read failed");
+    serde_json::from_slice(&frame.into_data()).expect("replies are JSON")
+}
+
+/// Checks that replies carry the request's id, numeric or string, and that
+/// `authenticated` reports the protocol version and the server's limits.
+#[tokio::test]
+async fn replies_echo_request_ids() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+        .await
+        .expect("handshake");
+    let login = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "login", "id": 1, "username": "admin", "password": "password"})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in");
+    assert_eq!(login["id"], 1);
+    let token = login["token"].as_str().expect("token").to_string();
+    let auth = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "auth", "id": "a", "token": token, "protocol": 1}).to_string(),
+    )
+    .await;
+    assert_eq!(auth["type"], "authenticated");
+    assert_eq!(auth["id"], "a");
+    assert_eq!(auth["protocol"], 1);
+    assert_eq!(auth["limits"]["max_inflight"], 100);
+    assert_eq!(auth["limits"]["session_expiry_secs"], 86_400);
+    let subscribed = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "subscribe", "id": 2, "topic": "chat"}).to_string(),
+    )
+    .await;
+    assert_eq!(subscribed["type"], "subscribed");
+    assert_eq!(subscribed["id"], 2);
+    let unsubscribed = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "unsubscribe", "id": 3, "topic": "chat"}).to_string(),
+    )
+    .await;
+    assert_eq!(
+        unsubscribed,
+        serde_json::json!({"type": "unsubscribed", "id": 3, "topic": "chat"})
+    );
+    let published = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 4, "topic": "chat", "payload": "x", "qos": 1})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(published["type"], "published");
+    assert_eq!(published["id"], 4);
+}
+
+/// Checks that a frame that doesn't parse gets `bad_request`, with its id
+/// when one can be read, and the connection stays open.
+#[tokio::test]
+async fn bad_frames_get_bad_request_and_keep_the_connection() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+        .await
+        .expect("handshake");
+    let not_json = send_raw(&mut ws, "this is not json").await;
+    assert_eq!(not_json["type"], "error");
+    assert_eq!(not_json["code"], "bad_request");
+    assert!(not_json.get("id").is_none());
+    let unknown = send_raw(&mut ws, r#"{"type": "teleport", "id": 9}"#).await;
+    assert_eq!(unknown["code"], "bad_request");
+    assert_eq!(unknown["id"], 9);
+    let missing = send_raw(
+        &mut ws,
+        r#"{"type": "login", "id": "x", "username": "admin"}"#,
+    )
+    .await;
+    assert_eq!(missing["code"], "bad_request");
+    assert_eq!(missing["id"], "x");
+    let still_open = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "login", "username": "admin", "password": "password"})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(still_open["type"], "logged_in");
+}
+
+/// Checks that asking for a protocol version the server doesn't speak gets
+/// `unsupported_protocol` and closes the connection.
+#[tokio::test]
+async fn an_unsupported_protocol_version_is_refused() {
+    let settings = Settings::default();
+    let (addr, broker) = start_server(&settings, RateLimiters::default()).await;
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+        .await
+        .expect("handshake");
+    let login = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "login", "username": "admin", "password": "password"})
+            .to_string(),
+    )
+    .await;
+    let token = login["token"].as_str().expect("token").to_string();
+    let refused = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "auth", "token": token, "protocol": 2}).to_string(),
+    )
+    .await;
+    assert_eq!(refused["code"], "unsupported_protocol");
+    assert!(wait_for_no_clients(&broker).await);
 }

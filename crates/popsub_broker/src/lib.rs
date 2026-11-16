@@ -4,7 +4,7 @@
 //! Every published message is appended to its topic's log in a
 //! `popsub_storage::Storage` backend, which numbers it with a `seq`, and is
 //! then delivered to current subscribers as a tagged `message` frame. A
-//! subscriber can ask for history with a `StartFrom`; replay and live
+//! subscriber can ask for history with a `popsub_protocol::StartFrom`; replay and live
 //! delivery are handled by one writer task per topic, so they never overlap
 //! or leave gaps. Each subscription has its own window of unacknowledged
 //! QoS 1 records, and a durable session's cursor is stored so it resumes
@@ -12,14 +12,13 @@
 //! through one `SharedBroker` handle.
 
 pub mod engine;
-pub mod frame;
+mod frame;
 mod replay;
 pub mod shared;
 pub mod topic;
 mod writer;
 
 pub use engine::{AckOutcome, Broker, RetryOutcome};
-pub use frame::{Delivery, Stalled, StartFrom, Subscribed, TopicFrame, Truncated};
 pub use shared::{LogSettings, SharedBroker, session_key};
 pub use topic::CursorUpdate;
 pub use writer::{Published, SubscribeOutcome};

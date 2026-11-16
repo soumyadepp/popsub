@@ -7,6 +7,7 @@ edition = "2024"
 popsub_broker = { path = "../popsub_broker" }
 popsub_client = { path = "../popsub_client" }
 popsub_config = { path = "../popsub_config" }
+popsub_protocol = { path = "../popsub_protocol" }
 popsub_storage = { path = "../popsub_storage" }
 popsub_transport = { path = "../popsub_transport" }
 popsub_utils = { path = "../popsub_utils" }

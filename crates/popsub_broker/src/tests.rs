@@ -15,10 +15,10 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tungstenite::protocol::Message as WsMessage;
 
-use crate::frame::StartFrom;
 use crate::replay::{ReplayPlan, plan};
 use crate::topic::{CursorUpdate, DeliveryState};
 use crate::{Broker, LogSettings, RetryOutcome, SharedBroker, session_key};
+use popsub_protocol::StartFrom;
 
 /// The receiving end of a fake client's channel.
 type Inbox = mpsc::UnboundedReceiver<WsMessage>;
@@ -65,6 +65,7 @@ fn shared_on(
         LogSettings {
             durability: Durability::None,
             retention,
+            session_expiry: Duration::from_secs(86_400),
         },
     )
     .expect("memory storage supports durability none")
@@ -475,6 +476,7 @@ fn unsupported_durability_is_refused() {
         LogSettings {
             durability: Durability::Synced,
             retention: Retention::default(),
+            session_expiry: Duration::from_secs(86_400),
         },
     );
     assert!(matches!(result, Err(StorageError::Unsupported(_))));
@@ -565,7 +567,7 @@ async fn subscribe_announces_the_replay_range_then_delivers_live() {
     publish_many(&broker, 3, 0).await;
     let (id, mut rx) = broker.with(connect);
     let outcome = broker
-        .subscribe("t", &id, StartFrom::default())
+        .subscribe("t", &id, StartFrom::default(), None)
         .await
         .expect("subscribe");
     assert!(outcome.added);
@@ -591,7 +593,7 @@ async fn last_replays_original_seqs_then_live() {
     publish_many(&broker, 5, 0).await;
     let (id, mut rx) = broker.with(connect);
     let outcome = broker
-        .subscribe("t", &id, StartFrom::Last(2))
+        .subscribe("t", &id, StartFrom::Last(2), None)
         .await
         .expect("subscribe");
     assert_eq!(outcome.replayed, 2);
@@ -618,7 +620,7 @@ async fn since_ms_replays_from_a_time() {
         .expect("publish");
     let (id, mut rx) = broker.with(connect);
     broker
-        .subscribe("t", &id, StartFrom::SinceMs(cutoff))
+        .subscribe("t", &id, StartFrom::SinceMs(cutoff), None)
         .await
         .expect("subscribe");
     assert_eq!(seqs(&frames(&mut rx)), vec![3]);
@@ -635,7 +637,7 @@ async fn trimmed_history_is_reported_before_replay() {
     publish_many(&broker, 6, 0).await;
     let (id, mut rx) = broker.with(connect);
     let outcome = broker
-        .subscribe("t", &id, StartFrom::Seq(1))
+        .subscribe("t", &id, StartFrom::Seq(1), None)
         .await
         .expect("subscribe");
     assert!(outcome.truncated);
@@ -659,7 +661,7 @@ async fn a_retried_publish_is_stored_and_delivered_once() {
     let broker = shared(Retention::default());
     let (id, mut rx) = broker.with(connect);
     broker
-        .subscribe("t", &id, StartFrom::New)
+        .subscribe("t", &id, StartFrom::New, None)
         .await
         .expect("subscribe");
     let first = broker
@@ -701,7 +703,7 @@ async fn subscribing_an_unknown_client_adds_nothing() {
     let broker = shared(Retention::default());
     publish_many(&broker, 2, 0).await;
     let outcome = broker
-        .subscribe("t", "ghost", StartFrom::Seq(1))
+        .subscribe("t", "ghost", StartFrom::Seq(1), None)
         .await
         .expect("subscribe");
     assert!(!outcome.added);
@@ -720,7 +722,7 @@ async fn retention_is_applied_on_publish_and_by_trim_all() {
     publish_many(&broker, 5, 0).await;
     let (id, mut rx) = broker.with(connect);
     broker
-        .subscribe("t", &id, StartFrom::Last(10))
+        .subscribe("t", &id, StartFrom::Last(10), None)
         .await
         .expect("subscribe");
     assert_eq!(seqs(&frames(&mut rx)), vec![4, 5]);
@@ -729,7 +731,7 @@ async fn retention_is_applied_on_publish_and_by_trim_all() {
     assert_eq!(broker.trim_all(much_later).await, 2);
     let (other, mut other_rx) = broker.with(connect);
     broker
-        .subscribe("t", &other, StartFrom::Seq(1))
+        .subscribe("t", &other, StartFrom::Seq(1), None)
         .await
         .expect("subscribe");
     let received = frames(&mut other_rx);
@@ -745,7 +747,7 @@ async fn concurrent_publishers_are_delivered_in_seq_order() {
     let broker = shared(Retention::default());
     let (id, mut rx) = broker.with(connect);
     broker
-        .subscribe("t", &id, StartFrom::New)
+        .subscribe("t", &id, StartFrom::New, None)
         .await
         .expect("subscribe");
     let mut tasks = Vec::new();
@@ -786,7 +788,7 @@ async fn replay_and_live_delivery_never_overlap_or_gap() {
     tokio::task::yield_now().await;
     let (id, mut rx) = broker.with(connect);
     broker
-        .subscribe("t", &id, StartFrom::Seq(1))
+        .subscribe("t", &id, StartFrom::Seq(1), None)
         .await
         .expect("subscribe");
     publisher.await.expect("publisher task");
@@ -804,7 +806,7 @@ async fn acks_catch_a_full_window_up_from_the_log() {
     );
     let (id, mut rx) = broker.with(connect);
     broker
-        .subscribe("t", &id, StartFrom::New)
+        .subscribe("t", &id, StartFrom::New, None)
         .await
         .expect("subscribe");
     publish_many(&broker, 5, 1).await;
@@ -835,7 +837,7 @@ async fn a_session_resumes_from_its_cursor_after_reconnecting() {
             .is_empty()
     );
     broker
-        .subscribe("t", &first, StartFrom::default())
+        .subscribe("t", &first, StartFrom::default(), None)
         .await
         .expect("subscribe");
     publish_many(&broker, 2, 1).await;
@@ -855,7 +857,7 @@ async fn a_session_resumes_from_its_cursor_after_reconnecting() {
     assert_eq!(stored.len(), 1);
     assert_eq!((stored[0].topic.as_str(), stored[0].acked_seq), ("t", 1));
     broker
-        .subscribe("t", &second, StartFrom::Resume)
+        .subscribe("t", &second, StartFrom::Resume, None)
         .await
         .expect("subscribe");
     assert_eq!(seqs(&frames(&mut rx)), vec![2, 3]);
@@ -879,7 +881,7 @@ async fn a_session_resumes_after_the_broker_restarts() {
             .await
             .expect("attach");
         broker
-            .subscribe("t", &id, StartFrom::default())
+            .subscribe("t", &id, StartFrom::default(), None)
             .await
             .expect("subscribe");
         publish_many(&broker, 3, 1).await;
@@ -893,7 +895,7 @@ async fn a_session_resumes_after_the_broker_restarts() {
         .await
         .expect("attach");
     broker
-        .subscribe("t", &id, StartFrom::Resume)
+        .subscribe("t", &id, StartFrom::Resume, None)
         .await
         .expect("subscribe");
     assert_eq!(seqs(&frames(&mut rx)), vec![2, 3]);
@@ -931,7 +933,7 @@ async fn clean_start_discards_stored_subscriptions() {
         .await
         .expect("attach");
     broker
-        .subscribe("t", &id, StartFrom::New)
+        .subscribe("t", &id, StartFrom::New, None)
         .await
         .expect("subscribe");
     broker.cleanup_client(&id);
@@ -969,7 +971,7 @@ async fn unsubscribing_forgets_the_stored_subscription() {
         .await
         .expect("attach");
     broker
-        .subscribe("t", &id, StartFrom::New)
+        .subscribe("t", &id, StartFrom::New, None)
         .await
         .expect("subscribe");
     assert_eq!(storage.load(&key).await.expect("load").len(), 1);
@@ -1004,7 +1006,7 @@ async fn topics_are_independent() {
     let broker = shared(Retention::default());
     let (id, mut rx) = broker.with(connect);
     broker
-        .subscribe("a", &id, StartFrom::New)
+        .subscribe("a", &id, StartFrom::New, None)
         .await
         .expect("subscribe");
     broker
@@ -1018,4 +1020,31 @@ async fn topics_are_independent() {
     let received = frames(&mut rx);
     assert_eq!(seqs(&received), vec![1]);
     assert_eq!(received[1]["topic"], "a");
+}
+
+/// Checks that the `subscribed` frame echoes the subscribe request's id and
+/// that the advertised limits match the configuration.
+#[tokio::test]
+async fn subscribed_echoes_the_request_id_and_limits_match_settings() {
+    let broker = shared_on(
+        with_window(7),
+        Arc::new(MemoryStorage::new()),
+        Retention::default(),
+    );
+    let (id, mut rx) = broker.with(connect);
+    broker
+        .subscribe(
+            "t",
+            &id,
+            StartFrom::New,
+            Some(popsub_protocol::RequestId::Number(9)),
+        )
+        .await
+        .expect("subscribe");
+    let received = frames(&mut rx);
+    assert_eq!(received[0]["type"], "subscribed");
+    assert_eq!(received[0]["id"], 9);
+    let limits = broker.limits();
+    assert_eq!(limits.max_inflight, 7);
+    assert_eq!(limits.session_expiry_secs, 86_400);
 }

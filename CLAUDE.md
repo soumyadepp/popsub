@@ -32,7 +32,8 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | Crate | Owns |
 |---|---|
 | `crates/popsub` | The binary and CLI wiring |
-| `crates/popsub_transport` | WebSocket server, JSON protocol, and enforcing auth, permissions and rate limits |
+| `crates/popsub_protocol` | Every frame type, error codes and `PROTOCOL_VERSION`. Depends only on `serde` |
+| `crates/popsub_transport` | WebSocket server, and enforcing auth, permissions and rate limits |
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
@@ -43,7 +44,7 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 
 Each crate has its own `CLAUDE.md` with its invariants and gotchas.
 
-Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then client and config, with storage and utils at the bottom. Never make a lower crate depend on a higher one. The broker must not know about sockets or JSON protocol messages.
+Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then client and config, with storage and utils at the bottom. Never make a lower crate depend on a higher one. `popsub_protocol` sits beside them and is used by transport, broker and binary. The broker writes protocol frames to channels but must not know about sockets or the transport's types.
 
 ## Conventions
 
@@ -56,7 +57,8 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 ## Rules for changes
 
-- **Protocol changes** touch `popsub_transport/src/message.rs`, the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change.
+- **Protocol changes** touch `popsub_protocol` (types and its wire tests), the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change. Within a protocol version only add frames, fields and error codes; anything else needs a new `PROTOCOL_VERSION`.
+- **Every failure a client sees is an `error` frame with an `ErrorCode`.** Don't send free-text-only errors, and echo the request's `id` in every reply.
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.
 - **Reach the broker only through `SharedBroker::with`** (inside the broker crate, `BrokerCell::with`, which it wraps). The closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
 - **Storage I/O belongs in the topic writer**, never under the broker lock. Publishes and subscribes for a topic go through its writer so they are handled one at a time; don't add a path that appends or replays around it.
@@ -66,8 +68,8 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 ## Gotchas
 
-- Delivered records and `truncated` frames are serialised by the broker (`TopicFrame`), not by the transport. `ServerMessage` wraps the same structs; keep the test that parses one as the other.
-- A subscribe is answered by a `subscribed` frame from the broker, but a QoS 0 publish has no reply. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
+- Deliveries, `subscribed`, `truncated` and `stalled` are written by the broker, not the transport, using the same `popsub_protocol::ServerFrame`.
+- A subscribe is answered by a `subscribed` frame from the broker, but a QoS 0 publish and an `ack` have no reply. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
 - Durable sessions are keyed by `session_key(username, session_id)`. Never key them by the client's `session_id` alone, or one user could attach to another's session.
 - QoS 1 is at-least-once per subscriber while connected, and across reconnects only for durable sessions whose records are still retained. With the `file` backend (the default) sessions and history survive restarts; with `memory` nothing does. Don't describe it more strongly in docs or READMEs.
 - `broker.max_connections` is loaded but not used.

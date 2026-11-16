@@ -1,15 +1,13 @@
 # popsub_transport
 
-The WebSocket edge. Accepts connections, speaks the JSON protocol, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls.
+The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_protocol`, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls.
 
 ## Files
 
-- `src/message.rs`: `ClientMessage` and `ServerMessage` (serde, tagged by `type`). This is the protocol.
 - `src/websocket.rs`:
   - `Server`: what every connection shares (a `SharedBroker`, the auth service, `RateLimiters`). Build with `Server::new` or `Server::from_settings`, swap limits with `with_rate_limiters`, then `listen(addr)` or `serve(listener)`.
-  - `Session`: one connection. `handle` dispatches to one method per message type; `require_user` is the single "is this connection logged in" check; `reply` queues frames on the session's own channel.
+  - `Session`: one connection. `handle` dispatches a `ClientFrame` to one method per message type, passing the request `id`; `require_user` is the single "is this connection logged in" check; `reply(id, ...)` and `fail(id, code, ...)` queue frames on the session's own channel.
   - `RateLimiters` and its defaults, the prune task, `registration_role` and `registration_error_message`.
-- `src/tests.rs`: the JSON wire format of client and server frames.
 - `src/websocket_tests.rs`: starts a real server on port 0 with `MemoryStorage` and drives it with `tokio-tungstenite`. `settle` waits until the server has handled a connection's earlier frames.
 
 ## Invariants
@@ -19,7 +17,8 @@ The WebSocket edge. Accepts connections, speaks the JSON protocol, runs register
 - If storage fails, a QoS 1 publisher gets `storage unavailable` and a failed subscribe gets an error and is not subscribed. A QoS 1 publish that succeeds gets `published` with its `seq`.
 - `authenticate` with a `session_id` replies `authenticated` first, then restores each stored subscription the user may still read (forgetting the rest), so the client sees the reply before any restored history.
 - `ack` takes a topic and `seq`; ACKs for records not in flight to the connection are ignored and only logged.
-- Replies go through `Session::reply`, never through the broker's client map.
+- Replies go through `Session::reply` or `Session::fail`, never through the broker's client map, and always carry the request's `id`. Every failure has an `ErrorCode`.
+- A frame that doesn't parse gets `bad_request` (with the `id` if `salvage_request_id` can read one) and the connection stays open.
 - Publish checks the topic permission before the rate limit, so denied publishes don't spend a user's allowance.
 - Failed logins are limited per `address|username` and per address; registration per address; publishing per username. See `docs/DESIGN.md` section 10.
 - Registration errors go through `registration_error_message`, which hides whether a username is taken.

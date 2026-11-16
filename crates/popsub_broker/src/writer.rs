@@ -28,7 +28,8 @@ use popsub_storage::{NewRecord, Result as StorageResult, Storage};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::frame::{StartFrom, Subscribed, TopicFrame, Truncated};
+use popsub_protocol::{RequestId, ServerFrame, ServerMessage, StartFrom, Subscribed, Truncated};
+
 use crate::replay;
 use crate::shared::{BrokerCell, LogSettings};
 use crate::topic::CursorUpdate;
@@ -80,6 +81,8 @@ pub(crate) enum Command {
         client_id: String,
         /// Where replay starts. `Resume` has already been resolved.
         from: StartFrom,
+        /// The subscribe request's id, echoed in the `subscribed` frame.
+        request_id: Option<RequestId>,
         /// Where the outcome is sent.
         reply: oneshot::Sender<StorageResult<SubscribeOutcome>>,
     },
@@ -152,9 +155,10 @@ impl TopicWriter {
                 Command::Subscribe {
                     client_id,
                     from,
+                    request_id,
                     reply,
                 } => {
-                    let _ = reply.send(self.subscribe(&client_id, from).await);
+                    let _ = reply.send(self.subscribe(&client_id, from, request_id).await);
                 }
                 Command::CatchUp { client_id } => {
                     if let Err(e) = self.catch_up(&client_id).await {
@@ -265,6 +269,7 @@ impl TopicWriter {
     /// Args:
     ///     client_id: The subscribing client.
     ///     from: Where replay starts, with `Resume` already resolved.
+    ///     request_id: The subscribe request's id, echoed in `subscribed`.
     ///
     /// Returns:
     ///     The replay range, how much was sent straight away, and whether a
@@ -278,6 +283,7 @@ impl TopicWriter {
         &mut self,
         client_id: &str,
         from: StartFrom,
+        request_id: Option<RequestId>,
     ) -> StorageResult<SubscribeOutcome> {
         let bounds = self.storage.bounds(&self.topic).await?;
         self.last_seq = Some(bounds.last_seq);
@@ -306,16 +312,19 @@ impl TopicWriter {
         }
         let topic = self.topic.clone();
         let frames = [
-            Some(TopicFrame::Subscribed(Subscribed {
-                topic: topic.clone(),
-                replay_from: plan.start,
-                replay_to: bounds.last_seq,
-            })),
+            Some(ServerFrame::reply(
+                request_id,
+                ServerMessage::Subscribed(Subscribed {
+                    topic: topic.clone(),
+                    replay_from: plan.start,
+                    replay_to: bounds.last_seq,
+                }),
+            )),
             plan.truncated.then(|| {
-                TopicFrame::Truncated(Truncated {
+                ServerFrame::event(ServerMessage::Truncated(Truncated {
                     topic: topic.clone(),
                     first_available: bounds.first_seq,
-                })
+                }))
             }),
         ];
         outcome.added = self.broker.with(|broker| {
@@ -363,10 +372,10 @@ impl TopicWriter {
                 let update = self.broker.with(|broker| {
                     broker.send_frame(
                         client_id,
-                        &TopicFrame::Truncated(Truncated {
+                        &ServerFrame::event(ServerMessage::Truncated(Truncated {
                             topic: self.topic.clone(),
                             first_available,
-                        }),
+                        })),
                     );
                     broker.skip_to(&self.topic, client_id, first_available)
                 });

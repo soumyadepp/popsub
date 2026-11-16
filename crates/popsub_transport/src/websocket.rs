@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
-use popsub_broker::{SharedBroker, StartFrom, session_key};
+use popsub_broker::{SharedBroker, session_key};
 use popsub_client::Client;
 use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
@@ -36,7 +36,10 @@ use tokio_tungstenite::accept_async;
 use tracing::{error, info, warn};
 use tungstenite::protocol::Message as WsMessage;
 
-use crate::message::{ClientMessage, ServerMessage};
+use popsub_protocol::{
+    ClientFrame, ClientMessage, ErrorCode, PROTOCOL_VERSION, RequestId, ServerFrame, ServerMessage,
+    StartFrom,
+};
 
 /// The longest `session_id` a client may choose, in characters.
 const MAX_SESSION_ID_CHARS: usize = 128;
@@ -241,10 +244,11 @@ impl Server {
     ///
     /// After the WebSocket handshake a `Client` is registered with the broker
     /// and a send loop starts draining the client's outgoing channel. Text
-    /// frames are parsed and passed to the session; invalid JSON is logged
-    /// and skipped, and binary frames are ignored. The connection ends when
+    /// frames are parsed and passed to the session; a frame that doesn't
+    /// parse gets a `bad_request` error (with its `id`, if one can be read)
+    /// and the connection stays open. Binary frames are ignored. The connection ends when
     /// the socket closes, a handler asks to close it, or a handler fails, in
-    /// which case the client is sent an `internal server error` frame first.
+    /// which case the client is sent an `internal` error first.
     /// The client is removed from the broker once, by whichever of this loop
     /// and the send loop finishes first.
     ///
@@ -285,15 +289,26 @@ impl Server {
                 }
                 _ => continue,
             };
-            let parsed = match serde_json::from_str::<ClientMessage>(&text) {
+            let parsed = match serde_json::from_str::<ClientFrame>(&text) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     warn!(
                         client_id = %session.client_id,
-                        "invalid client message: {} | {}",
+                        "invalid client frame: {} | {}",
                         err,
                         text.chars().take(100).collect::<String>()
                     );
+                    if session
+                        .fail(
+                            salvage_request_id(&text).as_ref(),
+                            ErrorCode::BadRequest,
+                            format!("invalid frame: {err}"),
+                            None,
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -302,9 +317,7 @@ impl Server {
                 Ok(Flow::Close) => break,
                 Err(e) => {
                     error!(client_id = %session.client_id, "error handling message: {}", e);
-                    let _ = session.reply(ServerMessage::Error {
-                        message: "internal server error".to_string(),
-                    });
+                    let _ = session.fail(None, ErrorCode::Internal, "internal server error", None);
                     break;
                 }
             }
@@ -437,7 +450,7 @@ impl Session {
     /// Dispatches a parsed client frame to its handler.
     ///
     /// Args:
-    ///     msg: The frame the client sent.
+    ///     frame: The frame the client sent, with its request id.
     ///
     /// Returns:
     ///     Whether to keep the connection open.
@@ -446,69 +459,89 @@ impl Session {
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When a reply can't be queued because the
     ///         connection's outgoing channel is closed.
-    async fn handle(&self, msg: ClientMessage) -> Result<Flow> {
-        match msg {
+    async fn handle(&self, frame: ClientFrame) -> Result<Flow> {
+        let id = frame.id.as_ref();
+        match frame.message {
             ClientMessage::Register { username, password } => {
-                self.register(&username, &password).await
+                self.register(id, &username, &password).await
             }
-            ClientMessage::Login { username, password } => self.login(&username, &password).await,
+            ClientMessage::Login { username, password } => {
+                self.login(id, &username, &password).await
+            }
             ClientMessage::Auth {
                 token,
+                protocol,
                 session_id,
                 clean_start,
             } => {
-                self.authenticate(&token, session_id.as_deref(), clean_start)
+                self.authenticate(id, &token, protocol, session_id.as_deref(), clean_start)
                     .await
             }
-            ClientMessage::Subscribe { topic, from } => self.subscribe(&topic, from).await,
-            ClientMessage::Unsubscribe { topic } => self.unsubscribe(&topic).await,
+            ClientMessage::Subscribe { topic, from } => self.subscribe(id, &topic, from).await,
+            ClientMessage::Unsubscribe { topic } => self.unsubscribe(id, &topic).await,
             ClientMessage::Publish {
                 topic,
                 payload,
                 message_id,
                 qos,
-            } => self.publish(&topic, payload, message_id, qos).await,
+            } => self.publish(id, &topic, payload, message_id, qos).await,
             ClientMessage::Ack { topic, seq } => self.ack(&topic, seq).await,
         }
     }
 
-    /// Queues a frame on this connection's outgoing channel.
+    /// Queues a reply on this connection's outgoing channel.
     ///
     /// Args:
-    ///     message: The frame to send.
+    ///     id: The id of the request being answered, if it had one.
+    ///     message: The reply.
     ///
     /// Raises:
     ///     PopSubError::Serialization: When the frame can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    fn reply(&self, message: ServerMessage) -> Result<()> {
-        let json = serde_json::to_string(&message)?;
+    fn reply(&self, id: Option<&RequestId>, message: ServerMessage) -> Result<()> {
+        let json = serde_json::to_string(&ServerFrame::reply(id.cloned(), message))?;
         self.outbox
             .send(WsMessage::Text(json.into()))
             .map_err(|_| PopSubError::Client("outgoing channel closed".to_string()))
     }
 
-    /// Queues an `error` frame with the given text.
+    /// Queues an `error` reply.
     ///
     /// Args:
-    ///     message: The error text for the client.
+    ///     id: The id of the request that failed, if it had one.
+    ///     code: What went wrong, for programs.
+    ///     message: What went wrong, for people.
+    ///     retry_after: Seconds to wait before retrying, for limits.
     ///
     /// Raises:
     ///     PopSubError::Serialization: When the frame can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    fn reply_error(&self, message: impl Into<String>) -> Result<()> {
-        self.reply(ServerMessage::Error {
-            message: message.into(),
-        })
+    fn fail(
+        &self,
+        id: Option<&RequestId>,
+        code: ErrorCode,
+        message: impl Into<String>,
+        retry_after: Option<u64>,
+    ) -> Result<()> {
+        self.reply(
+            id,
+            ServerMessage::Error {
+                code,
+                message: message.into(),
+                retry_after,
+            },
+        )
     }
 
     /// Returns the authenticated user, or tells the client to authenticate first.
     ///
     /// Every handler except `register`, `login` and `auth` starts here. A
     /// client that is no longer registered, or hasn't authenticated, gets no
-    /// user back and its connection should be closed; the second also gets a
-    /// `must authenticate first` error.
+    /// user back and its connection should be closed; the second also gets
+    /// an `unauthenticated` error.
     ///
     /// Args:
+    ///     id: The id of the request being handled.
     ///     action: What the client tried to do, for the log.
     ///
     /// Returns:
@@ -517,7 +550,7 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When the error frame can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    fn require_user(&self, action: &str) -> Result<Option<String>> {
+    fn require_user(&self, id: Option<&RequestId>, action: &str) -> Result<Option<String>> {
         let state = self.server.broker.with(|broker| {
             broker
                 .clients
@@ -531,22 +564,29 @@ impl Session {
             }
             Some((false, _)) => {
                 warn!(client_id = %self.client_id, action, "request before authentication");
-                self.reply_error("must authenticate first")?;
+                self.fail(
+                    id,
+                    ErrorCode::Unauthenticated,
+                    "must authenticate first",
+                    None,
+                )?;
                 Ok(None)
             }
             Some((true, username)) => Ok(Some(username.unwrap_or_default())),
         }
     }
 
-    /// Creates a user account and replies with a `register_response`.
+    /// Creates a user account and replies with `registered`.
     ///
     /// Every attempt counts against the registration limit for this address,
-    /// whether or not it succeeds. Over the limit, the reply says how many
-    /// seconds to wait and the auth service isn't called. A failed
-    /// registration is reported with `registration_error_message`, which
-    /// doesn't reveal whether the username is taken. The connection stays open.
+    /// whether or not it succeeds. Over the limit, the client gets
+    /// `rate_limited` with `retry_after` and the auth service isn't called. A
+    /// failed registration gets `registration_failed` with the text from
+    /// `registration_error_message`, which doesn't reveal whether the
+    /// username is taken. The connection stays open.
     ///
     /// Args:
+    ///     id: The request id.
     ///     username: The requested username.
     ///     password: The requested password.
     ///
@@ -556,50 +596,54 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When the reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    async fn register(&self, username: &str, password: &str) -> Result<Flow> {
+    async fn register(
+        &self,
+        id: Option<&RequestId>,
+        username: &str,
+        password: &str,
+    ) -> Result<Flow> {
         let limiter = &self.server.limiters.register_limiter;
         if !limiter.try_acquire(&self.peer_ip) {
             let retry_after = limiter.retry_after(&self.peer_ip).unwrap_or(1);
             warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, retry_after, "registration rate limited");
-            self.reply(ServerMessage::RegisterResponse {
-                success: false,
-                message: format!("Too many attempts. Try again in {retry_after} seconds."),
-            })?;
+            self.fail(
+                id,
+                ErrorCode::RateLimited,
+                format!("too many registration attempts, try again in {retry_after} seconds"),
+                Some(retry_after),
+            )?;
             return Ok(Flow::Continue);
         }
-
-        let result = self.server.auth.register_user(username, password).await;
-        let response = match result {
+        match self.server.auth.register_user(username, password).await {
             Ok(()) => {
                 info!(client_id = %self.client_id, username, "registration successful");
-                ServerMessage::RegisterResponse {
-                    success: true,
-                    message: "User registered successfully".to_string(),
-                }
+                self.reply(id, ServerMessage::Registered {})?;
             }
             Err(e) => {
                 warn!(client_id = %self.client_id, username, "registration failed: {}", e);
-                ServerMessage::RegisterResponse {
-                    success: false,
-                    message: registration_error_message(&e),
-                }
+                self.fail(
+                    id,
+                    ErrorCode::RegistrationFailed,
+                    registration_error_message(&e),
+                    None,
+                )?;
             }
-        };
-        self.reply(response)?;
+        }
         Ok(Flow::Continue)
     }
 
-    /// Checks a username and password and replies with a JWT or an error.
+    /// Checks a username and password and replies with `logged_in` and a JWT.
     ///
-    /// The attempt is refused with `Too many login attempts`, without calling
-    /// the auth service, while this address or this address and username pair
-    /// is locked out. Only wrong credentials count as failures, against both
+    /// While this address, or this address and username pair, is locked out,
+    /// the client gets `locked_out` with `retry_after` and the auth service
+    /// isn't called. Only wrong credentials count as failures, against both
     /// limiters; a success clears the pair's failures but not the address
     /// count, so one valid account can't be used to reset guessing against
-    /// others. Every login error is reported as `invalid credentials`. The
+    /// others. Every login error is reported as `invalid_credentials`. The
     /// connection stays open.
     ///
     /// Args:
+    ///     id: The request id.
     ///     username: The username to log in as.
     ///     password: The password to check.
     ///
@@ -609,7 +653,7 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When the reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    async fn login(&self, username: &str, password: &str) -> Result<Flow> {
+    async fn login(&self, id: Option<&RequestId>, username: &str, password: &str) -> Result<Flow> {
         let limiters = &self.server.limiters;
         let pair_key = format!("{}|{username}", self.peer_ip);
         let lockout = match limiters.ip_login_limiter.check_status(&self.peer_ip) {
@@ -621,18 +665,19 @@ impl Session {
         };
         if let Some(retry_after) = lockout {
             warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, username, retry_after, "login rate limited");
-            self.reply_error(format!(
-                "Too many login attempts. Try again in {retry_after} seconds."
-            ))?;
+            self.fail(
+                id,
+                ErrorCode::LockedOut,
+                format!("too many login attempts, try again in {retry_after} seconds"),
+                Some(retry_after),
+            )?;
             return Ok(Flow::Continue);
         }
-
-        let result = self.server.auth.login(username, password).await;
-        match result {
+        match self.server.auth.login(username, password).await {
             Ok(token) => {
                 info!(client_id = %self.client_id, username, "login successful");
                 limiters.login_limiter.record_success(&pair_key);
-                self.reply(ServerMessage::LoginResponse { token })?;
+                self.reply(id, ServerMessage::LoggedIn { token })?;
             }
             Err(e) => {
                 warn!(client_id = %self.client_id, username, "login failed: {}", e);
@@ -640,7 +685,12 @@ impl Session {
                     limiters.login_limiter.record_failure(&pair_key);
                     limiters.ip_login_limiter.record_failure(&self.peer_ip);
                 }
-                self.reply_error("invalid credentials")?;
+                self.fail(
+                    id,
+                    ErrorCode::InvalidCredentials,
+                    "invalid credentials",
+                    None,
+                )?;
             }
         }
         Ok(Flow::Continue)
@@ -649,10 +699,12 @@ impl Session {
     /// Validates a JWT, marks the connection as authenticated as its subject,
     /// and attaches the durable session if one is named.
     ///
-    /// A valid token gets an `authenticated` reply. An invalid or expired
-    /// token, an invalid `session_id`, or a session store that can't be
-    /// reached gets an error and closes the connection, as does a client
-    /// that is no longer registered.
+    /// The reply is `authenticated` with the protocol version and the
+    /// server's limits. These get an error and close the connection: an
+    /// unsupported `protocol` (`unsupported_protocol`), an invalid or expired
+    /// token (`auth_failed`), an invalid `session_id` (`invalid_session_id`),
+    /// a session store that can't be reached (`session_unavailable`), and a
+    /// client that is no longer registered (no reply).
     ///
     /// With a `session_id`, the session is bound to the token's user (another
     /// user's identical id is a different session), any other connection
@@ -661,7 +713,9 @@ impl Session {
     /// permissions; one the user may no longer read is forgotten.
     ///
     /// Args:
+    ///     id: The request id.
     ///     token: The JWT from a previous `login`.
+    ///     protocol: The protocol version the client speaks; `None` means 1.
     ///     session_id: The durable session to hold, if any.
     ///     clean_start: Whether to discard the session's stored subscriptions.
     ///
@@ -673,26 +727,44 @@ impl Session {
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn authenticate(
         &self,
+        id: Option<&RequestId>,
         token: &str,
+        protocol: Option<u32>,
         session_id: Option<&str>,
         clean_start: bool,
     ) -> Result<Flow> {
-        let validated = self.server.auth.validate_token(token);
-        let claims = match validated {
+        if let Some(version) = protocol
+            && version != PROTOCOL_VERSION
+        {
+            warn!(client_id = %self.client_id, version, "unsupported protocol version");
+            self.fail(
+                id,
+                ErrorCode::UnsupportedProtocol,
+                format!("this server speaks protocol {PROTOCOL_VERSION}, not {version}"),
+                None,
+            )?;
+            return Ok(Flow::Close);
+        }
+        let claims = match self.server.auth.validate_token(token) {
             Ok(claims) => claims,
             Err(e) => {
                 warn!(client_id = %self.client_id, "authentication failed: {}", e);
-                self.reply_error("authentication failed")?;
+                self.fail(id, ErrorCode::AuthFailed, "authentication failed", None)?;
                 return Ok(Flow::Close);
             }
         };
-        if let Some(id) = session_id
-            && !valid_session_id(id)
+        if let Some(session_id) = session_id
+            && !valid_session_id(session_id)
         {
             warn!(client_id = %self.client_id, "invalid session_id");
-            self.reply_error(format!(
-                "session_id must be 1 to {MAX_SESSION_ID_CHARS} characters with no control characters"
-            ))?;
+            self.fail(
+                id,
+                ErrorCode::InvalidSessionId,
+                format!(
+                    "session_id must be 1 to {MAX_SESSION_ID_CHARS} characters with no control characters"
+                ),
+                None,
+            )?;
             return Ok(Flow::Close);
         }
         let username = claims.sub;
@@ -710,12 +782,18 @@ impl Session {
             warn!(client_id = %self.client_id, "client not registered");
             return Ok(Flow::Close);
         }
+        let limits = self.server.broker.limits();
         let Some(session_id) = session_id else {
             info!(client_id = %self.client_id, username, "authenticated successfully");
-            self.reply(ServerMessage::Authenticated {
-                session_id: None,
-                resumed: Vec::new(),
-            })?;
+            self.reply(
+                id,
+                ServerMessage::Authenticated {
+                    protocol: PROTOCOL_VERSION,
+                    session_id: None,
+                    resumed: Vec::new(),
+                    limits,
+                },
+            )?;
             return Ok(Flow::Continue);
         };
 
@@ -729,7 +807,12 @@ impl Session {
             Ok(stored) => stored,
             Err(e) => {
                 error!(client_id = %self.client_id, username, %e, "attaching a session failed");
-                self.reply_error("can't open the session, try again")?;
+                self.fail(
+                    id,
+                    ErrorCode::SessionUnavailable,
+                    "can't open the session, try again",
+                    None,
+                )?;
                 return Ok(Flow::Close);
             }
         };
@@ -755,21 +838,29 @@ impl Session {
             }
         }
         info!(client_id = %self.client_id, username, session_id, clean_start, resumed = resumed.len(), "authenticated with a session");
-        self.reply(ServerMessage::Authenticated {
-            session_id: Some(session_id.to_string()),
-            resumed: resumed.clone(),
-        })?;
+        self.reply(
+            id,
+            ServerMessage::Authenticated {
+                protocol: PROTOCOL_VERSION,
+                session_id: Some(session_id.to_string()),
+                resumed: resumed.clone(),
+                limits,
+            },
+        )?;
         for topic in resumed {
             if let Err(e) = self
                 .server
                 .broker
-                .subscribe(&topic, &self.client_id, StartFrom::Resume)
+                .subscribe(&topic, &self.client_id, StartFrom::Resume, None)
                 .await
             {
                 error!(client_id = %self.client_id, topic, %e, "restoring a subscription failed");
-                self.reply_error(format!(
-                    "can't restore the subscription to '{topic}', subscribe again"
-                ))?;
+                self.fail(
+                    None,
+                    ErrorCode::StorageUnavailable,
+                    format!("can't restore the subscription to '{topic}', subscribe again"),
+                    None,
+                )?;
             }
         }
         Ok(Flow::Continue)
@@ -777,15 +868,16 @@ impl Session {
 
     /// Subscribes the connection to a topic if its user may read it.
     ///
-    /// A user without permission gets a `not authorized` error and stays
-    /// connected. On success the broker sends a `subscribed` frame with the
-    /// replay range, a `truncated` frame if some of it was already trimmed,
+    /// A user without permission gets `not_authorized` and stays connected.
+    /// On success the broker sends `subscribed` (carrying this request's id)
+    /// with the replay range, `truncated` if some of it was already trimmed,
     /// and then the history `from` asks for. For a durable session the
     /// subscription and its cursor are stored. If the log or the session
-    /// store can't be reached, the client gets an error, is not subscribed,
-    /// and may try again.
+    /// store can't be reached, the client gets `storage_unavailable`, is not
+    /// subscribed, and may try again.
     ///
     /// Args:
+    ///     id: The request id.
     ///     topic: The topic to subscribe to.
     ///     from: Where replay starts.
     ///
@@ -796,20 +888,29 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    async fn subscribe(&self, topic: &str, from: StartFrom) -> Result<Flow> {
-        let Some(username) = self.require_user("subscribe")? else {
+    async fn subscribe(
+        &self,
+        id: Option<&RequestId>,
+        topic: &str,
+        from: StartFrom,
+    ) -> Result<Flow> {
+        let Some(username) = self.require_user(id, "subscribe")? else {
             return Ok(Flow::Close);
         };
-        let allowed = self.server.auth.can_subscribe(&username, topic).await;
-        if !allowed {
+        if !self.server.auth.can_subscribe(&username, topic).await {
             warn!(client_id = %self.client_id, username, topic, "subscribe denied");
-            self.reply_error(format!("not authorized to subscribe to '{topic}'"))?;
+            self.fail(
+                id,
+                ErrorCode::NotAuthorized,
+                format!("not authorized to subscribe to '{topic}'"),
+                None,
+            )?;
             return Ok(Flow::Continue);
         }
         match self
             .server
             .broker
-            .subscribe(topic, &self.client_id, from)
+            .subscribe(topic, &self.client_id, from, id.cloned())
             .await
         {
             Ok(outcome) => {
@@ -826,22 +927,27 @@ impl Session {
             }
             Err(e) => {
                 error!(client_id = %self.client_id, username, topic, %e, "replay failed, not subscribed");
-                self.reply_error(format!(
-                    "can't read the history of '{topic}', not subscribed"
-                ))?;
+                self.fail(
+                    id,
+                    ErrorCode::StorageUnavailable,
+                    format!("can't read the history of '{topic}', not subscribed"),
+                    None,
+                )?;
             }
         }
         Ok(Flow::Continue)
     }
 
-    /// Unsubscribes the connection from a topic.
+    /// Unsubscribes the connection from a topic and replies with `unsubscribed`.
     ///
     /// No permission check is made, since leaving a topic grants nothing.
-    /// Leaving a topic the client isn't on does nothing. For a durable
-    /// session the stored subscription is removed too; if that fails the
-    /// client gets an error and the subscription may come back on reconnect.
+    /// Leaving a topic the client isn't on still gets `unsubscribed`. For a
+    /// durable session the stored subscription is removed too; if that
+    /// fails the client gets `storage_unavailable`, live delivery has still
+    /// stopped, and the subscription may come back on reconnect.
     ///
     /// Args:
+    ///     id: The request id.
     ///     topic: The topic to leave.
     ///
     /// Returns:
@@ -851,38 +957,48 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    async fn unsubscribe(&self, topic: &str) -> Result<Flow> {
-        let Some(username) = self.require_user("unsubscribe")? else {
+    async fn unsubscribe(&self, id: Option<&RequestId>, topic: &str) -> Result<Flow> {
+        let Some(username) = self.require_user(id, "unsubscribe")? else {
             return Ok(Flow::Close);
         };
         if let Err(e) = self.server.broker.unsubscribe(topic, &self.client_id).await {
             error!(client_id = %self.client_id, username, topic, %e, "removing a stored subscription failed");
-            self.reply_error(format!(
-                "unsubscribed from '{topic}', but the session may restore it"
-            ))?;
+            self.fail(
+                id,
+                ErrorCode::StorageUnavailable,
+                format!("unsubscribed from '{topic}', but the session may restore it"),
+                None,
+            )?;
             return Ok(Flow::Continue);
         }
         info!(client_id = %self.client_id, username, topic, "unsubscribed");
+        self.reply(
+            id,
+            ServerMessage::Unsubscribed {
+                topic: topic.to_string(),
+            },
+        )?;
         Ok(Flow::Continue)
     }
 
     /// Publishes a payload to a topic if the user may write to it and is within its rate limit.
     ///
     /// The topic permission is checked before the rate limit, so a denied
-    /// publish doesn't use up the user's allowance. Both a denied and a rate
-    /// limited publish get an error and keep the connection open. The broker
-    /// sets the publish time, generates an id when `message_id` is missing,
-    /// stores the record and delivers it. A repeated `message_id` from the
-    /// same user is stored and delivered once. A QoS 1 publisher gets a
-    /// `published` frame with the id and `seq` once the record is stored at
-    /// the configured durability (the original `seq` for a retry), or a
-    /// `storage unavailable` error so it can retry. A failed QoS 0 publish is
-    /// logged and dropped, as QoS 0 promises nothing.
+    /// publish doesn't use up the user's allowance. A denied publish gets
+    /// `not_authorized` and a limited one `rate_limited` with `retry_after`;
+    /// both keep the connection open. The broker sets the publish time,
+    /// generates an id when `message_id` is missing, stores the record and
+    /// delivers it. A repeated `message_id` from the same user is stored and
+    /// delivered once. A QoS 1 publisher gets `published` with the id and
+    /// `seq` once the record is stored at the configured durability (the
+    /// original `seq` for a retry). If storage fails, the publisher gets
+    /// `storage_unavailable` whatever the QoS, so it knows nothing was sent.
     ///
     /// Args:
+    ///     id: The request id.
     ///     topic: The topic to publish to.
     ///     payload: The message body.
-    ///     message_id: The client's id for the message, used to match its `ack`.
+    ///     message_id: The publisher's idempotency key.
     ///     qos: The delivery level, 0 or 1. Defaults to 0.
     ///
     /// Returns:
@@ -894,23 +1010,35 @@ impl Session {
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn publish(
         &self,
+        id: Option<&RequestId>,
         topic: &str,
         payload: String,
         message_id: Option<String>,
         qos: Option<u8>,
     ) -> Result<Flow> {
-        let Some(username) = self.require_user("publish")? else {
+        let Some(username) = self.require_user(id, "publish")? else {
             return Ok(Flow::Close);
         };
-        let allowed = self.server.auth.can_publish(&username, topic).await;
-        if !allowed {
+        if !self.server.auth.can_publish(&username, topic).await {
             warn!(client_id = %self.client_id, username, topic, "publish denied");
-            self.reply_error(format!("not authorized to publish to '{topic}'"))?;
+            self.fail(
+                id,
+                ErrorCode::NotAuthorized,
+                format!("not authorized to publish to '{topic}'"),
+                None,
+            )?;
             return Ok(Flow::Continue);
         }
-        if !self.server.limiters.message_limiter.try_acquire(&username) {
-            warn!(client_id = %self.client_id, username, "message rate limited");
-            self.reply_error("Rate limited. Too many messages.")?;
+        let limiter = &self.server.limiters.message_limiter;
+        if !limiter.try_acquire(&username) {
+            let retry_after = limiter.retry_after(&username).unwrap_or(1);
+            warn!(client_id = %self.client_id, username, retry_after, "message rate limited");
+            self.fail(
+                id,
+                ErrorCode::RateLimited,
+                "too many messages",
+                Some(retry_after),
+            )?;
             return Ok(Flow::Continue);
         }
         let qos = qos.unwrap_or(0);
@@ -932,23 +1060,29 @@ impl Session {
                     "published"
                 );
                 if qos == 1 {
-                    self.reply(ServerMessage::Published {
-                        message_id: published.message_id,
-                        seq: published.seq,
-                    })?;
+                    self.reply(
+                        id,
+                        ServerMessage::Published {
+                            message_id: published.message_id,
+                            seq: published.seq,
+                        },
+                    )?;
                 }
             }
             Err(e) => {
                 error!(client_id = %self.client_id, username, topic, qos, %e, "publish not stored");
-                if qos == 1 {
-                    self.reply_error("storage unavailable")?;
-                }
+                self.fail(
+                    id,
+                    ErrorCode::StorageUnavailable,
+                    "storage unavailable, nothing was published",
+                    None,
+                )?;
             }
         }
         Ok(Flow::Continue)
     }
 
-    /// Acknowledges a QoS 1 record delivered to this connection.
+    /// Acknowledges a QoS 1 record delivered to this connection. No reply.
     ///
     /// Only a record in flight to this connection on this topic is accepted;
     /// anything else (a record sent to another client, a repeat ACK) is
@@ -966,7 +1100,7 @@ impl Session {
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn ack(&self, topic: &str, seq: u64) -> Result<Flow> {
-        if self.require_user("ack")?.is_none() {
+        if self.require_user(None, "ack")?.is_none() {
             return Ok(Flow::Close);
         }
         if !self.server.broker.ack(&self.client_id, topic, seq).await {
@@ -974,6 +1108,19 @@ impl Session {
         }
         Ok(Flow::Continue)
     }
+}
+
+/// Reads the request id out of a frame that didn't parse, so the
+/// `bad_request` error can still be matched to it.
+///
+/// Args:
+///     text: The frame as received.
+///
+/// Returns:
+///     The id, when the text is a JSON object with a valid `id`.
+fn salvage_request_id(text: &str) -> Option<RequestId> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    serde_json::from_value(value.get("id")?.clone()).ok()
 }
 
 /// Checks a client-chosen session id.

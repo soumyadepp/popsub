@@ -81,28 +81,40 @@ Configuration
 
 Protocol basics (short)
 
+The protocol is versioned (this is version 1) and its types live in the `popsub_protocol` crate. Every frame is a JSON object with a `type`. Any request may carry an `id` (a number or a string); the reply to it carries the same `id`, so a client can match replies to requests. Frames the server sends on its own (messages, `truncated`, `stalled`) have no `id`. Clients should ignore fields and frame types they don't recognise.
+
+Every failure is an `error` frame with a machine-readable `code`:
+
+```json
+{ "type": "error", "id": 7, "code": "rate_limited", "message": "too many messages", "retry_after": 1 }
+```
+
+The codes are `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable` and `internal`. A frame that isn't valid JSON or has an unknown `type` gets `bad_request` and the connection stays open.
+
 - Register, when the server allows it:
 
   ```json
   { "type": "register", "username": "alice", "password": "at-least-8-chars" }
   ```
 
-  The reply is `{ "type": "register_response", "success": true, "message": "..." }`. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`. Passwords are at least 8 characters. A taken username gets a plain "registration failed", so the endpoint can't be used to discover accounts.
+  The reply is `{ "type": "registered" }`, or an error with code `registration_failed`. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`. Passwords are at least 8 characters. A taken username gets a plain "registration failed", so the endpoint can't be used to discover accounts.
 
 - Login to obtain a JWT:
 
   ```json
-  { "type": "login", "username": "admin", "password": "password" }
+  { "type": "login", "id": 1, "username": "admin", "password": "password" }
   ```
+
+  The reply is `{ "type": "logged_in", "id": 1, "token": "<jwt>" }`, or `invalid_credentials`, or `locked_out` with `retry_after`.
 
 - Use the JWT to authenticate:
 
   ```json
-  { "type": "auth", "token": "<jwt>" }
-  { "type": "auth", "token": "<jwt>", "session_id": "phone-1" }
+  { "type": "auth", "token": "<jwt>", "protocol": 1 }
+  { "type": "auth", "token": "<jwt>", "protocol": 1, "session_id": "phone-1" }
   ```
 
-  The reply is `{ "type": "authenticated" }`. With a `session_id`, the connection holds a durable session of that user: its subscriptions and how far it has acknowledged are kept after it disconnects (for `session_expiry_secs`), and restored when it authenticates with the same `session_id` again. The reply then echoes the `session_id` and lists the restored topics in `resumed`. Add `"clean_start": true` to discard what was stored. Reconnecting with a session another connection still holds closes that connection.
+  The reply is `{ "type": "authenticated", "protocol": 1, "limits": { "max_inflight": 100, "session_expiry_secs": 86400 } }`. `protocol` may be left out (it means 1); a version the server doesn't speak gets `unsupported_protocol` and the connection closes. With a `session_id`, the connection holds a durable session of that user: its subscriptions and how far it has acknowledged are kept after it disconnects (for `session_expiry_secs`), and restored when it authenticates with the same `session_id` again. The reply then echoes the `session_id` and lists the restored topics in `resumed`. Add `"clean_start": true` to discard what was stored. Reconnecting with a session another connection still holds closes that connection.
 
 - Subscribe / Unsubscribe:
 
@@ -112,7 +124,7 @@ Protocol basics (short)
   { "type": "unsubscribe", "topic": "chat" }
   ```
 
-  The reply is `{ "type": "subscribed", "topic": "chat", "replay_from": 41, "replay_to": 90 }`: messages 41 to 90 are history, anything later is live. `from` decides where replay starts: `"resume"` (the default: continue a durable session's stored subscription, otherwise no history), `"new"` (no history), `{ "last": N }`, `{ "since_ms": <unix ms> }` or `{ "seq": S }`. Replayed and live messages arrive in `seq` order with no gap or repeat between them. If some of the requested history was already trimmed, a `{ "type": "truncated", "topic": "chat", "first_available": 1300 }` frame comes before it. A failure gets an `error` frame instead.
+  The reply to `unsubscribe` is `{ "type": "unsubscribed", "topic": "chat" }`. The reply to `subscribe` is `{ "type": "subscribed", "topic": "chat", "replay_from": 41, "replay_to": 90 }`: messages 41 to 90 are history, anything later is live. `from` decides where replay starts: `"resume"` (the default: continue a durable session's stored subscription, otherwise no history), `"new"` (no history), `{ "last": N }`, `{ "since_ms": <unix ms> }` or `{ "seq": S }`. Replayed and live messages arrive in `seq` order with no gap or repeat between them. If some of the requested history was already trimmed, a `{ "type": "truncated", "topic": "chat", "first_available": 1300 }` frame comes before it. A failure gets an `error` frame instead.
 
 - Publish:
 
@@ -122,7 +134,7 @@ Protocol basics (short)
   { "type": "publish", "topic": "critical", "payload": "Important", "message_id": "id-123", "qos": 1 }
   ```
 
-  A QoS 1 publish is confirmed with `{ "type": "published", "message_id": "id-123", "seq": 42 }` once it is stored. Publishing the same `message_id` again from the same user (for example, retrying after a dropped connection) stores and delivers it once and gets the original `seq` back. When `message_id` is missing the server generates one.
+  A QoS 1 publish is confirmed with `{ "type": "published", "message_id": "id-123", "seq": 42 }` once it is stored. A QoS 0 publish gets no reply unless it fails; if storage fails, either QoS gets `storage_unavailable` and nothing was sent. Publishing the same `message_id` again from the same user (for example, retrying after a dropped connection) stores and delivers it once and gets the original `seq` back. When `message_id` is missing the server generates one.
 
 - Messages arrive as:
 

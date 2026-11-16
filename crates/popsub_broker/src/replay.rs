@@ -5,7 +5,7 @@
 
 use popsub_storage::LogBounds;
 
-use crate::frame::StartFrom;
+use popsub_protocol::StartFrom;
 
 /// The replay a subscribe asks for, resolved against the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
