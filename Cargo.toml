@@ -3,7 +3,7 @@ members = [
 	"crates/popsub",
 	"crates/popsub_auth",
 	"crates/popsub_broker",
-	"crates/popsub_client",
+	"crates/popsub_connection",
 	"crates/popsub_config",
 	"crates/popsub_protocol",
 	"crates/popsub_ratelimit",

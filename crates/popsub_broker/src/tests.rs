@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use popsub_client::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_config::Settings;
 use popsub_config::settings::BrokerSettings;
+use popsub_connection::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_storage::{
     Durability, LogBounds, MemoryStorage, NewRecord, Record, Retention, StorageError,
     SubscriptionStore,

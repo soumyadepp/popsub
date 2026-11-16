@@ -1,6 +1,6 @@
-# popsub_client
+# popsub_connection
 
-Despite the name, this is not a client library. `Client` is the server's record of one connected socket.
+`Client` is the server's record of one connected socket, and `Outbox` is its outgoing queue. Client libraries for PopSub live elsewhere (`popsub_sdk`).
 
 ## What it holds
 
@@ -15,4 +15,3 @@ Despite the name, this is not a client library. `Client` is the server's record 
 - Above the soft limit `has_room` is false: callers that can wait (deliveries, catch-up) must check it and leave the work to the log; `ready()` wakes when the queue drains. `send` ignores the soft limit but refuses anything over the hard limit and closes the connection as `SlowConsumer`.
 - Every close goes through `Outbox::close`, first reason wins. Queued frames are written before the close frame, except for a slow consumer, whose backlog is dropped.
 - `OutboxReceiver::try_recv` keeps returning the close once closing; test helpers must stop at the first `Outgoing::Close`.
-- If a real client SDK is ever written, give it a different crate name, and consider renaming this one to something like `popsub_session`.

@@ -1537,8 +1537,8 @@ dependencies = [
  "clap",
  "futures-util",
  "popsub_broker",
- "popsub_client",
  "popsub_config",
+ "popsub_connection",
  "popsub_protocol",
  "popsub_storage",
  "popsub_transport",
@@ -1573,24 +1573,14 @@ name = "popsub_broker"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "popsub_client",
  "popsub_config",
+ "popsub_connection",
  "popsub_protocol",
  "popsub_storage",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "tungstenite",
- "uuid",
-]
-
-[[package]]
-name = "popsub_client"
-version = "0.1.0"
-dependencies = [
- "popsub_protocol",
- "tokio",
  "tungstenite",
  "uuid",
 ]
@@ -1603,6 +1593,16 @@ dependencies = [
  "popsub_storage",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "popsub_connection"
+version = "0.1.0"
+dependencies = [
+ "popsub_protocol",
+ "tokio",
+ "tungstenite",
+ "uuid",
 ]
 
 [[package]]
@@ -1644,8 +1644,8 @@ dependencies = [
  "jsonwebtoken",
  "popsub_auth",
  "popsub_broker",
- "popsub_client",
  "popsub_config",
+ "popsub_connection",
  "popsub_protocol",
  "popsub_ratelimit",
  "popsub_storage",

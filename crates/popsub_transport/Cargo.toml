@@ -15,7 +15,7 @@ tracing = "0.1.41"
 
 popsub_auth = { path = "../popsub_auth" }
 popsub_broker = { path = "../popsub_broker" }
-popsub_client = { path = "../popsub_client" }
+popsub_connection = { path = "../popsub_connection" }
 popsub_config = { path = "../popsub_config" }
 popsub_storage = { path = "../popsub_storage" }
 popsub_protocol = { path = "../popsub_protocol" }
