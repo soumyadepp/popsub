@@ -1,6 +1,6 @@
 # popsub (binary)
 
-The CLI. Loads config, refuses to start on a non-loopback host while published default secrets are set (warns on localhost), opens the `[storage]` backend (`open_storage`: `FileStorage` in `storage.path`, or `MemoryStorage`) and the matching user store (`open_users`: `users.json` in `storage.path`, or in memory), builds a `SharedBroker` (which refuses a durability the backend can't provide), applies the `[limits]` rate limits (`RateLimiters::from_settings`) and `server.trusted_proxies` (`TrustedProxies::parse`, an invalid entry stops startup), spawns its retry and retention loops and runs `Server::from_settings(...).listen(...)` until Ctrl+C. Any startup failure (bad config, a data directory another server holds or damaged data, unsupported durability, port in use) is logged and the process exits with a failure status. Also has a `client` subcommand, a demo built on `popsub_sdk` that connects, subscribes, publishes with confirmation and prints the delivered message, and `users`, which manages accounts on a running server through `Client::admin`.
+The CLI. Loads config, refuses to start on a non-loopback host while published default secrets are set (warns on localhost), opens the `[storage]` backend (`open_storage`: `FileStorage` in `storage.path`, or `MemoryStorage`) and the matching user store (`open_users`: `users.json` in `storage.path`, or in memory), builds a `SharedBroker` (which refuses a durability the backend can't provide), loads TLS when `server.tls_cert` and `server.tls_key` are both set (`open_tls`; one without the other stops startup), applies the `[limits]` rate limits (`RateLimiters::from_settings`) and `server.trusted_proxies` (`TrustedProxies::parse`, an invalid entry stops startup), spawns its retry and retention loops and runs `Server::from_settings(...).listen(...)` until Ctrl+C. Any startup failure (bad config, a data directory another server holds or damaged data, unsupported durability, port in use) is logged and the process exits with a failure status. Also has a `client` subcommand, a demo built on `popsub_sdk` that connects, subscribes, publishes with confirmation and prints the delivered message, and `users`, which manages accounts on a running server through `Client::admin`.
 
 ## Structure
 
@@ -10,6 +10,7 @@ The CLI. Loads config, refuses to start on a non-loopback host while published d
 ## Rules
 
 - Keep this crate thin. Wiring only: no protocol parsing, routing or storage logic here. Those belong in transport, broker and storage. `open_storage` only maps the configured backend name to a constructor.
+- `client` and `users` take `--ca-cert` to trust a PEM certificate for `wss://` (`trust`).
 - `run_client` uses `popsub_sdk`, so protocol changes reach it through the SDK. Don't write WebSocket or JSON frame code here.
 - The client defaults to `admin` / `password`, which match only the default settings; `--username` and `--password` override them. It is a demo; the client library is `popsub_sdk`.
 - Logging is initialised at `info`, or `warn` for `users` so its output stays readable. `RUST_LOG` is not read yet.

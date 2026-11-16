@@ -67,6 +67,11 @@ pub struct ServerSettings {
     /// Behind a proxy, set `trusted_proxies` first, or every client counts
     /// as the proxy's address.
     pub max_connections_per_address: usize,
+    /// PEM file with the TLS certificate chain, leaf first. Set it with
+    /// `tls_key` to serve `wss://`; both empty (the default) serves `ws://`.
+    pub tls_cert: String,
+    /// PEM file with the TLS private key for `tls_cert`.
+    pub tls_key: String,
 }
 
 impl Default for ServerSettings {
@@ -74,7 +79,7 @@ impl Default for ServerSettings {
     /// secret and admin password (fine only for local development), 24 hour
     /// tokens, registration off, a ping every 30 seconds, a 90 second idle
     /// timeout, 1 MiB payloads, a 16 MiB outbound queue per connection, no
-    /// trusted proxies and no per-address connection limit.
+    /// trusted proxies, no per-address connection limit and no TLS.
     ///
     /// Returns:
     ///     The default `[server]` section.
@@ -94,6 +99,8 @@ impl Default for ServerSettings {
             outbound_queue_bytes: 16 * 1024 * 1024,
             trusted_proxies: Vec::new(),
             max_connections_per_address: 0,
+            tls_cert: String::new(),
+            tls_key: String::new(),
         }
     }
 }

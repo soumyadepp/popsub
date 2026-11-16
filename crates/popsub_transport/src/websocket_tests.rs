@@ -2141,3 +2141,100 @@ async fn one_address_cannot_take_every_connection() {
     }
     assert!(admitted, "the address's freed slot was never reused");
 }
+
+/// A self-signed certificate for `127.0.0.1`, as PEM.
+///
+/// Returns:
+///     The certificate and its private key.
+fn self_signed() -> (String, String) {
+    let generated =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("certificate");
+    (generated.cert.pem(), generated.key_pair.serialize_pem())
+}
+
+/// Opens a `wss://` connection that trusts one certificate.
+///
+/// Args:
+///     addr: The server's address.
+///     trusted: The certificate to trust, as PEM.
+///
+/// Returns:
+///     The connection, or the error from the TLS or WebSocket handshake.
+async fn tls_connection(
+    addr: std::net::SocketAddr,
+    trusted: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls::pki_types::CertificateDer::pem_slice_iter(trusted.as_bytes()) {
+        roots.add(certificate.expect("PEM")).expect("root");
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").expect("name");
+    let tls = connector
+        .connect(name, stream)
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio_tungstenite::client_async(format!("wss://{addr}/"), tls)
+        .await
+        .map(|(ws, _)| ws)
+        .map_err(|e| e.to_string())
+}
+
+/// Checks that a server with a certificate serves `wss://`: a client that
+/// trusts it logs in, one that doesn't fails the handshake, and a plain
+/// `ws://` client is refused.
+#[tokio::test]
+async fn tls_servers_serve_wss_only() {
+    let settings = Settings::default();
+    let (cert, key) = self_signed();
+    let tls = crate::ServerTls::from_pem(cert.as_bytes(), key.as_bytes()).expect("tls");
+    let addr = start_configured(&settings, |server| server.with_tls(tls)).await;
+
+    let mut ws = tls_connection(addr, &cert).await.expect("wss handshake");
+    ws.send(WsMessage::Text(
+        r#"{"type": "login", "username": "admin", "password": "password"}"#.into(),
+    ))
+    .await
+    .expect("send");
+    let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("a reply")
+        .expect("open")
+        .expect("read");
+    assert!(reply.to_text().expect("text").contains("logged_in"));
+
+    let (other_cert, _) = self_signed();
+    assert!(tls_connection(addr, &other_cert).await.is_err());
+
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let plain = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async("ws://localhost/", stream),
+    )
+    .await
+    .expect("the server answers a plain client in time");
+    assert!(plain.is_err(), "a plain ws:// client was served");
+}
+
+/// Checks that a certificate without its key, or with another key, is refused.
+#[test]
+fn mismatched_tls_material_is_refused() {
+    let (cert, key) = self_signed();
+    let (_, other_key) = self_signed();
+    assert!(crate::ServerTls::from_pem(cert.as_bytes(), key.as_bytes()).is_ok());
+    assert!(crate::ServerTls::from_pem(cert.as_bytes(), other_key.as_bytes()).is_err());
+    assert!(crate::ServerTls::from_pem(b"", key.as_bytes()).is_err());
+    assert!(crate::ServerTls::from_pem(cert.as_bytes(), b"").is_err());
+}

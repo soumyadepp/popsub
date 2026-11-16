@@ -14,6 +14,8 @@ max_payload_bytes = 1048576
 outbound_queue_bytes = 16777216
 trusted_proxies = []
 max_connections_per_address = 0
+tls_cert = ""
+tls_key = ""
 
 [broker]
 max_connections = 1000

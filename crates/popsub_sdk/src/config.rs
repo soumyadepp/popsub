@@ -2,6 +2,11 @@
 
 use std::time::Duration;
 
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
+
+use crate::error::Error;
+
 /// How the client proves who it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credentials {
@@ -96,7 +101,8 @@ impl ReconnectPolicy {
 /// Everything a `Client` needs to connect.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// The server's WebSocket URL, such as `ws://127.0.0.1:8080`.
+    /// The server's WebSocket URL, such as `ws://127.0.0.1:8080`, or
+    /// `wss://` for TLS.
     pub url: String,
     /// Who to connect as.
     pub credentials: Credentials,
@@ -117,6 +123,9 @@ pub struct ClientConfig {
     /// one is full the client stops reading the socket until there is room,
     /// and the server paces delivery.
     pub subscription_buffer: usize,
+    /// Certificates trusted for `wss://` besides the public web roots, such
+    /// as a private CA or a self-signed development certificate.
+    pub(crate) extra_roots: Vec<CertificateDer<'static>>,
 }
 
 impl ClientConfig {
@@ -140,7 +149,31 @@ impl ClientConfig {
             reconnect: ReconnectPolicy::default(),
             request_timeout: Duration::from_secs(30),
             subscription_buffer: 1024,
+            extra_roots: Vec::new(),
         }
+    }
+
+    /// Trusts more certificates for `wss://`, on top of the public web roots
+    /// (Mozilla's list, built in): a private CA, or a self-signed
+    /// certificate during development.
+    ///
+    /// Args:
+    ///     pem: One or more PEM certificates.
+    ///
+    /// Returns:
+    ///     The configuration.
+    ///
+    /// Raises:
+    ///     Error::Config: When the PEM holds no certificate or doesn't parse.
+    pub fn add_root_certificates_pem(mut self, pem: &[u8]) -> Result<Self, Error> {
+        let certificates = CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Config(format!("the certificate isn't valid PEM: {e}")))?;
+        if certificates.is_empty() {
+            return Err(Error::Config("no certificate found".to_string()));
+        }
+        self.extra_roots.extend(certificates);
+        Ok(self)
     }
 
     /// Holds a durable session.

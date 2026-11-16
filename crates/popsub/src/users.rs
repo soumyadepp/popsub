@@ -33,6 +33,9 @@ pub struct Connection {
     /// Admin password; prefer POPSUB_PASSWORD or the prompt, since arguments are visible to other users
     #[arg(long, global = true)]
     password: Option<String>,
+    /// PEM certificate to trust for wss://, such as a self-signed one
+    #[arg(long, global = true)]
+    ca_cert: Option<std::path::PathBuf>,
 }
 
 /// What an account may do, on the command line.
@@ -136,7 +139,8 @@ pub enum UsersCommand {
 ///
 /// Raises:
 ///     popsub_sdk::Error: When connecting fails or the server refuses the request.
-///     String: When a password can't be read, or a `--topic` is malformed.
+///     String: When a password can't be read, a `--topic` is malformed, or
+///         the `--ca-cert` file can't be read.
 pub async fn run(
     connection: Connection,
     command: UsersCommand,
@@ -149,15 +153,18 @@ pub async fn run(
             false,
         )?,
     };
-    let config = ClientConfig::new(
-        connection.url.as_str(),
-        Credentials::password(connection.username.as_str(), password),
-    )
-    .reconnect(ReconnectPolicy {
-        max_attempts: Some(0),
-        ..ReconnectPolicy::default()
-    })
-    .request_timeout(Duration::from_secs(10));
+    let config = crate::trust(
+        ClientConfig::new(
+            connection.url.as_str(),
+            Credentials::password(connection.username.as_str(), password),
+        )
+        .reconnect(ReconnectPolicy {
+            max_attempts: Some(0),
+            ..ReconnectPolicy::default()
+        })
+        .request_timeout(Duration::from_secs(10)),
+        connection.ca_cert.as_deref(),
+    )?;
     let client = Client::connect(config).await?;
     let outcome = act(&client, command).await;
     client.close();

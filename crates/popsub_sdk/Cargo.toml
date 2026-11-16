@@ -12,11 +12,14 @@ rand = "0.8"
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1.46.1", features = ["rt", "sync", "time", "macros", "net"] }
-tokio-tungstenite = "0.28.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+webpki-roots = "1"
 tracing = "0.1"
 uuid = { version = "1.8", features = ["v4"] }
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 popsub_broker = { path = "../popsub_broker" }
 popsub_config = { path = "../popsub_config" }
 popsub_storage = { path = "../popsub_storage" }

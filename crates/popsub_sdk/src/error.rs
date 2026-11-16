@@ -30,6 +30,9 @@ pub enum Error {
     /// The server sent something this client doesn't expect.
     #[error("unexpected reply from the server: {0}")]
     Protocol(String),
+    /// The configuration is invalid, such as a root certificate that doesn't parse.
+    #[error("invalid configuration: {0}")]
+    Config(String),
 }
 
 impl Error {
@@ -50,7 +53,7 @@ impl Error {
                     | ErrorCode::SessionUnavailable
                     | ErrorCode::Internal
             ),
-            Error::Closed(_) | Error::Protocol(_) => false,
+            Error::Closed(_) | Error::Protocol(_) | Error::Config(_) => false,
         }
     }
 }

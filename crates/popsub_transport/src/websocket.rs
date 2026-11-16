@@ -41,6 +41,7 @@ use popsub_connection::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
 use popsub_storage::{MAX_TOPIC_BYTES, NewRecord};
 use popsub_utils::error::{PopSubError, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -51,6 +52,7 @@ use tungstenite::protocol::Message as WsMessage;
 use tungstenite::protocol::WebSocketConfig;
 
 use crate::proxy::TrustedProxies;
+use crate::tls::ServerTls;
 
 use popsub_protocol::{
     ClientFrame, ClientMessage, CloseCode, ErrorCode, Limits, PROTOCOL_VERSION, RequestId,
@@ -245,8 +247,10 @@ pub struct Server {
     /// Open connections per client address, after the handshake, shared by
     /// every clone. Addresses with none are removed.
     per_address: Arc<Mutex<HashMap<IpAddr, usize>>>,
-    /// How long a new connection has to finish the WebSocket handshake.
+    /// How long a new connection has to finish its TLS and WebSocket handshakes.
     handshake_timeout: Duration,
+    /// The certificate to serve `wss://` with, or `None` for plain `ws://`.
+    tls: Option<ServerTls>,
 }
 
 impl Server {
@@ -273,6 +277,7 @@ impl Server {
             max_per_address: None,
             per_address: Arc::new(Mutex::new(HashMap::new())),
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            tls: None,
             broker,
         }
     }
@@ -386,6 +391,18 @@ impl Server {
         self
     }
 
+    /// Serves `wss://`: every connection must complete a TLS handshake first.
+    ///
+    /// Args:
+    ///     tls: The certificate and key.
+    ///
+    /// Returns:
+    ///     The server with TLS on.
+    pub fn with_tls(mut self, tls: ServerTls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     /// Replaces the default 10 second handshake timeout.
     ///
     /// Args:
@@ -479,8 +496,9 @@ impl Server {
     ///     std::io::Error: When the address can't be bound.
     pub async fn listen(self, addr: &str) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
+        let scheme = if self.tls.is_some() { "wss" } else { "ws" };
         info!(
-            "WebSocket server listening on ws://{}",
+            "WebSocket server listening on {scheme}://{}",
             listener.local_addr()?
         );
         self.serve(listener).await;
@@ -507,13 +525,46 @@ impl Server {
                 Ok((stream, peer)) => {
                     let slot = ConnectionSlot::take(&self.open_connections);
                     let over_limit = self.max_connections.is_some_and(|max| slot.before >= max);
-                    tokio::spawn(self.clone().run_connection(stream, peer, slot, over_limit));
+                    tokio::spawn(self.clone().open_connection(stream, peer, slot, over_limit));
                 }
                 Err(e) => {
                     warn!(%e, "accepting a connection failed");
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                 }
             }
+        }
+    }
+
+    /// Starts serving an accepted socket: performs the TLS handshake when the
+    /// server has TLS, then hands over to `run_connection`. The TLS and
+    /// WebSocket handshakes share one deadline, the handshake timeout from
+    /// `accept`, so a socket can't hold its slot by stalling either.
+    ///
+    /// Args:
+    ///     stream: The accepted TCP connection.
+    ///     peer: The connection's remote address.
+    ///     slot: This connection's place in the open connection count.
+    ///     over_limit: Whether the server was at its connection limit.
+    async fn open_connection(
+        self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        slot: ConnectionSlot,
+        over_limit: bool,
+    ) {
+        let deadline = Instant::now() + self.handshake_timeout;
+        let Some(tls) = self.tls.clone() else {
+            self.run_connection(stream, peer, slot, over_limit, deadline)
+                .await;
+            return;
+        };
+        match tokio::time::timeout_at(deadline, tls.acceptor().accept(stream)).await {
+            Ok(Ok(stream)) => {
+                self.run_connection(stream, peer, slot, over_limit, deadline)
+                    .await;
+            }
+            Ok(Err(e)) => warn!(%peer, %e, "TLS handshake failed"),
+            Err(_) => warn!(%peer, "TLS handshake timed out"),
         }
     }
 
@@ -542,19 +593,23 @@ impl Server {
     /// `clippy::result_large_err` because tungstenite fixes its error type.
     ///
     /// Args:
-    ///     stream: The accepted TCP connection.
+    ///     stream: The accepted connection, after TLS if the server has it.
     ///     peer: The connection's remote address.
     ///     _slot: This connection's place in the open connection count,
     ///         released when the connection ends.
     ///     over_limit: Whether the server was already at its connection
     ///         limit when it was accepted.
-    async fn run_connection(
+    ///     deadline: When the WebSocket handshake must be done by.
+    async fn run_connection<S>(
         self,
-        stream: TcpStream,
+        stream: S,
         peer: SocketAddr,
         _slot: ConnectionSlot,
         over_limit: bool,
-    ) {
+        deadline: Instant,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let mut forwarded_for = Vec::new();
         #[allow(clippy::result_large_err)]
         let keep_forwarded_for = |request: &Request, response: Response| {
@@ -569,7 +624,7 @@ impl Server {
         };
         let handshake =
             accept_hdr_async_with_config(stream, keep_forwarded_for, Some(self.websocket_config()));
-        let mut ws_stream = match tokio::time::timeout(self.handshake_timeout, handshake).await {
+        let mut ws_stream = match tokio::time::timeout_at(deadline, handshake).await {
             Ok(Ok(ws)) => ws,
             Ok(Err(e)) => {
                 warn!(%peer, %e, "WebSocket handshake failed");
@@ -778,7 +833,10 @@ impl Drop for AddressSlot {
 /// Args:
 ///     ws: The connection, after its handshake.
 ///     code: Why it is closed.
-async fn refuse(ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>, code: CloseCode) {
+async fn refuse<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, code: CloseCode)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if ws.send(close_message(code)).await.is_err() {
         return;
     }

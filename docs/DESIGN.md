@@ -262,6 +262,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
 | `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
 | `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
+| `server.tls_cert`, `server.tls_key` | empty | The binary. PEM certificate chain (leaf first) and private key; with both set the server serves `wss://`. Setting only one, or files that can't be read or don't match, stops startup |
 | `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
@@ -321,7 +322,8 @@ The defaults below are set in the `[limits]` section (section 9).
 
 - The server refuses to listen on a non-loopback address while `jwt_secret` is one of the published defaults or the admin password is `password`. On localhost it starts and logs a warning. The auth library also warns when constructed with those values.
 - Taken usernames get a generic "registration failed", so registration can't be used to discover accounts.
-- No TLS in the process. Run it behind a TLS-terminating proxy, listed in `server.trusted_proxies`. The README shows an nginx setup.
+- TLS is optional in the process: with `server.tls_cert` and `server.tls_key` set, every connection must complete a TLS handshake (TLS 1.2 or 1.3, through rustls with `ring`) before the WebSocket one, within the same 10 second deadline. Plain `ws://` clients are refused. The files are read at startup; a renewed certificate takes a restart. Client certificates aren't requested.
+- Or terminate TLS at a proxy listed in `server.trusted_proxies`. The README shows an nginx setup.
 
 ## 11. Failure modes
 
@@ -394,7 +396,7 @@ Done: a per-address connection limit, `server.max_connections_per_address`, off 
   - a byte budget for each connection's outbound queue, with slow subscribers caught up from the log
   - a JSON Schema in `docs/protocol/`, generated from the types and checked in CI
 - Done: the Rust client library, `popsub_sdk`. Next: TypeScript (types generated from `docs/protocol/`), then Python, held to one shared scenario suite against a real server.
-- `wss://` support in `popsub_sdk` (TLS through `tokio-tungstenite`).
+- Done: TLS in the server (`server.tls_cert`, `server.tls_key`) and `wss://` in `popsub_sdk`, with extra trusted roots for private CAs. Not done: reloading a renewed certificate without a restart, and client certificates.
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.
 - Published benchmarks against NATS and Redis pub/sub, including where PopSub loses.

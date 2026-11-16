@@ -11,6 +11,7 @@
 
 mod users;
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +23,7 @@ use popsub_protocol::CloseCode;
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
 use popsub_transport::{
-    FileUserStore, InMemoryUserStore, RateLimiters, Server, TrustedProxies, UserStore,
+    FileUserStore, InMemoryUserStore, RateLimiters, Server, ServerTls, TrustedProxies, UserStore,
 };
 use tracing::{error, info, warn};
 
@@ -50,6 +51,9 @@ enum Command {
         /// Topic to subscribe and publish to
         #[arg(long, default_value = "chat")]
         topic: String,
+        /// PEM certificate to trust for wss://, such as a self-signed one
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
     },
     /// Manage accounts on a running server, as an admin
     Users {
@@ -84,7 +88,8 @@ async fn main() -> ExitCode {
             username,
             password,
             topic,
-        } => run_client(&url, &username, &password, &topic).await,
+            ca_cert,
+        } => run_client(&url, &username, &password, &topic, ca_cert.as_deref()).await,
         Command::Users {
             connection,
             command,
@@ -118,6 +123,8 @@ async fn main() -> ExitCode {
 ///         the wrong type, including an unknown backend or durability name.
 ///     String: When published default secrets are set and the host is not a loopback address.
 ///     String: When an entry in `server.trusted_proxies` isn't an IP address or CIDR range.
+///     String: When only one of `server.tls_cert` and `server.tls_key` is set,
+///         or they can't be read or don't match.
 ///     String: When the storage backend can't be opened, for example because
 ///         another server is using its directory.
 ///     String: When `users.json` in the storage directory exists but can't be
@@ -141,6 +148,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let addr = format!("{}:{}", config.server.host, config.server.port);
+    let tls = open_tls(&config.server.tls_cert, &config.server.tls_key)?;
     let storage = open_storage(&config.storage).await?;
     let log = LogSettings {
         durability: config.storage.durability,
@@ -167,10 +175,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             "believing X-Forwarded-For from trusted proxies"
         );
     }
-    let server = Server::from_settings_with_users(broker.clone(), &config.server, users)
+    let mut server = Server::from_settings_with_users(broker.clone(), &config.server, users)
         .await
         .with_rate_limiters(RateLimiters::from_settings(&config.limits))
         .with_trusted_proxies(proxies);
+    if let Some(tls) = tls {
+        server = server.with_tls(tls);
+    }
 
     tokio::select! {
         served = server.listen(&addr) => served.map_err(|e| format!("can't serve on {addr}: {e}"))?,
@@ -209,6 +220,30 @@ async fn open_storage(settings: &StorageSettings) -> Result<Arc<dyn Storage>, St
             );
             Ok(Arc::new(MemoryStorage::new()))
         }
+    }
+}
+
+/// Loads the TLS certificate and key when both are configured.
+///
+/// Args:
+///     cert: `server.tls_cert`, empty for none.
+///     key: `server.tls_key`, empty for none.
+///
+/// Returns:
+///     The TLS setup, or `None` when neither is set.
+///
+/// Raises:
+///     String: When only one is set, or the files can't be read or don't match.
+fn open_tls(cert: &str, key: &str) -> Result<Option<ServerTls>, String> {
+    match (cert.is_empty(), key.is_empty()) {
+        (true, true) => Ok(None),
+        (false, false) => {
+            let tls = ServerTls::from_pem_files(Path::new(cert), Path::new(key))
+                .map_err(|e| format!("can't load the TLS certificate: {e}"))?;
+            info!(cert, "TLS enabled");
+            Ok(Some(tls))
+        }
+        _ => Err("set both server.tls_cert and server.tls_key, or neither".to_string()),
     }
 }
 
@@ -258,18 +293,24 @@ fn open_users(settings: &StorageSettings) -> Result<Arc<dyn UserStore>, String> 
 ///     username: The account to log in as.
 ///     password: The account's password.
 ///     topic: The topic to subscribe and publish to.
+///     ca_cert: A PEM certificate to trust for `wss://`, if any.
 ///
 /// Raises:
 ///     popsub_sdk::Error: When connecting, subscribing or publishing fails.
+///     String: When the `ca_cert` file can't be read.
 ///     String: When the subscription ends before the message arrives.
 async fn run_client(
     url: &str,
     username: &str,
     password: &str,
     topic: &str,
+    ca_cert: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = ClientConfig::new(url, Credentials::password(username, password))
-        .request_timeout(Duration::from_secs(10));
+    let config = trust(
+        ClientConfig::new(url, Credentials::password(username, password))
+            .request_timeout(Duration::from_secs(10)),
+        ca_cert,
+    )?;
     let client = Client::connect(config).await?;
     println!("Logged in as {username}");
     println!("Authenticated");
@@ -289,4 +330,27 @@ async fn run_client(
     );
     client.close();
     Ok(())
+}
+
+/// Adds a certificate file to a client's trusted roots, when one is given.
+///
+/// Args:
+///     config: The client configuration.
+///     ca_cert: A PEM certificate file, or `None`.
+///
+/// Returns:
+///     The configuration.
+///
+/// Raises:
+///     String: When the file can't be read.
+///     popsub_sdk::Error: When it holds no usable certificate.
+fn trust(
+    config: ClientConfig,
+    ca_cert: Option<&Path>,
+) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let Some(path) = ca_cert else {
+        return Ok(config);
+    };
+    let pem = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    Ok(config.add_root_certificates_pem(&pem)?)
 }

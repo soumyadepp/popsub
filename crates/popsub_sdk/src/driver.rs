@@ -38,7 +38,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 use tracing::{debug, info, warn};
 
 use crate::config::{AckMode, ClientConfig, Credentials};
@@ -258,6 +260,8 @@ pub(crate) struct Driver {
     /// How long to wait for anything from the server before giving up on
     /// the connection.
     silence: Duration,
+    /// The TLS setup for `wss://` URLs, built once.
+    tls: Connector,
 }
 
 impl Driver {
@@ -280,7 +284,6 @@ impl Driver {
         closed: Arc<OnceLock<Option<CloseCode>>>,
     ) -> Self {
         Self {
-            config,
             commands,
             acker,
             events,
@@ -293,6 +296,8 @@ impl Driver {
             next_id: 1,
             connected_once: false,
             silence: DEFAULT_SILENCE,
+            tls: tls_connector(&config.extra_roots),
+            config,
         }
     }
 
@@ -305,6 +310,7 @@ impl Driver {
     pub(crate) async fn run(mut self, ready: oneshot::Sender<Result<(), Error>>) {
         let mut ready = Some(ready);
         let mut attempt: u32 = 0;
+        let mut last_error: Option<Error> = None;
         let final_code = loop {
             match self.connect().await {
                 Ok((socket, resumed)) => {
@@ -330,6 +336,7 @@ impl Driver {
                 }
                 Err(failure) => {
                     warn!(error = %failure.error, "connecting failed");
+                    last_error = Some(failure.error.clone());
                     if !failure.retry {
                         if let Some(ready) = ready.take() {
                             let _ = ready.send(Err(failure.error));
@@ -346,9 +353,12 @@ impl Driver {
                 .is_some_and(|max| attempt > max)
             {
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Err(Error::Connect(
-                        "ran out of reconnect attempts".to_string(),
-                    )));
+                    let reason = last_error
+                        .as_ref()
+                        .map_or_else(String::new, |e| format!("; the last attempt failed: {e}"));
+                    let _ = ready.send(Err(Error::Connect(format!(
+                        "ran out of reconnect attempts{reason}"
+                    ))));
                 }
                 break None;
             }
@@ -453,9 +463,14 @@ impl Driver {
     ///         unsupported protocol or a bad session id, and true otherwise.
     async fn connect(&mut self) -> Result<(Socket, Vec<String>), ConnectFailure> {
         let retry = |error: Error| ConnectFailure { error, retry: true };
-        let (mut socket, _) = connect_async(self.config.url.as_str())
-            .await
-            .map_err(|e| retry(Error::Connect(e.to_string())))?;
+        let (mut socket, _) = connect_async_tls_with_config(
+            self.config.url.as_str(),
+            None,
+            false,
+            Some(self.tls.clone()),
+        )
+        .await
+        .map_err(|e| retry(Error::Connect(e.to_string())))?;
         let token = match self.config.credentials.clone() {
             Credentials::Token(token) => token,
             Credentials::Password { username, password } => {
@@ -1143,6 +1158,31 @@ fn fail_command(command: Command, code: Option<CloseCode>) {
         }
         _ => {}
     }
+}
+
+/// Builds the TLS setup for `wss://`: the public web roots plus any the
+/// application added, with `ring` for crypto.
+///
+/// Args:
+///     extra_roots: Certificates to trust besides the public roots.
+///
+/// Returns:
+///     The connector.
+fn tls_connector(extra_roots: &[rustls::pki_types::CertificateDer<'static>]) -> Connector {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for root in extra_roots {
+        if let Err(e) = roots.add(root.clone()) {
+            warn!(%e, "ignoring a root certificate rustls can't use");
+        }
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Connector::Rustls(Arc::new(config))
 }
 
 /// Turns an unexpected reply during connecting into a failure.
