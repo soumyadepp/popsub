@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use popsub_client::Client;
+use popsub_client::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_config::Settings;
 use popsub_config::settings::BrokerSettings;
 use popsub_storage::{
@@ -12,7 +12,6 @@ use popsub_storage::{
     SubscriptionStore,
 };
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tungstenite::protocol::Message as WsMessage;
 
 use crate::replay::{ReplayPlan, plan};
@@ -20,8 +19,8 @@ use crate::topic::{CursorUpdate, DeliveryState};
 use crate::{Broker, LogSettings, RetryOutcome, SharedBroker, session_key};
 use popsub_protocol::StartFrom;
 
-/// The receiving end of a fake client's channel.
-type Inbox = mpsc::UnboundedReceiver<WsMessage>;
+/// The receiving end of a fake client's outgoing queue.
+type Inbox = OutboxReceiver;
 
 /// Builds an empty broker with the default settings.
 ///
@@ -106,7 +105,24 @@ fn connect(broker: &mut Broker) -> (String, Inbox) {
 /// Returns:
 ///     The client's id and its inbox.
 fn connect_as(broker: &mut Broker, session: Option<&str>) -> (String, Inbox) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    connect_with(broker, session, QueueLimits::default())
+}
+
+/// Registers a fake client with chosen outgoing queue limits.
+///
+/// Args:
+///     broker: The broker to register with.
+///     session: The session's storage key, if any.
+///     limits: The client's queue limits.
+///
+/// Returns:
+///     The client's id and its inbox.
+fn connect_with(
+    broker: &mut Broker,
+    session: Option<&str>,
+    limits: QueueLimits,
+) -> (String, Inbox) {
+    let (tx, rx) = Outbox::channel(limits);
     let mut client = Client::new(tx);
     client.session = session.map(str::to_string);
     let id = client.id.clone();
@@ -161,7 +177,7 @@ fn new_record(message_id: &str, qos: u8) -> NewRecord {
 ///     Each text frame parsed as JSON, in order.
 fn frames(rx: &mut Inbox) -> Vec<Value> {
     let mut out = Vec::new();
-    while let Ok(frame) = rx.try_recv() {
+    while let Some(Outgoing::Frame(frame)) = rx.try_recv() {
         if let WsMessage::Text(text) = frame {
             out.push(serde_json::from_str(&text).expect("frames are JSON"));
         }
@@ -448,7 +464,7 @@ fn qos0_records_move_the_cursor_when_sent() {
     let mut broker = test_broker();
     let (id, _rx) = connect_as(&mut broker, Some("key"));
     broker.add_subscriber("t", id, 1, 0);
-    let updates = broker.deliver(&record(1, 0), 0);
+    let updates = broker.deliver(&record(1, 0), 0).cursors;
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].acked_seq, 1);
 }
@@ -917,13 +933,12 @@ async fn a_new_connection_takes_over_a_session() {
         .attach_session(&new, &key, false)
         .await
         .expect("attach");
-    match old_rx.try_recv() {
-        Ok(WsMessage::Close(Some(frame))) => {
-            assert_eq!(u16::from(frame.code), 4003);
-            assert_eq!(frame.reason.as_str(), "session_taken_over");
-        }
-        other => panic!("expected a close frame, got {other:?}"),
-    }
+    assert_eq!(
+        old_rx.try_recv(),
+        Some(Outgoing::Close(
+            popsub_protocol::CloseCode::SessionTakenOver
+        ))
+    );
     assert!(broker.with(|b| !b.clients.contains_key(&old)));
     assert_eq!(broker.with(|b| b.session_holder(&key)), Some(new));
 }
@@ -1062,9 +1077,84 @@ fn close_all_sends_every_client_a_close_frame() {
     let (_b, mut rx_b) = broker.with(connect);
     assert_eq!(broker.close_all(popsub_protocol::CloseCode::GoingAway), 2);
     for rx in [&mut rx_a, &mut rx_b] {
-        match rx.try_recv() {
-            Ok(WsMessage::Close(Some(frame))) => assert_eq!(u16::from(frame.code), 1001),
-            other => panic!("expected a close frame, got {other:?}"),
+        assert_eq!(
+            rx.try_recv(),
+            Some(Outgoing::Close(popsub_protocol::CloseCode::GoingAway))
+        );
+    }
+    assert_eq!(broker.close_all(popsub_protocol::CloseCode::GoingAway), 0);
+}
+
+/// Limits small enough that one delivery fills the queue past its soft limit.
+const TINY_QUEUE: QueueLimits = QueueLimits {
+    soft_bytes: 100,
+    hard_bytes: 1_000_000,
+};
+
+/// Checks that a subscriber whose queue is over its soft limit is skipped
+/// and reported once, rather than having frames piled up.
+#[test]
+fn a_busy_subscriber_is_skipped_and_reported_once() {
+    let mut broker = test_broker();
+    let (id, mut rx) = connect_with(&mut broker, None, TINY_QUEUE);
+    broker.add_subscriber("t", id.clone(), 1, 0);
+    assert!(broker.deliver(&record(1, 0), 0).backed_up.is_empty());
+    let second = broker.deliver(&record(2, 0), 0);
+    assert_eq!(second.backed_up, vec![id.clone()]);
+    assert!(broker.deliver(&record(3, 0), 0).backed_up.is_empty());
+    assert_eq!(seqs(&frames(&mut rx)), vec![1]);
+    assert_eq!(broker.wants("t", &id), Some(2));
+}
+
+/// Checks that live records skipped while a subscriber's queue was full
+/// reach it, in order and without gaps, once it drains.
+#[tokio::test]
+async fn a_busy_subscriber_catches_up_when_its_queue_drains() {
+    let broker = shared(Retention::default());
+    let (id, mut rx) = broker.with(|b| connect_with(b, None, TINY_QUEUE));
+    broker
+        .subscribe("t", &id, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    frames(&mut rx);
+    publish_many(&broker, 20, 0).await;
+    let mut received = Vec::new();
+    while received.len() < 20 {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(Outgoing::Frame(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("json");
+                received.extend(seqs(&[value]));
+            }
+            other => panic!("expected frames, got {other:?}"),
         }
     }
+    assert_eq!(received, (1..=20).collect::<Vec<_>>());
+}
+
+/// Checks that a large replay is paced by the subscriber's queue: it never
+/// holds much more than the soft limit, and every record still arrives.
+#[tokio::test]
+async fn replay_is_paced_by_the_subscribers_queue() {
+    let broker = shared(Retention::default());
+    publish_many(&broker, 200, 0).await;
+    let (id, mut rx) = broker.with(|b| connect_with(b, None, TINY_QUEUE));
+    let outbox = broker.with(|b| b.client_sender(&id)).expect("registered");
+    broker
+        .subscribe("t", &id, StartFrom::Seq(1), None)
+        .await
+        .expect("subscribe");
+    let mut received = Vec::new();
+    let mut peak = 0;
+    while received.len() < 200 {
+        peak = peak.max(outbox.queued_bytes());
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(Outgoing::Frame(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("json");
+                received.extend(seqs(&[value]));
+            }
+            other => panic!("expected frames, got {other:?}"),
+        }
+    }
+    assert_eq!(received, (1..=200).collect::<Vec<_>>());
+    assert!(peak < 1_000, "the queue peaked at {peak} bytes");
 }

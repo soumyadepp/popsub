@@ -89,7 +89,9 @@ Every failure is an `error` frame with a machine-readable `code`:
 { "type": "error", "id": 7, "code": "rate_limited", "message": "too many messages", "retry_after": 1 }
 ```
 
-When the server closes a connection it sends a WebSocket close code saying why: `1001` shutting down, `1009` frame too large, `1011` internal error, `4001` auth failed, `4002` request before auth, `4003` session taken over by another connection (don't reconnect), `4004` token expired, `4005` idle timeout, `4006` unsupported protocol (don't reconnect), `4007` session store unavailable. The server pings every 30 seconds and closes a connection that sends nothing, not even a pong, for 90 seconds; WebSocket libraries answer pings by themselves.
+When the server closes a connection it sends a WebSocket close code saying why: `1001` shutting down, `1009` frame too large, `1011` internal error, `4001` auth failed, `4002` request before auth, `4003` session taken over by another connection (don't reconnect), `4004` token expired, `4005` idle timeout, `4006` unsupported protocol (don't reconnect), `4007` session store unavailable, `4008` slow consumer. The server pings every 30 seconds and closes a connection that sends nothing, not even a pong, for 90 seconds; WebSocket libraries answer pings by themselves.
+
+A client that reads slowly isn't sent messages faster than it reads: once 1 MiB is waiting for it, new messages wait in the topic log and are sent as it catches up, in order. Only if replies alone push its queue past `server.outbound_queue_bytes` (16 MiB) is it closed with `4008`; a durable session then resumes where it left off.
 
 The error codes are `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic` and `internal`. A frame that isn't valid JSON or has an unknown `type` gets `bad_request` and the connection stays open.
 

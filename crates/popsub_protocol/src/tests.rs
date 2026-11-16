@@ -390,6 +390,7 @@ fn close_codes_are_stable_and_say_whether_to_reconnect() {
             (4005, "idle_timeout", true),
             (4006, "unsupported_protocol", false),
             (4007, "session_unavailable", true),
+            (4008, "slow_consumer", true),
         ]
     );
     for code in CloseCode::ALL {

@@ -31,13 +31,12 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
 use popsub_broker::{SharedBroker, close_message, session_key};
-use popsub_client::Client;
+use popsub_client::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
 use popsub_storage::{MAX_TOPIC_BYTES, NewRecord};
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::accept_async_with_config;
@@ -198,6 +197,8 @@ pub struct Server {
     heartbeat: Heartbeat,
     /// The longest payload a publish may carry, in bytes.
     max_payload_bytes: usize,
+    /// The byte budget of each connection's outgoing queue.
+    queue_limits: QueueLimits,
 }
 
 impl Server {
@@ -217,6 +218,7 @@ impl Server {
             limiters: RateLimiters::default(),
             heartbeat: Heartbeat::default(),
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+            queue_limits: QueueLimits::default(),
         }
     }
 
@@ -224,7 +226,8 @@ impl Server {
     ///
     /// The JWT secret and expiry, the admin user, whether self-registration
     /// is allowed, the role new users get (see `registration_role`), the
-    /// heartbeat and the payload limit all come from `settings`. Rate limits are the defaults.
+    /// heartbeat, the payload limit and the outbound queue budget all come
+    /// from `settings`. Rate limits are the defaults.
     ///
     /// Args:
     ///     broker: The broker every connection shares.
@@ -245,6 +248,7 @@ impl Server {
                 idle_timeout: Duration::from_secs(settings.idle_timeout_secs.max(1)),
             })
             .with_max_payload_bytes(settings.max_payload_bytes)
+            .with_queue_limits(QueueLimits::from_hard_limit(settings.outbound_queue_bytes))
     }
 
     /// Replaces the default rate limits.
@@ -281,6 +285,18 @@ impl Server {
     ///     The server with the new limit.
     pub fn with_max_payload_bytes(mut self, max_payload_bytes: usize) -> Self {
         self.max_payload_bytes = max_payload_bytes.max(1);
+        self
+    }
+
+    /// Replaces the default outbound queue budget.
+    ///
+    /// Args:
+    ///     limits: The soft and hard byte limits for each connection.
+    ///
+    /// Returns:
+    ///     The server with the new budget.
+    pub fn with_queue_limits(mut self, limits: QueueLimits) -> Self {
+        self.queue_limits = limits;
         self
     }
 
@@ -368,8 +384,9 @@ impl Server {
     /// and a send loop starts draining the client's outgoing channel. The
     /// loop then waits for whichever comes first: a frame from the client
     /// (handled by `Session::on_frame`), the heartbeat tick, the token
-    /// expiry warning, or the token expiry. Any frame received, pongs
-    /// included, counts as the client being alive. When the server ends the
+    /// expiry warning, the token expiry, or the connection's `Outbox`
+    /// starting to close (a takeover, a slow consumer, a shutdown). Any frame
+    /// received, pongs included, counts as the client being alive. When the server ends the
     /// connection it sends a close frame with the reason's `CloseCode`, then
     /// keeps the connection open for up to `CLOSE_GRACE` until the client
     /// replies with its own close. Dropping it straight away would make a
@@ -390,7 +407,7 @@ impl Server {
             }
         };
         let (ws_sender, mut ws_receiver) = ws_stream.split();
-        let (outbox, rx) = mpsc::unbounded_channel::<WsMessage>();
+        let (outbox, rx) = Outbox::channel(self.queue_limits);
         let client = Client::new(outbox.clone());
         let client_id = client.id.clone();
         self.broker.with(|broker| broker.register_client(client));
@@ -447,11 +464,14 @@ impl Server {
                     info!(client_id = %session.client_id, "closing a connection whose token expired");
                     break Flow::Close(CloseCode::TokenExpired);
                 }
+                code = session.outbox.closed() => {
+                    info!(client_id = %session.client_id, reason = code.reason(), "connection closed by the server");
+                    break Flow::Close(code);
+                }
             }
         };
-        if let Flow::Close(code) = ending
-            && session.outbox.send(close_message(code)).is_ok()
-        {
+        if let Flow::Close(code) = ending {
+            session.outbox.close(code);
             let _ = tokio::time::timeout(CLOSE_GRACE, async {
                 while let Some(Ok(frame)) = ws_receiver.next().await {
                     if matches!(frame, WsMessage::Close(_)) {
@@ -578,28 +598,37 @@ impl ClientCleanup {
     }
 }
 
-/// Spawns a task that forwards frames from a client's outgoing channel to its WebSocket.
+/// Spawns a task that writes a client's outgoing queue to its WebSocket.
 ///
-/// The task stops when every sender for the channel has been dropped or a
-/// write to the socket fails, then runs `cleanup`.
+/// Frames are written in order. When the `Outbox` closes, the close frame
+/// is written (after the backlog, unless it is a slow consumer) and the task
+/// stops; it also stops when a write fails or every `Outbox` is dropped.
+/// Then it runs `cleanup`.
 ///
 /// Args:
 ///     ws_sender: The write half of the client's WebSocket.
-///     rx: The receiving end of the channel the broker and session send to.
+///     rx: The receiving side of the client's `Outbox`.
 ///     client_id: The client's broker id, for logging.
 ///     cleanup: Removes the client from the broker, once.
 fn spawn_send_loop<S>(
     mut ws_sender: S,
-    mut rx: mpsc::UnboundedReceiver<WsMessage>,
+    mut rx: OutboxReceiver,
     client_id: String,
     cleanup: ClientCleanup,
 ) where
     S: futures_util::Sink<WsMessage, Error = tungstenite::Error> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Err(e) = ws_sender.send(msg).await {
+        while let Some(next) = rx.recv().await {
+            let (frame, last) = match next {
+                Outgoing::Frame(frame) => (frame, false),
+                Outgoing::Close(code) => (close_message(code), true),
+            };
+            if let Err(e) = ws_sender.send(frame).await {
                 warn!(client_id = %client_id, %e, "failed to write to socket");
+                break;
+            }
+            if last {
                 break;
             }
         }
@@ -616,8 +645,8 @@ struct Session {
     client_id: String,
     /// This connection's remote address, the key for login and registration limits.
     peer_ip: String,
-    /// This connection's outgoing channel. Replies are queued here directly.
-    outbox: mpsc::UnboundedSender<WsMessage>,
+    /// This connection's outgoing queue. Replies are queued here directly.
+    outbox: Outbox,
     /// The session id and token expiry from `auth`.
     auth: Mutex<AuthState>,
 }
@@ -789,7 +818,7 @@ impl Session {
         let json = serde_json::to_string(&ServerFrame::reply(id.cloned(), message))?;
         self.outbox
             .send(WsMessage::Text(json.into()))
-            .map_err(|_| PopSubError::Client("outgoing channel closed".to_string()))
+            .map_err(|e| PopSubError::Client(format!("outgoing queue refused a reply: {e:?}")))
     }
 
     /// Queues an `error` reply.

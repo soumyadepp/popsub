@@ -1412,3 +1412,59 @@ async fn invalid_topics_and_message_ids_are_refused() {
     .await;
     assert_eq!(fine["type"], "published");
 }
+
+/// Checks that a subscriber that stops reading doesn't make the server queue
+/// without limit: its queue stays near the soft limit while thousands of
+/// messages are published, and when it reads again it receives every one,
+/// in order, caught up from the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_reader_is_caught_up_from_the_log_without_unbounded_queueing() {
+    let mut settings = Settings::default();
+    settings.server.outbound_queue_bytes = 1_000_000;
+    settings.storage.retention.max_messages = 10_000;
+    let limiters = RateLimiters {
+        message_limiter: Arc::new(popsub_ratelimit::TokenBucket::new(
+            100_000,
+            100_000,
+            Duration::from_secs(1),
+        )),
+        ..RateLimiters::default()
+    };
+    let (addr, broker) = start_server(&settings, limiters).await;
+    let mut reader = admin_connection(addr, &settings).await;
+    let subscribed = send_raw(
+        &mut reader,
+        &serde_json::json!({"type": "subscribe", "topic": "flood"}).to_string(),
+    )
+    .await;
+    assert_eq!(subscribed["type"], "subscribed");
+
+    let mut publisher = admin_connection(addr, &settings).await;
+    let payload = "x".repeat(1_000);
+    for n in 0..3_000 {
+        send_json(
+            &mut publisher,
+            serde_json::json!({"type": "publish", "topic": "flood", "payload": payload, "message_id": format!("m{n}")}),
+        )
+        .await;
+    }
+    settle(&mut publisher, "settle-flood").await;
+
+    let queued = broker.with(|b| {
+        b.clients
+            .values()
+            .map(|c| c.sender.queued_bytes())
+            .max()
+            .unwrap_or(0)
+    });
+    assert!(queued < 70 * 1024, "a connection queued {queued} bytes");
+
+    let mut seqs = Vec::new();
+    while seqs.len() < 3_000 {
+        match next_frame(&mut reader).await {
+            ServerMessage::Message(delivery) => seqs.push(delivery.seq),
+            other => panic!("expected only messages, got {other:?}"),
+        }
+    }
+    assert_eq!(seqs, (1..=3_000).collect::<Vec<_>>());
+}

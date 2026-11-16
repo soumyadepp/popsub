@@ -13,9 +13,10 @@
 //! - The broker lock is only taken for short, non-blocking work, never
 //!   while waiting on storage.
 //!
-//! Replay on subscribe and catch-up after an ACK are the same operation:
-//! read the log from the subscription's `next_seq` and send while its window
-//! has room. Records are never queued in memory for a subscriber that is
+//! Replay on subscribe, catch-up after an ACK, and catch-up after a slow
+//! client's outgoing queue drains are the same operation: read the log from
+//! the subscription's `next_seq` and send while its window and its client's
+//! queue have room. Records are never queued in memory for a subscriber that is
 //! behind, so a slow subscriber costs nothing until it catches up, and
 //! retention still applies to it (it is told with a `truncated` frame).
 //!
@@ -106,6 +107,10 @@ pub(crate) struct TopicWriter {
     /// The log's `last_seq` as this writer last saw it, or `None` until it
     /// has been read or after a failed append, when it is read again.
     last_seq: Option<u64>,
+    /// A weak handle on this writer's own queue, for catch-ups that start
+    /// once a client's outgoing queue drains. Weak, so the writer still
+    /// stops when every `SharedBroker` is dropped.
+    queue: mpsc::WeakUnboundedSender<Command>,
 }
 
 impl TopicWriter {
@@ -134,6 +139,7 @@ impl TopicWriter {
             storage,
             log,
             last_seq: None,
+            queue: tx.downgrade(),
         };
         tokio::spawn(writer.run(rx));
         tx
@@ -246,8 +252,11 @@ impl TopicWriter {
         }
         self.last_seq = Some(stored.seq);
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let updates = self.broker.with(|broker| broker.deliver(&stored, now_ms));
-        self.store_cursors(updates).await;
+        let outcome = self.broker.with(|broker| broker.deliver(&stored, now_ms));
+        self.store_cursors(outcome.cursors).await;
+        for client_id in outcome.backed_up {
+            self.catch_up_when_ready(client_id);
+        }
         if let Err(e) = self
             .storage
             .trim(&self.topic, &self.log.retention, now_ms)
@@ -340,6 +349,30 @@ impl TopicWriter {
         Ok(outcome)
     }
 
+    /// Arranges a catch-up for a client once its outgoing queue drains below
+    /// the soft limit.
+    ///
+    /// A small task waits on the client's `Outbox::ready` and then queues a
+    /// `CatchUp` on this writer. It gives up if the connection closes or the
+    /// writer has stopped.
+    ///
+    /// Args:
+    ///     client_id: The client whose queue was too full.
+    fn catch_up_when_ready(&self, client_id: String) {
+        let Some(outbox) = self.broker.with(|broker| broker.client_sender(&client_id)) else {
+            return;
+        };
+        let queue = self.queue.clone();
+        tokio::spawn(async move {
+            outbox.ready().await;
+            if outbox.closing().is_none()
+                && let Some(queue) = queue.upgrade()
+            {
+                let _ = queue.send(Command::CatchUp { client_id });
+            }
+        });
+    }
+
     /// Sends a subscription the records it has missed, while its window has room.
     ///
     /// Reads the log from the subscription's `next_seq` in pages of
@@ -357,6 +390,8 @@ impl TopicWriter {
     ///     StorageError::Unavailable: When the log can't be read.
     ///     StorageError::Corrupt: When a stored record fails its checks.
     async fn catch_up(&mut self, client_id: &str) -> StorageResult<u64> {
+        self.broker
+            .with(|broker| broker.room_restored(&self.topic, client_id));
         let last_seq = self.last_seq().await?;
         let mut sent_total = 0;
         while let Some(next) = self
@@ -385,11 +420,14 @@ impl TopicWriter {
                 break;
             }
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let (sent, update) = self
+            let (sent, update, backed_up) = self
                 .broker
                 .with(|broker| broker.send_records(&self.topic, client_id, &page, now_ms));
             self.store_cursors(update).await;
             sent_total += sent as u64;
+            if backed_up {
+                self.catch_up_when_ready(client_id.to_string());
+            }
             if sent < page.len() {
                 break;
             }

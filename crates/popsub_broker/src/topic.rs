@@ -54,6 +54,9 @@ pub struct DeliveryState {
     pub stalled: Option<u64>,
     /// The cursor last handed out as a `CursorUpdate`.
     persisted: u64,
+    /// Whether a catch-up is already arranged for when the client's
+    /// outgoing queue drains, so only one is arranged at a time.
+    pub awaiting_room: bool,
 }
 
 impl DeliveryState {
@@ -73,6 +76,7 @@ impl DeliveryState {
             inflight: BTreeMap::new(),
             stalled: None,
             persisted: start_seq - 1,
+            awaiting_room: false,
         }
     }
 

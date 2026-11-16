@@ -150,6 +150,7 @@ All replies also carry the request's `id` when it had one. The broker writes `me
 | 4005 | `idle_timeout` | Nothing received for the idle timeout | Yes |
 | 4006 | `unsupported_protocol` | `auth` named a protocol version the server doesn't speak | No |
 | 4007 | `session_unavailable` | The session store couldn't be reached during `auth` | Yes, with backoff |
+| 4008 | `slow_consumer` | The client's outgoing queue passed `server.outbound_queue_bytes` | Yes; a durable session resumes from its cursor |
 
 The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the last column.
 
@@ -175,7 +176,7 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 - Each subscription has its own window of QoS 1 records sent but not acknowledged, at most `broker.max_inflight`. While the window is full, nothing more is sent to it, QoS 0 included, so order is kept.
 - `ack` with `topic` and `seq` removes that record from that connection's window only. ACKs for anything else are ignored.
 - A subscription's cursor is the highest `seq` with nothing outstanding at or below it: one below its oldest in-flight record, or one below the next record it expects. It moves when records are acknowledged with no gap below them, or when QoS 0 records are sent. A durable session's cursor is written to the subscription store whenever it moves.
-- When an ACK frees room and the subscription has missed records, the writer reads them from the log and sends them while the window has room. Subscribe uses the same catch-up. If records it was due were trimmed meanwhile, it gets `truncated` and moves past them: retention always wins over slow subscribers.
+- When an ACK frees room and the subscription has missed records, the writer reads them from the log and sends them while the window has room. The same happens when a client's outgoing queue had passed its soft limit and drains again: deliveries skipped meanwhile are read back from the log, so a slow reader is paced instead of queued. Subscribe uses the same catch-up. If records it was due were trimmed meanwhile, it gets `truncated` and moves past them: retention always wins over slow subscribers.
 - Every second the retry loop resends records older than `ack_timeout_ms` to the one subscription that hasn't acknowledged them. A record already resent `max_retries` times stalls the subscription instead: it gets `stalled`, and nothing is sent or resent to it until it acknowledges something (which also gives its outstanding records a fresh set of retries) or subscribes again.
 
 ### 5.4 Sessions
@@ -215,7 +216,7 @@ The design is in `docs/STORAGE.md`; rollout steps 1 to 4 and 6 are done, and ste
 
 - Broker state (clients, subscriptions and their windows) is behind one `std::sync::Mutex`, through `SharedBroker::with`. It is held only for short, non-blocking work: fan-out, subscriber changes, ACKs, connects, disconnects and retry passes.
 - Storage I/O happens in the topic writers, outside the lock. Each topic's publishes and subscribes are handled one at a time by its writer, so a long replay delays publishes to that topic only.
-- Each client's outbound channel is unbounded. A subscriber that reads slower than publishers write grows server memory without limit.
+- Each connection's outgoing queue (`popsub_client::Outbox`) has a byte budget. Above the soft limit (a sixteenth of `server.outbound_queue_bytes`, at least 64 KiB) no new deliveries are queued: the subscription falls behind and is caught up from the log once the queue drains, the same way as when its QoS 1 window is full. Replies, retries and pings ignore the soft limit; if they push the queue past `server.outbound_queue_bytes`, the connection is closed as a slow consumer.
 - The lock is never held across an `.await`, which keeps the synchronous mutex safe inside Tokio.
 
 ## 9. Configuration
@@ -235,6 +236,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.registration_role` | `none` | Auth. `none`, `readonly` or `full`; anything else means `none` |
 | `server.heartbeat_secs` | `30` | Transport. How often each connection is pinged |
 | `server.idle_timeout_secs` | `90` | Transport. How long a connection may send nothing before it is closed |
+| `server.outbound_queue_bytes` | `16777216` | Transport. The hard byte limit of each connection's outgoing queue; the soft limit is a sixteenth of it, at least 64 KiB |
 | `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
 | `broker.max_connections` | `1000` | Nothing. Not enforced. |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
@@ -293,7 +295,7 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | A connection goes half-open (the client vanished without closing) | No pongs come back, and it is closed with `idle_timeout` after `server.idle_timeout_secs`, freeing its subscriptions and session. |
 | A token expires on a long connection | The client is warned with `auth_expiring`, then closed with `token_expired` unless it sent a fresh `auth`. |
 | The server is stopped with Ctrl+C | Every client is sent `going_away` before the process exits. |
-| Subscriber reads slowly | Its channel grows without bound until memory runs out. |
+| Subscriber reads slowly | Once its queue passes the soft limit, deliveries wait in the topic log and are sent as it catches up, in order. Server memory for it stays near the soft limit. If it falls behind retention, it gets `truncated`. |
 | Publisher sends to a topic nobody subscribes to | Stored in the topic log until retention trims it. |
 | A subscriber stops acknowledging | Its window fills and delivery to it pauses; after `max_retries` it gets `stalled`. Other subscribers are unaffected, and nothing is queued in memory for it. |
 | A client acknowledges a record it wasn't sent | Ignored. |
@@ -317,10 +319,9 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 
 ## 12. Known gaps, in priority order
 
-1. Unbounded per-client channels. Windows bound QoS 1 records per subscription, but QoS 0 records and replies to a slow reader still queue without limit.
-2. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
-3. `max_connections` is ignored, and rate limits aren't configurable.
-4. No client libraries, release artefacts, health check or metrics.
+1. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
+2. `max_connections` is ignored, and rate limits aren't configurable.
+3. No client libraries, release artefacts, health check or metrics.
 
 ## 13. Proposed direction
 
@@ -329,7 +330,7 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 The storage proposal in `docs/STORAGE.md` covers most of this phase: per-topic logs with sequence numbers, durable per-session cursors, resume, per-subscriber acknowledgement and pluggable backends.
 
 - Done: per-subscriber delivery state, durable sessions, per-topic sequence numbers with resume from a stored cursor, and publisher-scoped idempotency keys (steps 1 to 3 of `docs/STORAGE.md`).
-- **Backpressure.** Bounded per-client queues. When one fills, disconnect the client (QoS 0) or stop reading from publishers to that topic (QoS 1), and report it in metrics.
+- Done: backpressure. Slow subscribers are paced from the log instead of queued in memory, and only a client that overflows on replies alone is disconnected.
 - **Concurrency.** Storage I/O already runs in one writer task per topic, outside the broker lock. Moving subscriber state into those tasks too would remove the remaining shared lock.
 - **Proof.** Failure tests that kill subscribers, restart the broker and slow the disk, asserting the guarantees in section 6 after each change.
 
@@ -346,7 +347,7 @@ Remaining:
 
 ### Phase 3: adoptable
 
-- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Also done: payload, frame, topic and message id limits. Next: a byte budget for each connection's outbound queue, then a JSON Schema generated from the types for other languages.
+- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Also done: payload, frame, topic and message id limits. Also done: a byte budget for each connection's outbound queue, with slow subscribers caught up from the log. Next: a JSON Schema generated from the types for other languages.
 - JavaScript and Python client libraries with reconnection and ACK handling built in.
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.

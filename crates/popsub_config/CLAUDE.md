@@ -25,7 +25,7 @@ Update all of these together:
 - `server.allow_registration` (default false) and `server.registration_role` (`none`, `readonly` or `full`, default `none`) are passed to the auth crate by the transport.
 - Tests pass `Some(HashMap::new())` (or their own map) as the environment so variables set on the machine running the tests can't leak in.
 - `max_connections` is loaded but nothing reads it yet.
-- `server.heartbeat_secs` and `server.idle_timeout_secs` set the transport's `Heartbeat`; values below 1 are treated as 1. `server.max_payload_bytes` sets the publish payload limit and, through it, the WebSocket frame limit.
+- `server.heartbeat_secs` and `server.idle_timeout_secs` set the transport's `Heartbeat`; values below 1 are treated as 1. `server.max_payload_bytes` sets the publish payload limit and, through it, the WebSocket frame limit. `server.outbound_queue_bytes` is each connection's hard outgoing queue limit; the soft limit is derived from it.
 - `broker.max_inflight` sizes each subscription's window of unacknowledged QoS 1 records; values below 1 behave as 1. `storage.session_expiry_secs` is how long a durable session outlives its last connection.
 - `[storage]` defaults to the `file` backend in `pubsub_data` with `buffered` durability. It uses typed enums: `backend` is a `StorageBackend` and `durability` is `popsub_storage::Durability`, so an unknown name is a load error. Retention limits are plain numbers (0 keeps nothing) and `RetentionSettings::to_retention` turns them into the policy the backends apply.
 - Nested keys from the environment use a double underscore at every level: `STORAGE__RETENTION__MAX_MESSAGES`.

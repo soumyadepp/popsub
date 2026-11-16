@@ -23,12 +23,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use popsub_client::Client;
+use popsub_client::{Client, Outbox};
 use popsub_config::settings::BrokerSettings;
 use popsub_storage::Record;
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
-use tungstenite::protocol::Message as WsMessage;
 
 use popsub_protocol::{ServerFrame, ServerMessage, Stalled};
 
@@ -61,6 +59,32 @@ pub struct AckOutcome {
     /// Whether the subscription has room again and records waiting in the
     /// log, so the topic's writer should catch it up.
     pub catch_up: bool,
+}
+
+/// What `Broker::deliver` did, beyond queueing frames.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliverOutcome {
+    /// Cursors that moved, to be stored.
+    pub cursors: Vec<CursorUpdate>,
+    /// Clients skipped because their outgoing queue was over its soft
+    /// limit, that nobody is yet waiting on. The caller arranges a
+    /// catch-up for each once its queue drains.
+    pub backed_up: Vec<SubscriberId>,
+}
+
+/// What happened when one record was offered to one subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offer {
+    /// It was queued.
+    Sent,
+    /// The subscription expects another `seq` (it is behind or ahead).
+    NotNext,
+    /// The subscription's window is full or it is stalled.
+    NoWindow,
+    /// The client's outgoing queue is over its soft limit.
+    Busy,
+    /// The client's connection is closing.
+    Closed,
 }
 
 /// What one `Broker::retry_overdue` pass did.
@@ -114,14 +138,14 @@ impl Broker {
         self.clients.remove(client_id);
     }
 
-    /// Returns a copy of a registered client's outgoing channel.
+    /// Returns a handle on a registered client's outgoing queue.
     ///
     /// Args:
     ///     client_id: The client to look up.
     ///
     /// Returns:
-    ///     The channel, or `None` if the client isn't registered.
-    pub fn client_sender(&self, client_id: &str) -> Option<UnboundedSender<WsMessage>> {
+    ///     The queue, or `None` if the client isn't registered.
+    pub fn client_sender(&self, client_id: &str) -> Option<Outbox> {
         self.clients.get(client_id).map(|c| c.sender.clone())
     }
 
@@ -237,33 +261,54 @@ impl Broker {
     /// Sends a newly stored record to every subscription that is up to date.
     ///
     /// Only the topic's writer calls this, once per record and in `seq`
-    /// order. Subscriptions that are behind, stalled or out of window room
-    /// are skipped; the writer catches them up from the log later.
+    /// order. Subscriptions that are behind, stalled, out of window room, or
+    /// whose client's outgoing queue is over its soft limit are skipped; the
+    /// writer catches them up from the log later.
     ///
     /// Args:
     ///     record: The record as the log stored it.
     ///     now_ms: The current time, recorded as the send time for retries.
     ///
     /// Returns:
-    ///     The cursors that moved, to be stored.
-    pub fn deliver(&mut self, record: &Record, now_ms: i64) -> Vec<CursorUpdate> {
+    ///     The cursors that moved, and the clients newly skipped for a full
+    ///     queue, which need a catch-up once it drains.
+    pub fn deliver(&mut self, record: &Record, now_ms: i64) -> DeliverOutcome {
         let max_inflight = self.settings.max_inflight;
         let Some(topic) = self.topics.get_mut(&record.topic) else {
-            return Vec::new();
+            return DeliverOutcome::default();
         };
         topic.last_seq = topic.last_seq.max(record.seq);
-        let mut updates = Vec::new();
+        let mut outcome = DeliverOutcome::default();
         for (client_id, state) in topic.subscribers.iter_mut() {
             let Some(client) = self.clients.get(client_id) else {
                 continue;
             };
-            if send_one(state, &client.sender, record, now_ms, max_inflight)
-                && let Some(update) = state.take_update(&topic.name)
-            {
-                updates.push(update);
+            match send_one(state, &client.sender, record, now_ms, max_inflight) {
+                Offer::Sent => outcome.cursors.extend(state.take_update(&topic.name)),
+                Offer::Busy if !state.awaiting_room => {
+                    state.awaiting_room = true;
+                    outcome.backed_up.push(client_id.clone());
+                }
+                _ => {}
             }
         }
-        updates
+        outcome
+    }
+
+    /// Notes that a subscription is being caught up, so the next time its
+    /// client's queue fills a new catch-up is arranged.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     client_id: The subscribed client.
+    pub fn room_restored(&mut self, topic: &str, client_id: &str) {
+        if let Some(state) = self
+            .topics
+            .get_mut(topic)
+            .and_then(|t| t.subscribers.get_mut(client_id))
+        {
+            state.awaiting_room = false;
+        }
     }
 
     /// Reports where a subscription that has room wants records from.
@@ -273,19 +318,20 @@ impl Broker {
     ///     client_id: The subscribed client.
     ///
     /// Returns:
-    ///     Its `next_seq`, or `None` when it doesn't exist, is stalled or has
-    ///     a full window.
+    ///     Its `next_seq`, or `None` when it doesn't exist, is stalled, has a
+    ///     full window, or its client's outgoing queue is over the soft limit.
     pub fn wants(&self, topic: &str, client_id: &str) -> Option<u64> {
         let state = self.topics.get(topic)?.subscribers.get(client_id)?;
-        state
-            .has_room(self.settings.max_inflight)
+        let client = self.clients.get(client_id)?;
+        (state.has_room(self.settings.max_inflight) && client.sender.has_room())
             .then_some(state.next_seq)
     }
 
     /// Sends records read from the log to one subscription, in order.
     ///
     /// Stops at the first record that isn't the subscription's `next_seq`,
-    /// or when its window fills or its channel is closed.
+    /// or when its window fills, its client's queue goes over the soft
+    /// limit, or its connection is closing.
     ///
     /// Args:
     ///     topic: The topic.
@@ -294,27 +340,38 @@ impl Broker {
     ///     now_ms: The current time, recorded as the send time for retries.
     ///
     /// Returns:
-    ///     How many records were sent, and the cursor to store if it moved.
+    ///     How many records were sent, the cursor to store if it moved, and
+    ///     whether it stopped for a full queue with nobody yet waiting on it
+    ///     (the caller then arranges a catch-up once the queue drains).
     pub fn send_records(
         &mut self,
         topic: &str,
         client_id: &str,
         records: &[Record],
         now_ms: i64,
-    ) -> (usize, Option<CursorUpdate>) {
+    ) -> (usize, Option<CursorUpdate>, bool) {
         let max_inflight = self.settings.max_inflight;
         let (Some(topic), Some(client)) = (self.topics.get_mut(topic), self.clients.get(client_id))
         else {
-            return (0, None);
+            return (0, None, false);
         };
         let Some(state) = topic.subscribers.get_mut(client_id) else {
-            return (0, None);
+            return (0, None, false);
         };
-        let sent = records
-            .iter()
-            .take_while(|record| send_one(state, &client.sender, record, now_ms, max_inflight))
-            .count();
-        (sent, state.take_update(&topic.name))
+        let mut sent = 0;
+        let mut backed_up = false;
+        for record in records {
+            match send_one(state, &client.sender, record, now_ms, max_inflight) {
+                Offer::Sent => sent += 1,
+                Offer::Busy => {
+                    backed_up = !state.awaiting_room;
+                    state.awaiting_room = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        (sent, state.take_update(&topic.name), backed_up)
     }
 
     /// Moves a subscription past records that were trimmed before it got them.
@@ -452,36 +509,46 @@ impl Broker {
     }
 }
 
-/// Sends one record to one subscription if it is the next one it expects
-/// and its window has room.
+/// Offers one record to one subscription: sends it if it is the next one
+/// the subscription expects, its window has room, and its client's queue is
+/// under the soft limit.
 ///
 /// A QoS 1 record goes into the subscription's window; a QoS 0 record is
 /// done once sent.
 ///
 /// Args:
 ///     state: The subscription's delivery state.
-///     sender: The client's outgoing channel.
+///     sender: The client's outgoing queue.
 ///     record: The record.
 ///     now_ms: The send time, for retries.
 ///     max_inflight: The window size.
 ///
 /// Returns:
-///     Whether the record was sent.
+///     What happened.
 fn send_one(
     state: &mut DeliveryState,
-    sender: &UnboundedSender<WsMessage>,
+    sender: &Outbox,
     record: &Record,
     now_ms: i64,
     max_inflight: usize,
-) -> bool {
-    if state.next_seq != record.seq || !state.has_room(max_inflight) {
-        return false;
+) -> Offer {
+    if state.next_seq != record.seq {
+        return Offer::NotNext;
+    }
+    if !state.has_room(max_inflight) {
+        return Offer::NoWindow;
+    }
+    if sender.closing().is_some() {
+        return Offer::Closed;
+    }
+    if !sender.has_room() {
+        return Offer::Busy;
     }
     let Some(ws) = to_ws(&delivery(record)) else {
-        return false;
+        return Offer::Closed;
     };
     if sender.send(ws).is_err() {
-        return false;
+        return Offer::Closed;
     }
     state.next_seq = record.seq + 1;
     if record.qos == 1 {
@@ -494,5 +561,5 @@ fn send_one(
             },
         );
     }
-    true
+    Offer::Sent
 }

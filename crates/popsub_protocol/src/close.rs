@@ -36,11 +36,15 @@ pub enum CloseCode {
     /// 4007: the session store couldn't be reached during `auth`. Reconnect
     /// with backoff.
     SessionUnavailable,
+    /// 4008: the client read so slowly that its outgoing queue passed the
+    /// server's hard limit. Reconnect; a durable session resumes from its
+    /// cursor.
+    SlowConsumer,
 }
 
 impl CloseCode {
     /// Every close code, for docs and tests.
-    pub const ALL: [CloseCode; 10] = [
+    pub const ALL: [CloseCode; 11] = [
         CloseCode::GoingAway,
         CloseCode::MessageTooBig,
         CloseCode::InternalError,
@@ -51,12 +55,13 @@ impl CloseCode {
         CloseCode::IdleTimeout,
         CloseCode::UnsupportedProtocol,
         CloseCode::SessionUnavailable,
+        CloseCode::SlowConsumer,
     ];
 
     /// The numeric WebSocket close code.
     ///
     /// Returns:
-    ///     1001, 1009 or 1011 for the standard codes, 4001 to 4007 for PopSub's own.
+    ///     1001, 1009 or 1011 for the standard codes, 4001 to 4008 for PopSub's own.
     pub fn code(self) -> u16 {
         match self {
             CloseCode::GoingAway => 1001,
@@ -69,6 +74,7 @@ impl CloseCode {
             CloseCode::IdleTimeout => 4005,
             CloseCode::UnsupportedProtocol => 4006,
             CloseCode::SessionUnavailable => 4007,
+            CloseCode::SlowConsumer => 4008,
         }
     }
 
@@ -88,6 +94,7 @@ impl CloseCode {
             CloseCode::IdleTimeout => "idle_timeout",
             CloseCode::UnsupportedProtocol => "unsupported_protocol",
             CloseCode::SessionUnavailable => "session_unavailable",
+            CloseCode::SlowConsumer => "slow_consumer",
         }
     }
 
