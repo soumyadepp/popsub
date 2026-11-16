@@ -8,8 +8,25 @@
 //! request from, so the rightmost address that isn't a trusted proxy is the
 //! client. Anything to the left of it was written by the client and could be
 //! made up. A peer that isn't trusted is used as is, whatever headers it sends.
+//!
+//! Load balancers that work at the TCP level can't add an HTTP header, so
+//! they send a PROXY protocol header (HAProxy's, version 1 or 2) before
+//! anything else on the connection instead. `read_proxy_header` reads one,
+//! and the server only does so for connections from trusted proxies.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+/// The longest version 1 header, `\r\n` included, as the specification sets it.
+const V1_MAX_BYTES: usize = 107;
+
+/// The version 2 signature every binary header starts with.
+const V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+
+/// The most address and extension bytes a version 2 header may carry. The
+/// format allows 65535; real load balancers send far fewer.
+const V2_MAX_PAYLOAD: usize = 4096;
 
 /// A range of addresses: one address, or a CIDR block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +227,133 @@ fn parse_hop(hop: &str) -> Option<IpAddr> {
     Some(address.to_canonical())
 }
 
+/// Reads a PROXY protocol header, version 1 or 2, from the start of a
+/// connection, and nothing after it.
+///
+/// Version 1 is a text line such as `PROXY TCP4 203.0.113.7 10.0.0.5 51234 443\r\n`;
+/// version 2 is binary, after a fixed signature. Extension fields (TLVs) in
+/// version 2 are skipped.
+///
+/// Args:
+///     stream: The connection, before TLS or the WebSocket handshake.
+///
+/// Returns:
+///     The original client's address, or `None` when the header says the
+///     connection carries no client (version 1 `UNKNOWN`, version 2 `LOCAL`,
+///     or an address family other than IPv4 and IPv6), such as a load
+///     balancer's health check.
+///
+/// Raises:
+///     String: When the connection doesn't start with a valid header, or
+///         closes or fails before one is read.
+pub async fn read_proxy_header<R>(stream: &mut R) -> Result<Option<IpAddr>, String>
+where
+    R: AsyncRead + Unpin,
+{
+    let io = |e: std::io::Error| format!("reading the PROXY header failed: {e}");
+    let mut start = [0u8; 6];
+    stream.read_exact(&mut start).await.map_err(io)?;
+    if &start == b"PROXY " {
+        let mut line = start.to_vec();
+        while !line.ends_with(b"\r\n") {
+            if line.len() >= V1_MAX_BYTES {
+                return Err("the PROXY header is longer than 107 bytes".to_string());
+            }
+            line.push(stream.read_u8().await.map_err(io)?);
+        }
+        return parse_v1(&line[..line.len() - 2]);
+    }
+    if start != V2_SIGNATURE[..6] {
+        return Err("the connection didn't start with a PROXY header".to_string());
+    }
+    let mut rest = [0u8; 10];
+    stream.read_exact(&mut rest).await.map_err(io)?;
+    if rest[..6] != V2_SIGNATURE[6..] {
+        return Err("the connection didn't start with a PROXY header".to_string());
+    }
+    let (version_command, family) = (rest[6], rest[7]);
+    let length = usize::from(u16::from_be_bytes([rest[8], rest[9]]));
+    if version_command >> 4 != 2 {
+        return Err(format!(
+            "unsupported PROXY header version {}",
+            version_command >> 4
+        ));
+    }
+    if length > V2_MAX_PAYLOAD {
+        return Err(format!(
+            "the PROXY header carries {length} bytes, more than {V2_MAX_PAYLOAD}"
+        ));
+    }
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).await.map_err(io)?;
+    match version_command & 0x0f {
+        0 => Ok(None),
+        1 => parse_v2_source(family, &payload),
+        command => Err(format!("unknown PROXY header command {command}")),
+    }
+}
+
+/// Parses a version 1 line, without its `\r\n`.
+///
+/// Args:
+///     line: The line, starting with `PROXY `.
+///
+/// Returns:
+///     The source address, or `None` for `UNKNOWN`.
+///
+/// Raises:
+///     String: When the line is malformed.
+fn parse_v1(line: &[u8]) -> Result<Option<IpAddr>, String> {
+    let malformed = || "malformed PROXY header".to_string();
+    let text = std::str::from_utf8(line).map_err(|_| malformed())?;
+    let fields: Vec<&str> = text.split(' ').collect();
+    match fields.get(1).copied() {
+        Some("UNKNOWN") => Ok(None),
+        Some("TCP4") if fields.len() == 6 => fields[2]
+            .parse::<Ipv4Addr>()
+            .map(|address| Some(IpAddr::V4(address)))
+            .map_err(|_| malformed()),
+        Some("TCP6") if fields.len() == 6 => fields[2]
+            .parse::<Ipv6Addr>()
+            .map(|address| Some(IpAddr::V6(address).to_canonical()))
+            .map_err(|_| malformed()),
+        _ => Err(malformed()),
+    }
+}
+
+/// Reads the source address from a version 2 `PROXY` header's payload.
+///
+/// Args:
+///     family: The address family and transport byte.
+///     payload: The addresses, followed by any extension fields.
+///
+/// Returns:
+///     The source address, or `None` for families other than IPv4 and IPv6.
+///
+/// Raises:
+///     String: When the payload is too short for its family.
+fn parse_v2_source(family: u8, payload: &[u8]) -> Result<Option<IpAddr>, String> {
+    let short = || "the PROXY header is too short for its addresses".to_string();
+    match family >> 4 {
+        1 => {
+            if payload.len() < 12 {
+                return Err(short());
+            }
+            let address = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+            Ok(Some(IpAddr::V4(address)))
+        }
+        2 => {
+            if payload.len() < 36 {
+                return Err(short());
+            }
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&payload[..16]);
+            Ok(Some(IpAddr::V6(Ipv6Addr::from(bytes)).to_canonical()))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Unit tests for parsing trusted ranges and resolving client addresses.
 #[cfg(test)]
 mod tests {
@@ -314,5 +458,99 @@ mod tests {
             proxies.client_address(ip("::ffff:10.0.0.2"), &header("203.0.113.7")),
             ip("203.0.113.7")
         );
+    }
+
+    /// Builds a version 2 header.
+    ///
+    /// Args:
+    ///     command: 0 for `LOCAL`, 1 for `PROXY`.
+    ///     family: The family and transport byte.
+    ///     payload: The addresses and extensions.
+    ///
+    /// Returns:
+    ///     The header bytes.
+    fn v2(command: u8, family: u8, payload: &[u8]) -> Vec<u8> {
+        let mut header = V2_SIGNATURE.to_vec();
+        header.push(0x20 | command);
+        header.push(family);
+        header.extend((payload.len() as u16).to_be_bytes());
+        header.extend(payload);
+        header
+    }
+
+    /// Reads a header from bytes and returns what it gave and what was left.
+    ///
+    /// Args:
+    ///     bytes: The start of a connection.
+    ///
+    /// Returns:
+    ///     The outcome and the unread bytes.
+    async fn read(bytes: &[u8]) -> (Result<Option<IpAddr>, String>, Vec<u8>) {
+        let mut stream = bytes;
+        let outcome = read_proxy_header(&mut stream).await;
+        (outcome, stream.to_vec())
+    }
+
+    /// Checks version 1 headers for IPv4, IPv6 and `UNKNOWN`, and that the
+    /// bytes after the header are left for the WebSocket handshake.
+    #[tokio::test]
+    async fn version_1_headers_give_the_source() {
+        let (outcome, rest) = read(b"PROXY TCP4 203.0.113.7 10.0.0.5 51234 443\r\nGET /").await;
+        assert_eq!(outcome, Ok(Some(ip("203.0.113.7"))));
+        assert_eq!(rest, b"GET /");
+        let (outcome, _) = read(b"PROXY TCP6 2001:db8::7 2001:db8::1 51234 443\r\n").await;
+        assert_eq!(outcome, Ok(Some(ip("2001:db8::7"))));
+        let (outcome, _) = read(b"PROXY UNKNOWN\r\n").await;
+        assert_eq!(outcome, Ok(None));
+    }
+
+    /// Checks version 2 headers for IPv4 with extensions, IPv6 and `LOCAL`,
+    /// and that the bytes after the header are left.
+    #[tokio::test]
+    async fn version_2_headers_give_the_source() {
+        let mut ipv4 = vec![203, 0, 113, 7, 10, 0, 0, 5, 0xc8, 0x22, 0x01, 0xbb];
+        ipv4.extend([0x04, 0x00, 0x03, b'a', b'b', b'c']);
+        let mut bytes = v2(1, 0x11, &ipv4);
+        bytes.extend(b"GET /");
+        let (outcome, rest) = read(&bytes).await;
+        assert_eq!(outcome, Ok(Some(ip("203.0.113.7"))));
+        assert_eq!(rest, b"GET /");
+        let mut ipv6 = ip_bytes("2001:db8::7");
+        ipv6.extend(ip_bytes("2001:db8::1"));
+        ipv6.extend([0, 1, 0, 2]);
+        let (outcome, _) = read(&v2(1, 0x21, &ipv6)).await;
+        assert_eq!(outcome, Ok(Some(ip("2001:db8::7"))));
+        let (outcome, rest) = read(&[v2(0, 0x00, &[]), b"GET".to_vec()].concat()).await;
+        assert_eq!(outcome, Ok(None));
+        assert_eq!(rest, b"GET");
+    }
+
+    /// The 16 bytes of an IPv6 address.
+    ///
+    /// Args:
+    ///     text: The address.
+    ///
+    /// Returns:
+    ///     Its bytes.
+    fn ip_bytes(text: &str) -> Vec<u8> {
+        text.parse::<Ipv6Addr>().expect("IPv6").octets().to_vec()
+    }
+
+    /// Checks that missing, malformed, truncated and oversized headers are refused.
+    #[tokio::test]
+    async fn bad_headers_are_refused() {
+        for bytes in [
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            b"PROXY TCP4 not-an-ip 10.0.0.5 1 2\r\n".to_vec(),
+            b"PROXY TCP4 203.0.113.7\r\n".to_vec(),
+            b"PROXY TCP4 203.0.113.7 10.0.0.5 51234 443".to_vec(),
+            [b"PROXY ".to_vec(), vec![b'x'; 200]].concat(),
+            v2(1, 0x11, &[203, 0, 113]),
+            v2(5, 0x11, &[0; 12]),
+            [V2_SIGNATURE.to_vec(), vec![0x21, 0x11, 0xff, 0xff]].concat(),
+        ] {
+            let (outcome, _) = read(&bytes).await;
+            assert!(outcome.is_err(), "{bytes:?} gave {outcome:?}");
+        }
     }
 }

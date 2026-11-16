@@ -14,6 +14,7 @@ max_payload_bytes = 1048576
 outbound_queue_bytes = 16777216
 trusted_proxies = []
 max_connections_per_address = 0
+proxy_protocol = false
 tls_cert = ""
 tls_key = ""
 

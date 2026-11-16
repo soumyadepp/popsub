@@ -261,6 +261,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.outbound_queue_bytes` | `16777216` | Transport. The hard byte limit of each connection's outgoing queue; the soft limit is a sixteenth of it, at least 64 KiB |
 | `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
 | `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
+| `server.proxy_protocol` | `false` | Transport. Connections from `server.trusted_proxies` must start with a PROXY protocol header (version 1 or 2), whose address is the client's. Needs `server.trusted_proxies`, or startup stops |
 | `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
 | `server.tls_cert`, `server.tls_key` | empty | The binary. PEM certificate chain (leaf first) and private key; with both set the server serves `wss://`. Setting only one, or files that can't be read or don't match, stops startup |
 | `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
@@ -313,7 +314,8 @@ The defaults below are set in the `[limits]` section (section 9).
 | Publishing | username, shared by all of a user's connections | 100 a second, bursts of 50 |
 
 - Keying failed logins by address and username together means someone guessing a password from one machine locks out only themselves.
-- Limits use the client's address. By default that is the socket's peer, so behind a reverse proxy every client would share the proxy's address. List the proxies in `server.trusted_proxies` and, for connections from them only, the server reads `X-Forwarded-For` from the right, skipping trusted proxies; the first other address is the client. Addresses further left were written by the client and are ignored. A header from a peer that isn't listed is ignored entirely, so a client that reaches the server directly can't choose its own address. Only list proxies you run, and make sure they append to `X-Forwarded-For` rather than pass on what the client sent unchecked.
+- Limits use the client's address. By default that is the socket's peer, so behind a reverse proxy every client would share the proxy's address. List the proxies in `server.trusted_proxies` and, for connections from them only, the server reads `X-Forwarded-For` from the right, skipping trusted proxies; the first other address is the client. Addresses further left were written by the client and are ignored. A header from a peer that isn't listed is ignored entirely, so a client that reaches the server directly can't choose its own address.
+- TCP load balancers can't add HTTP headers, so with `server.proxy_protocol` on, a connection from a trusted proxy must start with a PROXY protocol header (HAProxy's format, version 1 text or version 2 binary, read before TLS). Its source address replaces the peer's, and `X-Forwarded-For` processing starts from there, so a TCP load balancer in front of an HTTP proxy in front of PopSub still resolves to the client. A trusted peer that sends no valid header within the handshake deadline is dropped; a header with no address (version 1 `UNKNOWN`, version 2 `LOCAL`, as health checks send) keeps the peer's. Version 2 extension fields are skipped. Peers that aren't trusted are never asked for a header. Only list proxies you run, and make sure they append to `X-Forwarded-For` rather than pass on what the client sent unchecked.
 - Every connection must finish its WebSocket handshake within 10 seconds, and at most `broker.max_connections` are open at once. With `server.max_connections_per_address` set, one client address may hold at most that many. Connections over either limit get `try_again_later` (1013).
 - The per-address limit is off by default because, behind a proxy that isn't in `server.trusted_proxies`, every client has the proxy's address and the limit would cap the whole server.
 - Idle limiter entries are pruned every minute, so memory doesn't grow with every address or username ever tried.
@@ -357,6 +359,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | More clients connect than `broker.max_connections` | Each one over the limit finishes its handshake and is closed with `try_again_later` (1013); clients reconnect with backoff. Connections already open are unaffected. |
 | One address opens many connections | With `server.max_connections_per_address` set, those over it are closed with `try_again_later`; other addresses are unaffected. Without it, one address can use up `broker.max_connections`. |
 | A socket connects and never sends a WebSocket handshake | It is dropped after 10 seconds, so it can't hold a connection slot. |
+| A trusted proxy connects without a PROXY header while `server.proxy_protocol` is on | Dropped once the header fails to parse or the handshake deadline passes. |
 | A client sends a made-up `X-Forwarded-For` | Ignored unless its socket peer is a trusted proxy. Through a trusted proxy, only the address the proxy appended counts. |
 | `accept` fails, for example out of file descriptors | Logged, and the accept loop retries after 100 ms. |
 | The port is taken, another server holds `storage.path`, or `storage.durability` is stronger than the backend provides | The binary logs the reason and exits with a failure status. |
@@ -385,7 +388,7 @@ Done: admin requests and `popsub users` to create accounts, grant and revoke top
 
 Done: an enforced connection limit and handshake timeout, rate limits in the `[limits]` settings, `server.trusted_proxies` so limits key on the real client behind a proxy, and a documented nginx setup.
 
-Done: a per-address connection limit, `server.max_connections_per_address`, off by default.
+Done: a per-address connection limit, `server.max_connections_per_address`, off by default, and PROXY protocol headers from TCP load balancers, `server.proxy_protocol`.
 
 ### Phase 3: adoptable
 

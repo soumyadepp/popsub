@@ -26,6 +26,7 @@ Update all of these together:
 - Tests pass `Some(HashMap::new())` (or their own map) as the environment so variables set on the machine running the tests can't leak in.
 - `broker.max_connections` is enforced by the transport through `SharedBroker::max_connections`; `0` means no limit.
 - `[limits]` (`LimitSettings`) holds the rate limits; the transport builds its limiters from it with `RateLimiters::from_settings`, which raises values below 1 to 1.
+- `server.proxy_protocol` only takes effect with `server.trusted_proxies`; the binary refuses to start with it on and the list empty.
 - `server.trusted_proxies` reads either a list (TOML) or one comma-separated string (the environment) through `list_or_commas`. Don't switch the environment source to `try_parsing` to get lists: it would turn secrets such as `1e5` into numbers.
 - `server.heartbeat_secs` and `server.idle_timeout_secs` set the transport's `Heartbeat`; values below 1 are treated as 1. `server.max_payload_bytes` sets the publish payload limit and, through it, the WebSocket frame limit. `server.outbound_queue_bytes` is each connection's hard outgoing queue limit; the soft limit is derived from it.
 - `broker.max_inflight` sizes each subscription's window of unacknowledged QoS 1 records; values below 1 behave as 1. `storage.session_expiry_secs` is how long a durable session outlives its last connection.

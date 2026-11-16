@@ -156,6 +156,7 @@ The settings you are most likely to change:
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
 | `server.max_payload_bytes` | 1 MiB | Largest publish |
+| `server.proxy_protocol` | `false` | Read PROXY protocol headers from trusted TCP load balancers |
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
 | `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
 | `server.max_connections_per_address` | `0` (no limit) | Connections one client address may hold. Set `trusted_proxies` first if you run behind a proxy |
@@ -200,6 +201,8 @@ location / {
     proxy_read_timeout 120s;
 }
 ```
+
+A TCP load balancer (such as AWS's Network Load Balancer, or HAProxy in TCP mode) can't add `X-Forwarded-For`. Turn on its PROXY protocol option, list it in `trusted_proxies`, and set `proxy_protocol = true`: PopSub then reads the client's address from the header it sends. Every connection from a listed proxy must carry one; connections from anywhere else are served as usual.
 
 Once the proxy is trusted, you can also cap connections per client with `server.max_connections_per_address`. `proxy_read_timeout` must be longer than `server.heartbeat_secs`, or the proxy will cut quiet connections. Entries in `trusted_proxies` can be CIDR ranges (`10.0.0.0/8`) for a fleet of proxies. Only list proxies you run: a client reaching PopSub directly could otherwise claim any address.
 

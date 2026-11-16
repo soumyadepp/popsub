@@ -51,7 +51,7 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::Message as WsMessage;
 use tungstenite::protocol::WebSocketConfig;
 
-use crate::proxy::TrustedProxies;
+use crate::proxy::{TrustedProxies, read_proxy_header};
 use crate::tls::ServerTls;
 
 use popsub_protocol::{
@@ -251,6 +251,8 @@ pub struct Server {
     handshake_timeout: Duration,
     /// The certificate to serve `wss://` with, or `None` for plain `ws://`.
     tls: Option<ServerTls>,
+    /// Whether connections from trusted proxies start with a PROXY protocol header.
+    proxy_protocol: bool,
 }
 
 impl Server {
@@ -278,6 +280,7 @@ impl Server {
             per_address: Arc::new(Mutex::new(HashMap::new())),
             handshake_timeout: HANDSHAKE_TIMEOUT,
             tls: None,
+            proxy_protocol: false,
             broker,
         }
     }
@@ -302,8 +305,9 @@ impl Server {
     ///
     /// The JWT secret and expiry, the admin user, whether self-registration
     /// is allowed, the role new users get (see `registration_role`), the
-    /// heartbeat, the payload limit, the outbound queue budget and the
-    /// per-address connection limit all come from `settings`. Rate limits are the defaults; pass the `[limits]`
+    /// heartbeat, the payload limit, the outbound queue budget, the
+    /// per-address connection limit and whether to read PROXY protocol
+    /// headers all come from `settings`. Rate limits are the defaults; pass the `[limits]`
     /// section through `RateLimiters::from_settings` and `with_rate_limiters`.
     /// `server.trusted_proxies` isn't applied here, because an invalid entry
     /// must stop startup: parse it with `TrustedProxies::parse` and pass it to
@@ -340,6 +344,7 @@ impl Server {
             .with_max_connections_per_address(
                 Some(settings.max_connections_per_address).filter(|max| *max > 0),
             )
+            .with_proxy_protocol(settings.proxy_protocol)
     }
 
     /// Replaces the default rate limits.
@@ -388,6 +393,20 @@ impl Server {
     ///     The server with the new limit.
     pub fn with_max_connections_per_address(mut self, max: Option<usize>) -> Self {
         self.max_per_address = max;
+        self
+    }
+
+    /// Reads a PROXY protocol header at the start of every connection from a
+    /// trusted proxy, before TLS and the WebSocket handshake. Connections
+    /// from other peers are served without one.
+    ///
+    /// Args:
+    ///     enabled: Whether to read the header.
+    ///
+    /// Returns:
+    ///     The server with the setting applied.
+    pub fn with_proxy_protocol(mut self, enabled: bool) -> Self {
+        self.proxy_protocol = enabled;
         self
     }
 
@@ -535,10 +554,15 @@ impl Server {
         }
     }
 
-    /// Starts serving an accepted socket: performs the TLS handshake when the
-    /// server has TLS, then hands over to `run_connection`. The TLS and
-    /// WebSocket handshakes share one deadline, the handshake timeout from
-    /// `accept`, so a socket can't hold its slot by stalling either.
+    /// Starts serving an accepted socket: reads the PROXY protocol header
+    /// when the server expects one and the peer is a trusted proxy, performs
+    /// the TLS handshake when the server has TLS, then hands over to
+    /// `run_connection`. The header, TLS and WebSocket handshakes share one
+    /// deadline, the handshake timeout from `accept`, so a socket can't hold
+    /// its slot by stalling any of them. A trusted peer that sends no valid
+    /// header is dropped. The header's address becomes the connection's
+    /// source, which `X-Forwarded-For` processing then starts from; a header
+    /// without one (a health check) leaves the peer's address.
     ///
     /// Args:
     ///     stream: The accepted TCP connection.
@@ -553,14 +577,30 @@ impl Server {
         over_limit: bool,
     ) {
         let deadline = Instant::now() + self.handshake_timeout;
+        let mut stream = stream;
+        let mut source = peer.ip();
+        if self.proxy_protocol && self.trusted_proxies.trusts(peer.ip()) {
+            match tokio::time::timeout_at(deadline, read_proxy_header(&mut stream)).await {
+                Ok(Ok(Some(address))) => source = address,
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    warn!(%peer, %e, "dropping a connection without a valid PROXY header");
+                    return;
+                }
+                Err(_) => {
+                    warn!(%peer, "PROXY header timed out");
+                    return;
+                }
+            }
+        }
         let Some(tls) = self.tls.clone() else {
-            self.run_connection(stream, peer, slot, over_limit, deadline)
+            self.run_connection(stream, peer, source, slot, over_limit, deadline)
                 .await;
             return;
         };
         match tokio::time::timeout_at(deadline, tls.acceptor().accept(stream)).await {
             Ok(Ok(stream)) => {
-                self.run_connection(stream, peer, slot, over_limit, deadline)
+                self.run_connection(stream, peer, source, slot, over_limit, deadline)
                     .await;
             }
             Ok(Err(e)) => warn!(%peer, %e, "TLS handshake failed"),
@@ -595,6 +635,8 @@ impl Server {
     /// Args:
     ///     stream: The accepted connection, after TLS if the server has it.
     ///     peer: The connection's remote address.
+    ///     source: Where the connection comes from: the PROXY header's
+    ///         address when there was one, otherwise the peer's.
     ///     _slot: This connection's place in the open connection count,
     ///         released when the connection ends.
     ///     over_limit: Whether the server was already at its connection
@@ -604,6 +646,7 @@ impl Server {
         self,
         stream: S,
         peer: SocketAddr,
+        source: IpAddr,
         _slot: ConnectionSlot,
         over_limit: bool,
         deadline: Instant,
@@ -635,9 +678,7 @@ impl Server {
                 return;
             }
         };
-        let client_ip = self
-            .trusted_proxies
-            .client_address(peer.ip(), &forwarded_for);
+        let client_ip = self.trusted_proxies.client_address(source, &forwarded_for);
         if over_limit {
             warn!(%peer, %client_ip, "at the connection limit, refusing a connection");
             refuse(&mut ws_stream, CloseCode::TryAgainLater).await;

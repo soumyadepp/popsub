@@ -123,6 +123,7 @@ async fn main() -> ExitCode {
 ///         the wrong type, including an unknown backend or durability name.
 ///     String: When published default secrets are set and the host is not a loopback address.
 ///     String: When an entry in `server.trusted_proxies` isn't an IP address or CIDR range.
+///     String: When `server.proxy_protocol` is on with no trusted proxies.
 ///     String: When only one of `server.tls_cert` and `server.tls_key` is set,
 ///         or they can't be read or don't match.
 ///     String: When the storage backend can't be opened, for example because
@@ -169,6 +170,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let users = open_users(&config.storage)?;
     let proxies = TrustedProxies::parse(&config.server.trusted_proxies)
         .map_err(|e| format!("server.trusted_proxies: {e}"))?;
+    if config.server.proxy_protocol && proxies.is_empty() {
+        return Err(
+            "server.proxy_protocol is on but server.trusted_proxies is empty; list the load balancers that send the header"
+                .into(),
+        );
+    }
     if !proxies.is_empty() {
         info!(
             proxies = config.server.trusted_proxies.len(),

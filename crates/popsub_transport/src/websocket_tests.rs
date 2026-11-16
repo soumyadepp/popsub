@@ -2238,3 +2238,86 @@ fn mismatched_tls_material_is_refused() {
     assert!(crate::ServerTls::from_pem(b"", key.as_bytes()).is_err());
     assert!(crate::ServerTls::from_pem(cert.as_bytes(), b"").is_err());
 }
+
+/// Connects, sends a PROXY protocol header, then does the WebSocket handshake.
+///
+/// Args:
+///     addr: The server's address.
+///     header: The PROXY header bytes.
+///
+/// Returns:
+///     The connection, or the handshake error.
+async fn proxied_connection(
+    addr: std::net::SocketAddr,
+    header: &[u8],
+) -> Result<TestSocket, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(header).await.expect("write the header");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async("ws://localhost/", stream),
+    )
+    .await
+    .expect("the server answers in time")
+    .map(|(ws, _)| ws)
+    .map_err(|e| e.to_string())
+}
+
+/// A version 2 PROXY header for an IPv4 client.
+///
+/// Args:
+///     client: The client's address.
+///
+/// Returns:
+///     The header bytes.
+fn proxy_v2(client: std::net::Ipv4Addr) -> Vec<u8> {
+    let mut header = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    header.extend([0x21, 0x11, 0, 12]);
+    header.extend(client.octets());
+    header.extend([127, 0, 0, 1, 0xc8, 0x22, 0x1f, 0x90]);
+    header
+}
+
+/// Checks that with `proxy_protocol` on, the login limits key on the
+/// address from the PROXY header (version 1 or 2), and that a trusted peer
+/// sending no header is dropped.
+#[tokio::test]
+async fn proxy_protocol_headers_give_the_client_address() {
+    let mut settings = Settings::default();
+    settings.server.proxy_protocol = true;
+    let proxies = crate::TrustedProxies::parse(&["127.0.0.1"]).expect("parse");
+    let addr = start_configured(&settings, |server| {
+        server
+            .with_rate_limiters(two_strikes())
+            .with_trusted_proxies(proxies)
+    })
+    .await;
+    let mut guesser = proxied_connection(addr, b"PROXY TCP4 203.0.113.1 127.0.0.1 51234 8080\r\n")
+        .await
+        .expect("v1 handshake");
+    let locked = two_bad_logins_then_a_good_one(&mut guesser).await;
+    assert_eq!(locked["code"], "locked_out", "{locked}");
+
+    let mut same = proxied_connection(addr, &proxy_v2("203.0.113.1".parse().expect("ip")))
+        .await
+        .expect("v2 handshake");
+    let login = send_raw(
+        &mut same,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["code"], "locked_out", "{login}");
+
+    let mut other = proxied_connection(addr, &proxy_v2("198.51.100.2".parse().expect("ip")))
+        .await
+        .expect("v2 handshake");
+    let login = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in", "{login}");
+
+    assert!(proxied_connection(addr, b"").await.is_err());
+}
