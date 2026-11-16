@@ -154,7 +154,7 @@ The README and the portfolio both describe PopSub as at-least-once. That is only
 - On write, if the tree exceeds `max_messages_per_topic`, the oldest keys are deleted.
 - On read, keys older than `ttl_seconds` are deleted first.
 - The binary opens the store at `pubsub_db` relative to the working directory, with the TTL from `broker.message_ttl_secs` and a cap of 1000 messages per topic. The path and cap aren't configurable. `sled` locks the directory, so a second server started from the same directory exits with an error instead of sharing it.
-- `Broker::new` (used by tests and `Broker::default`) still opens `Persistence::default()`, which panics when the store can't be opened.
+- The broker never opens a store itself: `Broker::new` takes an open `Persistence`, so a store that can't be opened is an error the caller reports, not a panic.
 - `sled` 0.34 has been the stable line for years while its successor stays in alpha. It is fine for this scale, but it is a dependency risk worth tracking.
 
 ## 8. Concurrency
@@ -250,9 +250,7 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 8. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
 9. Token expiry is only checked at `auth`.
 10. `max_connections` is ignored, the storage path and per-topic cap are hard-coded, and rate limits aren't configurable.
-11. Two versions of the `config` crate in the workspace (`popsub_utils` uses 0.13, `popsub_config` uses 0.15), so `PopSubError::Config` can't wrap errors from the loader.
-12. `popsub_broker` depends on `tempfile` at runtime because `Broker::default` branches on `cfg!(test)`.
-13. No client libraries, release artefacts, health check or metrics.
+11. No client libraries, release artefacts, health check or metrics.
 
 ## 13. Proposed direction
 

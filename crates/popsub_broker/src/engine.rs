@@ -13,7 +13,6 @@
 //! resends unacknowledged messages and drops them after `max_retries`
 //! resends; `SharedBroker::run_retry_loop` calls it on a timer.
 
-use popsub_config::Settings;
 use std::collections::HashMap;
 
 use crate::message::Message;
@@ -66,56 +65,11 @@ impl Broker {
     pub const ACK_TIMEOUT: Duration = Duration::from_millis(5000);
 }
 
-impl Default for Broker {
-    /// Creates a broker with the default broker settings.
-    ///
-    /// In test builds the store is opened in a fresh temporary directory. The
-    /// `TempDir` handle is dropped when this function returns, so the
-    /// directory is removed while the store still has it open. Outside tests
-    /// this calls `Broker::new`, which opens `pubsub_db` in the working
-    /// directory. Panics if the temporary directory or the store can't be
-    /// created.
-    ///
-    /// Returns:
-    ///     An empty broker.
-    fn default() -> Self {
-        if cfg!(test) {
-            let dir = tempfile::tempdir().expect("Failed to create temp dir");
-            let persistence =
-                Persistence::new(dir.path().to_str().expect("path to_str failed"), None, None)
-                    .expect("Failed to create persistence");
-            Self::new_with_persistence(persistence, Settings::default().broker)
-        } else {
-            Self::new(Settings::default().broker)
-        }
-    }
-}
-
 impl Broker {
-    /// Creates an empty broker backed by the default persistence store.
-    ///
-    /// The store is `Persistence::default()`, which always opens `pubsub_db`
-    /// in the working directory with its own TTL, so `message_ttl_secs` from
-    /// the settings is not applied. Panics if the store can't be opened.
-    ///
-    /// Args:
-    ///     settings: ACK timeout and retry limit for QoS 1 messages.
-    ///
-    /// Returns:
-    ///     A broker with no topics, clients or pending messages.
-    pub fn new(settings: BrokerSettings) -> Self {
-        Self {
-            topics: HashMap::new(),
-            clients: HashMap::new(),
-            pending_acks: HashMap::new(),
-            persistence: Persistence::default(),
-            settings,
-        }
-    }
-
     /// Creates an empty broker backed by the given persistence store.
     ///
-    /// Use this in tests or wherever the store's path and limits need to be chosen.
+    /// The caller opens the store, so it chooses the path, TTL and per-topic
+    /// cap, and can report a failure to open it instead of panicking.
     ///
     /// Args:
     ///     persistence: The store to write published messages to and replay from.
@@ -123,7 +77,7 @@ impl Broker {
     ///
     /// Returns:
     ///     A broker with no topics, clients or pending messages.
-    pub fn new_with_persistence(persistence: Persistence, settings: BrokerSettings) -> Self {
+    pub fn new(persistence: Persistence, settings: BrokerSettings) -> Self {
         Self {
             topics: HashMap::new(),
             clients: HashMap::new(),

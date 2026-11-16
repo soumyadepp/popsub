@@ -25,4 +25,4 @@ Update all of these together:
 - `server.allow_registration` (default false) and `server.registration_role` (`none`, `readonly` or `full`, default `none`) are passed to the auth crate by the transport.
 - Tests pass `Some(HashMap::new())` (or their own map) as the environment so variables set on the machine running the tests can't leak in.
 - `max_connections` is loaded but nothing reads it yet. `message_ttl_secs` sets the message store's TTL.
-- This crate uses the `config` crate at 0.15 while `popsub_utils` uses 0.13. Align them before relying on `PopSubError::Config`.
+- `popsub_utils` uses the same `config` version (0.15), so `PopSubError::Config` can wrap loader errors. Bump both together.

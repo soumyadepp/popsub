@@ -25,10 +25,6 @@ pub enum PopSubError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// A lock couldn't be taken. Nothing in the workspace returns this yet.
-    #[error("Lock error")]
-    Lock,
-
     /// A frame couldn't be handed to a connected client, described by the message.
     #[error("Client error: {0}")]
     Client(String),
