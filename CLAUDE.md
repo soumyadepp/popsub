@@ -36,7 +36,8 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topics, routing, QoS 1 retries, replay |
-| `crates/popsub_persistence` | `sled` storage of recent messages per topic |
+| `crates/popsub_persistence` | `sled` storage of recent messages per topic (being replaced by `popsub_storage`) |
+| `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the memory backend and the conformance suite. Nothing uses it yet. |
 | `crates/popsub_client` | `Client`, the server-side record of one connection (not a client library) |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
 | `crates/popsub_utils` | `PopSubError`, `Result`, logging |

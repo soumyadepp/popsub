@@ -53,6 +53,7 @@ This document describes how the system works today, where its guarantees hold an
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | The engine: topics, subscriber sets, publishing, QoS 1 pending table and retries, replay on subscribe. Synchronous API, shared through `SharedBroker`. |
 | `popsub_persistence` | `sled` store of recent messages per topic, with a TTL and a per-topic cap. |
+| `popsub_storage` | The storage layer proposed in `docs/STORAGE.md`: per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, an in-memory backend and the conformance suite every backend must pass. Not wired into the broker yet. |
 | `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
 | `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
 | `popsub_utils` | `PopSubError`, the shared `Result` alias, and logging setup. |

@@ -1528,6 +1528,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "popsub_storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+]
+
+[[package]]
 name = "popsub_transport"
 version = "0.1.0"
 dependencies = [

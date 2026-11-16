@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposal, for review before implementation |
+| Status | Being implemented. Step 1 of the rollout (the `popsub_storage` crate) is done |
 | Owner | Soumyadeep Ghosh |
 | Replaces | `popsub_persistence` (the `sled` replay store) and the in-memory `pending_acks` table |
 | Related | `docs/DESIGN.md` sections 6, 7, 12 and 13 (phase 1) |
@@ -99,14 +99,16 @@ pub trait MessageLog: Send + Sync {
     /// Returns up to `max` records with seq >= from, in seq order.
     async fn read(&self, topic: &str, from: u64, max: usize) -> Result<Vec<Record>>;
 
-    /// The first and last retained seq, or None for an empty or unknown topic.
-    async fn bounds(&self, topic: &str) -> Result<Option<(u64, u64)>>;
+    /// The first retained seq and the last seq ever appended. An unknown
+    /// topic is 1..=0; a fully trimmed one keeps its last seq.
+    async fn bounds(&self, topic: &str) -> Result<LogBounds>;
 
     /// The first seq published at or after `time_ms`, for "replay since".
     async fn seq_at(&self, topic: &str, time_ms: i64) -> Result<Option<u64>>;
 
     /// Trims records outside the policy and returns how many were removed.
-    async fn trim(&self, topic: &str, policy: &Retention) -> Result<u64>;
+    /// `now_ms` is passed in so the age limit is testable.
+    async fn trim(&self, topic: &str, policy: &Retention, now_ms: i64) -> Result<u64>;
 
     /// Every topic that has a log.
     async fn topics(&self) -> Result<Vec<String>>;
@@ -146,6 +148,8 @@ pub struct Capabilities {
 
 pub enum Durability { None, Buffered, Synced }
 ```
+
+`LogBounds` keeps the last `seq` even when every record has been trimmed, so a caller can always tell what the next `seq` will be (the broker needs that for `from: "new"`). Each log also keeps publish times non-decreasing: a record whose `published_at_ms` is earlier than the previous record's is stored with the previous record's time, so `seq_at` is a binary search.
 
 **Why two traits.** Logs and cursors have different access patterns (sequential append and scan versus small random updates). Splitting them lets a backend implement each well, and lets a future setup keep logs in one place and cursors in another. Most backends implement both on one type.
 
@@ -306,8 +310,20 @@ max_inflight = 100
 `popsub_storage` exports a test suite that any backend runs against itself:
 
 ```rust
-popsub_storage::conformance_tests!(|| async { MyStorage::open_temp().await });
+struct TempDirFixture(tempfile::TempDir);
+
+impl popsub_storage::conformance::Fixture for TempDirFixture {
+    type Storage = MyStorage;
+
+    async fn open(&self) -> MyStorage {
+        MyStorage::open(self.0.path()).await.unwrap()
+    }
+}
+
+popsub_storage::conformance_tests!(TempDirFixture(tempfile::tempdir().unwrap()));
 ```
+
+The suite is behind the `conformance` feature. Each generated test builds a new fixture, and opening the same fixture again must reach the same data, which is how reopen is tested. Checks that need persistence or `synced` pass trivially on backends whose `capabilities()` don't offer them.
 
 It checks, with the backend reopened between steps where persistence matters:
 
@@ -316,9 +332,11 @@ It checks, with the backend reopened between steps where persistence matters:
 - Retention by count, age and bytes trims from the front only.
 - Appending the same `(topic, publisher, message_id)` twice returns the same `seq`.
 - Cursors only move forward, and survive reopen when `persistent` is true.
+- Publish times never decrease along a log, and `seq_at` finds the first record at or after a time.
 - Concurrent appends to one topic produce one gap-free sequence.
 - Appends to different topics don't interfere.
-- Errors are returned, never panics.
+- Durability stronger than the backend offers is refused with `Unsupported` and stores nothing.
+- Acks for unknown subscriptions are ignored, and `expire` removes idle sessions with their subscriptions.
 
 The `file` backend also gets a crash test: a child process appends with `synced` durability and is killed at random points, and every confirmed `seq` must be readable afterwards.
 
@@ -346,10 +364,12 @@ Stacked pull requests, each merged on its own with tests:
 
 The delivery semantics table in `docs/DESIGN.md` section 6 is updated in PR 3, where the guarantees actually change.
 
-## 14. Open questions
+## 14. Decisions taken for implementation
 
-1. **Per-topic retention.** Allow overrides by topic pattern in config (`"metrics/#" = { max_age_secs = 60 }`), or keep one global policy for now?
-2. **Default for ephemeral subscribers.** `"new"` (no replay unless asked) is the least surprising for a pub/sub broker, but today's behaviour replays everything. Changing the default is a visible behaviour change.
-3. **Slow subscribers versus retention.** This proposal lets retention win and tells the client. An alternative is a per-topic option to block trimming behind the slowest durable cursor, at the cost of unbounded storage.
-4. **Payload type.** Switch to bytes now (base64 in JSON frames) while the record format is being defined, or keep strings?
-5. **Protocol versioning.** Tagging deliveries and changing `ack` breaks existing clients. Accept it now (there are no external clients yet), or add a `protocol` field to `auth` and support both for one release?
+These were open questions in the proposal. Implementation goes ahead with the proposal's defaults; any of them can still change before the step that depends on it.
+
+1. **Per-topic retention:** one global policy for now. Overrides by topic pattern can be added later without changing the traits, because `trim` already takes the policy per call.
+2. **Default for ephemeral subscribers:** `"new"`. This is a visible change from today's replay-everything behaviour and is called out in the README when it ships (step 2).
+3. **Slow subscribers versus retention:** retention wins, and the client is told with a `truncated` frame.
+4. **Payload type:** strings stay. The record format can move to bytes later as its own change.
+5. **Protocol versioning:** accept the break now; there are no external clients yet.

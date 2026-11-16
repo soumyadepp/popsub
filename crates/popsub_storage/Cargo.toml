@@ -1,0 +1,20 @@
+[package]
+name = "popsub_storage"
+version = "0.1.0"
+edition = "2024"
+description = "Topic logs, subscription cursors and pluggable storage backends for PopSub"
+license = "Apache-2.0"
+
+[features]
+default = []
+conformance = ["dep:tokio"]
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
