@@ -1,6 +1,6 @@
 # popsub (binary)
 
-The CLI. Loads config, refuses to start on a non-loopback host while published default secrets are set (warns on localhost), builds the broker, spawns the retry loop and runs the WebSocket server until Ctrl+C. Also has a `client` subcommand and `examples/simple_client.rs` that walk through login, auth, subscribe and publish.
+The CLI. Loads config, refuses to start on a non-loopback host while published default secrets are set (warns on localhost), opens the message store in `DATA_DIR`, builds a `SharedBroker`, spawns its retry loop and runs `Server::from_settings(...).listen(...)` until Ctrl+C. Any startup failure (bad config, locked store, port in use) is logged and the process exits with a failure status. Also has a `client` subcommand and `examples/simple_client.rs` that walk through login, auth, subscribe and publish.
 
 ## Structure
 

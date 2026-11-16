@@ -1,37 +1,44 @@
 //! WebSocket server that turns JSON protocol frames into broker operations.
 //!
-//! Each accepted connection gets a `Client` registered with the `Broker`, a
-//! reader loop that parses frames and dispatches them, and a send loop that
-//! drains the client's outgoing channel onto the socket. Only `login`,
-//! `register` and `auth` are accepted before the connection presents a valid
-//! JWT; anything else sent first, or a failed `auth`, closes the connection.
-//! Subscribe and publish are then checked against the user's topic permissions
-//! in `AuthService`, and login, registration and publishing are rate limited.
+//! `Server` holds what every connection shares: the broker, the auth service
+//! and the rate limiters. Each accepted connection gets a `Session`, which
+//! owns that connection's id, remote address and outgoing channel, and has
+//! one method per client message type. Only `register`, `login` and `auth`
+//! are accepted before the connection presents a valid JWT; anything else
+//! sent first, or a failed `auth`, closes the connection. Subscribe and
+//! publish are checked against the user's topic permissions, and login,
+//! registration and publishing are rate limited.
 //!
-//! The broker is a `std::sync::Mutex` shared by every connection, so no handler
-//! holds it across an `.await`. Handlers that need both the broker and the auth
-//! service read what they need from the broker, release it, await the auth
-//! check, and then take the broker lock again.
+//! Replies go straight onto the session's own outgoing channel, so sending
+//! one never takes the broker lock. The broker is only reached through
+//! `SharedBroker::with`, whose closures can't await, and the auth lock is
+//! always released before the broker lock is taken.
 
-use futures_util::{SinkExt, StreamExt};
-use popsub_auth::{AuthError, AuthService};
-use popsub_ratelimit::{LoginRateLimiter, RateLimiter, SlidingWindow, TokenBucket};
-use popsub_utils::error::{PopSubError, Result};
-use tokio::net::TcpListener;
-use tokio::spawn;
-use tokio::sync::{RwLock, mpsc};
-use tokio_tungstenite::accept_async;
-use tungstenite::protocol::Message as WsMessage;
-
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
+use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
+use popsub_broker::SharedBroker;
+use popsub_broker::message::Message;
+use popsub_client::Client;
+use popsub_config::ServerSettings;
+use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
+use popsub_utils::error::{PopSubError, Result};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::accept_async;
 use tracing::{error, info, warn};
+use tungstenite::protocol::Message as WsMessage;
 
 use crate::message::{ClientMessage, ServerMessage};
-use popsub_broker::engine::Broker;
-use popsub_client::Client;
+
+/// How long the accept loop waits after a failed `accept` before trying again,
+/// so a persistent error such as running out of file descriptors doesn't spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The rate limiters one WebSocket server shares across all its connections.
 ///
@@ -115,329 +122,726 @@ impl Default for RateLimiters {
     }
 }
 
-/// Runs the WebSocket server with an existing auth service and the default
-/// rate limits from `RateLimiters::default`.
+/// The WebSocket server: shared state plus the accept loop.
 ///
-/// Panics if `addr` can't be bound. See
-/// `start_websocket_server_with_rate_limiting` for how connections are served.
-///
-/// Args:
-///     addr: The address to listen on, such as `127.0.0.1:8080`.
-///     broker: The broker shared by every connection.
-///     auth_service: Handles register, login and token checks, and decides
-///         which topics each user may subscribe and publish to.
-pub async fn start_websocket_server_with_auth(
-    addr: String,
-    broker: Arc<Mutex<Broker>>,
-    auth_service: Arc<RwLock<AuthService>>,
-) {
-    start_websocket_server_with_rate_limiting(addr, broker, auth_service, RateLimiters::default())
-        .await
+/// Build one with `Server::new` or `Server::from_settings`, optionally replace
+/// the rate limits with `with_rate_limiters`, then call `listen` or `serve`.
+/// Cloning is cheap and every clone shares the same broker, users and limits.
+#[derive(Clone)]
+pub struct Server {
+    /// The broker every connection publishes and subscribes through.
+    broker: SharedBroker,
+    /// Users, passwords, tokens and topic permissions.
+    auth: Arc<RwLock<AuthService>>,
+    /// Limits shared by every connection on this server.
+    limiters: RateLimiters,
 }
 
-/// Runs the WebSocket server with an existing auth service and the given rate
-/// limiters.
-///
-/// Spawns a background task that prunes idle limiter entries every
-/// `PRUNE_INTERVAL`, then accepts connections until `accept` fails. Each
-/// connection runs in its own task: after the WebSocket handshake it registers
-/// a `Client` with the broker, starts the send loop, and reads text frames,
-/// parsing each one before taking any lock and passing it to `handle_message`.
-/// Frames that aren't valid JSON protocol messages are logged and skipped.
-/// The connection closes when the socket ends, when a handler asks to
-/// disconnect, or when a handler returns an error, in which case the client is
-/// first sent an `internal server error` frame. The client is removed from the
-/// broker exactly once, by whichever of the reader and send loops finishes
-/// first, guarded by an `AtomicBool`.
-///
-/// Panics if `addr` can't be bound or the broker mutex is poisoned.
-///
-/// Args:
-///     addr: The address to listen on, such as `127.0.0.1:8080`.
-///     broker: The broker shared by every connection.
-///     auth_service: Handles register, login and token checks, and decides
-///         which topics each user may subscribe and publish to.
-///     rate_limiters: The limiters shared by every connection on this server.
-pub async fn start_websocket_server_with_rate_limiting(
-    addr: String,
-    broker: Arc<Mutex<Broker>>,
-    auth_service: Arc<RwLock<AuthService>>,
-    rate_limiters: RateLimiters,
-) {
-    let listener = TcpListener::bind(addr.clone()).await.expect("Can't bind");
-
-    info!("WebSocket server listening on ws://{}", addr);
-
-    {
-        let rate_limiters = rate_limiters.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(PRUNE_INTERVAL);
-            loop {
-                ticker.tick().await;
-                let pruned = rate_limiters.prune_idle();
-                if pruned > 0 {
-                    info!(pruned, "pruned idle rate limiter entries");
-                }
-            }
-        });
+impl Server {
+    /// Creates a server with the default rate limits.
+    ///
+    /// Args:
+    ///     broker: The broker every connection shares.
+    ///     auth: The service that handles register, login and token checks
+    ///         and decides which topics each user may use.
+    ///
+    /// Returns:
+    ///     A server ready to `listen` or `serve`.
+    pub fn new(broker: SharedBroker, auth: Arc<RwLock<AuthService>>) -> Self {
+        Self {
+            broker,
+            auth,
+            limiters: RateLimiters::default(),
+        }
     }
 
-    while let Ok((stream, peer)) = listener.accept().await {
-        let peer_ip = peer.ip().to_string();
-        let broker = broker.clone();
-        let auth_service = auth_service.clone();
-        let rate_limiters = rate_limiters.clone();
+    /// Creates a server whose auth service is configured from the `[server]` settings.
+    ///
+    /// The JWT secret and expiry, the admin user, whether self-registration
+    /// is allowed and the role new users get (see `registration_role`) all
+    /// come from `settings`. Rate limits are the defaults.
+    ///
+    /// Args:
+    ///     broker: The broker every connection shares.
+    ///     settings: The `[server]` section of the loaded configuration.
+    ///
+    /// Returns:
+    ///     A server ready to `listen` or `serve`.
+    pub async fn from_settings(broker: SharedBroker, settings: &ServerSettings) -> Self {
+        let config = AuthConfig::new(&settings.jwt_secret)
+            .with_expiration(settings.jwt_expiration_hours)
+            .with_admin(&settings.username, &settings.password)
+            .with_registration(settings.allow_registration)
+            .with_default_role(registration_role(&settings.registration_role));
+        let auth = Arc::new(RwLock::new(AuthService::new(config).await));
+        Self::new(broker, auth)
+    }
 
-        tokio::spawn(async move {
-            let ws_stream = match accept_async(stream).await {
-                Ok(ws) => ws,
+    /// Replaces the default rate limits.
+    ///
+    /// Args:
+    ///     limiters: The limiters to use for every connection.
+    ///
+    /// Returns:
+    ///     The server with the new limits.
+    pub fn with_rate_limiters(mut self, limiters: RateLimiters) -> Self {
+        self.limiters = limiters;
+        self
+    }
+
+    /// Binds `addr` and serves connections on it until the future is dropped.
+    ///
+    /// Args:
+    ///     addr: The address to listen on, such as `127.0.0.1:8080`.
+    ///
+    /// Raises:
+    ///     std::io::Error: When the address can't be bound.
+    pub async fn listen(self, addr: &str) -> std::io::Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        info!(
+            "WebSocket server listening on ws://{}",
+            listener.local_addr()?
+        );
+        self.serve(listener).await;
+        Ok(())
+    }
+
+    /// Serves connections on an already bound listener until the future is dropped.
+    ///
+    /// Taking a bound listener lets tests bind port 0 and learn the real port
+    /// before the server starts. A background task prunes idle rate limiter
+    /// entries every `PRUNE_INTERVAL` and is stopped when this future is
+    /// dropped. A failed `accept` is logged and retried after
+    /// `ACCEPT_BACKOFF` instead of stopping the server. Each connection runs
+    /// in its own task.
+    ///
+    /// Args:
+    ///     listener: The bound listener to accept connections from.
+    pub async fn serve(self, listener: TcpListener) {
+        let _pruner = AbortOnDrop(tokio::spawn(prune_forever(self.limiters.clone())));
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    tokio::spawn(self.clone().run_connection(stream, peer));
+                }
                 Err(e) => {
-                    eprintln!("WebSocket handshake error: {e}");
-                    return;
-                }
-            };
-
-            let (ws_sender, mut ws_receiver) = ws_stream.split();
-            let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
-            let client = Client::new(tx.clone());
-            let client_id = client.id.clone();
-
-            {
-                let mut broker = broker.lock().expect("Broker lock poisoned");
-                broker.register_client(client);
-            }
-
-            let cleanup_called = Arc::new(AtomicBool::new(false));
-
-            let do_cleanup = {
-                let broker = broker.clone();
-                let client_id = client_id.clone();
-                let cleanup_called = cleanup_called.clone();
-
-                move || {
-                    if !cleanup_called.swap(true, Ordering::SeqCst) {
-                        let mut broker = broker.lock().expect("Broker lock poisoned");
-                        broker.cleanup_client(&client_id);
-                    }
-                }
-            };
-
-            spawn_send_loop(ws_sender, rx, client_id.clone(), do_cleanup.clone());
-
-            while let Some(Ok(msg)) = ws_receiver.next().await {
-                if msg.is_text() {
-                    let text = match msg.to_text() {
-                        Ok(text) => text,
-                        Err(_) => {
-                            warn!(client_id = %client_id, "Received non-text message");
-                            continue;
-                        }
-                    };
-
-                    let parsed = match serde_json::from_str::<ClientMessage>(text) {
-                        Ok(pm) => pm,
-                        Err(err) => {
-                            error!(
-                                client_id = %client_id,
-                                "Invalid client message: {} | {}",
-                                err,
-                                &text.chars().take(100).collect::<String>()
-                            );
-                            continue;
-                        }
-                    };
-
-                    let result = handle_message(
-                        &broker,
-                        &auth_service,
-                        &rate_limiters,
-                        &client_id,
-                        &peer_ip,
-                        parsed,
-                    )
-                    .await;
-
-                    match result {
-                        Ok(should_continue) => {
-                            if !should_continue {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!(client_id = %client_id, "Error handling message: {}", e);
-                            let broker_lock = broker.lock().expect("Broker lock poisoned");
-                            if let Some(client) = broker_lock.clients.get(&client_id) {
-                                let response = ServerMessage::Error {
-                                    message: "internal server error".to_string(),
-                                };
-                                if let Ok(json) = serde_json::to_string(&response) {
-                                    let _ = client.sender.send(WsMessage::Text(json.into()));
-                                }
-                            }
-                            break;
-                        }
-                    }
+                    warn!(%e, "accepting a connection failed");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
                 }
             }
+        }
+    }
 
-            do_cleanup();
-        });
+    /// Runs one connection from handshake to cleanup.
+    ///
+    /// After the WebSocket handshake a `Client` is registered with the broker
+    /// and a send loop starts draining the client's outgoing channel. Text
+    /// frames are parsed and passed to the session; invalid JSON is logged
+    /// and skipped, and binary frames are ignored. The connection ends when
+    /// the socket closes, a handler asks to close it, or a handler fails, in
+    /// which case the client is sent an `internal server error` frame first.
+    /// The client is removed from the broker once, by whichever of this loop
+    /// and the send loop finishes first.
+    ///
+    /// Args:
+    ///     stream: The accepted TCP connection.
+    ///     peer: The connection's remote address, used for rate limit keys.
+    async fn run_connection(self, stream: TcpStream, peer: SocketAddr) {
+        let ws_stream = match accept_async(stream).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                warn!(%peer, %e, "WebSocket handshake failed");
+                return;
+            }
+        };
+        let (ws_sender, mut ws_receiver) = ws_stream.split();
+        let (outbox, rx) = mpsc::unbounded_channel::<WsMessage>();
+        let client = Client::new(outbox.clone());
+        let client_id = client.id.clone();
+        self.broker.with(|broker| broker.register_client(client));
+
+        let cleanup = ClientCleanup::new(self.broker.clone(), client_id.clone());
+        spawn_send_loop(ws_sender, rx, client_id.clone(), cleanup.clone());
+
+        let session = Session {
+            server: self,
+            client_id,
+            peer_ip: peer.ip().to_string(),
+            outbox,
+        };
+
+        while let Some(Ok(frame)) = ws_receiver.next().await {
+            let text = match frame {
+                WsMessage::Text(text) => text,
+                WsMessage::Close(_) => break,
+                WsMessage::Binary(_) => {
+                    warn!(client_id = %session.client_id, "ignoring binary frame");
+                    continue;
+                }
+                _ => continue,
+            };
+            let parsed = match serde_json::from_str::<ClientMessage>(&text) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    warn!(
+                        client_id = %session.client_id,
+                        "invalid client message: {} | {}",
+                        err,
+                        text.chars().take(100).collect::<String>()
+                    );
+                    continue;
+                }
+            };
+            match session.handle(parsed).await {
+                Ok(Flow::Continue) => {}
+                Ok(Flow::Close) => break,
+                Err(e) => {
+                    error!(client_id = %session.client_id, "error handling message: {}", e);
+                    let _ = session.reply(ServerMessage::Error {
+                        message: "internal server error".to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+
+        cleanup.run();
     }
 }
 
-/// Dispatches a parsed client frame to the handler for its type.
-///
-/// Panics if the broker mutex is poisoned.
+/// Prunes idle rate limiter entries every `PRUNE_INTERVAL`, forever.
 ///
 /// Args:
-///     broker: The broker shared by every connection.
-///     auth_service: The service used for register, login, token and
-///         permission checks.
-///     rate_limiters: The limiters shared by every connection.
-///     client_id: The broker id of the connection that sent the frame.
-///     peer_ip: The connection's remote address, used as the rate limit key
-///         for login and registration.
-///     msg: The parsed frame.
+///     limiters: The limiters to prune.
+async fn prune_forever(limiters: RateLimiters) {
+    let mut ticker = tokio::time::interval(PRUNE_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let pruned = limiters.prune_idle();
+        if pruned > 0 {
+            info!(pruned, "pruned idle rate limiter entries");
+        }
+    }
+}
+
+/// Aborts a spawned task when dropped, tying the task's life to its owner.
+struct AbortOnDrop(
+    /// The task to abort.
+    JoinHandle<()>,
+);
+
+impl Drop for AbortOnDrop {
+    /// Aborts the task.
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Whether a connection should keep reading after a handler returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// Keep the connection open.
+    Continue,
+    /// Close the connection.
+    Close,
+}
+
+/// Removes a client from the broker exactly once.
 ///
-/// Returns:
-///     `true` to keep reading from the connection, `false` to close it.
+/// The reader loop and the send loop each hold a clone, and whichever ends
+/// first does the removal.
+#[derive(Clone)]
+struct ClientCleanup {
+    /// The broker to remove the client from.
+    broker: SharedBroker,
+    /// The client to remove.
+    client_id: String,
+    /// Set by the first call to `run`.
+    done: Arc<AtomicBool>,
+}
+
+impl ClientCleanup {
+    /// Prepares the removal of one client.
+    ///
+    /// Args:
+    ///     broker: The broker the client is registered with.
+    ///     client_id: The client to remove.
+    ///
+    /// Returns:
+    ///     A cleanup that has not run yet.
+    fn new(broker: SharedBroker, client_id: String) -> Self {
+        Self {
+            broker,
+            client_id,
+            done: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Removes the client and its subscriptions, unless a clone already did.
+    fn run(&self) {
+        if !self.done.swap(true, Ordering::SeqCst) {
+            self.broker
+                .with(|broker| broker.cleanup_client(&self.client_id));
+        }
+    }
+}
+
+/// Spawns a task that forwards frames from a client's outgoing channel to its WebSocket.
 ///
-/// Raises:
-///     PopSubError::Serialization: When a response frame can't be serialised.
-///     PopSubError::Client: When a response can't be queued because the
-///         client's outgoing channel is closed.
-async fn handle_message(
-    broker: &Arc<Mutex<Broker>>,
-    auth_service: &Arc<RwLock<AuthService>>,
-    rate_limiters: &RateLimiters,
-    client_id: &str,
-    peer_ip: &str,
-    msg: ClientMessage,
-) -> Result<bool> {
-    match msg {
-        ClientMessage::Login { username, password } => {
-            handle_login(
-                broker,
-                auth_service,
-                rate_limiters,
-                client_id,
-                peer_ip,
-                &username,
-                &password,
-            )
-            .await
+/// The task stops when every sender for the channel has been dropped or a
+/// write to the socket fails, then runs `cleanup`.
+///
+/// Args:
+///     ws_sender: The write half of the client's WebSocket.
+///     rx: The receiving end of the channel the broker and session send to.
+///     client_id: The client's broker id, for logging.
+///     cleanup: Removes the client from the broker, once.
+fn spawn_send_loop<S>(
+    mut ws_sender: S,
+    mut rx: mpsc::UnboundedReceiver<WsMessage>,
+    client_id: String,
+    cleanup: ClientCleanup,
+) where
+    S: futures_util::Sink<WsMessage, Error = tungstenite::Error> + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = ws_sender.send(msg).await {
+                warn!(client_id = %client_id, %e, "failed to write to socket");
+                break;
+            }
         }
-        ClientMessage::Register { username, password } => {
-            handle_register(
-                broker,
-                auth_service,
-                rate_limiters,
-                client_id,
-                peer_ip,
-                &username,
-                &password,
-            )
-            .await
-        }
-        ClientMessage::Auth { token } => handle_auth(broker, auth_service, client_id, &token).await,
-        ClientMessage::Subscribe { topic } => {
-            handle_subscribe(broker, auth_service, client_id, &topic).await
-        }
-        ClientMessage::Unsubscribe { topic } => handle_unsubscribe(broker, client_id, &topic),
-        ClientMessage::Publish {
-            topic,
-            payload,
-            message_id,
-            qos,
-        } => {
-            handle_publish(
-                broker,
-                auth_service,
-                rate_limiters,
-                client_id,
-                &topic,
+        cleanup.run();
+        info!(client_id = %client_id, "send loop closed");
+    });
+}
+
+/// One connection's view of the server, with a handler per client message type.
+struct Session {
+    /// The state every connection shares.
+    server: Server,
+    /// This connection's id in the broker.
+    client_id: String,
+    /// This connection's remote address, the key for login and registration limits.
+    peer_ip: String,
+    /// This connection's outgoing channel. Replies are queued here directly.
+    outbox: mpsc::UnboundedSender<WsMessage>,
+}
+
+impl Session {
+    /// Dispatches a parsed client frame to its handler.
+    ///
+    /// Args:
+    ///     msg: The frame the client sent.
+    ///
+    /// Returns:
+    ///     Whether to keep the connection open.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When a reply can't be queued because the
+    ///         connection's outgoing channel is closed.
+    async fn handle(&self, msg: ClientMessage) -> Result<Flow> {
+        match msg {
+            ClientMessage::Register { username, password } => {
+                self.register(&username, &password).await
+            }
+            ClientMessage::Login { username, password } => self.login(&username, &password).await,
+            ClientMessage::Auth { token } => self.authenticate(&token).await,
+            ClientMessage::Subscribe { topic } => self.subscribe(&topic).await,
+            ClientMessage::Unsubscribe { topic } => self.unsubscribe(&topic),
+            ClientMessage::Publish {
+                topic,
                 payload,
                 message_id,
                 qos,
-            )
-            .await
+            } => self.publish(&topic, payload, message_id, qos).await,
+            ClientMessage::Ack { message_id } => self.ack(&message_id),
         }
-        ClientMessage::Ack { message_id } => handle_ack(broker, client_id, &message_id),
-    }
-}
-
-/// Creates a user account and replies with a `register_response`.
-///
-/// Every attempt counts against the registration limit for `peer_ip`, whether
-/// or not it succeeds. Over the limit, the reply says how many seconds to wait
-/// and the auth service isn't called. A failed registration is reported with
-/// `registration_error_message`, which doesn't reveal whether the username is
-/// taken. The connection always stays open. The auth service read lock is
-/// still held while the reply is queued under the broker lock. Panics if the
-/// broker mutex is poisoned.
-///
-/// Args:
-///     broker: The broker, used to find the client to reply to.
-///     auth_service: The service that creates the account.
-///     rate_limiters: Holds the per address registration limiter.
-///     client_id: The broker id of the connection that sent the request.
-///     peer_ip: The connection's remote address, the rate limit key.
-///     username: The requested username.
-///     password: The requested password.
-///
-/// Returns:
-///     Always `true`, to keep the connection open.
-///
-/// Raises:
-///     PopSubError::Serialization: When the reply can't be serialised.
-///     PopSubError::Client: When the reply can't be queued because the
-///         client's outgoing channel is closed.
-#[allow(clippy::too_many_arguments)]
-async fn handle_register(
-    broker: &Arc<Mutex<Broker>>,
-    auth_service: &Arc<RwLock<AuthService>>,
-    rate_limiters: &RateLimiters,
-    client_id: &str,
-    peer_ip: &str,
-    username: &str,
-    password: &str,
-) -> Result<bool> {
-    if !rate_limiters.register_limiter.try_acquire(peer_ip).await {
-        let retry_after = rate_limiters
-            .register_limiter
-            .retry_after(peer_ip)
-            .await
-            .unwrap_or(1);
-        warn!(client_id = %client_id, peer_ip = %peer_ip, retry_after, "registration rate limited");
-        let response = ServerMessage::RegisterResponse {
-            success: false,
-            message: format!("Too many attempts. Try again in {retry_after} seconds."),
-        };
-        send_to_client(broker, client_id, response)?;
-        return Ok(true);
     }
 
-    let auth = auth_service.read().await;
+    /// Queues a frame on this connection's outgoing channel.
+    ///
+    /// Args:
+    ///     message: The frame to send.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When the frame can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn reply(&self, message: ServerMessage) -> Result<()> {
+        let json = serde_json::to_string(&message)?;
+        self.outbox
+            .send(WsMessage::Text(json.into()))
+            .map_err(|_| PopSubError::Client("outgoing channel closed".to_string()))
+    }
 
-    let response = match auth.register_user(username, password).await {
-        Ok(()) => {
-            info!(client_id = %client_id, username = %username, "registration successful");
-            ServerMessage::RegisterResponse {
-                success: true,
-                message: "User registered successfully".to_string(),
+    /// Queues an `error` frame with the given text.
+    ///
+    /// Args:
+    ///     message: The error text for the client.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When the frame can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn reply_error(&self, message: impl Into<String>) -> Result<()> {
+        self.reply(ServerMessage::Error {
+            message: message.into(),
+        })
+    }
+
+    /// Returns the authenticated user, or tells the client to authenticate first.
+    ///
+    /// Every handler except `register`, `login` and `auth` starts here. A
+    /// client that is no longer registered, or hasn't authenticated, gets no
+    /// user back and its connection should be closed; the second also gets a
+    /// `must authenticate first` error.
+    ///
+    /// Args:
+    ///     action: What the client tried to do, for the log.
+    ///
+    /// Returns:
+    ///     The username, or `None` when the connection should close.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When the error frame can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn require_user(&self, action: &str) -> Result<Option<String>> {
+        let state = self.server.broker.with(|broker| {
+            broker
+                .clients
+                .get(&self.client_id)
+                .map(|client| (client.authenticated, client.username.clone()))
+        });
+        match state {
+            None => {
+                warn!(client_id = %self.client_id, action, "client not registered");
+                Ok(None)
             }
+            Some((false, _)) => {
+                warn!(client_id = %self.client_id, action, "request before authentication");
+                self.reply_error("must authenticate first")?;
+                Ok(None)
+            }
+            Some((true, username)) => Ok(Some(username.unwrap_or_default())),
         }
-        Err(e) => {
-            warn!(client_id = %client_id, username = %username, "registration failed: {}", e);
-            ServerMessage::RegisterResponse {
+    }
+
+    /// Creates a user account and replies with a `register_response`.
+    ///
+    /// Every attempt counts against the registration limit for this address,
+    /// whether or not it succeeds. Over the limit, the reply says how many
+    /// seconds to wait and the auth service isn't called. A failed
+    /// registration is reported with `registration_error_message`, which
+    /// doesn't reveal whether the username is taken. The connection stays open.
+    ///
+    /// Args:
+    ///     username: The requested username.
+    ///     password: The requested password.
+    ///
+    /// Returns:
+    ///     Always `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When the reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    async fn register(&self, username: &str, password: &str) -> Result<Flow> {
+        let limiter = &self.server.limiters.register_limiter;
+        if !limiter.try_acquire(&self.peer_ip).await {
+            let retry_after = limiter.retry_after(&self.peer_ip).await.unwrap_or(1);
+            warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, retry_after, "registration rate limited");
+            self.reply(ServerMessage::RegisterResponse {
                 success: false,
-                message: registration_error_message(&e),
+                message: format!("Too many attempts. Try again in {retry_after} seconds."),
+            })?;
+            return Ok(Flow::Continue);
+        }
+
+        let result = {
+            let auth = self.server.auth.read().await;
+            auth.register_user(username, password).await
+        };
+        let response = match result {
+            Ok(()) => {
+                info!(client_id = %self.client_id, username, "registration successful");
+                ServerMessage::RegisterResponse {
+                    success: true,
+                    message: "User registered successfully".to_string(),
+                }
+            }
+            Err(e) => {
+                warn!(client_id = %self.client_id, username, "registration failed: {}", e);
+                ServerMessage::RegisterResponse {
+                    success: false,
+                    message: registration_error_message(&e),
+                }
+            }
+        };
+        self.reply(response)?;
+        Ok(Flow::Continue)
+    }
+
+    /// Checks a username and password and replies with a JWT or an error.
+    ///
+    /// The attempt is refused with `Too many login attempts`, without calling
+    /// the auth service, while this address or this address and username pair
+    /// is locked out. Only wrong credentials count as failures, against both
+    /// limiters; a success clears the pair's failures but not the address
+    /// count, so one valid account can't be used to reset guessing against
+    /// others. Every login error is reported as `invalid credentials`. The
+    /// connection stays open.
+    ///
+    /// Args:
+    ///     username: The username to log in as.
+    ///     password: The password to check.
+    ///
+    /// Returns:
+    ///     Always `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When the reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    async fn login(&self, username: &str, password: &str) -> Result<Flow> {
+        let limiters = &self.server.limiters;
+        let pair_key = format!("{}|{username}", self.peer_ip);
+        let lockout = match limiters.ip_login_limiter.check_status(&self.peer_ip).await {
+            LoginStatus::LockedOut { retry_after } => Some(retry_after),
+            _ => match limiters.login_limiter.check_status(&pair_key).await {
+                LoginStatus::LockedOut { retry_after } => Some(retry_after),
+                _ => None,
+            },
+        };
+        if let Some(retry_after) = lockout {
+            warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, username, retry_after, "login rate limited");
+            self.reply_error(format!(
+                "Too many login attempts. Try again in {retry_after} seconds."
+            ))?;
+            return Ok(Flow::Continue);
+        }
+
+        let result = {
+            let auth = self.server.auth.read().await;
+            auth.login(username, password).await
+        };
+        match result {
+            Ok(token) => {
+                info!(client_id = %self.client_id, username, "login successful");
+                limiters.login_limiter.record_success(&pair_key).await;
+                self.reply(ServerMessage::LoginResponse { token })?;
+            }
+            Err(e) => {
+                warn!(client_id = %self.client_id, username, "login failed: {}", e);
+                if matches!(e, AuthError::InvalidCredentials) {
+                    limiters.login_limiter.record_failure(&pair_key).await;
+                    limiters
+                        .ip_login_limiter
+                        .record_failure(&self.peer_ip)
+                        .await;
+                }
+                self.reply_error("invalid credentials")?;
             }
         }
-    };
+        Ok(Flow::Continue)
+    }
 
-    send_to_client(broker, client_id, response)?;
-    Ok(true)
+    /// Validates a JWT and marks the connection as authenticated as its subject.
+    ///
+    /// A valid token sets the client's `authenticated` flag and username and
+    /// gets an `authenticated` reply. An invalid or expired token gets an
+    /// `authentication failed` error and closes the connection, as does a
+    /// client that is no longer registered.
+    ///
+    /// Args:
+    ///     token: The JWT from a previous `login`.
+    ///
+    /// Returns:
+    ///     `Flow::Continue` when the token was valid, otherwise `Flow::Close`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    async fn authenticate(&self, token: &str) -> Result<Flow> {
+        let validated = self.server.auth.read().await.validate_token(token);
+        let claims = match validated {
+            Ok(claims) => claims,
+            Err(e) => {
+                warn!(client_id = %self.client_id, "authentication failed: {}", e);
+                self.reply_error("authentication failed")?;
+                return Ok(Flow::Close);
+            }
+        };
+        let registered = self.server.broker.with(|broker| {
+            broker
+                .clients
+                .get_mut(&self.client_id)
+                .map(|client| {
+                    client.authenticated = true;
+                    client.username = Some(claims.sub.clone());
+                })
+                .is_some()
+        });
+        if !registered {
+            warn!(client_id = %self.client_id, "client not registered");
+            return Ok(Flow::Close);
+        }
+        info!(client_id = %self.client_id, username = %claims.sub, "authenticated successfully");
+        self.reply(ServerMessage::Authenticated {})?;
+        Ok(Flow::Continue)
+    }
+
+    /// Subscribes the connection to a topic if its user may read it.
+    ///
+    /// A user without permission gets a `not authorized` error and stays
+    /// connected. Subscribing replays the topic's stored messages to the
+    /// client.
+    ///
+    /// Args:
+    ///     topic: The topic to subscribe to.
+    ///
+    /// Returns:
+    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    async fn subscribe(&self, topic: &str) -> Result<Flow> {
+        let Some(username) = self.require_user("subscribe")? else {
+            return Ok(Flow::Close);
+        };
+        let allowed = self
+            .server
+            .auth
+            .read()
+            .await
+            .can_subscribe(&username, topic)
+            .await;
+        if !allowed {
+            warn!(client_id = %self.client_id, username, topic, "subscribe denied");
+            self.reply_error(format!("not authorized to subscribe to '{topic}'"))?;
+            return Ok(Flow::Continue);
+        }
+        self.server
+            .broker
+            .with(|broker| broker.subscribe(topic, self.client_id.clone()));
+        info!(client_id = %self.client_id, username, topic, "subscribed");
+        Ok(Flow::Continue)
+    }
+
+    /// Unsubscribes the connection from a topic.
+    ///
+    /// No permission check is made, since leaving a topic grants nothing.
+    /// Leaving a topic the client isn't on does nothing.
+    ///
+    /// Args:
+    ///     topic: The topic to leave.
+    ///
+    /// Returns:
+    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn unsubscribe(&self, topic: &str) -> Result<Flow> {
+        let Some(username) = self.require_user("unsubscribe")? else {
+            return Ok(Flow::Close);
+        };
+        self.server
+            .broker
+            .with(|broker| broker.unsubscribe(topic, &self.client_id));
+        info!(client_id = %self.client_id, username, topic, "unsubscribed");
+        Ok(Flow::Continue)
+    }
+
+    /// Publishes a payload to a topic if the user may write to it and is within its rate limit.
+    ///
+    /// The topic permission is checked before the rate limit, so a denied
+    /// publish doesn't use up the user's allowance. Both a denied and a rate
+    /// limited publish get an error and keep the connection open. The broker
+    /// sets the timestamp and generates an id when `message_id` is missing.
+    ///
+    /// Args:
+    ///     topic: The topic to publish to.
+    ///     payload: The message body.
+    ///     message_id: The client's id for the message, used to match its `ack`.
+    ///     qos: The delivery level, 0 or 1. Defaults to 0.
+    ///
+    /// Returns:
+    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    async fn publish(
+        &self,
+        topic: &str,
+        payload: String,
+        message_id: Option<String>,
+        qos: Option<u8>,
+    ) -> Result<Flow> {
+        let Some(username) = self.require_user("publish")? else {
+            return Ok(Flow::Close);
+        };
+        let allowed = self
+            .server
+            .auth
+            .read()
+            .await
+            .can_publish(&username, topic)
+            .await;
+        if !allowed {
+            warn!(client_id = %self.client_id, username, topic, "publish denied");
+            self.reply_error(format!("not authorized to publish to '{topic}'"))?;
+            return Ok(Flow::Continue);
+        }
+        if !self
+            .server
+            .limiters
+            .message_limiter
+            .try_acquire(&username)
+            .await
+        {
+            warn!(client_id = %self.client_id, username, "message rate limited");
+            self.reply_error("Rate limited. Too many messages.")?;
+            return Ok(Flow::Continue);
+        }
+        let message = Message {
+            topic: topic.to_string(),
+            payload,
+            timestamp: 0,
+            message_id: message_id.unwrap_or_default(),
+            qos: qos.unwrap_or(0),
+        };
+        self.server.broker.with(|broker| broker.publish(message));
+        info!(client_id = %self.client_id, username, topic, "published");
+        Ok(Flow::Continue)
+    }
+
+    /// Acknowledges a QoS 1 message so the broker stops retrying it.
+    ///
+    /// The ack is matched by message id alone, without checking that the
+    /// message was delivered to this client (see `docs/DESIGN.md` section 12).
+    ///
+    /// Args:
+    ///     message_id: The id of the message being acknowledged.
+    ///
+    /// Returns:
+    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn ack(&self, message_id: &str) -> Result<Flow> {
+        if self.require_user("ack")?.is_none() {
+            return Ok(Flow::Close);
+        }
+        self.server
+            .broker
+            .with(|broker| broker.handle_ack(message_id));
+        Ok(Flow::Continue)
+    }
 }
 
 /// Turns a registration error into text that is safe to show the client.
@@ -459,524 +863,6 @@ fn registration_error_message(error: &AuthError) -> String {
     }
 }
 
-/// Checks a username and password and replies with a JWT or an error.
-///
-/// The request is refused with a `Too many login attempts` error, without
-/// calling the auth service, while either `peer_ip` or the `peer_ip|username`
-/// pair is locked out. The address is checked first. Only
-/// `AuthError::InvalidCredentials` counts as a failure against both limiters,
-/// and a success clears the pair's failures (the address count is left as it
-/// is). Every login error is reported to the client as `invalid credentials`.
-/// The connection always stays open. The auth service read lock is still held
-/// while the reply is queued under the broker lock. Panics if the broker
-/// mutex is poisoned.
-///
-/// Args:
-///     broker: The broker, used to find the client to reply to.
-///     auth_service: The service that checks the credentials and issues the
-///         token.
-///     rate_limiters: Holds the per pair and per address login limiters.
-///     client_id: The broker id of the connection that sent the request.
-///     peer_ip: The connection's remote address.
-///     username: The username to log in as.
-///     password: The password to check.
-///
-/// Returns:
-///     Always `true`, to keep the connection open.
-///
-/// Raises:
-///     PopSubError::Serialization: When the reply can't be serialised.
-///     PopSubError::Client: When the reply can't be queued because the
-///         client's outgoing channel is closed.
-#[allow(clippy::too_many_arguments)]
-async fn handle_login(
-    broker: &Arc<Mutex<Broker>>,
-    auth_service: &Arc<RwLock<AuthService>>,
-    rate_limiters: &RateLimiters,
-    client_id: &str,
-    peer_ip: &str,
-    username: &str,
-    password: &str,
-) -> Result<bool> {
-    let pair_key = format!("{peer_ip}|{username}");
-    let blocked = match rate_limiters.ip_login_limiter.check_status(peer_ip).await {
-        popsub_ratelimit::LoginStatus::LockedOut { retry_after } => Some(retry_after),
-        _ => match rate_limiters.login_limiter.check_status(&pair_key).await {
-            popsub_ratelimit::LoginStatus::LockedOut { retry_after } => Some(retry_after),
-            _ => None,
-        },
-    };
-    if let Some(retry_after) = blocked {
-        warn!(
-            client_id = %client_id,
-            peer_ip = %peer_ip,
-            username = %username,
-            retry_after = %retry_after,
-            "login rate limited"
-        );
-        let response = ServerMessage::Error {
-            message: format!("Too many login attempts. Try again in {retry_after} seconds."),
-        };
-        send_to_client(broker, client_id, response)?;
-        return Ok(true);
-    }
-
-    let auth = auth_service.read().await;
-
-    let response = match auth.login(username, password).await {
-        Ok(token) => {
-            info!(client_id = %client_id, username = %username, "login successful");
-            rate_limiters.login_limiter.record_success(&pair_key).await;
-            ServerMessage::LoginResponse { token }
-        }
-        Err(e) => {
-            warn!(client_id = %client_id, username = %username, "login failed: {}", e);
-            if matches!(e, AuthError::InvalidCredentials) {
-                rate_limiters.login_limiter.record_failure(&pair_key).await;
-                rate_limiters.ip_login_limiter.record_failure(peer_ip).await;
-            }
-            ServerMessage::Error {
-                message: "invalid credentials".to_string(),
-            }
-        }
-    };
-
-    send_to_client(broker, client_id, response)?;
-    Ok(true)
-}
-
-/// Validates a JWT and marks the connection as authenticated as its subject.
-///
-/// On success the auth service read lock is released before the broker lock
-/// is taken, then the client's `authenticated` flag and `username` are set and
-/// an `authenticated` frame is queued. If the client is no longer registered
-/// nothing is sent. An invalid or expired token gets an `authentication
-/// failed` error and closes the connection. Panics if the broker mutex is
-/// poisoned.
-///
-/// Args:
-///     broker: The broker holding the client record to update.
-///     auth_service: The service that validates the token.
-///     client_id: The broker id of the connection that sent the token.
-///     token: The JWT from a previous `login`.
-///
-/// Returns:
-///     `true` when the token was valid, `false` to close the connection.
-///
-/// Raises:
-///     PopSubError::Serialization: When a reply can't be serialised.
-///     PopSubError::Client: When the failure reply can't be queued because
-///         the client's outgoing channel is closed.
-async fn handle_auth(
-    broker: &Arc<Mutex<Broker>>,
-    auth_service: &Arc<RwLock<AuthService>>,
-    client_id: &str,
-    token: &str,
-) -> Result<bool> {
-    let auth = auth_service.read().await;
-
-    match auth.validate_token(token) {
-        Ok(claims) => {
-            let username = claims.sub.clone();
-            drop(auth);
-
-            let mut broker_lock = broker.lock().expect("Broker lock poisoned");
-            if let Some(client) = broker_lock.clients.get_mut(client_id) {
-                client.authenticated = true;
-                client.username = Some(username.clone());
-                info!(client_id = %client_id, username = %username, "authenticated successfully");
-
-                let response = ServerMessage::Authenticated {};
-                let json = serde_json::to_string(&response)?;
-                let _ = client.sender.send(WsMessage::Text(json.into()));
-            }
-            Ok(true)
-        }
-        Err(e) => {
-            warn!(client_id = %client_id, "authentication failed: {}", e);
-            let response = ServerMessage::Error {
-                message: "authentication failed".to_string(),
-            };
-            send_to_client(broker, client_id, response)?;
-            Ok(false)
-        }
-    }
-}
-
-/// Subscribes the connection to a topic if its user may read it.
-///
-/// The broker lock is taken to check that the client is authenticated and to
-/// copy its username and sender, then released before the auth service is
-/// awaited, and taken again to subscribe. An unauthenticated client gets a
-/// `must authenticate first` error and the connection is closed. A user without
-/// permission for the topic gets a `not authorized` error and stays connected.
-/// Subscribing replays the topic's stored messages to the client. Panics if
-/// the broker mutex is poisoned.
-///
-/// Args:
-///     broker: The broker to subscribe on.
-///     auth_service: The service that checks topic permissions.
-///     client_id: The broker id of the connection that sent the request.
-///     topic: The topic to subscribe to.
-///
-/// Returns:
-///     `true` to keep the connection open, `false` when the client is not
-///     authenticated or no longer registered.
-///
-/// Raises:
-///     PopSubError::Serialization: When an error reply can't be serialised.
-async fn handle_subscribe(
-    broker: &Arc<Mutex<Broker>>,
-    auth_service: &Arc<RwLock<AuthService>>,
-    client_id: &str,
-    topic: &str,
-) -> Result<bool> {
-    let (username, sender) = {
-        let broker_lock = broker.lock().expect("Broker lock poisoned");
-
-        let client = match broker_lock.clients.get(client_id) {
-            Some(c) => c,
-            None => {
-                warn!(client_id = %client_id, "Client not found");
-                return Ok(false);
-            }
-        };
-
-        if !client.authenticated {
-            warn!(client_id = %client_id, "subscribe attempt before authentication");
-            let response = ServerMessage::Error {
-                message: "must authenticate first".to_string(),
-            };
-            let json = serde_json::to_string(&response)?;
-            let _ = client.sender.send(WsMessage::Text(json.into()));
-            return Ok(false);
-        }
-
-        (
-            client.username.clone().unwrap_or_default(),
-            client.sender.clone(),
-        )
-    };
-
-    let auth = auth_service.read().await;
-    if !auth.can_subscribe(&username, topic).await {
-        warn!(client_id = %client_id, username = %username, topic = %topic, "subscribe denied");
-        let response = ServerMessage::Error {
-            message: format!("not authorized to subscribe to '{topic}'"),
-        };
-        drop(auth);
-        let json = serde_json::to_string(&response)?;
-        let _ = sender.send(WsMessage::Text(json.into()));
-        return Ok(true);
-    }
-    drop(auth);
-
-    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
-    broker_lock.subscribe(topic, client_id.to_string());
-    info!(client_id = %client_id, username = %username, topic = %topic, "subscribed");
-
-    Ok(true)
-}
-
-/// Unsubscribes the connection from a topic.
-///
-/// No permission check is made, since leaving a topic grants nothing.
-/// Unsubscribing from a topic the client isn't on, or one that doesn't exist,
-/// does nothing. An unauthenticated client gets a `must authenticate first`
-/// error and the connection is closed. Panics if the broker mutex is
-/// poisoned.
-///
-/// Args:
-///     broker: The broker to unsubscribe on.
-///     client_id: The broker id of the connection that sent the request.
-///     topic: The topic to leave.
-///
-/// Returns:
-///     `true` to keep the connection open, `false` when the client is not
-///     authenticated or no longer registered.
-///
-/// Raises:
-///     PopSubError::Serialization: When the error reply can't be serialised.
-fn handle_unsubscribe(broker: &Arc<Mutex<Broker>>, client_id: &str, topic: &str) -> Result<bool> {
-    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
-
-    let client = match broker_lock.clients.get(client_id) {
-        Some(c) => c,
-        None => {
-            warn!(client_id = %client_id, "Client not found");
-            return Ok(false);
-        }
-    };
-
-    if !client.authenticated {
-        warn!(client_id = %client_id, "unsubscribe attempt before authentication");
-        let response = ServerMessage::Error {
-            message: "must authenticate first".to_string(),
-        };
-        let json = serde_json::to_string(&response)?;
-        let _ = client.sender.send(WsMessage::Text(json.into()));
-        return Ok(false);
-    }
-
-    let username = client.username.clone().unwrap_or_default();
-
-    broker_lock.unsubscribe(topic, &client_id.to_string());
-    info!(client_id = %client_id, username = %username, topic = %topic, "unsubscribed");
-
-    Ok(true)
-}
-
-/// Publishes a payload to a topic if the user may write to it and is within
-/// the message rate limit.
-///
-/// Authentication is checked first, under the broker lock, so unauthenticated
-/// clients can't spend the rate limit tokens of real users. An unauthenticated
-/// client gets a `must authenticate first` error and the connection is closed.
-/// The broker lock is then released while the per user rate limit and the
-/// topic permission are awaited, in that order, so a denied publish still uses
-/// a token. Both a rate limited and a denied publish get an error frame and
-/// keep the connection open. Otherwise the broker lock is taken again and the
-/// message is published with a random UUID if `message_id` is missing and
-/// QoS 0 if `qos` is missing. The broker overwrites the timestamp set here.
-/// Panics if the broker mutex is poisoned.
-///
-/// Args:
-///     broker: The broker to publish on.
-///     auth_service: The service that checks topic permissions.
-///     rate_limiters: Holds the per user message limiter.
-///     client_id: The broker id of the connection that sent the request.
-///     topic: The topic to publish to.
-///     payload: The message body.
-///     message_id: The client's id for the message, used to match its `ack`.
-///     qos: The delivery level, 0 or 1.
-///
-/// Returns:
-///     `true` to keep the connection open, `false` when the client is not
-///     authenticated or no longer registered.
-///
-/// Raises:
-///     PopSubError::Serialization: When an error reply can't be serialised.
-///     PopSubError::Client: When the rate limit reply can't be queued because
-///         the client's outgoing channel is closed.
-#[allow(clippy::too_many_arguments)]
-async fn handle_publish(
-    broker: &Arc<Mutex<Broker>>,
-    auth_service: &Arc<RwLock<AuthService>>,
-    rate_limiters: &RateLimiters,
-    client_id: &str,
-    topic: &str,
-    payload: String,
-    message_id: Option<String>,
-    qos: Option<u8>,
-) -> Result<bool> {
-    let (username, sender) = {
-        let broker_lock = broker.lock().expect("Broker lock poisoned");
-
-        let client = match broker_lock.clients.get(client_id) {
-            Some(c) => c,
-            None => {
-                warn!(client_id = %client_id, "Client not found");
-                return Ok(false);
-            }
-        };
-
-        if !client.authenticated {
-            warn!(client_id = %client_id, "publish attempt before authentication");
-            let response = ServerMessage::Error {
-                message: "must authenticate first".to_string(),
-            };
-            let json = serde_json::to_string(&response)?;
-            let _ = client.sender.send(WsMessage::Text(json.into()));
-            return Ok(false);
-        }
-
-        (
-            client.username.clone().unwrap_or_default(),
-            client.sender.clone(),
-        )
-    };
-
-    if !rate_limiters.message_limiter.try_acquire(&username).await {
-        warn!(client_id = %client_id, "message rate limited");
-        let response = ServerMessage::Error {
-            message: "Rate limited. Too many messages.".to_string(),
-        };
-        send_to_client(broker, client_id, response)?;
-        return Ok(true);
-    }
-
-    let auth = auth_service.read().await;
-    if !auth.can_publish(&username, topic).await {
-        warn!(client_id = %client_id, username = %username, topic = %topic, "publish denied");
-        let response = ServerMessage::Error {
-            message: format!("not authorized to publish to '{topic}'"),
-        };
-        drop(auth);
-        let json = serde_json::to_string(&response)?;
-        let _ = sender.send(WsMessage::Text(json.into()));
-        return Ok(true);
-    }
-    drop(auth);
-
-    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
-
-    let timestamp = chrono::Utc::now().timestamp_millis();
-    let msg = popsub_broker::message::Message {
-        topic: topic.to_string(),
-        payload,
-        timestamp,
-        message_id: message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        qos: qos.unwrap_or(0),
-    };
-
-    broker_lock.publish(msg);
-    info!(client_id = %client_id, username = %username, topic = %topic, "published");
-
-    Ok(true)
-}
-
-/// Acknowledges a QoS 1 message so the broker stops retrying it.
-///
-/// The ack is passed to the broker by message id alone, without checking that
-/// the message was delivered to this client. An unauthenticated client gets a
-/// `must authenticate first` error and the connection is closed. Panics if
-/// the broker mutex is poisoned.
-///
-/// Args:
-///     broker: The broker holding the pending acks.
-///     client_id: The broker id of the connection that sent the ack.
-///     message_id: The id of the message being acknowledged.
-///
-/// Returns:
-///     `true` to keep the connection open, `false` when the client is not
-///     authenticated or no longer registered.
-///
-/// Raises:
-///     PopSubError::Serialization: When the error reply can't be serialised.
-fn handle_ack(broker: &Arc<Mutex<Broker>>, client_id: &str, message_id: &str) -> Result<bool> {
-    let mut broker_lock = broker.lock().expect("Broker lock poisoned");
-
-    let client = match broker_lock.clients.get(client_id) {
-        Some(c) => c,
-        None => {
-            warn!(client_id = %client_id, "Client not found");
-            return Ok(false);
-        }
-    };
-
-    if !client.authenticated {
-        warn!(client_id = %client_id, "ack attempt before authentication");
-        let response = ServerMessage::Error {
-            message: "must authenticate first".to_string(),
-        };
-        let json = serde_json::to_string(&response)?;
-        let _ = client.sender.send(WsMessage::Text(json.into()));
-        return Ok(false);
-    }
-
-    broker_lock.handle_ack(message_id);
-    Ok(true)
-}
-
-/// Queues a server frame on a client's outgoing channel.
-///
-/// The frame is serialised before the broker lock is taken. If the client is
-/// no longer registered, nothing is sent and no error is returned. Panics if
-/// the broker mutex is poisoned.
-///
-/// Args:
-///     broker: The broker holding the client's sender.
-///     client_id: The broker id of the client to send to.
-///     message: The frame to send.
-///
-/// Raises:
-///     PopSubError::Serialization: When the frame can't be serialised.
-///     PopSubError::Client: When the client's outgoing channel is closed.
-fn send_to_client(
-    broker: &Arc<Mutex<Broker>>,
-    client_id: &str,
-    message: ServerMessage,
-) -> Result<()> {
-    let json = serde_json::to_string(&message)?;
-    let broker_lock = broker.lock().expect("Broker lock poisoned");
-
-    if let Some(client) = broker_lock.clients.get(client_id) {
-        client
-            .sender
-            .send(WsMessage::Text(json.into()))
-            .map_err(|e| {
-                error!(client_id = %client_id, "Failed to send message: {}", e);
-                PopSubError::Client("Failed to send message".to_string())
-            })?;
-    }
-
-    Ok(())
-}
-
-/// Spawns a task that forwards frames from a client's outgoing channel to its
-/// WebSocket.
-///
-/// The task stops when every sender for the channel has been dropped or when a
-/// write to the socket fails, then runs `do_cleanup` to remove the client from
-/// the broker.
-///
-/// Args:
-///     ws_sender: The write half of the client's WebSocket.
-///     rx: The receiving end of the channel the broker and handlers send to.
-///     client_id: The client's broker id, for logging.
-///     do_cleanup: Removes the client from the broker. It is shared with the
-///         reader loop and does its work only on the first call.
-fn spawn_send_loop<S, F>(
-    mut ws_sender: S,
-    mut rx: mpsc::UnboundedReceiver<WsMessage>,
-    client_id: String,
-    do_cleanup: F,
-) where
-    S: futures_util::Sink<WsMessage, Error = tungstenite::Error> + Unpin + Send + 'static,
-    F: Fn() + Send + Clone + 'static,
-{
-    spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Err(e) = ws_sender.send(msg).await {
-                error!(client_id = %client_id, %e, "Failed to send message");
-                break;
-            }
-        }
-
-        do_cleanup();
-        info!(client_id = %client_id, "Send loop closed");
-    });
-}
-
-use popsub_config::Settings;
-
-/// Runs the WebSocket server configured from the application settings.
-///
-/// This is the entry point the `popsub` binary uses. It builds an
-/// `AuthService` from `settings.server`: the JWT secret and expiry, the admin
-/// user from `username` and `password`, whether self-registration is allowed,
-/// and the role new users get (see `registration_role`). It then serves with
-/// the default rate limits through `start_websocket_server_with_auth`. Panics
-/// if `addr` can't be bound.
-///
-/// Args:
-///     addr: The address to listen on, such as `127.0.0.1:8080`.
-///     broker: The broker shared by every connection.
-///     settings: The loaded configuration. Only the `server` section is read.
-pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, settings: Settings) {
-    use popsub_auth::AuthConfig;
-
-    let config = AuthConfig::new(&settings.server.jwt_secret)
-        .with_expiration(settings.server.jwt_expiration_hours)
-        .with_admin(&settings.server.username, &settings.server.password)
-        .with_registration(settings.server.allow_registration)
-        .with_default_role(registration_role(&settings.server.registration_role));
-
-    let auth_service = Arc::new(RwLock::new(AuthService::new(config).await));
-
-    start_websocket_server_with_auth(addr, broker, auth_service).await
-}
-
 /// Maps the `server.registration_role` setting to the role self-registered
 /// users receive.
 ///
@@ -988,8 +874,7 @@ pub async fn start_websocket_server(addr: String, broker: Arc<Mutex<Broker>>, se
 /// Returns:
 ///     The default role for new users: full access, read only, or limited
 ///     access to no topics.
-pub fn registration_role(name: &str) -> popsub_auth::DefaultUserRole {
-    use popsub_auth::DefaultUserRole;
+pub fn registration_role(name: &str) -> DefaultUserRole {
     match name {
         "full" => DefaultUserRole::FullAccess,
         "readonly" => DefaultUserRole::ReadOnly,

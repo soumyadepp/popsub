@@ -1,17 +1,17 @@
 //! The `Broker` engine: topic routing, delivery to client channels, QoS 1 retries and replay.
 //!
-//! The broker is synchronous and has no locking of its own. The server keeps
-//! one `Arc<Mutex<Broker>>` and every connection task locks it for each call,
-//! so callers must not hold that lock across an `.await`. Delivery pushes
+//! The broker is synchronous and has no locking of its own. The server shares
+//! it through one `SharedBroker`, whose `with` method runs a closure under the
+//! lock, so the lock can't be held across an `.await`. Delivery pushes
 //! `tungstenite` messages into each client's unbounded channel, so no call
 //! here waits on the network. Calls that touch persistence (`publish` and
 //! `subscribe`) do disk work while the caller holds the lock.
 //!
 //! QoS 1 messages are kept in `pending_acks`, keyed by message id only. One
 //! ACK from any subscriber clears the message for all of them, and every
-//! retry goes to every current subscriber of the topic. `start_retry_loop`
-//! is the background task that resends unacknowledged messages and drops
-//! them after `max_retries` resends.
+//! retry goes to every current subscriber of the topic. `retry_overdue`
+//! resends unacknowledged messages and drops them after `max_retries`
+//! resends; `SharedBroker::run_retry_loop` calls it on a timer.
 
 use popsub_config::Settings;
 use std::collections::HashMap;
@@ -386,46 +386,41 @@ impl Broker {
         info!(client = %client_id, "Cleaned up client");
     }
 
-    /// Resends or drops overdue QoS 1 messages once a second, forever.
+    /// Resends overdue QoS 1 messages and drops those out of retries, in one pass.
     ///
-    /// Spawn this as a background task. Each tick it locks the broker to
-    /// collect overdue messages, then locks it again for each message to drop
-    /// and each message to resend, so other callers can run in between. A
-    /// message is sent at most `1 + max_retries` times before it is dropped.
-    /// The lock is a `std::sync::Mutex` taken from async code, so a tick
-    /// blocks its worker thread while another caller holds the lock. Panics
-    /// if the lock is poisoned.
+    /// A message is overdue when more than `ack_timeout_ms` has passed since
+    /// it was last sent. Overdue messages that have already been resent
+    /// `max_retries` times are dropped, so each message is sent at most
+    /// `1 + max_retries` times. `SharedBroker::run_retry_loop` calls this on a
+    /// timer; tests call it directly with a chosen time.
     ///
     /// Args:
-    ///     broker: The shared broker to retry messages on.
-    pub async fn start_retry_loop(broker: std::sync::Arc<std::sync::Mutex<Broker>>) {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-            let current_time = chrono::Utc::now().timestamp_millis();
-
-            let (messages_to_resend, messages_to_drop) = {
-                let broker_read = broker.lock().expect("Broker lock poisoned");
-                broker_read.collect_retry_candidates(current_time)
-            };
-
-            for message_id in messages_to_drop {
-                if let Ok(mut broker_write) = broker.try_lock() {
-                    if broker_write.pending_acks.remove(&message_id).is_some() {
-                        warn!(message_id = %message_id, retries = %broker_write.settings.max_retries, "Message dropped after max retries");
-                    }
-                } else {
-                    let mut broker_write = broker.lock().expect("Broker lock poisoned");
-                    if broker_write.pending_acks.remove(&message_id).is_some() {
-                        warn!(message_id = %message_id, retries = %broker_write.settings.max_retries, "Message dropped after max retries");
-                    }
-                }
-            }
-
-            for message_id in messages_to_resend {
-                let mut broker_write = broker.lock().expect("Broker lock poisoned");
-                let _ = broker_write.resend_pending_message(&message_id, current_time);
+    ///     now_ms: The current time in milliseconds since the UNIX epoch.
+    ///
+    /// Returns:
+    ///     How many messages were resent and how many were dropped.
+    pub fn retry_overdue(&mut self, now_ms: i64) -> RetryOutcome {
+        let (to_resend, to_drop) = self.collect_retry_candidates(now_ms);
+        for message_id in &to_drop {
+            if self.pending_acks.remove(message_id).is_some() {
+                warn!(message_id = %message_id, retries = %self.settings.max_retries, "Message dropped after max retries");
             }
         }
+        for message_id in &to_resend {
+            self.resend_pending_message(message_id, now_ms);
+        }
+        RetryOutcome {
+            resent: to_resend.len(),
+            dropped: to_drop.len(),
+        }
     }
+}
+
+/// What one `Broker::retry_overdue` pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryOutcome {
+    /// Messages sent again to their topic's subscribers.
+    pub resent: usize,
+    /// Messages removed after running out of retries.
+    pub dropped: usize,
 }

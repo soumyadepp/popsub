@@ -47,11 +47,11 @@ This document describes how the system works today, where its guarantees hold an
 
 | Crate | Responsibility |
 |---|---|
-| `popsub` | Binary. Parses the CLI, loads config, refuses published default secrets on public addresses, starts the broker, the retry loop and the WebSocket server. Also contains a small demo client. |
-| `popsub_transport` | Accepts connections, parses `ClientMessage` JSON, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls. |
+| `popsub` | Binary. Parses the CLI, loads config, refuses published default secrets on public addresses, opens the message store, starts the broker, the retry loop and the WebSocket server, and exits with a failure status when any of that fails. Also contains a small demo client. |
+| `popsub_transport` | `Server` (shared state and the accept loop) and `Session` (one connection, one method per message type). Parses `ClientMessage` JSON, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls. |
 | `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
-| `popsub_broker` | The engine: topics, subscriber sets, publishing, QoS 1 pending table and retry loop, replay on subscribe. Synchronous API. |
+| `popsub_broker` | The engine: topics, subscriber sets, publishing, QoS 1 pending table and retries, replay on subscribe. Synchronous API, shared through `SharedBroker`. |
 | `popsub_persistence` | `sled` store of recent messages per topic, with a TTL and a per-topic cap. |
 | `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
 | `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
@@ -62,19 +62,20 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 ### 3.2 Runtime
 
 ```
- socket --> connection task --(lock)--> Broker --> client.sender (unbounded mpsc) --> send loop --> socket
-                                          ^
-                    retry loop (every 1s) |
-                                          v
-                                        sled
+ socket --> Session (connection task) --SharedBroker::with--> Broker --> client channel (unbounded mpsc) --> send loop --> socket
+            |  replies go straight to the session's own channel           ^
+            |                                    retry loop (every 1s)    |
+            +--> AuthService (RwLock, released before the broker is used)  v
+                                                                         sled
 ```
 
-- **Connection task.** One per socket. Reads frames, parses JSON outside the lock, then takes the broker lock to update the client and apply the request.
-- **Send loop.** One per socket. Drains the client's channel and writes frames. When the socket fails it cleans the client up.
-- **Broker.** A single `Arc<std::sync::Mutex<Broker>>` shared by every task.
-- **Retry loop.** A background task that wakes every second, collects QoS 1 messages whose ACK is overdue, and resends or drops them.
-- **Auth service.** An `Arc<tokio::sync::RwLock<AuthService>>`. Handlers read client state under the broker lock, release it, check permissions under the auth lock, release that, then take the broker lock again to act. The two locks are never held together.
-- **Prune task.** Every minute, drops rate limiter entries for keys that have gone quiet.
+- **Server.** Holds what every connection shares (broker, auth service, rate limiters) and runs the accept loop. A failed `accept` is logged and retried after 100 ms instead of stopping the server.
+- **Session.** One per socket, in its own task. Reads frames, parses JSON, and calls the method for the message type. Replies are queued on the session's own outgoing channel, so replying never takes the broker lock.
+- **Send loop.** One per socket. Drains the client's channel and writes frames. Whichever of the session and the send loop ends first removes the client from the broker.
+- **Broker.** A `SharedBroker`: the broker behind one `std::sync::Mutex`, reachable only through `with(|broker| ...)`. A closure can't await, so the lock is never held across an await point. If a task panics while holding it, the next caller logs the poisoning and carries on with the broker's state instead of panicking too.
+- **Retry loop.** `SharedBroker::run_retry_loop` wakes every second and runs one `Broker::retry_overdue` pass, which resends overdue QoS 1 messages and drops those out of retries.
+- **Auth service.** An `Arc<tokio::sync::RwLock<AuthService>>`. Handlers release it before touching the broker, so the two locks are never held together.
+- **Prune task.** Every minute, drops rate limiter entries for keys that have gone quiet. It stops when the server stops.
 
 ## 4. Protocol
 
@@ -152,12 +153,13 @@ The README and the portfolio both describe PopSub as at-least-once. That is only
 - The message id and QoS level are not stored.
 - On write, if the tree exceeds `max_messages_per_topic`, the oldest keys are deleted.
 - On read, keys older than `ttl_seconds` are deleted first.
-- `Broker::new` uses `Persistence::default()`: path `pubsub_db` relative to the working directory, TTL 3600 seconds, cap 1000. The `message_ttl_secs` setting is loaded but never passed to persistence, and the path isn't configurable.
+- The binary opens the store at `pubsub_db` relative to the working directory, with the TTL from `broker.message_ttl_secs` and a cap of 1000 messages per topic. The path and cap aren't configurable. `sled` locks the directory, so a second server started from the same directory exits with an error instead of sharing it.
+- `Broker::new` (used by tests and `Broker::default`) still opens `Persistence::default()`, which panics when the store can't be opened.
 - `sled` 0.34 has been the stable line for years while its successor stays in alpha. It is fine for this scale, but it is a dependency risk worth tracking.
 
 ## 8. Concurrency
 
-- Every operation takes the same `std::sync::Mutex`. Publishes, subscribes, ACKs, connects, disconnects and the retry loop all queue behind each other.
+- Every operation takes the same `std::sync::Mutex`, through `SharedBroker::with`. Publishes, subscribes, ACKs, connects, disconnects and the retry loop all queue behind each other.
 - `sled` writes and full-history replays happen while the lock is held, so one slow disk write stalls every client.
 - Each client's outbound channel is unbounded. A subscriber that reads slower than publishers write grows server memory without limit.
 - The lock is never held across an `.await`, which keeps the synchronous mutex safe inside Tokio.
@@ -178,7 +180,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.allow_registration` | `false` | Auth |
 | `server.registration_role` | `none` | Auth. `none`, `readonly` or `full`; anything else means `none` |
 | `broker.max_connections` | `1000` | Nothing. Not enforced. |
-| `broker.message_ttl_secs` | `3600` | Nothing. Persistence uses its own default. |
+| `broker.message_ttl_secs` | `3600` | Message store TTL |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop |
 
@@ -231,7 +233,9 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | The server restarts | Self-registered users are lost with the in-memory store. The admin is recreated from config. |
 | `sled` write fails | Logged. The message is still delivered live. |
 | Broker process restarts | Retained history survives. In-flight QoS 1 state and all sessions are lost. |
-| A task panics while holding the lock | The mutex is poisoned and every later `.lock().expect(...)` panics. The server effectively stops. |
+| A task panics while holding the broker lock | The mutex is poisoned. The next `SharedBroker::with` logs it and carries on with the broker's state, so other connections keep working. |
+| `accept` fails, for example out of file descriptors | Logged, and the accept loop retries after 100 ms. |
+| The port is taken, or another server holds the store | The binary logs the reason and exits with a failure status. |
 
 ## 12. Known gaps, in priority order
 
@@ -244,7 +248,7 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 7. Delivered messages lack a `type` tag.
 8. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
 9. Token expiry is only checked at `auth`.
-10. `max_connections` and `message_ttl_secs` are ignored, the storage path is hard-coded, and rate limits aren't configurable.
+10. `max_connections` is ignored, the storage path and per-topic cap are hard-coded, and rate limits aren't configurable.
 11. Two versions of the `config` crate in the workspace (`popsub_utils` uses 0.13, `popsub_config` uses 0.15), so `PopSubError::Config` can't wrap errors from the loader.
 12. `popsub_broker` depends on `tempfile` at runtime because `Broker::default` branches on `cfg!(test)`.
 13. No client libraries, release artefacts, health check or metrics.

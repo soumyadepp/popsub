@@ -5,22 +5,51 @@
 //! configured from `Settings::default()`.
 
 use crate::message::{ClientMessage, ServerMessage};
-use crate::websocket::start_websocket_server;
+use crate::websocket::{RateLimiters, Server};
 use futures_util::{SinkExt, StreamExt};
-use popsub_broker::Broker;
+use popsub_broker::{Broker, SharedBroker};
 use popsub_config::Settings;
 use popsub_persistence::Persistence;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// Starts a server on a free local port and opens a TCP connection to it.
+/// Starts a server on a free local port and returns its address.
 ///
-/// The server is built with `start_websocket_server` from default settings and
-/// a broker whose persistence lives in a new temporary directory. The function
-/// waits 100 milliseconds for the server to start listening before connecting.
-/// Panics if no port is free, the directory or store can't be created, or the
-/// connection fails.
+/// The server listens on port 0, so the operating system picks a free port
+/// and the server is accepting connections before this returns. Its broker
+/// stores messages in a new temporary directory.
+///
+/// Args:
+///     settings: The settings to configure the server's auth service from.
+///     limiters: The rate limiters the server uses.
+///
+/// Returns:
+///     The address to connect to, the temporary directory (kept alive so the
+///     store isn't deleted) and the server's broker.
+async fn start_server(
+    settings: &Settings,
+    limiters: RateLimiters,
+) -> (std::net::SocketAddr, tempfile::TempDir, SharedBroker) {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let persistence = Persistence::new(temp_dir.path().to_str().unwrap(), None, None)
+        .expect("Failed to create persistence");
+    let broker = SharedBroker::new(Broker::new_with_persistence(
+        persistence,
+        settings.broker.clone(),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind");
+    let addr = listener.local_addr().expect("No local address");
+    let server = Server::from_settings(broker.clone(), &settings.server)
+        .await
+        .with_rate_limiters(limiters);
+    tokio::spawn(server.serve(listener));
+    (addr, temp_dir, broker)
+}
+
+/// Starts a server with default settings and limits and opens a TCP connection to it.
 ///
 /// Returns:
 ///     The connected stream (before the WebSocket handshake), the settings the
@@ -30,33 +59,34 @@ async fn setup_server_and_client() -> (
     tokio::net::TcpStream,
     Settings,
     tempfile::TempDir,
-    Arc<Mutex<Broker>>,
+    SharedBroker,
 ) {
     let settings = Settings::default();
-    let addr = format!(
-        "127.0.0.1:{}",
-        portpicker::pick_unused_port().expect("No free ports")
-    );
-
-    let temp_dir = tempdir().expect("Failed to create temp dir");
-    let persistence = Persistence::new(temp_dir.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
-        persistence.expect("Failed to create persistence"),
-        settings.broker.clone(),
-    )));
-
-    tokio::spawn(start_websocket_server(
-        addr.clone(),
-        broker.clone(),
-        settings.clone(),
-    ));
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    let stream = tokio::net::TcpStream::connect(&addr)
+    let (addr, temp_dir, broker) = start_server(&settings, RateLimiters::default()).await;
+    let stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("Failed to connect");
     (stream, settings, temp_dir, broker)
+}
+
+/// Waits up to two seconds for the broker to have no registered clients.
+///
+/// Cleanup runs in the connection's own task after the socket closes, so a
+/// test can't check for it straight after closing.
+///
+/// Args:
+///     broker: The broker to watch.
+///
+/// Returns:
+///     Whether the broker emptied in time.
+async fn wait_for_no_clients(broker: &SharedBroker) -> bool {
+    for _ in 0..200 {
+        if broker.with(|broker| broker.clients.is_empty()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
 }
 
 /// Checks that logging in with the default admin credentials returns a token
@@ -239,8 +269,7 @@ async fn test_action_before_auth_fails() {
         .await;
     assert!(res.is_err());
 
-    let broker_lock = broker.lock().unwrap();
-    assert!(broker_lock.clients.is_empty());
+    assert!(wait_for_no_clients(&broker).await);
 }
 
 /// Sends one client frame and waits for the next server frame.
@@ -343,4 +372,63 @@ async fn locking_out_one_username_leaves_others_usable() {
         matches!(admin, ServerMessage::LoginResponse { .. }),
         "admin should still log in, got {admin:?}"
     );
+}
+
+/// Checks that a publish refused for lack of permission doesn't use up the user's rate limit.
+#[tokio::test]
+async fn denied_publishes_do_not_spend_the_rate_limit() {
+    let mut settings = Settings::default();
+    settings.server.allow_registration = true;
+    let limiters = RateLimiters {
+        message_limiter: std::sync::Arc::new(popsub_ratelimit::TokenBucket::new(
+            1,
+            1,
+            Duration::from_secs(3600),
+        )),
+        ..RateLimiters::default()
+    };
+    let (addr, _temp_dir, _broker) = start_server(&settings, limiters).await;
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut ws_stream, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+        .await
+        .expect("WebSocket handshake failed");
+
+    let credentials = ("no_topics_user".to_string(), "password123".to_string());
+    send_and_receive(
+        &mut ws_stream,
+        &ClientMessage::Register {
+            username: credentials.0.clone(),
+            password: credentials.1.clone(),
+        },
+    )
+    .await;
+    let ServerMessage::LoginResponse { token } = send_and_receive(
+        &mut ws_stream,
+        &ClientMessage::Login {
+            username: credentials.0,
+            password: credentials.1,
+        },
+    )
+    .await
+    else {
+        panic!("login failed");
+    };
+    send_and_receive(&mut ws_stream, &ClientMessage::Auth { token }).await;
+
+    for _ in 0..3 {
+        let reply = send_and_receive(
+            &mut ws_stream,
+            &ClientMessage::Publish {
+                topic: "private".to_string(),
+                payload: "hello".to_string(),
+                message_id: None,
+                qos: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&reply, ServerMessage::Error { message } if message.starts_with("not authorized")),
+            "expected a permission error, got {reply:?}"
+        );
+    }
 }

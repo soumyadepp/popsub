@@ -12,7 +12,7 @@ Stores recent messages per topic in an embedded `sled` database so new subscribe
 
 - `store_message(topic, payload)`: inserts, then trims the oldest entries beyond `max_messages_per_topic`.
 - `load_messages(topic)`: deletes entries older than `ttl_seconds`, then returns the rest in order.
-- `Persistence::default()`: path `pubsub_db` (relative to the working directory), TTL 3600 seconds, cap 1000.
+- `Persistence::default()`: path `pubsub_db` (relative to the working directory), TTL 3600 seconds, cap 1000. It panics if the store can't be opened; the binary calls `Persistence::new` instead and reports the error.
 
 ## Gotchas
 

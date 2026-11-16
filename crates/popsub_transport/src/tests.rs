@@ -1,253 +1,98 @@
-//! Tests that drive the broker with parsed protocol frames, without a socket.
+//! Tests for the JSON wire format of client and server frames.
 //!
-//! The `handle_message` helper here is a simplified stand-in for the server's
-//! dispatcher: it skips authentication, permissions and rate limits, so these
-//! tests cover how frames map onto broker calls rather than the server itself.
+//! Clients in other languages build these frames by hand, so the exact field
+//! names and `type` tags are part of the protocol. Server behaviour is covered
+//! by `websocket_tests.rs`, which drives a real server.
 
-pub use crate::message::ClientMessage;
-pub use popsub_broker::Broker;
-use popsub_config::Settings;
-use popsub_persistence::Persistence;
-pub use serde_json::json;
-use std::sync::{Arc, Mutex};
-use tempfile::tempdir;
-pub use tokio::sync::mpsc;
-use uuid::Uuid;
+use crate::message::{ClientMessage, ServerMessage};
+use serde_json::json;
 
-/// Parses a raw frame and applies it to the broker directly, as the server
-/// would after its auth checks.
-///
-/// `auth`, `login` and `register` frames, and frames that fail to parse, are
-/// ignored. Publish fills in the current time, a random UUID for a missing
-/// `message_id` and QoS 0 for a missing `qos`. Panics if the broker mutex is
-/// poisoned.
+/// Parses a client frame from a JSON value.
 ///
 /// Args:
-///     broker: The broker to apply the frame to.
-///     client_id: The subscriber id to subscribe or unsubscribe.
-///     msg: The raw JSON frame.
-async fn handle_message(broker: Arc<Mutex<Broker>>, client_id: String, msg: String) {
-    match serde_json::from_str::<ClientMessage>(&msg) {
-        Ok(ClientMessage::Auth { .. }) => {}
-        Ok(ClientMessage::Login { .. }) => {}
-        Ok(ClientMessage::Register { .. }) => {}
-        Ok(ClientMessage::Subscribe { topic }) => {
-            let mut broker = broker.lock().unwrap();
-            broker.subscribe(&topic, client_id.clone());
-        }
-        Ok(ClientMessage::Unsubscribe { topic }) => {
-            let mut broker = broker.lock().unwrap();
-            broker.unsubscribe(&topic, &client_id);
-        }
-        Ok(ClientMessage::Publish {
+///     value: The frame as a client would send it.
+///
+/// Returns:
+///     The parsed frame. Panics if it doesn't parse.
+fn parse(value: serde_json::Value) -> ClientMessage {
+    serde_json::from_value(value).expect("frame should parse")
+}
+
+/// Checks that login and register frames are read from their `type` tag and fields.
+#[test]
+fn login_and_register_frames_parse() {
+    assert!(matches!(
+        parse(json!({"type": "login", "username": "alice", "password": "secret"})),
+        ClientMessage::Login { username, password } if username == "alice" && password == "secret"
+    ));
+    assert!(matches!(
+        parse(json!({"type": "register", "username": "bob", "password": "secret"})),
+        ClientMessage::Register { username, .. } if username == "bob"
+    ));
+}
+
+/// Checks that a publish frame may leave out `message_id` and `qos`.
+#[test]
+fn publish_optional_fields_default_to_none() {
+    match parse(json!({"type": "publish", "topic": "chat", "payload": "hi"})) {
+        ClientMessage::Publish {
             topic,
             payload,
             message_id,
             qos,
-        }) => {
-            let mut broker = broker.lock().unwrap();
-            let timestamp = chrono::Utc::now().timestamp_millis();
-            broker.publish(popsub_broker::message::Message {
-                topic: topic.clone(),
-                payload,
-                timestamp,
-                message_id: message_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-                qos: qos.unwrap_or(0),
-            });
+        } => {
+            assert_eq!((topic.as_str(), payload.as_str()), ("chat", "hi"));
+            assert_eq!(message_id, None);
+            assert_eq!(qos, None);
         }
-        Ok(ClientMessage::Ack { message_id }) => {
-            let mut broker = broker.lock().unwrap();
-            broker.handle_ack(&message_id);
-        }
-        Err(_) => {}
+        other => panic!("expected publish, got {other:?}"),
     }
 }
 
-/// Checks that a subscribe frame adds the client to the topic's subscribers.
-#[tokio::test]
-async fn test_handle_subscribe() {
-    let tmp = tempdir().unwrap();
-    let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
-        Result::unwrap(persistence),
-        Settings::default().broker,
-    )));
-    let client_id = "test_client".to_string();
-
-    let msg = json!({
-        "type": "subscribe",
-        "topic": "test_topic"
-    })
-    .to_string();
-
-    handle_message(broker.clone(), client_id.clone(), msg).await;
-
-    let broker = broker.lock().unwrap();
-    let topic = broker.topics.get("test_topic").unwrap();
-    assert!(topic.subscribers.contains(&client_id));
-}
-
-/// Checks that an unsubscribe frame removes a subscribed client from the
-/// topic.
-#[tokio::test]
-async fn test_handle_unsubscribe() {
-    let tmp = tempdir().unwrap();
-    let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
-        Result::unwrap(persistence),
-        Settings::default().broker,
-    )));
-    let client_id = "test_client".to_string();
-
-    broker
-        .lock()
-        .unwrap()
-        .subscribe("test_topic", client_id.clone());
-
-    let msg = json!({
-        "type": "unsubscribe",
-        "topic": "test_topic"
-    })
-    .to_string();
-
-    handle_message(broker.clone(), client_id.clone(), msg).await;
-
-    let broker = broker.lock().unwrap();
-    let topic = broker.topics.get("test_topic").unwrap();
-    assert!(!topic.subscribers.contains(&client_id));
-}
-
-/// Checks that a publish frame delivers the payload, id and QoS to a
-/// registered subscriber.
-#[tokio::test]
-async fn test_handle_publish() {
-    let tmp = tempdir().unwrap();
-    let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
-        Result::unwrap(persistence),
-        Settings::default().broker,
-    )));
-    let client_id = "test_client".to_string();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = popsub_client::Client::new(tx);
-    let client_id_for_broker = client.id.clone();
-    broker.lock().unwrap().register_client(client);
-    broker
-        .lock()
-        .unwrap()
-        .subscribe("test_topic", client_id_for_broker.clone());
-
-    let msg = json!({
-        "type": "publish",
-        "topic": "test_topic",
-        "payload": "hello",
-        "message_id": "publish_message_id",
-        "qos": 0
-    })
-    .to_string();
-
-    handle_message(broker.clone(), client_id.clone(), msg).await;
-
-    let received_msg = rx.try_recv().unwrap();
-    if let tungstenite::protocol::Message::Text(text) = received_msg {
-        let received_message: popsub_broker::message::Message =
-            serde_json::from_str(&text).unwrap();
-        assert_eq!(received_message.topic, "test_topic");
-        assert_eq!(received_message.payload, "hello");
-        assert_eq!(received_message.message_id, "publish_message_id");
-        assert_eq!(received_message.qos, 0);
-    } else {
-        panic!("Expected a text message");
+/// Checks that frames with an unknown `type`, or missing required fields, are rejected.
+#[test]
+fn malformed_frames_are_rejected() {
+    for value in [
+        json!({"type": "teleport", "topic": "chat"}),
+        json!({"type": "subscribe"}),
+        json!({"topic": "chat"}),
+    ] {
+        assert!(
+            serde_json::from_value::<ClientMessage>(value.clone()).is_err(),
+            "{value}"
+        );
     }
 }
 
-/// Checks that a QoS 1 publish is tracked as pending and an ack frame clears it.
-#[tokio::test]
-async fn test_handle_ack() {
-    let tmp = tempdir().unwrap();
-    let persistence = Persistence::new(tmp.path().to_str().unwrap(), None, None);
-    let broker = Arc::new(Mutex::new(Broker::new_with_persistence(
-        Result::unwrap(persistence),
-        Settings::default().broker,
-    )));
-    let client_id = "test_client".to_string();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = popsub_client::Client::new(tx);
-    let client_id_for_broker = client.id.clone();
-    broker.lock().unwrap().register_client(client);
-    broker
-        .lock()
-        .unwrap()
-        .subscribe("test_topic", client_id_for_broker.clone());
-
-    let message_id = "ack_message_id".to_string();
-    let publish_msg = json!({
-        "type": "publish",
-        "topic": "test_topic",
-        "payload": "hello_qos1",
-        "message_id": message_id,
-        "qos": 1
-    })
-    .to_string();
-
-    handle_message(broker.clone(), client_id.clone(), publish_msg).await;
-
-    assert!(
-        broker
-            .lock()
-            .unwrap()
-            .pending_acks
-            .contains_key("ack_message_id")
-    );
-
-    let received_msg = rx.try_recv().unwrap();
-    if let tungstenite::protocol::Message::Text(text) = received_msg {
-        let received_message: popsub_broker::message::Message =
-            serde_json::from_str(&text).unwrap();
-        assert_eq!(received_message.message_id, "ack_message_id");
-        assert_eq!(received_message.qos, 1);
-    } else {
-        panic!("Expected a text message");
+/// Checks that server frames carry the `type` tags and fields clients look for.
+#[test]
+fn server_frames_serialise_with_type_tags() {
+    let cases = [
+        (
+            ServerMessage::LoginResponse {
+                token: "t".to_string(),
+            },
+            json!({"type": "login_response", "token": "t"}),
+        ),
+        (
+            ServerMessage::RegisterResponse {
+                success: false,
+                message: "registration failed".to_string(),
+            },
+            json!({"type": "register_response", "success": false, "message": "registration failed"}),
+        ),
+        (
+            ServerMessage::Authenticated {},
+            json!({"type": "authenticated"}),
+        ),
+        (
+            ServerMessage::Error {
+                message: "must authenticate first".to_string(),
+            },
+            json!({"type": "error", "message": "must authenticate first"}),
+        ),
+    ];
+    for (frame, expected) in cases {
+        assert_eq!(serde_json::to_value(&frame).unwrap(), expected);
     }
-
-    let ack_msg = json!({
-        "type": "ack",
-        "message_id": "ack_message_id"
-    })
-    .to_string();
-
-    handle_message(broker.clone(), client_id.clone(), ack_msg).await;
-
-    assert!(
-        !broker
-            .lock()
-            .unwrap()
-            .pending_acks
-            .contains_key("ack_message_id")
-    );
-}
-
-/// Checks that a text frame sent on a client's tokio channel can be read back
-/// on another thread. It doesn't call `spawn_send_loop` itself.
-#[tokio::test]
-async fn test_send_loop_forwards_message() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<tungstenite::protocol::Message>();
-    let (cap_tx, cap_rx) = std::sync::mpsc::sync_channel::<String>(1);
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            while let Some(msg) = rx.recv().await {
-                if msg.is_text() {
-                    let _ = cap_tx.send(msg.to_text().unwrap().to_string());
-                }
-            }
-        });
-    });
-
-    tx.send(tungstenite::protocol::Message::Text("hello".into()))
-        .unwrap();
-
-    let received = cap_rx.recv().expect("should receive message");
-    assert_eq!(received, "hello");
 }
