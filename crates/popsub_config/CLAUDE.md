@@ -25,6 +25,7 @@ Update all of these together:
 - `server.allow_registration` (default false) and `server.registration_role` (`none`, `readonly` or `full`, default `none`) are passed to the auth crate by the transport.
 - Tests pass `Some(HashMap::new())` (or their own map) as the environment so variables set on the machine running the tests can't leak in.
 - `max_connections` is loaded but nothing reads it yet.
+- `broker.max_inflight` sizes each subscription's window of unacknowledged QoS 1 records; values below 1 behave as 1. `storage.session_expiry_secs` is how long a durable session outlives its last connection.
 - `[storage]` uses typed enums: `backend` is a `StorageBackend` and `durability` is `popsub_storage::Durability`, so an unknown name is a load error. Retention limits are plain numbers (0 keeps nothing) and `RetentionSettings::to_retention` turns them into the policy the backends apply.
 - Nested keys from the environment use a double underscore at every level: `STORAGE__RETENTION__MAX_MESSAGES`.
 - This crate depends on `popsub_storage` for `Durability` and `Retention`. Storage must never depend back on config.

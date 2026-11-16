@@ -1,32 +1,36 @@
 # popsub_broker
 
-Topic writers, the broker engine, replay and QoS 1 retries. Every published record goes into its topic's log in a `popsub_storage::Storage` backend and is then delivered to subscribers as a tagged `message` frame with its `seq`.
+Topic writers, the broker engine, replay, per-subscriber acknowledgement and durable sessions. Every published record goes into its topic's log in a `popsub_storage::Storage` backend and is then delivered to subscribers as a tagged `message` frame with its `seq`.
 
 ## Files
 
-- `src/shared.rs`: `SharedBroker`, the cloneable handle everything uses. `with(|broker| ...)` locks the broker (through the crate-private `BrokerCell`, the only lock path, which recovers from poisoning). `publish` and `subscribe` are `async` and go to the topic's writer. `run_retry_loop` (every second) and `run_retention_loop` (every minute) are spawned by the binary. `LogSettings` holds durability and retention. `SharedBroker::new` refuses a durability the backend can't provide.
-- `src/writer.rs`: `TopicWriter`, one task per topic, started on first use. Handles `Publish` (append, deliver if new, trim) and `Subscribe` (replay, then add the subscriber) one at a time. `Published` and `Subscribed` are their outcomes.
+- `src/shared.rs`: `SharedBroker`, the cloneable handle everything uses. `with(|broker| ...)` locks the broker (through the crate-private `BrokerCell`, the only lock path, which recovers from poisoning). `publish`, `subscribe`, `unsubscribe`, `ack`, `attach_session` and `forget_subscription` are `async`; publishes, subscribes and catch-ups go to the topic's writer. `cleanup_client` removes a client and touches its session in the background. Background loops: `run_retry_loop` (1 s), `run_retention_loop` (60 s), `run_session_expiry_loop` (60 s). `session_key` builds the store key from username and session id. `SharedBroker::new` refuses a durability the backend can't provide.
+- `src/writer.rs`: `TopicWriter`, one task per topic, started on first use. Handles `Publish` (append, deliver, store cursors, trim), `Subscribe` (store the subscription, add it, send `subscribed` and `truncated`, catch up) and `CatchUp` (read the log from a subscription's `next_seq` and send while its window has room) one at a time.
+- `src/engine.rs`: `Broker`, synchronous: clients, subscriptions, `deliver`, `send_records`, `skip_to`, `ack`, `retry_overdue` (resends per subscription, stalls after `max_retries`), session lookups.
+- `src/topic.rs`: `Topic` and each subscription's `DeliveryState` (`next_seq`, the in-flight window, stall, and the derived `cursor`), plus `CursorUpdate`.
 - `src/replay.rs`: `plan`, which turns a `StartFrom` and the log's bounds into a starting `seq` and whether to report a truncation. Pure, unit tested.
-- `src/engine.rs`: `Broker`, synchronous: clients, subscriber sets, `deliver` (fan-out plus `pending_acks`), ACKs, `retry_overdue`.
-- `src/frame.rs`: `Delivery`, `Truncated`, `TopicFrame` (what the broker writes to channels) and `StartFrom` (the `from` of a subscribe).
-- `src/topic.rs`: `Topic`, a name and a set of subscriber ids.
-- `src/tests.rs`: unit tests with `mpsc` channels as fake clients and `MemoryStorage` as the log.
+- `src/frame.rs`: the frames the broker writes (`Delivery`, `Truncated`, `Subscribed`, `Stalled`, wrapped in `TopicFrame`) and `StartFrom`.
+- `src/tests.rs`: unit tests with `mpsc` channels as fake clients and `MemoryStorage` as the log and session store.
 
 ## Contract
 
-- Storage is only touched in a topic writer, outside the broker lock. The lock is only taken through `with`, whose closure can't await.
-- Every publish and subscribe for a topic goes through that topic's writer. That is what gives seq-ordered delivery and gap-free replay; `concurrent_publishers_are_delivered_in_seq_order` and `replay_and_live_delivery_never_overlap_or_gap` fail without it.
-- Only the writer calls `Broker::deliver`, once per new record, in `seq` order.
-- The broker serialises its own frames and must not depend on transport types. The transport's `ServerMessage` wraps `Delivery` and `Truncated`; a transport test checks they still match.
+- Storage is only touched outside the broker lock. The lock is only taken through `with`, whose closure can't await.
+- Every publish, subscribe and catch-up for a topic goes through that topic's writer. That is what gives seq-ordered delivery and gap-free replay; `concurrent_publishers_are_delivered_in_seq_order` and `replay_and_live_delivery_never_overlap_or_gap` fail without it.
+- A subscription is only sent the exact `seq` it expects next. Anything it misses is read back from the log by catch-up, never queued in memory.
+- ACKs are per subscription: only a record in that connection's window is accepted. `acks_are_per_subscriber` and `retries_go_only_to_the_subscriber_that_has_not_acked` guard this.
+- The cursor is derived (one below the oldest in-flight record, or below `next_seq`); never store it separately in memory.
+- Sessions are keyed by `session_key(username, session_id)`, so one user can't reach another's.
+- The broker serialises its own frames and must not depend on transport types. The transport's `ServerMessage` wraps the same structs; transport tests check they still match.
 
 ## Current behaviour to keep in mind
 
-- `pending_acks` is keyed by `message_id` only. One ACK from any subscriber clears the record for everyone, and retries go to every subscriber. Replayed records are never added to it. Step 3 of `docs/STORAGE.md` replaces it with per-subscription windows.
-- A subscribe without `from` replays nothing (`StartFrom::New`).
-- A duplicate publish (same publisher and message id, still retained) returns the original `seq` and is not delivered again.
-- If storage fails during a subscribe, the client is not subscribed.
-- A long replay holds up publishes to that topic until it finishes.
-- Writer tasks hold the broker and storage but not the `SharedBroker`, so they stop when every handle is dropped.
+- `Resume` (the default `from`) becomes one past the stored cursor for a durable session with a stored subscription to the topic, and `New` otherwise.
+- QoS 0 records count as done once sent and move the cursor. While a window is full, QoS 0 waits too.
+- A stalled subscription gets nothing, not even retries, until it ACKs something (which resets the remaining records' retries) or resubscribes.
+- Resubscribing replaces the subscription and drops its window; for a session, `resume` replays from the stored cursor.
+- Attaching a session held by another connection sends that connection a close frame and removes it.
+- A cursor that fails to store is logged; the worst case is resending acknowledged records after a reconnect.
+- A long catch-up holds up publishes to that topic until it finishes.
 
 ## When changing delivery logic
 

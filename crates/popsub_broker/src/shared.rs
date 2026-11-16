@@ -6,11 +6,16 @@
 //! closure under the lock, so no caller can hold it across an await point
 //! and the poisoning policy lives in one place.
 //!
-//! Publishing and subscribing touch storage, so they are `async` and go
+//! Publishing, subscribing and anything that moves a stored cursor touch
+//! storage, so they are `async`. Publishes, subscribes and catch-ups go
 //! through the topic's writer task (see `writer`), which is started the
 //! first time a topic is used. The writers hold the broker and the storage
 //! but not this handle, so they stop once every `SharedBroker` clone is
 //! dropped.
+//!
+//! Durable sessions are keyed in the subscription store by `session_key`,
+//! which combines the username with the client's session id, so one user
+//! can never attach to another user's session.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -18,15 +23,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use popsub_storage::{
-    Durability, NewRecord, Result as StorageResult, Retention, Storage, StorageError,
+    Durability, NewRecord, Result as StorageResult, Retention, Storage, StorageError, Subscription,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
+use tungstenite::protocol::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::engine::Broker;
 use crate::frame::StartFrom;
-use crate::writer::{Command, Published, Subscribed, TopicWriter};
+use crate::writer::{Command, Published, SubscribeOutcome, TopicWriter};
 
 /// How often `run_retry_loop` looks for overdue QoS 1 records.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -34,6 +40,33 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// How often `run_retention_loop` trims every topic, so topics nobody
 /// publishes to still lose records past their age limit.
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often `run_session_expiry_loop` touches connected sessions and
+/// removes expired ones.
+pub const SESSION_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Builds the subscription store key for a user's durable session.
+///
+/// The username's length goes first, so no username and session id pair
+/// can produce the same key as another, whatever characters they contain.
+///
+/// Args:
+///     username: The authenticated user.
+///     session_id: The id the client chose.
+///
+/// Returns:
+///     The key.
+pub fn session_key(username: &str, session_id: &str) -> String {
+    format!("{}:{username}:{session_id}", username.len())
+}
+
+/// The current time in milliseconds since the Unix epoch.
+///
+/// Returns:
+///     The time.
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 
 /// How firmly appends are stored and how much history each topic keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +204,7 @@ impl SharedBroker {
     ///         writer stopped.
     ///     StorageError::Unsupported: When the backend refuses the durability.
     pub async fn publish(&self, topic: &str, mut record: NewRecord) -> StorageResult<Published> {
-        record.published_at_ms = chrono::Utc::now().timestamp_millis();
+        record.published_at_ms = now_ms();
         if record.message_id.is_empty() {
             record.message_id = Uuid::new_v4().to_string();
         }
@@ -182,7 +215,11 @@ impl SharedBroker {
         .await
     }
 
-    /// Replays a topic's history to a client as asked, then subscribes it.
+    /// Subscribes a client to a topic and starts replaying the history it asked for.
+    ///
+    /// `Resume` becomes `Seq` one past the stored cursor when the client's
+    /// durable session has a stored subscription to the topic, and `New`
+    /// otherwise.
     ///
     /// Args:
     ///     topic: The topic to subscribe to.
@@ -190,24 +227,197 @@ impl SharedBroker {
     ///     from: Where replay starts.
     ///
     /// Returns:
-    ///     What was replayed and whether the subscription was added.
+    ///     The replay range and whether the subscription was added.
     ///
     /// Raises:
-    ///     StorageError::Unavailable: When the log can't be read or the
-    ///         topic's writer stopped. The client is not subscribed.
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached, or the topic's writer stopped. The client is
+    ///         not subscribed.
     ///     StorageError::Corrupt: When a stored record fails its checks.
     pub async fn subscribe(
         &self,
         topic: &str,
         client_id: &str,
         from: StartFrom,
-    ) -> StorageResult<Subscribed> {
+    ) -> StorageResult<SubscribeOutcome> {
+        let from = match from {
+            StartFrom::Resume => self.resume_point(topic, client_id).await?,
+            other => other,
+        };
         self.request(topic, |reply| Command::Subscribe {
             client_id: client_id.to_string(),
             from,
             reply,
         })
         .await
+    }
+
+    /// Works out where `Resume` starts for a client and topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     client_id: The client.
+    ///
+    /// Returns:
+    ///     `Seq` one past the stored cursor, or `New` when there is none.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the subscription store can't be read.
+    async fn resume_point(&self, topic: &str, client_id: &str) -> StorageResult<StartFrom> {
+        let Some(session) = self.with(|broker| broker.client_session(client_id)) else {
+            return Ok(StartFrom::New);
+        };
+        let stored = self.storage.load(&session).await?;
+        Ok(stored
+            .iter()
+            .find(|s| s.topic == topic)
+            .map_or(StartFrom::New, |s| StartFrom::Seq(s.acked_seq + 1)))
+    }
+
+    /// Unsubscribes a client from a topic, and forgets the stored
+    /// subscription if the client holds a durable session.
+    ///
+    /// Args:
+    ///     topic: The topic to leave.
+    ///     client_id: The client.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the stored subscription can't be removed.
+    pub async fn unsubscribe(&self, topic: &str, client_id: &str) -> StorageResult<()> {
+        let session = self.with(|broker| broker.unsubscribe(topic, &client_id.to_string()));
+        match session {
+            Some(session) => self.storage.unsubscribe(&session, topic).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Records a client's acknowledgement of one record on one topic.
+    ///
+    /// Only a record in flight to this client is accepted. An accepted ACK
+    /// stores the session's cursor if it moved, and asks the topic's writer
+    /// to send whatever the subscription missed while its window was full.
+    ///
+    /// Args:
+    ///     client_id: The acknowledging client.
+    ///     topic: The topic the record was delivered on.
+    ///     seq: The acknowledged record.
+    ///
+    /// Returns:
+    ///     Whether the ACK was accepted.
+    pub async fn ack(&self, client_id: &str, topic: &str, seq: u64) -> bool {
+        let outcome = self.with(|broker| broker.ack(client_id, topic, seq, now_ms()));
+        if let Some(update) = &outcome.cursor
+            && let Err(e) = self
+                .storage
+                .ack(&update.session, &update.topic, update.acked_seq)
+                .await
+        {
+            warn!(topic, %e, "storing a cursor failed");
+        }
+        if outcome.catch_up {
+            self.send(
+                topic,
+                Command::CatchUp {
+                    client_id: client_id.to_string(),
+                },
+            );
+        }
+        outcome.accepted
+    }
+
+    /// Binds a durable session to a connected client.
+    ///
+    /// Another connection already holding the session is closed and removed
+    /// first, so a client that reconnects before the server noticed its old
+    /// connection drop takes the session over. The session is touched for
+    /// expiry. With `clean_start`, its stored subscriptions are discarded.
+    ///
+    /// Args:
+    ///     client_id: The connected client.
+    ///     session: The session's storage key, from `session_key`.
+    ///     clean_start: Whether to discard the stored subscriptions.
+    ///
+    /// Returns:
+    ///     The stored subscriptions to restore, empty after a clean start or
+    ///     for a new session.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the subscription store can't be reached.
+    pub async fn attach_session(
+        &self,
+        client_id: &str,
+        session: &str,
+        clean_start: bool,
+    ) -> StorageResult<Vec<Subscription>> {
+        self.with(|broker| {
+            if let Some(old) = broker.session_holder(session)
+                && old != client_id
+            {
+                if let Some(sender) = broker.client_sender(&old) {
+                    let _ = sender.send(WsMessage::Close(None));
+                }
+                broker.cleanup_client(&old);
+                info!(old_client = %old, client = %client_id, "session taken over by a new connection");
+            }
+            if let Some(client) = broker.clients.get_mut(client_id) {
+                client.session = Some(session.to_string());
+            }
+        });
+        self.storage.touch(session, now_ms()).await?;
+        let stored = self.storage.load(session).await?;
+        if !clean_start {
+            return Ok(stored);
+        }
+        for subscription in stored {
+            self.storage
+                .unsubscribe(session, &subscription.topic)
+                .await?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// Removes a stored subscription the session may no longer have, such as
+    /// one whose topic permission was withdrawn.
+    ///
+    /// Args:
+    ///     session: The session's storage key.
+    ///     topic: The topic.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the subscription store can't be changed.
+    pub async fn forget_subscription(&self, session: &str, topic: &str) -> StorageResult<()> {
+        self.storage.unsubscribe(session, topic).await
+    }
+
+    /// Removes a disconnected client and all its subscriptions.
+    ///
+    /// If it held a durable session, the session is touched in the
+    /// background, so its expiry counts from the disconnect.
+    ///
+    /// Args:
+    ///     client_id: The client to remove.
+    pub fn cleanup_client(&self, client_id: &str) {
+        let session = self.with(|broker| broker.cleanup_client(&client_id.to_string()));
+        if let Some(session) = session {
+            let storage = self.storage.clone();
+            tokio::spawn(async move {
+                if let Err(e) = storage.touch(&session, now_ms()).await {
+                    warn!(%e, "touching a session on disconnect failed");
+                }
+            });
+        }
+    }
+
+    /// Queues a command to a topic's writer without waiting for it.
+    ///
+    /// Args:
+    ///     topic: The topic whose writer handles the command.
+    ///     command: The command.
+    fn send(&self, topic: &str, command: Command) {
+        if let Err(mpsc::error::SendError(command)) = self.writer(topic).send(command) {
+            self.writers().remove(topic);
+            let _ = self.writer(topic).send(command);
+        }
     }
 
     /// Sends a command to a topic's writer and waits for its result.
@@ -281,12 +491,11 @@ impl SharedBroker {
         let mut ticker = tokio::time::interval(RETRY_INTERVAL);
         loop {
             ticker.tick().await;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let outcome = self.with(|broker| broker.retry_overdue(now_ms));
-            if outcome.resent > 0 || outcome.dropped > 0 {
+            let outcome = self.with(|broker| broker.retry_overdue(now_ms()));
+            if outcome.resent > 0 || outcome.stalled > 0 {
                 info!(
                     resent = outcome.resent,
-                    dropped = outcome.dropped,
+                    stalled = outcome.stalled,
                     "retried QoS 1 messages"
                 );
             }
@@ -302,7 +511,51 @@ impl SharedBroker {
         let mut ticker = tokio::time::interval(RETENTION_INTERVAL);
         loop {
             ticker.tick().await;
-            self.trim_all(chrono::Utc::now().timestamp_millis()).await;
+            self.trim_all(now_ms()).await;
+        }
+    }
+
+    /// Expires durable sessions not seen for `expiry`, every `SESSION_EXPIRY_INTERVAL`, forever.
+    ///
+    /// Connected sessions are touched first, so a long-lived connection never
+    /// loses its session. Spawn it as a background task.
+    ///
+    /// Args:
+    ///     expiry: How long a session is kept after its last connection ends.
+    pub async fn run_session_expiry_loop(self, expiry: Duration) {
+        let mut ticker = tokio::time::interval(SESSION_EXPIRY_INTERVAL);
+        loop {
+            ticker.tick().await;
+            self.expire_sessions(now_ms(), expiry).await;
+        }
+    }
+
+    /// Touches connected sessions, then removes sessions idle longer than `expiry`.
+    ///
+    /// Args:
+    ///     now_ms: The current time.
+    ///     expiry: How long an idle session is kept.
+    ///
+    /// Returns:
+    ///     How many sessions were removed.
+    pub async fn expire_sessions(&self, now_ms: i64, expiry: Duration) -> u64 {
+        for session in self.with(|broker| broker.connected_sessions()) {
+            if let Err(e) = self.storage.touch(&session, now_ms).await {
+                warn!(%e, "touching a connected session failed");
+            }
+        }
+        let cutoff = now_ms.saturating_sub(i64::try_from(expiry.as_millis()).unwrap_or(i64::MAX));
+        match self.storage.expire(cutoff).await {
+            Ok(removed) => {
+                if removed > 0 {
+                    info!(removed, "expired idle sessions");
+                }
+                removed
+            }
+            Err(e) => {
+                warn!(%e, "expiring sessions failed");
+                0
+            }
         }
     }
 

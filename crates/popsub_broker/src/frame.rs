@@ -2,9 +2,9 @@
 //! options a subscriber can give for replay.
 //!
 //! The broker serialises these itself, so it never depends on the transport.
-//! The transport's `ServerMessage` wraps `Delivery` and `Truncated` in
-//! variants with the same `type` tags, so clients parse both through one
-//! enum.
+//! The transport's `ServerMessage` wraps `Delivery`, `Truncated`,
+//! `Subscribed` and `Stalled` in variants with the same `type` tags, so
+//! clients parse every server frame through one enum.
 
 use popsub_storage::Record;
 use serde::{Deserialize, Serialize};
@@ -59,14 +59,46 @@ pub struct Truncated {
     pub first_available: u64,
 }
 
+/// Confirms a subscription and says which records are history.
+///
+/// Sent before any replayed record. Records `replay_from` to `replay_to`
+/// are history; anything after `replay_to` is live. The range is empty when
+/// `replay_from` is greater than `replay_to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subscribed {
+    /// The topic subscribed to.
+    pub topic: String,
+    /// The first `seq` that will be sent.
+    pub replay_from: u64,
+    /// The newest `seq` in the log when the subscription started.
+    pub replay_to: u64,
+}
+
+/// Tells a subscriber that a QoS 1 record ran out of retries.
+///
+/// Delivery to that subscription pauses until the client acknowledges a
+/// record or subscribes again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stalled {
+    /// The subscribed topic.
+    pub topic: String,
+    /// The record that was never acknowledged.
+    pub seq: u64,
+}
+
 /// Every frame the broker sends, tagged by `type` like the transport's frames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TopicFrame {
     /// A delivered record, `{"type":"message", ...}`.
     Message(Delivery),
-    /// A replay that starts later than asked, `{"type":"truncated", ...}`.
+    /// Records the subscriber expected were trimmed, `{"type":"truncated", ...}`.
     Truncated(Truncated),
+    /// A subscription started, `{"type":"subscribed", ...}`.
+    Subscribed(Subscribed),
+    /// A subscription paused after a record ran out of retries,
+    /// `{"type":"stalled", ...}`.
+    Stalled(Stalled),
 }
 
 impl TopicFrame {
@@ -88,13 +120,18 @@ impl TopicFrame {
 
 /// Where replay starts when a client subscribes.
 ///
-/// On the wire this is `"new"`, `{"last": 50}`, `{"since_ms": 1794800000000}`
-/// or `{"seq": 1200}`. A subscribe without `from` means `"new"`.
+/// On the wire this is `"resume"`, `"new"`, `{"last": 50}`,
+/// `{"since_ms": 1794800000000}` or `{"seq": 1200}`. A subscribe without
+/// `from` means `"resume"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartFrom {
-    /// No replay. Only records published after subscribing.
+    /// One past the stored cursor of this session's subscription to the
+    /// topic. For an ephemeral connection, or a session with no stored
+    /// subscription to the topic, the same as `New`.
     #[default]
+    Resume,
+    /// No replay. Only records published after subscribing.
     New,
     /// The last N retained records.
     Last(u64),

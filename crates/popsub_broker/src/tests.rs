@@ -1,12 +1,15 @@
 //! Unit tests for the broker, using `tokio::sync::mpsc` channels as fake
-//! client connections and `MemoryStorage` for topic logs.
+//! client connections and `MemoryStorage` for topic logs and sessions.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use popsub_client::Client;
 use popsub_config::Settings;
+use popsub_config::settings::BrokerSettings;
 use popsub_storage::{
     Durability, LogBounds, MemoryStorage, NewRecord, Record, Retention, StorageError,
+    SubscriptionStore,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -14,7 +17,11 @@ use tungstenite::protocol::Message as WsMessage;
 
 use crate::frame::StartFrom;
 use crate::replay::{ReplayPlan, plan};
-use crate::{Broker, LogSettings, RetryOutcome, SharedBroker};
+use crate::topic::{CursorUpdate, DeliveryState};
+use crate::{Broker, LogSettings, RetryOutcome, SharedBroker, session_key};
+
+/// The receiving end of a fake client's channel.
+type Inbox = mpsc::UnboundedReceiver<WsMessage>;
 
 /// Builds an empty broker with the default settings.
 ///
@@ -24,17 +31,37 @@ fn test_broker() -> Broker {
     Broker::new(Settings::default().broker)
 }
 
-/// Builds a shared broker on a fresh `MemoryStorage`.
+/// Builds broker settings with a chosen window size.
 ///
 /// Args:
+///     max_inflight: The window size.
+///
+/// Returns:
+///     The default broker settings with that window.
+fn with_window(max_inflight: usize) -> BrokerSettings {
+    BrokerSettings {
+        max_inflight,
+        ..Settings::default().broker
+    }
+}
+
+/// Builds a shared broker on the given storage.
+///
+/// Args:
+///     settings: The broker settings.
+///     storage: Where logs and sessions live.
 ///     retention: The retention every topic gets.
 ///
 /// Returns:
 ///     The shared broker.
-fn shared(retention: Retention) -> SharedBroker {
+fn shared_on(
+    settings: BrokerSettings,
+    storage: Arc<MemoryStorage>,
+    retention: Retention,
+) -> SharedBroker {
     SharedBroker::new(
-        test_broker(),
-        Arc::new(MemoryStorage::new()),
+        Broker::new(settings),
+        storage,
         LogSettings {
             durability: Durability::None,
             retention,
@@ -43,16 +70,44 @@ fn shared(retention: Retention) -> SharedBroker {
     .expect("memory storage supports durability none")
 }
 
-/// Registers a fake client with a broker.
+/// Builds a shared broker with default settings on a fresh `MemoryStorage`.
+///
+/// Args:
+///     retention: The retention every topic gets.
+///
+/// Returns:
+///     The shared broker.
+fn shared(retention: Retention) -> SharedBroker {
+    shared_on(
+        Settings::default().broker,
+        Arc::new(MemoryStorage::new()),
+        retention,
+    )
+}
+
+/// Registers a fake ephemeral client with a broker.
 ///
 /// Args:
 ///     broker: The broker to register with.
 ///
 /// Returns:
-///     The client's id and the receiving end of its channel.
-fn connect(broker: &mut Broker) -> (String, mpsc::UnboundedReceiver<WsMessage>) {
+///     The client's id and its inbox.
+fn connect(broker: &mut Broker) -> (String, Inbox) {
+    connect_as(broker, None)
+}
+
+/// Registers a fake client, optionally holding a durable session.
+///
+/// Args:
+///     broker: The broker to register with.
+///     session: The session's storage key, if any.
+///
+/// Returns:
+///     The client's id and its inbox.
+fn connect_as(broker: &mut Broker, session: Option<&str>) -> (String, Inbox) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let client = Client::new(tx);
+    let mut client = Client::new(tx);
+    client.session = session.map(str::to_string);
     let id = client.id.clone();
     broker.register_client(client);
     (id, rx)
@@ -62,16 +117,15 @@ fn connect(broker: &mut Broker) -> (String, mpsc::UnboundedReceiver<WsMessage>) 
 ///
 /// Args:
 ///     seq: The record's sequence number.
-///     message_id: The message id.
 ///     qos: The delivery level.
 ///
 /// Returns:
-///     A record on topic `t`.
-fn record(seq: u64, message_id: &str, qos: u8) -> Record {
+///     A record on topic `t` with message id `m{seq}`.
+fn record(seq: u64, qos: u8) -> Record {
     Record {
         topic: "t".to_string(),
         seq,
-        message_id: message_id.to_string(),
+        message_id: format!("m{seq}"),
         publisher: "alice".to_string(),
         payload: format!("payload {seq}"),
         qos,
@@ -83,16 +137,16 @@ fn record(seq: u64, message_id: &str, qos: u8) -> Record {
 ///
 /// Args:
 ///     message_id: The message id, or empty to have one generated.
-///     payload: The message body.
+///     qos: The delivery level.
 ///
 /// Returns:
-///     A QoS 0 record from `alice`.
-fn new_record(message_id: &str, payload: &str) -> NewRecord {
+///     A record from `alice` whose payload is the message id.
+fn new_record(message_id: &str, qos: u8) -> NewRecord {
     NewRecord {
         message_id: message_id.to_string(),
         publisher: "alice".to_string(),
-        payload: payload.to_string(),
-        qos: 0,
+        payload: message_id.to_string(),
+        qos,
         published_at_ms: 0,
     }
 }
@@ -100,14 +154,16 @@ fn new_record(message_id: &str, payload: &str) -> NewRecord {
 /// Drains every frame already queued on a fake client's channel.
 ///
 /// Args:
-///     rx: The receiving end of the client's channel.
+///     rx: The client's inbox.
 ///
 /// Returns:
-///     Each frame parsed as JSON, in order.
-fn frames(rx: &mut mpsc::UnboundedReceiver<WsMessage>) -> Vec<Value> {
+///     Each text frame parsed as JSON, in order.
+fn frames(rx: &mut Inbox) -> Vec<Value> {
     let mut out = Vec::new();
-    while let Ok(WsMessage::Text(text)) = rx.try_recv() {
-        out.push(serde_json::from_str(&text).expect("frames are JSON"));
+    while let Ok(frame) = rx.try_recv() {
+        if let WsMessage::Text(text) = frame {
+            out.push(serde_json::from_str(&text).expect("frames are JSON"));
+        }
     }
     out
 }
@@ -127,15 +183,37 @@ fn seqs(frames: &[Value]) -> Vec<u64> {
         .collect()
 }
 
-/// Publishes payloads `m1` to `mN` to topic `t`.
+/// Waits up to two seconds for a client to have received `count` messages,
+/// for checks on work the topic writer does in the background.
+///
+/// Args:
+///     rx: The client's inbox.
+///     count: How many `message` frames to wait for.
+///
+/// Returns:
+///     Every frame received while waiting.
+async fn wait_for_messages(rx: &mut Inbox, count: usize) -> Vec<Value> {
+    let mut received = Vec::new();
+    for _ in 0..200 {
+        received.extend(frames(rx));
+        if seqs(&received).len() >= count {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    received
+}
+
+/// Publishes records `m1` to `mN` to topic `t`.
 ///
 /// Args:
 ///     broker: The shared broker.
 ///     count: How many to publish.
-async fn publish_many(broker: &SharedBroker, count: u64) {
+///     qos: Their delivery level.
+async fn publish_many(broker: &SharedBroker, count: u64, qos: u8) {
     for n in 1..=count {
         broker
-            .publish("t", new_record(&format!("m{n}"), &format!("m{n}")))
+            .publish("t", new_record(&format!("m{n}"), qos))
             .await
             .expect("publish");
     }
@@ -147,61 +225,79 @@ fn test_topic_new() {
     let topic = super::topic::Topic::new("test_topic");
     assert_eq!(topic.name, "test_topic");
     assert!(topic.subscribers.is_empty());
+    assert_eq!(topic.last_seq, 0);
 }
 
-/// Checks that subscribing and unsubscribing change the topic's subscriber set.
+/// Checks that a subscription's cursor sits below its oldest in-flight
+/// record, and only moves for durable sessions.
 #[test]
-fn test_topic_subscribe_and_unsubscribe() {
-    let mut topic = super::topic::Topic::new("test_topic");
-    topic.subscribe("client1".to_string());
-    assert!(topic.subscribers.contains("client1"));
-    topic.unsubscribe(&"client1".to_string());
-    assert!(!topic.subscribers.contains("client1"));
+fn cursor_tracks_the_oldest_unacknowledged_record() {
+    let mut state = DeliveryState::new(5, Some("s".to_string()));
+    assert_eq!(state.cursor(), 4);
+    assert_eq!(state.take_update("t"), None);
+    state.next_seq = 9;
+    state.inflight.insert(
+        7,
+        crate::topic::InFlight {
+            record: record(7, 1),
+            sent_at: 0,
+            retries: 0,
+        },
+    );
+    assert_eq!(state.cursor(), 6);
+    assert_eq!(
+        state.take_update("t"),
+        Some(CursorUpdate {
+            session: "s".to_string(),
+            topic: "t".to_string(),
+            acked_seq: 6
+        })
+    );
+    assert_eq!(state.take_update("t"), None);
+
+    let mut ephemeral = DeliveryState::new(1, None);
+    ephemeral.next_seq = 50;
+    assert_eq!(ephemeral.take_update("t"), None);
 }
 
-/// Checks that a new broker starts with no topics, clients or pending records.
+/// Checks client registration, removal and session lookups.
 #[test]
-fn test_broker_new() {
-    let broker = test_broker();
-    assert!(broker.topics.is_empty());
-    assert!(broker.clients.is_empty());
-    assert!(broker.pending_acks.is_empty());
-}
-
-/// Checks that a registered client is stored by id and removed by `remove_client`.
-#[test]
-fn test_broker_register_and_remove_client() {
+fn clients_and_sessions_are_tracked() {
     let mut broker = test_broker();
-    let (id, _rx) = connect(&mut broker);
-    assert!(broker.clients.contains_key(&id));
-    assert!(broker.client_sender(&id).is_some());
-    broker.remove_client(&id);
-    assert!(!broker.clients.contains_key(&id));
-    assert!(broker.client_sender(&id).is_none());
+    let (plain, _a) = connect(&mut broker);
+    let (durable, _b) = connect_as(&mut broker, Some("key"));
+    assert_eq!(broker.client_session(&plain), None);
+    assert_eq!(broker.client_session(&durable).as_deref(), Some("key"));
+    assert_eq!(broker.session_holder("key"), Some(durable.clone()));
+    assert_eq!(broker.connected_sessions(), vec!["key".to_string()]);
+    broker.remove_client(&plain);
+    assert!(broker.client_sender(&plain).is_none());
+    assert_eq!(broker.cleanup_client(&durable).as_deref(), Some("key"));
+    assert!(broker.session_holder("key").is_none());
 }
 
-/// Checks that adding a subscriber creates the topic and that an unregistered
-/// client is not added.
+/// Checks that an unregistered client can't subscribe and that unsubscribing
+/// reports the session whose stored subscription must go too.
 #[test]
 fn add_subscriber_requires_a_registered_client() {
     let mut broker = test_broker();
-    let (id, _rx) = connect(&mut broker);
-    assert!(broker.add_subscriber("t", id.clone()));
-    assert!(broker.topics["t"].subscribers.contains(&id));
-    assert!(!broker.add_subscriber("t", "ghost".to_string()));
-    assert!(!broker.topics["t"].subscribers.contains("ghost"));
-    broker.unsubscribe("t", &id);
-    assert!(!broker.topics["t"].subscribers.contains(&id));
+    let (id, _rx) = connect_as(&mut broker, Some("key"));
+    assert!(broker.add_subscriber("t", id.clone(), 1, 0));
+    assert!(broker.topics["t"].subscribers.contains_key(&id));
+    assert!(!broker.add_subscriber("t", "ghost".to_string(), 1, 0));
+    assert_eq!(broker.unsubscribe("t", &id).as_deref(), Some("key"));
+    assert_eq!(broker.unsubscribe("t", &id), None);
 }
 
 /// Checks that a delivered record arrives as a tagged `message` frame with
-/// its seq and without the publisher's username.
+/// its seq and without the publisher's username, and that QoS 0 leaves
+/// nothing in flight.
 #[test]
 fn deliver_sends_a_tagged_frame_with_seq() {
     let mut broker = test_broker();
     let (id, mut rx) = connect(&mut broker);
-    broker.add_subscriber("t", id);
-    assert_eq!(broker.deliver(&record(7, "m7", 0), 1_000), 1);
+    broker.add_subscriber("t", id.clone(), 7, 6);
+    broker.deliver(&record(7, 0), 1_000);
     let received = frames(&mut rx);
     assert_eq!(received.len(), 1);
     let frame = &received[0];
@@ -213,106 +309,147 @@ fn deliver_sends_a_tagged_frame_with_seq() {
     assert_eq!(frame["qos"], 0);
     assert_eq!(frame["published_at_ms"], 1_000);
     assert!(frame.get("publisher").is_none());
-    assert!(broker.pending_acks.is_empty());
+    assert!(broker.topics["t"].subscribers[&id].inflight.is_empty());
 }
 
-/// Checks that a QoS 1 record is held in `pending_acks` until acknowledged.
+/// Checks that one subscriber's ACK clears the record only for itself, and
+/// that ACKs from a client the record wasn't sent to are ignored.
 #[test]
-fn qos1_delivery_is_pending_until_acked() {
+fn acks_are_per_subscriber() {
     let mut broker = test_broker();
-    let (id, mut rx) = connect(&mut broker);
-    broker.add_subscriber("t", id);
-    broker.deliver(&record(1, "q1", 1), 1_000);
-    assert!(broker.pending_acks.contains_key("q1"));
-    assert_eq!(seqs(&frames(&mut rx)), vec![1]);
-    broker.handle_ack("q1");
-    assert!(!broker.pending_acks.contains_key("q1"));
-    broker.handle_ack("unknown");
-    assert!(broker.pending_acks.is_empty());
+    let (a, mut rx_a) = connect(&mut broker);
+    let (b, mut rx_b) = connect(&mut broker);
+    let (outsider, _rx_c) = connect(&mut broker);
+    broker.add_subscriber("t", a.clone(), 1, 0);
+    broker.add_subscriber("t", b.clone(), 1, 0);
+    broker.deliver(&record(1, 1), 0);
+    assert_eq!(seqs(&frames(&mut rx_a)), vec![1]);
+    assert_eq!(seqs(&frames(&mut rx_b)), vec![1]);
+
+    assert!(!broker.ack(&outsider, "t", 1, 0).accepted);
+    assert!(broker.ack(&a, "t", 1, 0).accepted);
+    assert!(!broker.ack(&a, "t", 1, 0).accepted);
+    assert!(!broker.ack(&a, "t", 2, 0).accepted);
+    assert!(!broker.ack(&a, "other", 1, 0).accepted);
+    assert!(broker.topics["t"].subscribers[&a].inflight.is_empty());
+    assert!(broker.topics["t"].subscribers[&b].inflight.contains_key(&1));
 }
 
-/// Checks that delivering to a topic without subscribers, or to a closed
-/// channel, doesn't panic and reaches nobody.
+/// Checks that a retry goes only to the subscriber that hasn't acknowledged.
 #[test]
-fn deliver_without_live_subscribers_reaches_nobody() {
+fn retries_go_only_to_the_subscriber_that_has_not_acked() {
+    let step = Settings::default().broker.ack_timeout_ms as i64 + 1;
     let mut broker = test_broker();
-    assert_eq!(broker.deliver(&record(1, "a", 0), 0), 0);
-    let (id, rx) = connect(&mut broker);
-    broker.add_subscriber("t", id);
-    drop(rx);
-    assert_eq!(broker.deliver(&record(2, "b", 0), 0), 0);
+    let (a, mut rx_a) = connect(&mut broker);
+    let (b, mut rx_b) = connect(&mut broker);
+    broker.add_subscriber("t", a.clone(), 1, 0);
+    broker.add_subscriber("t", b.clone(), 1, 0);
+    broker.deliver(&record(1, 1), 0);
+    frames(&mut rx_a);
+    frames(&mut rx_b);
+    broker.ack(&a, "t", 1, 0);
+
+    let outcome = broker.retry_overdue(step);
+    assert_eq!(
+        outcome,
+        RetryOutcome {
+            resent: 1,
+            stalled: 0
+        }
+    );
+    assert!(frames(&mut rx_a).is_empty());
+    assert_eq!(seqs(&frames(&mut rx_b)), vec![1]);
 }
 
-/// Checks that `cleanup_client` removes the client and its subscriptions.
+/// Checks that a record unacknowledged after `max_retries` resends stalls
+/// its subscription with a `stalled` frame, pauses delivery, and that an ACK
+/// lifts the stall and asks for a catch-up.
 #[test]
-fn test_broker_cleanup_client() {
-    let mut broker = test_broker();
-    let (id, _rx) = connect(&mut broker);
-    broker.add_subscriber("t", id.clone());
-    broker.cleanup_client(&id);
-    assert!(!broker.clients.contains_key(&id));
-    assert!(!broker.topics["t"].subscribers.contains(&id));
-}
-
-/// Checks that an unacknowledged QoS 1 record is resent `max_retries` times
-/// with its original seq, then dropped, and that a late ACK is ignored.
-#[test]
-fn test_broker_qos1_retry_mechanism() {
+fn running_out_of_retries_stalls_the_subscription() {
     let settings = Settings::default().broker;
     let step = settings.ack_timeout_ms as i64 + 1;
     let mut broker = test_broker();
     let (id, mut rx) = connect(&mut broker);
-    broker.add_subscriber("t", id);
-    let sent_at = 10_000;
-    broker.deliver(&record(3, "retry", 1), sent_at);
-    assert_eq!(seqs(&frames(&mut rx)), vec![3]);
+    broker.add_subscriber("t", id.clone(), 1, 0);
+    broker.deliver(&record(1, 1), 0);
+    frames(&mut rx);
 
-    assert_eq!(broker.retry_overdue(sent_at).resent, 0);
+    assert_eq!(broker.retry_overdue(0).resent, 0);
     for attempt in 1..=settings.max_retries {
-        let outcome = broker.retry_overdue(sent_at + step * attempt as i64);
-        assert_eq!(
-            outcome,
-            RetryOutcome {
-                resent: 1,
-                dropped: 0
-            }
-        );
-        assert_eq!(seqs(&frames(&mut rx)), vec![3]);
-        assert_eq!(broker.pending_acks["retry"].retries, attempt);
+        assert_eq!(broker.retry_overdue(step * attempt as i64).resent, 1);
+        assert_eq!(seqs(&frames(&mut rx)), vec![1]);
     }
-
-    let last = sent_at + step * (settings.max_retries as i64 + 1);
+    let last = step * (settings.max_retries as i64 + 1);
     assert_eq!(
         broker.retry_overdue(last),
         RetryOutcome {
             resent: 0,
-            dropped: 1
+            stalled: 1
         }
     );
+    let stalled = frames(&mut rx);
+    assert_eq!(stalled.len(), 1);
+    assert_eq!(stalled[0]["type"], "stalled");
+    assert_eq!(stalled[0]["seq"], 1);
+
+    broker.deliver(&record(2, 0), last);
     assert!(frames(&mut rx).is_empty());
-    assert!(!broker.pending_acks.contains_key("retry"));
-    broker.handle_ack("retry");
+    assert_eq!(broker.retry_overdue(last * 2).resent, 0);
+
+    let outcome = broker.ack(&id, "t", 1, last);
+    assert!(outcome.accepted);
+    assert!(outcome.catch_up);
+    assert!(broker.topics["t"].subscribers[&id].stalled.is_none());
 }
 
-/// Checks that only overdue records are picked for resending.
+/// Checks that a full window holds back later records, QoS 0 included, and
+/// that an ACK asks for a catch-up.
 #[test]
-fn test_collect_retry_candidates_and_resend() {
-    let mut broker = test_broker();
+fn a_full_window_holds_back_later_records() {
+    let mut broker = Broker::new(with_window(2));
     let (id, mut rx) = connect(&mut broker);
-    broker.add_subscriber("t", id);
-    let timeout = Broker::ACK_TIMEOUT.as_millis() as i64;
-    broker.deliver(&record(1, "overdue", 1), 0);
-    broker.deliver(&record(2, "recent", 1), timeout);
+    broker.add_subscriber("t", id.clone(), 1, 0);
+    broker.deliver(&record(1, 1), 0);
+    broker.deliver(&record(2, 1), 0);
+    broker.deliver(&record(3, 0), 0);
+    assert_eq!(seqs(&frames(&mut rx)), vec![1, 2]);
+    assert_eq!(broker.wants("t", &id), None);
+    let outcome = broker.ack(&id, "t", 1, 0);
+    assert!(outcome.catch_up);
+    assert_eq!(broker.wants("t", &id), Some(3));
+}
+
+/// Checks that a session's cursor only advances over acknowledged records
+/// with no gap, whatever order the ACKs arrive in.
+#[test]
+fn cursors_advance_only_over_contiguous_acks() {
+    let mut broker = test_broker();
+    let (id, mut rx) = connect_as(&mut broker, Some("key"));
+    broker.add_subscriber("t", id.clone(), 1, 0);
+    for seq in 1..=3 {
+        broker.deliver(&record(seq, 1), 0);
+    }
     frames(&mut rx);
+    assert_eq!(broker.ack(&id, "t", 2, 0).cursor, None);
+    assert_eq!(
+        broker.ack(&id, "t", 1, 0).cursor.map(|c| c.acked_seq),
+        Some(2)
+    );
+    assert_eq!(
+        broker.ack(&id, "t", 3, 0).cursor.map(|c| c.acked_seq),
+        Some(3)
+    );
+}
 
-    let (to_resend, to_drop) = broker.collect_retry_candidates(timeout + 1);
-    assert_eq!(to_resend, vec!["overdue".to_string()]);
-    assert!(to_drop.is_empty());
-
-    assert!(broker.resend_pending_message("overdue", timeout + 1));
-    assert_eq!(broker.pending_acks["overdue"].retries, 1);
-    assert_eq!(seqs(&frames(&mut rx)), vec![1]);
-    assert!(!broker.resend_pending_message("missing", 0));
+/// Checks that QoS 0 records move a session's cursor as soon as they are sent.
+#[test]
+fn qos0_records_move_the_cursor_when_sent() {
+    let mut broker = test_broker();
+    let (id, _rx) = connect_as(&mut broker, Some("key"));
+    broker.add_subscriber("t", id, 1, 0);
+    let updates = broker.deliver(&record(1, 0), 0);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].acked_seq, 1);
 }
 
 /// Checks that `SharedBroker` keeps working after a task panics while holding its lock.
@@ -326,7 +463,7 @@ fn shared_broker_recovers_from_a_poisoned_lock() {
     .join();
     assert!(result.is_err());
     let (id, _rx) = shared.with(connect);
-    assert!(shared.with(|broker| broker.add_subscriber("after_panic", id)));
+    assert!(shared.with(|broker| broker.add_subscriber("after_panic", id, 1, 0)));
 }
 
 /// Checks that a durability stronger than the backend offers is refused at construction.
@@ -341,6 +478,14 @@ fn unsupported_durability_is_refused() {
         },
     );
     assert!(matches!(result, Err(StorageError::Unsupported(_))));
+}
+
+/// Checks that session keys can't collide across users, whatever the ids contain.
+#[test]
+fn session_keys_are_per_user() {
+    assert_ne!(session_key("alice", "s"), session_key("bob", "s"));
+    assert_ne!(session_key("a:b", "c"), session_key("a", "b:c"));
+    assert_eq!(session_key("alice", "s"), session_key("alice", "s"));
 }
 
 /// Checks the replay plan for each `from` option on a log holding 1 to 10.
@@ -358,6 +503,7 @@ fn replay_plan_on_an_untrimmed_log() {
             truncated: false
         }
     );
+    assert_eq!(starts(StartFrom::Resume, None).start, 11);
     assert_eq!(starts(StartFrom::Last(3), None).start, 8);
     assert_eq!(starts(StartFrom::Last(0), None).start, 11);
     assert_eq!(
@@ -389,90 +535,52 @@ fn replay_plan_on_a_trimmed_log() {
         first_seq: 6,
         last_seq: 10,
     };
-    assert_eq!(
-        plan(StartFrom::Seq(2), bounds, None),
-        ReplayPlan {
-            start: 6,
-            truncated: true
-        }
-    );
-    assert_eq!(
-        plan(StartFrom::Seq(6), bounds, None),
-        ReplayPlan {
-            start: 6,
-            truncated: false
-        }
-    );
-    assert_eq!(
-        plan(StartFrom::Last(8), bounds, None),
-        ReplayPlan {
-            start: 6,
-            truncated: true
-        }
-    );
-    assert_eq!(
-        plan(StartFrom::Last(5), bounds, None),
-        ReplayPlan {
-            start: 6,
-            truncated: false
-        }
-    );
+    let truncated = |start| ReplayPlan {
+        start,
+        truncated: true,
+    };
+    let clean = |start| ReplayPlan {
+        start,
+        truncated: false,
+    };
+    assert_eq!(plan(StartFrom::Seq(2), bounds, None), truncated(6));
+    assert_eq!(plan(StartFrom::Seq(6), bounds, None), clean(6));
+    assert_eq!(plan(StartFrom::Last(8), bounds, None), truncated(6));
+    assert_eq!(plan(StartFrom::Last(5), bounds, None), clean(6));
     assert!(!plan(StartFrom::New, bounds, None).truncated);
-    assert_eq!(
-        plan(StartFrom::SinceMs(0), bounds, Some(6)),
-        ReplayPlan {
-            start: 6,
-            truncated: true
-        }
-    );
-    assert_eq!(
-        plan(StartFrom::SinceMs(0), bounds, Some(8)),
-        ReplayPlan {
-            start: 8,
-            truncated: false
-        }
-    );
+    assert_eq!(plan(StartFrom::SinceMs(0), bounds, Some(6)), truncated(6));
+    assert_eq!(plan(StartFrom::SinceMs(0), bounds, Some(8)), clean(8));
     let emptied = LogBounds {
         first_seq: 11,
         last_seq: 10,
     };
-    assert_eq!(
-        plan(StartFrom::SinceMs(0), emptied, None),
-        ReplayPlan {
-            start: 11,
-            truncated: true
-        }
-    );
+    assert_eq!(plan(StartFrom::SinceMs(0), emptied, None), truncated(11));
 }
 
-/// Checks that a published record is stored with a seq and delivered to a
-/// subscriber as a tagged frame, and that a subscriber gets no history by default.
+/// Checks that a subscriber is told its replay range before anything else,
+/// gets no history by default, and then receives live records in order.
 #[tokio::test]
-async fn publish_delivers_in_seq_order_and_new_subscribers_get_no_history() {
+async fn subscribe_announces_the_replay_range_then_delivers_live() {
     let broker = shared(Retention::default());
-    let (early, mut early_rx) = broker.with(connect);
-    broker
-        .subscribe("t", &early, StartFrom::New)
-        .await
-        .expect("subscribe");
-    publish_many(&broker, 3).await;
-    assert_eq!(seqs(&frames(&mut early_rx)), vec![1, 2, 3]);
-
-    let (late, mut late_rx) = broker.with(connect);
+    publish_many(&broker, 3, 0).await;
+    let (id, mut rx) = broker.with(connect);
     let outcome = broker
-        .subscribe("t", &late, StartFrom::default())
+        .subscribe("t", &id, StartFrom::default())
         .await
         .expect("subscribe");
-    assert_eq!(
-        (outcome.replayed, outcome.truncated, outcome.added),
-        (0, false, true)
-    );
+    assert!(outcome.added);
+    assert_eq!((outcome.replay_from, outcome.replay_to), (4, 3));
+    let received = frames(&mut rx);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["type"], "subscribed");
+    assert_eq!(received[0]["replay_from"], 4);
+    assert_eq!(received[0]["replay_to"], 3);
+
     broker
-        .publish("t", new_record("m4", "m4"))
+        .publish("t", new_record("m4", 0))
         .await
         .expect("publish");
-    assert_eq!(seqs(&frames(&mut late_rx)), vec![4]);
-    assert_eq!(seqs(&frames(&mut early_rx)), vec![4]);
+    assert_eq!(seqs(&frames(&mut rx)), vec![4]);
 }
 
 /// Checks that `last` replays the newest records with their original seq and
@@ -480,7 +588,7 @@ async fn publish_delivers_in_seq_order_and_new_subscribers_get_no_history() {
 #[tokio::test]
 async fn last_replays_original_seqs_then_live() {
     let broker = shared(Retention::default());
-    publish_many(&broker, 5).await;
+    publish_many(&broker, 5, 0).await;
     let (id, mut rx) = broker.with(connect);
     let outcome = broker
         .subscribe("t", &id, StartFrom::Last(2))
@@ -488,24 +596,24 @@ async fn last_replays_original_seqs_then_live() {
         .expect("subscribe");
     assert_eq!(outcome.replayed, 2);
     broker
-        .publish("t", new_record("m6", "m6"))
+        .publish("t", new_record("m6", 0))
         .await
         .expect("publish");
     let received = frames(&mut rx);
     assert_eq!(seqs(&received), vec![4, 5, 6]);
-    assert_eq!(received[0]["message_id"], "m4");
+    assert_eq!(received[1]["message_id"], "m4");
 }
 
 /// Checks that `since_ms` replays from the first record at or after the time.
 #[tokio::test]
 async fn since_ms_replays_from_a_time() {
     let broker = shared(Retention::default());
-    publish_many(&broker, 2).await;
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    publish_many(&broker, 2, 0).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let cutoff = chrono::Utc::now().timestamp_millis();
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
     broker
-        .publish("t", new_record("m3", "m3"))
+        .publish("t", new_record("m3", 0))
         .await
         .expect("publish");
     let (id, mut rx) = broker.with(connect);
@@ -524,7 +632,7 @@ async fn trimmed_history_is_reported_before_replay() {
         max_messages: Some(3),
         ..Retention::default()
     });
-    publish_many(&broker, 6).await;
+    publish_many(&broker, 6, 0).await;
     let (id, mut rx) = broker.with(connect);
     let outcome = broker
         .subscribe("t", &id, StartFrom::Seq(1))
@@ -532,14 +640,20 @@ async fn trimmed_history_is_reported_before_replay() {
         .expect("subscribe");
     assert!(outcome.truncated);
     let received = frames(&mut rx);
-    assert_eq!(received[0]["type"], "truncated");
-    assert_eq!(received[0]["topic"], "t");
-    assert_eq!(received[0]["first_available"], 4);
+    let types: Vec<&str> = received
+        .iter()
+        .map(|f| f["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["subscribed", "truncated", "message", "message", "message"]
+    );
+    assert_eq!(received[1]["first_available"], 4);
     assert_eq!(seqs(&received), vec![4, 5, 6]);
 }
 
 /// Checks that a publisher retrying the same message id gets the original
-/// seq back and subscribers receive it once.
+/// seq and id back and subscribers receive it once.
 #[tokio::test]
 async fn a_retried_publish_is_stored_and_delivered_once() {
     let broker = shared(Retention::default());
@@ -549,48 +663,43 @@ async fn a_retried_publish_is_stored_and_delivered_once() {
         .await
         .expect("subscribe");
     let first = broker
-        .publish("t", new_record("same", "x"))
+        .publish("t", new_record("same", 0))
         .await
         .expect("publish");
     let again = broker
-        .publish("t", new_record("same", "x"))
+        .publish("t", new_record("same", 0))
         .await
         .expect("publish");
     assert!(!first.duplicate);
     assert!(again.duplicate);
-    assert_eq!(first.seq, again.seq);
+    assert_eq!((first.seq, first.message_id.as_str()), (1, "same"));
+    assert_eq!(again.seq, first.seq);
     assert_eq!(seqs(&frames(&mut rx)), vec![1]);
 }
 
-/// Checks that a missing message id is replaced with a different UUID each time.
+/// Checks that a missing message id is replaced with a different UUID each
+/// time and returned to the publisher.
 #[tokio::test]
 async fn missing_message_ids_are_generated() {
     let broker = shared(Retention::default());
-    let (id, mut rx) = broker.with(connect);
-    broker
-        .subscribe("t", &id, StartFrom::New)
-        .await
-        .expect("subscribe");
-    broker
-        .publish("t", new_record("", "a"))
+    let a = broker
+        .publish("t", new_record("", 0))
         .await
         .expect("publish");
-    broker
-        .publish("t", new_record("", "b"))
+    let b = broker
+        .publish("t", new_record("", 0))
         .await
         .expect("publish");
-    let received = frames(&mut rx);
-    assert_eq!(seqs(&received), vec![1, 2]);
-    let first = received[0]["message_id"].as_str().expect("id");
-    assert_eq!(first.len(), 36);
-    assert_ne!(received[0]["message_id"], received[1]["message_id"]);
+    assert_eq!(a.message_id.len(), 36);
+    assert_ne!(a.message_id, b.message_id);
+    assert_eq!((a.seq, b.seq), (1, 2));
 }
 
 /// Checks that subscribing a client that isn't registered adds nothing.
 #[tokio::test]
 async fn subscribing_an_unknown_client_adds_nothing() {
     let broker = shared(Retention::default());
-    publish_many(&broker, 2).await;
+    publish_many(&broker, 2, 0).await;
     let outcome = broker
         .subscribe("t", "ghost", StartFrom::Seq(1))
         .await
@@ -608,7 +717,7 @@ async fn retention_is_applied_on_publish_and_by_trim_all() {
         max_age_ms: Some(60_000),
         max_bytes: None,
     });
-    publish_many(&broker, 5).await;
+    publish_many(&broker, 5, 0).await;
     let (id, mut rx) = broker.with(connect);
     broker
         .subscribe("t", &id, StartFrom::Last(10))
@@ -624,9 +733,9 @@ async fn retention_is_applied_on_publish_and_by_trim_all() {
         .await
         .expect("subscribe");
     let received = frames(&mut other_rx);
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0]["type"], "truncated");
-    assert_eq!(received[0]["first_available"], 6);
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[1]["type"], "truncated");
+    assert_eq!(received[1]["first_available"], 6);
 }
 
 /// Checks that concurrent publishers to one topic produce one gap-free,
@@ -645,7 +754,7 @@ async fn concurrent_publishers_are_delivered_in_seq_order() {
         tasks.push(tokio::spawn(async move {
             for n in 0..25 {
                 broker
-                    .publish("t", new_record(&format!("w{writer}-{n}"), "x"))
+                    .publish("t", new_record(&format!("w{writer}-{n}"), 0))
                     .await
                     .expect("publish");
             }
@@ -662,13 +771,13 @@ async fn concurrent_publishers_are_delivered_in_seq_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_and_live_delivery_never_overlap_or_gap() {
     let broker = shared(Retention::default());
-    publish_many(&broker, 50).await;
+    publish_many(&broker, 50, 0).await;
     let publisher = {
         let broker = broker.clone();
         tokio::spawn(async move {
             for n in 51..=300 {
                 broker
-                    .publish("t", new_record(&format!("m{n}"), "x"))
+                    .publish("t", new_record(&format!("m{n}"), 0))
                     .await
                     .expect("publish");
             }
@@ -684,6 +793,211 @@ async fn replay_and_live_delivery_never_overlap_or_gap() {
     assert_eq!(seqs(&frames(&mut rx)), (1..=300).collect::<Vec<_>>());
 }
 
+/// Checks that a subscriber whose window is full gets the records it missed
+/// from the log once it acknowledges, in order and without gaps.
+#[tokio::test]
+async fn acks_catch_a_full_window_up_from_the_log() {
+    let broker = shared_on(
+        with_window(2),
+        Arc::new(MemoryStorage::new()),
+        Retention::default(),
+    );
+    let (id, mut rx) = broker.with(connect);
+    broker
+        .subscribe("t", &id, StartFrom::New)
+        .await
+        .expect("subscribe");
+    publish_many(&broker, 5, 1).await;
+    let mut received = seqs(&frames(&mut rx));
+    assert_eq!(received, vec![1, 2]);
+    for seq in 1..=5 {
+        assert!(broker.ack(&id, "t", seq).await);
+        if seq < 4 {
+            let more = wait_for_messages(&mut rx, 1).await;
+            received.extend(seqs(&more));
+        }
+    }
+    assert_eq!(received, vec![1, 2, 3, 4, 5]);
+}
+
+/// Checks that a durable session gets back what it hadn't acknowledged, and
+/// what was published while it was away, after reconnecting.
+#[tokio::test]
+async fn a_session_resumes_from_its_cursor_after_reconnecting() {
+    let broker = shared(Retention::default());
+    let key = session_key("alice", "phone");
+    let (first, mut rx) = broker.with(|b| connect_as(b, None));
+    assert!(
+        broker
+            .attach_session(&first, &key, false)
+            .await
+            .expect("attach")
+            .is_empty()
+    );
+    broker
+        .subscribe("t", &first, StartFrom::default())
+        .await
+        .expect("subscribe");
+    publish_many(&broker, 2, 1).await;
+    assert_eq!(seqs(&frames(&mut rx)), vec![1, 2]);
+    assert!(broker.ack(&first, "t", 1).await);
+    broker.cleanup_client(&first);
+    broker
+        .publish("t", new_record("m3", 1))
+        .await
+        .expect("publish");
+
+    let (second, mut rx) = broker.with(connect);
+    let stored = broker
+        .attach_session(&second, &key, false)
+        .await
+        .expect("attach");
+    assert_eq!(stored.len(), 1);
+    assert_eq!((stored[0].topic.as_str(), stored[0].acked_seq), ("t", 1));
+    broker
+        .subscribe("t", &second, StartFrom::Resume)
+        .await
+        .expect("subscribe");
+    assert_eq!(seqs(&frames(&mut rx)), vec![2, 3]);
+}
+
+/// Checks that a session resumes from its stored cursor when the broker
+/// itself is rebuilt on the same storage, as after a restart.
+#[tokio::test]
+async fn a_session_resumes_after_the_broker_restarts() {
+    let storage = Arc::new(MemoryStorage::new());
+    let key = session_key("alice", "phone");
+    {
+        let broker = shared_on(
+            Settings::default().broker,
+            storage.clone(),
+            Retention::default(),
+        );
+        let (id, mut rx) = broker.with(connect);
+        broker
+            .attach_session(&id, &key, false)
+            .await
+            .expect("attach");
+        broker
+            .subscribe("t", &id, StartFrom::default())
+            .await
+            .expect("subscribe");
+        publish_many(&broker, 3, 1).await;
+        frames(&mut rx);
+        assert!(broker.ack(&id, "t", 1).await);
+    }
+    let broker = shared_on(Settings::default().broker, storage, Retention::default());
+    let (id, mut rx) = broker.with(connect);
+    broker
+        .attach_session(&id, &key, false)
+        .await
+        .expect("attach");
+    broker
+        .subscribe("t", &id, StartFrom::Resume)
+        .await
+        .expect("subscribe");
+    assert_eq!(seqs(&frames(&mut rx)), vec![2, 3]);
+}
+
+/// Checks that attaching a session held by another connection closes that
+/// connection and moves the session to the new one.
+#[tokio::test]
+async fn a_new_connection_takes_over_a_session() {
+    let broker = shared(Retention::default());
+    let key = session_key("alice", "phone");
+    let (old, mut old_rx) = broker.with(connect);
+    broker
+        .attach_session(&old, &key, false)
+        .await
+        .expect("attach");
+    let (new, _new_rx) = broker.with(connect);
+    broker
+        .attach_session(&new, &key, false)
+        .await
+        .expect("attach");
+    assert!(matches!(old_rx.try_recv(), Ok(WsMessage::Close(None))));
+    assert!(broker.with(|b| !b.clients.contains_key(&old)));
+    assert_eq!(broker.with(|b| b.session_holder(&key)), Some(new));
+}
+
+/// Checks that `clean_start` discards a session's stored subscriptions.
+#[tokio::test]
+async fn clean_start_discards_stored_subscriptions() {
+    let broker = shared(Retention::default());
+    let key = session_key("alice", "phone");
+    let (id, _rx) = broker.with(connect);
+    broker
+        .attach_session(&id, &key, false)
+        .await
+        .expect("attach");
+    broker
+        .subscribe("t", &id, StartFrom::New)
+        .await
+        .expect("subscribe");
+    broker.cleanup_client(&id);
+    let (again, _rx) = broker.with(connect);
+    assert!(
+        broker
+            .attach_session(&again, &key, true)
+            .await
+            .expect("attach")
+            .is_empty()
+    );
+    let (third, _rx) = broker.with(connect);
+    assert!(
+        broker
+            .attach_session(&third, &key, false)
+            .await
+            .expect("attach")
+            .is_empty()
+    );
+}
+
+/// Checks that unsubscribing a session removes its stored subscription too.
+#[tokio::test]
+async fn unsubscribing_forgets_the_stored_subscription() {
+    let storage = Arc::new(MemoryStorage::new());
+    let broker = shared_on(
+        Settings::default().broker,
+        storage.clone(),
+        Retention::default(),
+    );
+    let key = session_key("alice", "phone");
+    let (id, _rx) = broker.with(connect);
+    broker
+        .attach_session(&id, &key, false)
+        .await
+        .expect("attach");
+    broker
+        .subscribe("t", &id, StartFrom::New)
+        .await
+        .expect("subscribe");
+    assert_eq!(storage.load(&key).await.expect("load").len(), 1);
+    broker.unsubscribe("t", &id).await.expect("unsubscribe");
+    assert!(storage.load(&key).await.expect("load").is_empty());
+}
+
+/// Checks that expiry keeps connected sessions and removes idle ones.
+#[tokio::test]
+async fn idle_sessions_expire_and_connected_ones_do_not() {
+    let storage = Arc::new(MemoryStorage::new());
+    let broker = shared_on(
+        Settings::default().broker,
+        storage.clone(),
+        Retention::default(),
+    );
+    let (connected, _rx) = broker.with(connect);
+    broker
+        .attach_session(&connected, "connected", false)
+        .await
+        .expect("attach");
+    storage.subscribe("idle", "t", 0).await.expect("subscribe");
+    storage.touch("idle", 1).await.expect("touch");
+    let now = chrono::Utc::now().timestamp_millis() + 10_000;
+    assert_eq!(broker.expire_sessions(now, Duration::from_secs(5)).await, 1);
+    assert!(storage.load("idle").await.expect("load").is_empty());
+}
+
 /// Checks that topics have independent sequences and subscribers.
 #[tokio::test]
 async fn topics_are_independent() {
@@ -694,14 +1008,14 @@ async fn topics_are_independent() {
         .await
         .expect("subscribe");
     broker
-        .publish("b", new_record("x", "x"))
+        .publish("b", new_record("x", 0))
         .await
         .expect("publish");
     broker
-        .publish("a", new_record("y", "y"))
+        .publish("a", new_record("y", 0))
         .await
         .expect("publish");
     let received = frames(&mut rx);
     assert_eq!(seqs(&received), vec![1]);
-    assert_eq!(received[0]["topic"], "a");
+    assert_eq!(received[1]["topic"], "a");
 }

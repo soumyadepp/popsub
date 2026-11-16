@@ -68,8 +68,9 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 ## Gotchas
 
 - Delivered records and `truncated` frames are serialised by the broker (`TopicFrame`), not by the transport. `ServerMessage` wraps the same structs; keep the test that parses one as the other.
-- A subscribe has no success reply. Tests that need to know it has been handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
-- QoS 1 is only at-least-once for a single subscriber that stays connected. Don't describe it more strongly in docs or READMEs.
+- A subscribe is answered by a `subscribed` frame from the broker, but a QoS 0 publish has no reply. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
+- Durable sessions are keyed by `session_key(username, session_id)`. Never key them by the client's `session_id` alone, or one user could attach to another's session.
+- QoS 1 is at-least-once per subscriber while connected, and across reconnects only for durable sessions whose records are still retained. With the `memory` backend nothing survives a restart. Don't describe it more strongly in docs or READMEs.
 - `broker.max_connections` is loaded but not used. The only storage backend is `memory`, so history is lost on restart until the `file` backend lands.
 - The JWT secret default differs between code (`default_secret`), `config/default.toml` (`a_very_secret_key`) and the auth crate (`change_me_in_production`). All three are treated as published; the server refuses them on non-loopback hosts.
 - Rate limits key on the socket address. Behind a proxy every client shares one address.

@@ -19,6 +19,9 @@ pub(crate) struct ReplayPlan {
 
 /// Resolves a `from` option against a topic's bounds.
 ///
+/// `Resume` is expected to have been turned into `Seq` (or `New`) by the
+/// caller, which knows the session's cursor; here it is treated as `New`.
+///
 /// `last` and `seq` count as truncated when the requested start is older
 /// than the oldest retained record and something has been trimmed.
 /// `since_ms` can't know the publish times of trimmed records, so it counts
@@ -42,7 +45,7 @@ pub(crate) fn plan(from: StartFrom, bounds: LogBounds, seq_at: Option<u64>) -> R
         truncated: trimmed && requested < bounds.first_seq,
     };
     match from {
-        StartFrom::New => ReplayPlan {
+        StartFrom::New | StartFrom::Resume => ReplayPlan {
             start: bounds.next_seq(),
             truncated: false,
         },

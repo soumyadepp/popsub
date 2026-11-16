@@ -72,13 +72,18 @@ pub struct BrokerSettings {
     pub max_connections: usize,
     /// How long to wait for a QoS 1 acknowledgement before resending, in milliseconds.
     pub ack_timeout_ms: u64,
-    /// How many times a QoS 1 message is resent before it is dropped.
+    /// How many times a QoS 1 message is resent before the subscription is
+    /// reported as stalled and delivery to it pauses.
     pub max_retries: u8,
+    /// The most QoS 1 records a subscription may have sent but unacknowledged.
+    /// When full, delivery to that subscription waits for acks. Values below
+    /// 1 are treated as 1.
+    pub max_inflight: usize,
 }
 
 impl Default for BrokerSettings {
-    /// Builds the broker defaults: 1000 connections, a 5 second ACK timeout
-    /// and 5 retries.
+    /// Builds the broker defaults: 1000 connections, a 5 second ACK timeout,
+    /// 5 retries and 100 unacknowledged records per subscription.
     ///
     /// Returns:
     ///     The default `[broker]` section.
@@ -87,6 +92,7 @@ impl Default for BrokerSettings {
             max_connections: 1000,
             ack_timeout_ms: 5000,
             max_retries: 5,
+            max_inflight: 100,
         }
     }
 }
@@ -114,11 +120,14 @@ pub struct StorageSettings {
     pub durability: Durability,
     /// How much history each topic keeps.
     pub retention: RetentionSettings,
+    /// How long a durable session's subscriptions and cursors are kept after
+    /// its last connection ends, in seconds.
+    pub session_expiry_secs: u64,
 }
 
 impl Default for StorageSettings {
-    /// Builds the storage defaults: the memory backend, no durability, and
-    /// the default retention.
+    /// Builds the storage defaults: the memory backend, no durability, the
+    /// default retention, and sessions kept for a day.
     ///
     /// Returns:
     ///     The default `[storage]` section.
@@ -127,6 +136,7 @@ impl Default for StorageSettings {
             backend: StorageBackend::Memory,
             durability: Durability::None,
             retention: RetentionSettings::default(),
+            session_expiry_secs: 86_400,
         }
     }
 }

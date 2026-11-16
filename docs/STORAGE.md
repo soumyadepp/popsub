@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Being implemented. Steps 1 (the `popsub_storage` crate) and 2 (the broker on the log) are done |
+| Status | Being implemented. Steps 1 (the `popsub_storage` crate), 2 (the broker on the log) and 3 (sessions and cursors) are done |
 | Owner | Soumyadeep Ghosh |
 | Replaces | `popsub_persistence` (the `sled` replay store) and the in-memory `pending_acks` table |
 | Related | `docs/DESIGN.md` sections 6, 7, 12 and 13 (phase 1) |
@@ -44,7 +44,7 @@ This proposal meets all three with one idea: **every topic is an append-only log
 | **Retention** | Which records a topic log keeps: at most N records, records younger than T, or at most B bytes. Older records are trimmed from the front. |
 | **Session** | A client identity that outlives a connection, chosen by the client (`session_id`). Connections without one are ephemeral, as today. |
 | **Subscription** | A session's interest in a topic, plus its **cursor**: the highest `seq` it has acknowledged without gaps. |
-| **In-flight window** | Records sent to a subscription but not yet acknowledged, capped at `max_inflight`. Kept in memory and rebuilt from the cursor after a restart. |
+| **In-flight window** | QoS 1 records sent to a subscription but not yet acknowledged, capped at `max_inflight`. Kept in memory and rebuilt from the cursor after a restart. |
 | **Durability level** | How firmly an append must be stored before the publisher is told it succeeded: `none`, `buffered` or `synced`. |
 
 ## 4. What changes, and why
@@ -245,7 +245,7 @@ Ordering: per topic, every subscriber sees records in `seq` order, live and on r
 | `{"seq": 1200}` | That `seq`, or the first retained one if it was trimmed |
 | `"resume"` (default for sessions with a stored subscription) | One past the subscription's cursor |
 
-Replay is read from the log in pages and sent before live records, without gaps or overlaps between the two: the subscriber is registered for live fan-out first, and records it receives live are buffered until replay catches up to them.
+Replay is read from the log in pages and sent before live records, without gaps or overlaps between the two. As built, a subscription remembers the next `seq` it expects and is only ever sent that one; anything it misses (because it is replaying, or its window is full) is read back from the log by the topic's writer rather than buffered in memory. The client is first sent `{"type":"subscribed","topic":"chat","replay_from":41,"replay_to":90}`, so it knows which records are history.
 
 If the requested start has already been trimmed, the subscriber gets `{"type":"truncated","topic":"chat","first_available":1300}` before the records, so it knows it missed something. **Retention always wins over slow subscribers**: storage stays bounded, and data loss is visible rather than silent.
 
@@ -255,7 +255,7 @@ If the requested start has already been trimmed, the subscriber gets `{"type":"t
 - A client acknowledges with `{"type":"ack","topic":"chat","seq":42}`. Acks are only accepted for records sent to that session, which closes today's "anyone can ack anything" gap.
 - The cursor advances to the highest contiguous acknowledged `seq`. Out-of-order acks above it are held in memory until the gap fills.
 - At most `max_inflight` unacknowledged records are outstanding per subscription. A record not acknowledged within `ack_timeout_ms` is resent, up to `max_retries`; after that, the subscription is reported to the client as `{"type":"stalled","topic":"chat","seq":42}` and delivery for it pauses until the client acks or resubscribes. (Today the message is silently dropped.)
-- QoS 0 subscriptions have no in-flight window and never move a cursor.
+- QoS 0 records take no space in the window and need no ACK. They count as done once sent, so they move a durable session's cursor as soon as they go out. While the window is full, QoS 0 records wait too, to keep order.
 
 ### 8.4 Sessions
 
@@ -358,7 +358,7 @@ Stacked pull requests, each merged on its own with tests:
 
 1. **`popsub_storage` crate:** types, traits, `memory` backend, conformance suite. Nothing uses it yet.
 2. **Broker on the log:** per-topic writers, `seq` on every record, tagged `message` delivery frames, `subscribe` with `from`, `truncated` frames, the `[storage]` settings and the retention loop. Ephemeral connections only. Protocol change, documented in the README and design doc. Until step 4, the only backend is `memory`, so history no longer survives a restart.
-3. **Sessions and cursors:** `session_id` and `clean_start`, per-subscription in-flight windows, `ack` by `topic` and `seq`, `published` confirmations, `stalled` frames. Removes `pending_acks`. Tests for several subscribers, reconnects and acks from the wrong session.
+3. **Sessions and cursors:** `session_id` and `clean_start`, per-subscription in-flight windows, `ack` by `topic` and `seq`, `published` confirmations, `stalled` frames, and a `subscribed` reply carrying the replay range. Removes `pending_acks`. Tests for several subscribers, reconnects and acks from the wrong session.
 4. **`file` backend:** segments, index, recovery, group commit, crash test. Becomes the default.
 5. **`postgres` backend**, run against a real database in CI (a Postgres service container).
 6. **Remove `popsub_persistence` and `sled`.** Existing `pubsub_db` data is replay history only, so it is not migrated; the release notes say so.

@@ -19,6 +19,8 @@ fn test_default_settings() {
     assert_eq!(settings.storage.durability, Durability::None);
     assert_eq!(settings.storage.retention.max_messages, 1000);
     assert_eq!(settings.storage.retention.max_age_secs, 3600);
+    assert_eq!(settings.storage.session_expiry_secs, 86_400);
+    assert_eq!(settings.broker.max_inflight, 100);
 }
 
 /// Checks that retention settings become a policy with every limit set and

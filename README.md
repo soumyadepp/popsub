@@ -1,6 +1,6 @@
 # PopSub: a small WebSocket pub/sub server in Rust
 
-PopSub is a small publish/subscribe server written in Rust, meant to be easy to run locally and to read end to end. It supports WebSocket clients, topic-based subscribe/publish, a small JSON protocol, per-topic logs with sequence numbers that subscribers can replay from, and a QoS 1 option with acknowledgements and retries (at-least-once for a single subscriber that stays connected; see `docs/DESIGN.md` section 6).
+PopSub is a small publish/subscribe server written in Rust, meant to be easy to run locally and to read end to end. It supports WebSocket clients, topic-based subscribe/publish, a small JSON protocol, per-topic logs with sequence numbers that subscribers can replay from, durable sessions that resume where they left off, and a QoS 1 option with per-subscriber acknowledgements and retries (at-least-once per subscriber while connected, and across reconnects for durable sessions; see `docs/DESIGN.md` section 6).
 
 Why this exists
 
@@ -59,10 +59,12 @@ Configuration
   [broker]
   ack_timeout_ms = 5000
   max_retries = 5
+  max_inflight = 100
 
   [storage]
   backend = "memory"
   durability = "none"
+  session_expiry_secs = 86400
 
   [storage.retention]
   max_messages = 1000
@@ -95,7 +97,10 @@ Protocol basics (short)
 
   ```json
   { "type": "auth", "token": "<jwt>" }
+  { "type": "auth", "token": "<jwt>", "session_id": "phone-1" }
   ```
+
+  The reply is `{ "type": "authenticated" }`. With a `session_id`, the connection holds a durable session of that user: its subscriptions and how far it has acknowledged are kept after it disconnects (for `session_expiry_secs`), and restored when it authenticates with the same `session_id` again. The reply then echoes the `session_id` and lists the restored topics in `resumed`. Add `"clean_start": true` to discard what was stored. Reconnecting with a session another connection still holds closes that connection.
 
 - Subscribe / Unsubscribe:
 
@@ -105,7 +110,7 @@ Protocol basics (short)
   { "type": "unsubscribe", "topic": "chat" }
   ```
 
-  Without `from`, a subscriber gets only messages published after it subscribes. To replay history first, `from` can be `"new"`, `{ "last": N }`, `{ "since_ms": <unix ms> }` or `{ "seq": S }`. Replayed and live messages arrive in `seq` order with no gap or repeat between them. If some of the requested history was already trimmed, a `{ "type": "truncated", "topic": "chat", "first_available": 1300 }` frame comes first. There is no reply to a successful subscribe; a failure gets an `error` frame.
+  The reply is `{ "type": "subscribed", "topic": "chat", "replay_from": 41, "replay_to": 90 }`: messages 41 to 90 are history, anything later is live. `from` decides where replay starts: `"resume"` (the default: continue a durable session's stored subscription, otherwise no history), `"new"` (no history), `{ "last": N }`, `{ "since_ms": <unix ms> }` or `{ "seq": S }`. Replayed and live messages arrive in `seq` order with no gap or repeat between them. If some of the requested history was already trimmed, a `{ "type": "truncated", "topic": "chat", "first_available": 1300 }` frame comes before it. A failure gets an `error` frame instead.
 
 - Publish:
 
@@ -115,7 +120,7 @@ Protocol basics (short)
   { "type": "publish", "topic": "critical", "payload": "Important", "message_id": "id-123", "qos": 1 }
   ```
 
-  Publishing the same `message_id` again from the same user (for example, retrying after a dropped connection) stores and delivers it once. When `message_id` is missing the server generates one.
+  A QoS 1 publish is confirmed with `{ "type": "published", "message_id": "id-123", "seq": 42 }` once it is stored. Publishing the same `message_id` again from the same user (for example, retrying after a dropped connection) stores and delivers it once and gets the original `seq` back. When `message_id` is missing the server generates one.
 
 - Messages arrive as:
 
@@ -125,11 +130,13 @@ Protocol basics (short)
 
   `seq` is the message's position in the topic, starting at 1. Use `(topic, seq)` to spot duplicates.
 
-- Acknowledge QoS=1 messages:
+- Acknowledge QoS 1 messages:
 
   ```json
-  { "type": "ack", "message_id": "id-123" }
+  { "type": "ack", "topic": "chat", "seq": 42 }
   ```
+
+  Each subscriber acknowledges its own copy; one subscriber's ACK never clears another's. An unacknowledged message is resent after `ack_timeout_ms`, up to `max_retries` times. After that the subscriber gets `{ "type": "stalled", "topic": "chat", "seq": 42 }` and delivery on that topic pauses until it acknowledges something or subscribes again. At most `max_inflight` QoS 1 messages are outstanding per subscription; later ones wait until earlier ones are acknowledged.
 
 Permissions and limits
 

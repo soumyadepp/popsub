@@ -120,7 +120,11 @@ async fn test_login_success() {
         _ => panic!("Expected LoginResponse, got {server_msg:?}"),
     };
 
-    let auth_msg = ClientMessage::Auth { token };
+    let auth_msg = ClientMessage::Auth {
+        token,
+        session_id: None,
+        clean_start: false,
+    };
     ws_stream
         .send(WsMessage::Text(
             serde_json::to_string(&auth_msg).unwrap().into(),
@@ -139,7 +143,7 @@ async fn test_login_success() {
     });
 
     match server_msg {
-        ServerMessage::Authenticated {} => {}
+        ServerMessage::Authenticated { .. } => {}
         _ => panic!("Expected Authenticated, got {server_msg:?}"),
     };
 }
@@ -193,6 +197,8 @@ async fn test_auth_failure_invalid_token() {
 
     let auth_msg = ClientMessage::Auth {
         token: "invalid.token.here".to_string(),
+        session_id: None,
+        clean_start: false,
     };
     ws_stream
         .send(WsMessage::Text(
@@ -410,7 +416,15 @@ async fn denied_publishes_do_not_spend_the_rate_limit() {
     else {
         panic!("login failed");
     };
-    send_and_receive(&mut ws_stream, &ClientMessage::Auth { token }).await;
+    send_and_receive(
+        &mut ws_stream,
+        &ClientMessage::Auth {
+            token,
+            session_id: None,
+            clean_start: false,
+        },
+    )
+    .await;
 
     for _ in 0..3 {
         let reply = send_and_receive(
@@ -433,7 +447,7 @@ async fn denied_publishes_do_not_spend_the_rate_limit() {
 /// A client's WebSocket connection in these tests.
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
-/// Connects to a server and logs in and authenticates as the admin.
+/// Connects to a server and logs in and authenticates as the admin, without a session.
 ///
 /// Args:
 ///     addr: The server's address.
@@ -442,6 +456,24 @@ type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 /// Returns:
 ///     An authenticated connection.
 async fn admin_connection(addr: std::net::SocketAddr, settings: &Settings) -> TestSocket {
+    admin_session(addr, settings, None).await.0
+}
+
+/// Connects to a server and authenticates as the admin, optionally holding
+/// a durable session.
+///
+/// Args:
+///     addr: The server's address.
+///     settings: The settings the server uses, for the admin credentials.
+///     session_id: The session to hold, if any.
+///
+/// Returns:
+///     An authenticated connection and the `authenticated` reply.
+async fn admin_session(
+    addr: std::net::SocketAddr,
+    settings: &Settings,
+    session_id: Option<&str>,
+) -> (TestSocket, ServerMessage) {
     let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
         .await
@@ -457,12 +489,20 @@ async fn admin_connection(addr: std::net::SocketAddr, settings: &Settings) -> Te
     else {
         panic!("admin login failed");
     };
-    let reply = send_and_receive(&mut ws, &ClientMessage::Auth { token }).await;
+    let reply = send_and_receive(
+        &mut ws,
+        &ClientMessage::Auth {
+            token,
+            session_id: session_id.map(str::to_string),
+            clean_start: false,
+        },
+    )
+    .await;
     assert!(
-        matches!(reply, ServerMessage::Authenticated {}),
+        matches!(reply, ServerMessage::Authenticated { .. }),
         "{reply:?}"
     );
-    ws
+    (ws, reply)
 }
 
 /// Sends a frame without waiting for a reply.
@@ -509,8 +549,8 @@ async fn next_delivery(ws: &mut TestSocket) -> (u64, String) {
 /// Waits until the server has handled every frame this connection sent so far.
 ///
 /// The server handles one connection's frames in order but doesn't confirm
-/// a subscribe, so the connection subscribes to a topic of its own, publishes
-/// to it, and waits for that record to come back.
+/// a QoS 0 publish, so the connection subscribes to a topic of its own,
+/// publishes to it, and waits for that record to come back.
 ///
 /// Args:
 ///     ws: The connection.
@@ -581,6 +621,15 @@ async fn subscribers_replay_the_history_they_ask_for() {
         serde_json::json!({"type": "subscribe", "topic": "chat", "from": {"last": 2}}),
     )
     .await;
+    match next_frame(&mut recent).await {
+        ServerMessage::Subscribed(s) => {
+            assert_eq!(
+                (s.topic.as_str(), s.replay_from, s.replay_to),
+                ("chat", 4, 5)
+            )
+        }
+        other => panic!("expected subscribed, got {other:?}"),
+    }
     assert_eq!(next_delivery(&mut recent).await, (4, "m4".to_string()));
     assert_eq!(next_delivery(&mut recent).await, (5, "m5".to_string()));
 
@@ -590,6 +639,10 @@ async fn subscribers_replay_the_history_they_ask_for() {
         serde_json::json!({"type": "subscribe", "topic": "chat", "from": {"seq": 1}}),
     )
     .await;
+    assert!(matches!(
+        next_frame(&mut everything).await,
+        ServerMessage::Subscribed(_)
+    ));
     match next_frame(&mut everything).await {
         ServerMessage::Truncated(t) => {
             assert_eq!((t.topic.as_str(), t.first_available), ("chat", 3))
@@ -603,4 +656,105 @@ async fn subscribers_replay_the_history_they_ask_for() {
         .await
         .expect("subscribe");
     assert!(!subscribed.added);
+}
+
+/// Checks that a QoS 1 publish is confirmed with its id and seq, including a
+/// retry of the same id.
+#[tokio::test]
+async fn qos1_publishes_are_confirmed() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut publisher = admin_connection(addr, &settings).await;
+    for _ in 0..2 {
+        send_json(
+            &mut publisher,
+            serde_json::json!({"type": "publish", "topic": "chat", "payload": "x", "message_id": "m-1", "qos": 1}),
+        )
+        .await;
+        match next_frame(&mut publisher).await {
+            ServerMessage::Published { message_id, seq } => {
+                assert_eq!((message_id.as_str(), seq), ("m-1", 1))
+            }
+            other => panic!("expected published, got {other:?}"),
+        }
+    }
+}
+
+/// Checks that a durable session gets back, after reconnecting, the QoS 1
+/// record it never acknowledged and the one published while it was away,
+/// while an acknowledged record isn't sent again.
+#[tokio::test]
+async fn a_session_resumes_after_reconnecting() {
+    let settings = Settings::default();
+    let (addr, broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut publisher = admin_connection(addr, &settings).await;
+    let publish = |payload: &str| serde_json::json!({"type": "publish", "topic": "chat", "payload": payload, "qos": 1});
+
+    let (mut phone, reply) = admin_session(addr, &settings, Some("phone")).await;
+    assert!(
+        matches!(&reply, ServerMessage::Authenticated { session_id: Some(id), resumed } if id == "phone" && resumed.is_empty()),
+        "{reply:?}"
+    );
+    send_json(
+        &mut phone,
+        serde_json::json!({"type": "subscribe", "topic": "chat"}),
+    )
+    .await;
+    assert!(matches!(
+        next_frame(&mut phone).await,
+        ServerMessage::Subscribed(_)
+    ));
+    for payload in ["one", "two"] {
+        send_json(&mut publisher, publish(payload)).await;
+        next_frame(&mut publisher).await;
+    }
+    assert_eq!(next_delivery(&mut phone).await, (1, "one".to_string()));
+    assert_eq!(next_delivery(&mut phone).await, (2, "two".to_string()));
+    send_json(
+        &mut phone,
+        serde_json::json!({"type": "ack", "topic": "chat", "seq": 1}),
+    )
+    .await;
+    settle(&mut phone, "settle-phone").await;
+    phone.close(None).await.expect("close");
+    drop(phone);
+    assert!(wait_for_no_session(&broker).await);
+
+    send_json(&mut publisher, publish("three")).await;
+    next_frame(&mut publisher).await;
+
+    let (mut phone, reply) = admin_session(addr, &settings, Some("phone")).await;
+    assert!(
+        matches!(&reply, ServerMessage::Authenticated { resumed, .. } if resumed.iter().any(|t| t == "chat")),
+        "{reply:?}"
+    );
+    let mut received = Vec::new();
+    while received.len() < 2 {
+        match next_frame(&mut phone).await {
+            ServerMessage::Message(d) if d.topic == "chat" => received.push((d.seq, d.payload)),
+            ServerMessage::Subscribed(s) if s.topic == "chat" => assert_eq!(s.replay_from, 2),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        received,
+        vec![(2, "two".to_string()), (3, "three".to_string())]
+    );
+}
+
+/// Waits up to two seconds for no connection to hold a durable session.
+///
+/// Args:
+///     broker: The broker to watch.
+///
+/// Returns:
+///     Whether every session was released in time.
+async fn wait_for_no_session(broker: &SharedBroker) -> bool {
+    for _ in 0..200 {
+        if broker.with(|broker| broker.connected_sessions().is_empty()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
 }

@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
-use popsub_broker::{SharedBroker, StartFrom};
+use popsub_broker::{SharedBroker, StartFrom, session_key};
 use popsub_client::Client;
 use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
@@ -37,6 +37,9 @@ use tracing::{error, info, warn};
 use tungstenite::protocol::Message as WsMessage;
 
 use crate::message::{ClientMessage, ServerMessage};
+
+/// The longest `session_id` a client may choose, in characters.
+const MAX_SESSION_ID_CHARS: usize = 128;
 
 /// How long the accept loop waits after a failed `accept` before trying again,
 /// so a persistent error such as running out of file descriptors doesn't spin.
@@ -380,10 +383,10 @@ impl ClientCleanup {
     }
 
     /// Removes the client and its subscriptions, unless a clone already did.
+    /// A durable session's stored subscriptions are kept.
     fn run(&self) {
         if !self.done.swap(true, Ordering::SeqCst) {
-            self.broker
-                .with(|broker| broker.cleanup_client(&self.client_id));
+            self.broker.cleanup_client(&self.client_id);
         }
     }
 }
@@ -449,16 +452,23 @@ impl Session {
                 self.register(&username, &password).await
             }
             ClientMessage::Login { username, password } => self.login(&username, &password).await,
-            ClientMessage::Auth { token } => self.authenticate(&token).await,
+            ClientMessage::Auth {
+                token,
+                session_id,
+                clean_start,
+            } => {
+                self.authenticate(&token, session_id.as_deref(), clean_start)
+                    .await
+            }
             ClientMessage::Subscribe { topic, from } => self.subscribe(&topic, from).await,
-            ClientMessage::Unsubscribe { topic } => self.unsubscribe(&topic),
+            ClientMessage::Unsubscribe { topic } => self.unsubscribe(&topic).await,
             ClientMessage::Publish {
                 topic,
                 payload,
                 message_id,
                 qos,
             } => self.publish(&topic, payload, message_id, qos).await,
-            ClientMessage::Ack { message_id } => self.ack(&message_id),
+            ClientMessage::Ack { topic, seq } => self.ack(&topic, seq).await,
         }
     }
 
@@ -636,23 +646,37 @@ impl Session {
         Ok(Flow::Continue)
     }
 
-    /// Validates a JWT and marks the connection as authenticated as its subject.
+    /// Validates a JWT, marks the connection as authenticated as its subject,
+    /// and attaches the durable session if one is named.
     ///
-    /// A valid token sets the client's `authenticated` flag and username and
-    /// gets an `authenticated` reply. An invalid or expired token gets an
-    /// `authentication failed` error and closes the connection, as does a
-    /// client that is no longer registered.
+    /// A valid token gets an `authenticated` reply. An invalid or expired
+    /// token, an invalid `session_id`, or a session store that can't be
+    /// reached gets an error and closes the connection, as does a client
+    /// that is no longer registered.
+    ///
+    /// With a `session_id`, the session is bound to the token's user (another
+    /// user's identical id is a different session), any other connection
+    /// holding it is closed, and its stored subscriptions are restored after
+    /// the reply. Each restored topic is checked against the user's current
+    /// permissions; one the user may no longer read is forgotten.
     ///
     /// Args:
     ///     token: The JWT from a previous `login`.
+    ///     session_id: The durable session to hold, if any.
+    ///     clean_start: Whether to discard the session's stored subscriptions.
     ///
     /// Returns:
-    ///     `Flow::Continue` when the token was valid, otherwise `Flow::Close`.
+    ///     `Flow::Continue` when authentication succeeded, otherwise `Flow::Close`.
     ///
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    async fn authenticate(&self, token: &str) -> Result<Flow> {
+    async fn authenticate(
+        &self,
+        token: &str,
+        session_id: Option<&str>,
+        clean_start: bool,
+    ) -> Result<Flow> {
         let validated = self.server.auth.validate_token(token);
         let claims = match validated {
             Ok(claims) => claims,
@@ -662,13 +686,23 @@ impl Session {
                 return Ok(Flow::Close);
             }
         };
+        if let Some(id) = session_id
+            && !valid_session_id(id)
+        {
+            warn!(client_id = %self.client_id, "invalid session_id");
+            self.reply_error(format!(
+                "session_id must be 1 to {MAX_SESSION_ID_CHARS} characters with no control characters"
+            ))?;
+            return Ok(Flow::Close);
+        }
+        let username = claims.sub;
         let registered = self.server.broker.with(|broker| {
             broker
                 .clients
                 .get_mut(&self.client_id)
                 .map(|client| {
                     client.authenticated = true;
-                    client.username = Some(claims.sub.clone());
+                    client.username = Some(username.clone());
                 })
                 .is_some()
         });
@@ -676,18 +710,80 @@ impl Session {
             warn!(client_id = %self.client_id, "client not registered");
             return Ok(Flow::Close);
         }
-        info!(client_id = %self.client_id, username = %claims.sub, "authenticated successfully");
-        self.reply(ServerMessage::Authenticated {})?;
+        let Some(session_id) = session_id else {
+            info!(client_id = %self.client_id, username, "authenticated successfully");
+            self.reply(ServerMessage::Authenticated {
+                session_id: None,
+                resumed: Vec::new(),
+            })?;
+            return Ok(Flow::Continue);
+        };
+
+        let key = session_key(&username, session_id);
+        let stored = match self
+            .server
+            .broker
+            .attach_session(&self.client_id, &key, clean_start)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(e) => {
+                error!(client_id = %self.client_id, username, %e, "attaching a session failed");
+                self.reply_error("can't open the session, try again")?;
+                return Ok(Flow::Close);
+            }
+        };
+        let mut resumed = Vec::new();
+        for subscription in stored {
+            if self
+                .server
+                .auth
+                .can_subscribe(&username, &subscription.topic)
+                .await
+            {
+                resumed.push(subscription.topic);
+            } else {
+                warn!(client_id = %self.client_id, username, topic = %subscription.topic, "dropping a stored subscription the user may no longer read");
+                if let Err(e) = self
+                    .server
+                    .broker
+                    .forget_subscription(&key, &subscription.topic)
+                    .await
+                {
+                    warn!(%e, "forgetting a stored subscription failed");
+                }
+            }
+        }
+        info!(client_id = %self.client_id, username, session_id, clean_start, resumed = resumed.len(), "authenticated with a session");
+        self.reply(ServerMessage::Authenticated {
+            session_id: Some(session_id.to_string()),
+            resumed: resumed.clone(),
+        })?;
+        for topic in resumed {
+            if let Err(e) = self
+                .server
+                .broker
+                .subscribe(&topic, &self.client_id, StartFrom::Resume)
+                .await
+            {
+                error!(client_id = %self.client_id, topic, %e, "restoring a subscription failed");
+                self.reply_error(format!(
+                    "can't restore the subscription to '{topic}', subscribe again"
+                ))?;
+            }
+        }
         Ok(Flow::Continue)
     }
 
     /// Subscribes the connection to a topic if its user may read it.
     ///
     /// A user without permission gets a `not authorized` error and stays
-    /// connected. The history `from` asks for is replayed first, preceded by
-    /// a `truncated` frame if some of it was already trimmed. If the history
-    /// can't be read, the client gets an error, is not subscribed, and may
-    /// try again. There is no reply frame on success.
+    /// connected. On success the broker sends a `subscribed` frame with the
+    /// replay range, a `truncated` frame if some of it was already trimmed,
+    /// and then the history `from` asks for. For a durable session the
+    /// subscription and its cursor are stored. If the log or the session
+    /// store can't be reached, the client gets an error, is not subscribed,
+    /// and may try again.
     ///
     /// Args:
     ///     topic: The topic to subscribe to.
@@ -721,6 +817,8 @@ impl Session {
                     client_id = %self.client_id,
                     username,
                     topic,
+                    replay_from = outcome.replay_from,
+                    replay_to = outcome.replay_to,
                     replayed = outcome.replayed,
                     truncated = outcome.truncated,
                     "subscribed"
@@ -739,7 +837,9 @@ impl Session {
     /// Unsubscribes the connection from a topic.
     ///
     /// No permission check is made, since leaving a topic grants nothing.
-    /// Leaving a topic the client isn't on does nothing.
+    /// Leaving a topic the client isn't on does nothing. For a durable
+    /// session the stored subscription is removed too; if that fails the
+    /// client gets an error and the subscription may come back on reconnect.
     ///
     /// Args:
     ///     topic: The topic to leave.
@@ -751,13 +851,17 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    fn unsubscribe(&self, topic: &str) -> Result<Flow> {
+    async fn unsubscribe(&self, topic: &str) -> Result<Flow> {
         let Some(username) = self.require_user("unsubscribe")? else {
             return Ok(Flow::Close);
         };
-        self.server
-            .broker
-            .with(|broker| broker.unsubscribe(topic, &self.client_id));
+        if let Err(e) = self.server.broker.unsubscribe(topic, &self.client_id).await {
+            error!(client_id = %self.client_id, username, topic, %e, "removing a stored subscription failed");
+            self.reply_error(format!(
+                "unsubscribed from '{topic}', but the session may restore it"
+            ))?;
+            return Ok(Flow::Continue);
+        }
         info!(client_id = %self.client_id, username, topic, "unsubscribed");
         Ok(Flow::Continue)
     }
@@ -769,9 +873,11 @@ impl Session {
     /// limited publish get an error and keep the connection open. The broker
     /// sets the publish time, generates an id when `message_id` is missing,
     /// stores the record and delivers it. A repeated `message_id` from the
-    /// same user is stored and delivered once. If storage fails, a QoS 1
-    /// publisher gets a `storage unavailable` error so it can retry; a QoS 0
-    /// publish is logged and dropped, as QoS 0 promises nothing.
+    /// same user is stored and delivered once. A QoS 1 publisher gets a
+    /// `published` frame with the id and `seq` once the record is stored at
+    /// the configured durability (the original `seq` for a retry), or a
+    /// `storage unavailable` error so it can retry. A failed QoS 0 publish is
+    /// logged and dropped, as QoS 0 promises nothing.
     ///
     /// Args:
     ///     topic: The topic to publish to.
@@ -825,6 +931,12 @@ impl Session {
                     duplicate = published.duplicate,
                     "published"
                 );
+                if qos == 1 {
+                    self.reply(ServerMessage::Published {
+                        message_id: published.message_id,
+                        seq: published.seq,
+                    })?;
+                }
             }
             Err(e) => {
                 error!(client_id = %self.client_id, username, topic, qos, %e, "publish not stored");
@@ -836,13 +948,15 @@ impl Session {
         Ok(Flow::Continue)
     }
 
-    /// Acknowledges a QoS 1 message so the broker stops retrying it.
+    /// Acknowledges a QoS 1 record delivered to this connection.
     ///
-    /// The ack is matched by message id alone, without checking that the
-    /// message was delivered to this client (see `docs/DESIGN.md` section 12).
+    /// Only a record in flight to this connection on this topic is accepted;
+    /// anything else (a record sent to another client, a repeat ACK) is
+    /// logged and ignored, so one client can never clear another's delivery.
     ///
     /// Args:
-    ///     message_id: The id of the message being acknowledged.
+    ///     topic: The topic the record was delivered on.
+    ///     seq: The record's `seq`.
     ///
     /// Returns:
     ///     `Flow::Close` when the client isn't authenticated, otherwise
@@ -851,15 +965,27 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    fn ack(&self, message_id: &str) -> Result<Flow> {
+    async fn ack(&self, topic: &str, seq: u64) -> Result<Flow> {
         if self.require_user("ack")?.is_none() {
             return Ok(Flow::Close);
         }
-        self.server
-            .broker
-            .with(|broker| broker.handle_ack(message_id));
+        if !self.server.broker.ack(&self.client_id, topic, seq).await {
+            info!(client_id = %self.client_id, topic, seq, "ignored an ACK for a record not in flight to this client");
+        }
         Ok(Flow::Continue)
     }
+}
+
+/// Checks a client-chosen session id.
+///
+/// Args:
+///     id: The `session_id` from an `auth` frame.
+///
+/// Returns:
+///     True for 1 to `MAX_SESSION_ID_CHARS` characters with no control characters.
+fn valid_session_id(id: &str) -> bool {
+    let chars = id.chars().count();
+    (1..=MAX_SESSION_ID_CHARS).contains(&chars) && !id.chars().any(char::is_control)
 }
 
 /// Turns a registration error into text that is safe to show the client.
@@ -905,7 +1031,7 @@ pub fn registration_role(name: &str) -> DefaultUserRole {
 }
 
 /// Unit tests for the private helpers in this file: registration error text,
-/// registration role parsing and rate limiter pruning.
+/// registration role parsing, session id checks and rate limiter pruning.
 #[cfg(test)]
 mod limiter_tests {
     use super::*;
@@ -943,6 +1069,16 @@ mod limiter_tests {
                 "{name}"
             );
         }
+    }
+
+    /// Checks that session ids must be short, non-empty and free of control characters.
+    #[test]
+    fn session_ids_are_checked() {
+        assert!(valid_session_id("phone-1"));
+        assert!(valid_session_id(&"x".repeat(MAX_SESSION_ID_CHARS)));
+        assert!(!valid_session_id(""));
+        assert!(!valid_session_id(&"x".repeat(MAX_SESSION_ID_CHARS + 1)));
+        assert!(!valid_session_id("bad\nid"));
     }
 
     /// Checks that a fresh message bucket survives the default prune but is

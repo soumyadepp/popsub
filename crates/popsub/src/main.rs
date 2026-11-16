@@ -1,7 +1,8 @@
 //! Command-line entry point for PopSub.
 //!
 //! The `server` subcommand loads settings, opens the configured storage
-//! backend, builds the broker, spawns its QoS 1 retry and retention loops and
+//! backend, builds the broker, spawns its QoS 1 retry, retention and session
+//! expiry loops and
 //! runs the WebSocket server until Ctrl+C. The `client` subcommand runs a
 //! short demo session (login, auth, subscribe, publish) against a running
 //! server, for smoke tests. Everything here is wiring; the protocol, routing
@@ -9,6 +10,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use popsub_broker::{Broker, LogSettings, SharedBroker, StartFrom};
@@ -74,7 +76,8 @@ async fn main() -> ExitCode {
 /// the server refuses to start on a non-loopback host and only logs a warning
 /// for each such setting on `localhost` or a loopback address. Otherwise it
 /// opens the `[storage]` backend, builds the broker (refusing a durability
-/// the backend can't provide), spawns the QoS 1 retry and retention loops,
+/// the backend can't provide), spawns the QoS 1 retry, retention and session
+/// expiry loops,
 /// and serves on `host:port` until Ctrl+C arrives.
 ///
 /// Raises:
@@ -116,6 +119,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     info!(backend = ?config.storage.backend, durability = ?log.durability, "storage opened");
     tokio::spawn(broker.clone().run_retry_loop());
     tokio::spawn(broker.clone().run_retention_loop());
+    tokio::spawn(
+        broker
+            .clone()
+            .run_session_expiry_loop(Duration::from_secs(config.storage.session_expiry_secs)),
+    );
     let server = Server::from_settings(broker, &config.server).await;
 
     tokio::select! {
@@ -143,9 +151,9 @@ fn open_storage(settings: &StorageSettings) -> Arc<dyn Storage> {
 
 /// Runs a short session against a PopSub server and prints each reply.
 ///
-/// Logs in, authenticates with the returned token, subscribes to `topic`,
-/// publishes `Hello from popsub client` to it at QoS 0, and prints the
-/// delivered message with its `seq`. Frames are built from the transport's own message
+/// Logs in, authenticates with the returned token, subscribes to `topic`
+/// and waits for the `subscribed` reply, publishes `Hello from popsub client`
+/// to it at QoS 0, and prints the delivered message with its `seq`. Frames are built from the transport's own message
 /// types, so the client always speaks the current protocol. The defaults
 /// match the default server settings; pass `--username` and `--password` for
 /// any other account.
@@ -182,13 +190,21 @@ async fn run_client(
     };
     println!("Logged in as {username}");
 
-    let reply = request(&mut ws, &ClientMessage::Auth { token }).await?;
-    if !matches!(reply, ServerMessage::Authenticated {}) {
+    let reply = request(
+        &mut ws,
+        &ClientMessage::Auth {
+            token,
+            session_id: None,
+            clean_start: false,
+        },
+    )
+    .await?;
+    if !matches!(reply, ServerMessage::Authenticated { .. }) {
         return Err(format!("auth refused: {reply:?}").into());
     }
     println!("Authenticated");
 
-    send(
+    let reply = request(
         &mut ws,
         &ClientMessage::Subscribe {
             topic: topic.to_string(),
@@ -196,6 +212,11 @@ async fn run_client(
         },
     )
     .await?;
+    if !matches!(reply, ServerMessage::Subscribed(_)) {
+        return Err(format!("subscribe refused: {reply:?}").into());
+    }
+    println!("Subscribed to {topic}");
+
     send(
         &mut ws,
         &ClientMessage::Publish {
@@ -208,7 +229,7 @@ async fn run_client(
     .await?;
     let delivered: ServerMessage = serde_json::from_str(&next_text(&mut ws).await?)?;
     let ServerMessage::Message(delivery) = delivered else {
-        return Err(format!("subscribe or publish refused: {delivered:?}").into());
+        return Err(format!("publish refused: {delivered:?}").into());
     };
     println!(
         "Received on {topic} (seq {}): {}",

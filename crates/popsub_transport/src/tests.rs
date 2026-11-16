@@ -5,7 +5,7 @@
 //! by `websocket_tests.rs`, which drives a real server.
 
 use crate::message::{ClientMessage, ServerMessage};
-use popsub_broker::{Delivery, StartFrom, TopicFrame, Truncated};
+use popsub_broker::{Delivery, Stalled, StartFrom, Subscribed, TopicFrame, Truncated};
 use serde_json::json;
 
 /// Parses a client frame from a JSON value.
@@ -83,7 +83,10 @@ fn server_frames_serialise_with_type_tags() {
             json!({"type": "register_response", "success": false, "message": "registration failed"}),
         ),
         (
-            ServerMessage::Authenticated {},
+            ServerMessage::Authenticated {
+                session_id: None,
+                resumed: Vec::new(),
+            },
             json!({"type": "authenticated"}),
         ),
         (
@@ -98,14 +101,18 @@ fn server_frames_serialise_with_type_tags() {
     }
 }
 
-/// Checks that `subscribe` without `from` means no replay, and that each
+/// Checks that `subscribe` without `from` means `resume`, and that each
 /// `from` form parses.
 #[test]
 fn subscribe_from_forms_parse() {
     let cases = [
         (
             json!({"type": "subscribe", "topic": "chat"}),
-            StartFrom::New,
+            StartFrom::Resume,
+        ),
+        (
+            json!({"type": "subscribe", "topic": "chat", "from": "resume"}),
+            StartFrom::Resume,
         ),
         (
             json!({"type": "subscribe", "topic": "chat", "from": "new"}),
@@ -199,4 +206,99 @@ fn broker_frames_parse_as_server_messages() {
         .and_then(serde_json::from_value)
         .unwrap();
     assert!(matches!(parsed, ServerMessage::Truncated(t) if t.first_available == 7));
+}
+
+/// Checks that `auth` may name a session and ask for a clean start, and that
+/// both default to off.
+#[test]
+fn auth_session_fields_parse() {
+    match parse(json!({"type": "auth", "token": "t"})) {
+        ClientMessage::Auth {
+            session_id,
+            clean_start,
+            ..
+        } => assert_eq!((session_id, clean_start), (None, false)),
+        other => panic!("expected auth, got {other:?}"),
+    }
+    match parse(json!({"type": "auth", "token": "t", "session_id": "phone", "clean_start": true})) {
+        ClientMessage::Auth {
+            session_id,
+            clean_start,
+            ..
+        } => assert_eq!((session_id.as_deref(), clean_start), (Some("phone"), true)),
+        other => panic!("expected auth, got {other:?}"),
+    }
+}
+
+/// Checks that `ack` names a topic and seq, and that the old message id form is rejected.
+#[test]
+fn ack_frames_name_topic_and_seq() {
+    assert!(matches!(
+        parse(json!({"type": "ack", "topic": "chat", "seq": 42})),
+        ClientMessage::Ack { topic, seq } if topic == "chat" && seq == 42
+    ));
+    assert!(
+        serde_json::from_value::<ClientMessage>(json!({"type": "ack", "message_id": "m"})).is_err()
+    );
+}
+
+/// Checks the exact JSON of the session, publish, subscribe and stall frames.
+#[test]
+fn session_and_delivery_frames_serialise_with_type_tags() {
+    let cases = [
+        (
+            ServerMessage::Authenticated {
+                session_id: Some("phone".to_string()),
+                resumed: vec!["chat".to_string()],
+            },
+            json!({"type": "authenticated", "session_id": "phone", "resumed": ["chat"]}),
+        ),
+        (
+            ServerMessage::Published {
+                message_id: "m-1".to_string(),
+                seq: 7,
+            },
+            json!({"type": "published", "message_id": "m-1", "seq": 7}),
+        ),
+        (
+            ServerMessage::Subscribed(Subscribed {
+                topic: "chat".to_string(),
+                replay_from: 4,
+                replay_to: 9,
+            }),
+            json!({"type": "subscribed", "topic": "chat", "replay_from": 4, "replay_to": 9}),
+        ),
+        (
+            ServerMessage::Stalled(Stalled {
+                topic: "chat".to_string(),
+                seq: 5,
+            }),
+            json!({"type": "stalled", "topic": "chat", "seq": 5}),
+        ),
+    ];
+    for (frame, expected) in cases {
+        assert_eq!(serde_json::to_value(&frame).unwrap(), expected);
+    }
+}
+
+/// Checks that the broker's subscribe and stall frames parse as `ServerMessage`.
+#[test]
+fn broker_session_frames_parse_as_server_messages() {
+    let subscribed = TopicFrame::Subscribed(Subscribed {
+        topic: "chat".to_string(),
+        replay_from: 1,
+        replay_to: 0,
+    });
+    let parsed: ServerMessage = serde_json::to_value(&subscribed)
+        .and_then(serde_json::from_value)
+        .unwrap();
+    assert!(matches!(parsed, ServerMessage::Subscribed(s) if s.replay_from == 1));
+    let stalled = TopicFrame::Stalled(Stalled {
+        topic: "chat".to_string(),
+        seq: 3,
+    });
+    let parsed: ServerMessage = serde_json::to_value(&stalled)
+        .and_then(serde_json::from_value)
+        .unwrap();
+    assert!(matches!(parsed, ServerMessage::Stalled(s) if s.seq == 3));
 }
