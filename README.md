@@ -45,6 +45,43 @@ Received on chat (seq 1): Hello from popsub client
 
 `make demo PORT=8090` does both in one go. The default admin is `admin` / `password`, which only works on `localhost`: see [Configuration](#configuration) before exposing the server.
 
+## How it works
+
+PopSub rests on five ideas. Once they click, the rest of the code is plumbing.
+
+1. **Every topic is an append-only log.** A publish is appended and numbered with the topic's next `seq` (1, 2, 3, ...). The log lives in a `Storage` backend: by default, checksummed segment files under `pubsub_data/`.
+2. **Every subscription is a position in a log.** For each subscription the broker remembers the next `seq` it expects and the QoS 1 messages it hasn't acknowledged yet (its window). A durable session also stores that position, so it can pick up where it left off after a disconnect or a restart.
+3. **Each topic has one writer.** Every publish, subscribe and catch-up for a topic goes through that topic's writer task, one at a time. That is what keeps delivery in order and makes replay join live delivery with no gap, without holding a lock during disk I/O.
+4. **Falling behind means reading from the log.** A subscription is only ever sent the exact `seq` it expects next. When it can't take more (its window is full, or its connection's outgoing queue is backed up), it falls behind, and once it is ready the writer reads what it missed back from the log. Nothing piles up in memory for a slow subscriber.
+5. **The protocol always says what happened.** Replies carry the request's `id`, errors carry codes, and the server's closes carry close codes, so a client always knows what to do next.
+
+The path of one message:
+
+```text
+publisher ──publish──▶ transport ───────────▶ topic writer ──append──▶ storage (topic log)
+                       checks auth,                │
+                       permission, rate            │ deliver to every subscription that
+                       limit and size              │ expects this seq and has room
+                                                   ▼
+subscriber ◀──message (topic, seq)── outbox ◀── broker
+subscriber ──ack (topic, seq)──────────────────▶ broker: clears it from that subscription's
+                                                 window, moves its position, stores the
+                                                 position for a durable session
+```
+
+Where to start reading the code:
+
+| File | What's there |
+|---|---|
+| `crates/popsub_transport/src/websocket.rs` | One connection's life: login and auth, a handler per request, heartbeats, token expiry, closing |
+| `crates/popsub_broker/src/writer.rs` | The topic writer: publish, subscribe with replay, catch-up |
+| `crates/popsub_broker/src/engine.rs`, `topic.rs` | Subscriptions, windows, acknowledgements, retries |
+| `crates/popsub_storage/src/storage.rs` | The storage traits; `file/` is the default backend |
+| `crates/popsub_protocol/src/` | Every frame, error code and close code |
+| `crates/popsub_sdk/src/driver.rs` | The client side of all of the above |
+
+The full design, with the reasons behind it, is in [`docs/DESIGN.md`](docs/DESIGN.md) and [`docs/STORAGE.md`](docs/STORAGE.md).
+
 ## Use it from Rust
 
 ```rust
@@ -147,7 +184,11 @@ make demo       # start a server, run the client against it, stop
 make schema     # regenerate docs/protocol/ after changing a protocol type
 ```
 
-Add `JOBS=2` to any target if a full build runs out of memory. Before changing code, read [`docs/STYLE.md`](docs/STYLE.md); before changing behaviour, read [`docs/DESIGN.md`](docs/DESIGN.md). The storage design is in [`docs/STORAGE.md`](docs/STORAGE.md).
+Add `JOBS=2` to any target if a full build runs out of memory.
+
+## Contributing
+
+Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers setting up, how to make a change, what each kind of change must also update (protocol, delivery behaviour, settings, storage), the code style, and what a pull request needs.
 
 ## License
 
