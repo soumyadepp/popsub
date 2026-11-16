@@ -1,6 +1,8 @@
 //! The PopSub WebSocket protocol: every frame clients and the server exchange.
 //!
-//! Frames are JSON objects tagged by `type`. A client frame may carry an
+//! Frames are JSON objects tagged by `type`. When the server closes a
+//! connection, the WebSocket close code (`CloseCode`) says why and whether
+//! to reconnect. A client frame may carry an
 //! `id` of the client's choosing; the reply to it carries the same `id`, so
 //! a client can match replies to requests. Frames the server sends on its
 //! own (deliveries, `truncated`, `stalled`) have no `id`.
@@ -15,12 +17,14 @@
 //! - Removing or changing the meaning of anything needs a new version.
 
 mod client;
+mod close;
 mod server;
 
 #[cfg(test)]
 mod tests;
 
 pub use client::{ClientFrame, ClientMessage, StartFrom};
+pub use close::CloseCode;
 pub use server::{
     Delivery, ErrorCode, Limits, ServerFrame, ServerMessage, Stalled, Subscribed, Truncated,
 };

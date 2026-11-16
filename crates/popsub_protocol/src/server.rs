@@ -55,7 +55,9 @@ pub enum ServerMessage {
     },
     /// The account from a `register` was created.
     Registered {},
-    /// An `auth` was accepted.
+    /// An `auth` was accepted. On an already authenticated connection,
+    /// `auth` with a new token for the same user only refreshes the token,
+    /// and the reply's `resumed` is empty.
     Authenticated {
         /// The protocol version the connection uses from now on.
         protocol: u32,
@@ -88,6 +90,13 @@ pub enum ServerMessage {
     Message(Delivery),
     /// Records the subscriber expected were trimmed before it got them.
     Truncated(Truncated),
+    /// The connection's token expires soon. Send `auth` with a new token
+    /// before `expires_at_ms`, or the connection is closed with
+    /// `CloseCode::TokenExpired`.
+    AuthExpiring {
+        /// When the token expires, in milliseconds since the Unix epoch.
+        expires_at_ms: i64,
+    },
     /// A QoS 1 record ran out of retries; delivery on the topic is paused
     /// until the client acknowledges something or subscribes again.
     Stalled(Stalled),
@@ -144,6 +153,11 @@ pub struct Limits {
     pub max_inflight: u64,
     /// How long a durable session is kept after its last connection, in seconds.
     pub session_expiry_secs: u64,
+    /// How often the server sends a WebSocket ping, in seconds.
+    pub heartbeat_secs: u64,
+    /// How long the server waits for anything from the client, a pong
+    /// included, before closing with `CloseCode::IdleTimeout`, in seconds.
+    pub idle_timeout_secs: u64,
 }
 
 /// A record delivered to a subscriber, live or replayed.

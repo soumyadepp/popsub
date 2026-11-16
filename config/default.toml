@@ -8,6 +8,8 @@ username = "admin"
 password = "password"
 allow_registration = false
 registration_role = "none"
+heartbeat_secs = 30
+idle_timeout_secs = 90
 
 [broker]
 max_connections = 1000

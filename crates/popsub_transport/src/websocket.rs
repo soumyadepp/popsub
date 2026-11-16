@@ -9,6 +9,13 @@
 //! publish are checked against the user's topic permissions, and login,
 //! registration and publishing are rate limited.
 //!
+//! Each connection's loop also pings the client every heartbeat interval and
+//! closes it after the idle timeout with nothing received, and closes it when
+//! its JWT expires unless the client sends `auth` again with a new token
+//! (it is warned with `auth_expiring` a minute before). Every close the
+//! server starts carries a `CloseCode`, so a client SDK knows whether to
+//! reconnect.
+//!
 //! Replies go straight onto the session's own outgoing channel, so sending
 //! one never takes the broker lock. Subscribe and publish are `async` calls
 //! on `SharedBroker`, which hands them to the topic's writer; everything else
@@ -17,13 +24,13 @@
 //! `&self` and its user store does its own locking.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
-use popsub_broker::{SharedBroker, session_key};
+use popsub_broker::{SharedBroker, close_message, session_key};
 use popsub_client::Client;
 use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
@@ -32,17 +39,50 @@ use popsub_utils::error::{PopSubError, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::accept_async;
 use tracing::{error, info, warn};
 use tungstenite::protocol::Message as WsMessage;
 
 use popsub_protocol::{
-    ClientFrame, ClientMessage, ErrorCode, PROTOCOL_VERSION, RequestId, ServerFrame, ServerMessage,
-    StartFrom,
+    ClientFrame, ClientMessage, CloseCode, ErrorCode, Limits, PROTOCOL_VERSION, RequestId,
+    ServerFrame, ServerMessage, StartFrom,
 };
 
 /// The longest `session_id` a client may choose, in characters.
 const MAX_SESSION_ID_CHARS: usize = 128;
+
+/// How long the server waits for the client's close reply after sending a
+/// close frame, before dropping the connection.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// How long before a connection's token expires the client is sent `auth_expiring`.
+const AUTH_EXPIRY_WARNING: Duration = Duration::from_secs(60);
+
+/// How often the server pings each connection and how long it waits for
+/// anything back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat {
+    /// How often a WebSocket ping is sent.
+    pub interval: Duration,
+    /// How long a connection may send nothing, not even a pong, before it
+    /// is closed with `CloseCode::IdleTimeout`.
+    pub idle_timeout: Duration,
+}
+
+impl Default for Heartbeat {
+    /// Builds the default heartbeat: a ping every 30 seconds, closed after 90
+    /// seconds of silence.
+    ///
+    /// Returns:
+    ///     The default heartbeat.
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(90),
+        }
+    }
+}
 
 /// How long the accept loop waits after a failed `accept` before trying again,
 /// so a persistent error such as running out of file descriptors doesn't spin.
@@ -143,6 +183,8 @@ pub struct Server {
     auth: Arc<AuthService>,
     /// Limits shared by every connection on this server.
     limiters: RateLimiters,
+    /// Ping interval and idle timeout for every connection.
+    heartbeat: Heartbeat,
 }
 
 impl Server {
@@ -160,14 +202,15 @@ impl Server {
             broker,
             auth,
             limiters: RateLimiters::default(),
+            heartbeat: Heartbeat::default(),
         }
     }
 
     /// Creates a server whose auth service is configured from the `[server]` settings.
     ///
     /// The JWT secret and expiry, the admin user, whether self-registration
-    /// is allowed and the role new users get (see `registration_role`) all
-    /// come from `settings`. Rate limits are the defaults.
+    /// is allowed, the role new users get (see `registration_role`) and the
+    /// heartbeat all come from `settings`. Rate limits are the defaults.
     ///
     /// Args:
     ///     broker: The broker every connection shares.
@@ -182,7 +225,10 @@ impl Server {
             .with_registration(settings.allow_registration)
             .with_default_role(registration_role(&settings.registration_role));
         let auth = Arc::new(AuthService::new(config).await);
-        Self::new(broker, auth)
+        Self::new(broker, auth).with_heartbeat(Heartbeat {
+            interval: Duration::from_secs(settings.heartbeat_secs.max(1)),
+            idle_timeout: Duration::from_secs(settings.idle_timeout_secs.max(1)),
+        })
     }
 
     /// Replaces the default rate limits.
@@ -195,6 +241,31 @@ impl Server {
     pub fn with_rate_limiters(mut self, limiters: RateLimiters) -> Self {
         self.limiters = limiters;
         self
+    }
+
+    /// Replaces the default heartbeat.
+    ///
+    /// Args:
+    ///     heartbeat: The ping interval and idle timeout for every connection.
+    ///
+    /// Returns:
+    ///     The server with the new heartbeat.
+    pub fn with_heartbeat(mut self, heartbeat: Heartbeat) -> Self {
+        self.heartbeat = heartbeat;
+        self
+    }
+
+    /// The limits clients are told about in `authenticated`.
+    ///
+    /// Returns:
+    ///     The window size, session expiry and heartbeat.
+    fn limits(&self) -> Limits {
+        Limits {
+            max_inflight: self.broker.max_inflight() as u64,
+            session_expiry_secs: self.broker.session_expiry().as_secs(),
+            heartbeat_secs: self.heartbeat.interval.as_secs(),
+            idle_timeout_secs: self.heartbeat.idle_timeout.as_secs(),
+        }
     }
 
     /// Binds `addr` and serves connections on it until the future is dropped.
@@ -243,14 +314,17 @@ impl Server {
     /// Runs one connection from handshake to cleanup.
     ///
     /// After the WebSocket handshake a `Client` is registered with the broker
-    /// and a send loop starts draining the client's outgoing channel. Text
-    /// frames are parsed and passed to the session; a frame that doesn't
-    /// parse gets a `bad_request` error (with its `id`, if one can be read)
-    /// and the connection stays open. Binary frames are ignored. The connection ends when
-    /// the socket closes, a handler asks to close it, or a handler fails, in
-    /// which case the client is sent an `internal` error first.
-    /// The client is removed from the broker once, by whichever of this loop
-    /// and the send loop finishes first.
+    /// and a send loop starts draining the client's outgoing channel. The
+    /// loop then waits for whichever comes first: a frame from the client
+    /// (handled by `Session::on_frame`), the heartbeat tick, the token
+    /// expiry warning, or the token expiry. Any frame received, pongs
+    /// included, counts as the client being alive. When the server ends the
+    /// connection it sends a close frame with the reason's `CloseCode`, then
+    /// keeps the connection open for up to `CLOSE_GRACE` until the client
+    /// replies with its own close. Dropping it straight away would make a
+    /// client with writes still queued (pongs, say) see a broken pipe instead
+    /// of the close code. The client is removed from the broker once, by whichever of
+    /// this loop and the send loop finishes first.
     ///
     /// Args:
     ///     stream: The accepted TCP connection.
@@ -272,57 +346,64 @@ impl Server {
         let cleanup = ClientCleanup::new(self.broker.clone(), client_id.clone());
         spawn_send_loop(ws_sender, rx, client_id.clone(), cleanup.clone());
 
+        let heartbeat = self.heartbeat;
         let session = Session {
             server: self,
             client_id,
             peer_ip: peer.ip().to_string(),
             outbox,
+            auth: Mutex::new(AuthState::default()),
         };
-
-        while let Some(Ok(frame)) = ws_receiver.next().await {
-            let text = match frame {
-                WsMessage::Text(text) => text,
-                WsMessage::Close(_) => break,
-                WsMessage::Binary(_) => {
-                    warn!(client_id = %session.client_id, "ignoring binary frame");
-                    continue;
-                }
-                _ => continue,
-            };
-            let parsed = match serde_json::from_str::<ClientFrame>(&text) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    warn!(
-                        client_id = %session.client_id,
-                        "invalid client frame: {} | {}",
-                        err,
-                        text.chars().take(100).collect::<String>()
-                    );
-                    if session
-                        .fail(
-                            salvage_request_id(&text).as_ref(),
-                            ErrorCode::BadRequest,
-                            format!("invalid frame: {err}"),
-                            None,
-                        )
-                        .is_err()
-                    {
-                        break;
+        let mut ticker =
+            tokio::time::interval_at(Instant::now() + heartbeat.interval, heartbeat.interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_heard = Instant::now();
+        let ending = loop {
+            let (warn_at, expire_at) = session.token_deadlines();
+            let never = Instant::now() + Duration::from_secs(365 * 24 * 3600);
+            tokio::select! {
+                frame = ws_receiver.next() => {
+                    let Some(Ok(frame)) = frame else {
+                        break Flow::Stop;
+                    };
+                    last_heard = Instant::now();
+                    match session.on_frame(frame).await {
+                        Flow::Continue => {}
+                        ending => break ending,
                     }
-                    continue;
                 }
-            };
-            match session.handle(parsed).await {
-                Ok(Flow::Continue) => {}
-                Ok(Flow::Close) => break,
-                Err(e) => {
-                    error!(client_id = %session.client_id, "error handling message: {}", e);
-                    let _ = session.fail(None, ErrorCode::Internal, "internal server error", None);
-                    break;
+                _ = ticker.tick() => {
+                    if last_heard.elapsed() >= heartbeat.idle_timeout {
+                        info!(client_id = %session.client_id, "closing an idle connection");
+                        break Flow::Close(CloseCode::IdleTimeout);
+                    }
+                    if session.outbox.send(WsMessage::Ping(Default::default())).is_err() {
+                        break Flow::Stop;
+                    }
+                }
+                _ = tokio::time::sleep_until(warn_at.unwrap_or(never)), if warn_at.is_some() => {
+                    if session.warn_token_expiring().is_err() {
+                        break Flow::Stop;
+                    }
+                }
+                _ = tokio::time::sleep_until(expire_at.unwrap_or(never)), if expire_at.is_some() => {
+                    info!(client_id = %session.client_id, "closing a connection whose token expired");
+                    break Flow::Close(CloseCode::TokenExpired);
                 }
             }
+        };
+        if let Flow::Close(code) = ending
+            && session.outbox.send(close_message(code)).is_ok()
+        {
+            let _ = tokio::time::timeout(CLOSE_GRACE, async {
+                while let Some(Ok(frame)) = ws_receiver.next().await {
+                    if matches!(frame, WsMessage::Close(_)) {
+                        break;
+                    }
+                }
+            })
+            .await;
         }
-
         cleanup.run();
     }
 }
@@ -355,13 +436,49 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Whether a connection should keep reading after a handler returns.
+/// Whether a connection should keep reading after a frame is handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
     /// Keep the connection open.
     Continue,
-    /// Close the connection.
-    Close,
+    /// Close the connection, telling the client why.
+    Close(CloseCode),
+    /// Stop without a close frame: the client already closed, or the
+    /// connection was already removed (for example, taken over).
+    Stop,
+}
+
+/// What a session knows about its own authentication.
+#[derive(Debug, Default)]
+struct AuthState {
+    /// The `session_id` the client named in `auth`, if any.
+    session_id: Option<String>,
+    /// When the current token expires, in milliseconds since the Unix epoch.
+    expires_at_ms: Option<i64>,
+    /// Whether `auth_expiring` was already sent for the current token.
+    warned: bool,
+}
+
+/// The current time in milliseconds since the Unix epoch.
+///
+/// Returns:
+///     The time.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Turns a wall-clock time into a Tokio deadline.
+///
+/// Args:
+///     at_ms: The time, in milliseconds since the Unix epoch.
+///
+/// Returns:
+///     The deadline, now if the time has passed.
+fn deadline(at_ms: i64) -> Instant {
+    let wait = u64::try_from(at_ms.saturating_sub(now_ms())).unwrap_or(0);
+    Instant::now() + Duration::from_millis(wait)
 }
 
 /// Removes a client from the broker exactly once.
@@ -444,9 +561,122 @@ struct Session {
     peer_ip: String,
     /// This connection's outgoing channel. Replies are queued here directly.
     outbox: mpsc::UnboundedSender<WsMessage>,
+    /// The session id and token expiry from `auth`.
+    auth: Mutex<AuthState>,
 }
 
 impl Session {
+    /// Handles one WebSocket frame from the client.
+    ///
+    /// Text frames are parsed and dispatched; a frame that doesn't parse
+    /// gets `bad_request` (with its `id`, if one can be read) and the
+    /// connection stays open. A close frame from the client ends the loop
+    /// without a close frame of our own. Binary, ping and pong frames need
+    /// no handling. A handler failure gets an `internal` error and closes
+    /// the connection with `CloseCode::InternalError`.
+    ///
+    /// Args:
+    ///     frame: The frame.
+    ///
+    /// Returns:
+    ///     Whether to keep the connection open.
+    async fn on_frame(&self, frame: WsMessage) -> Flow {
+        let text = match frame {
+            WsMessage::Text(text) => text,
+            WsMessage::Close(_) => return Flow::Stop,
+            WsMessage::Binary(_) => {
+                warn!(client_id = %self.client_id, "ignoring binary frame");
+                return Flow::Continue;
+            }
+            _ => return Flow::Continue,
+        };
+        let parsed = match serde_json::from_str::<ClientFrame>(&text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                warn!(
+                    client_id = %self.client_id,
+                    "invalid client frame: {} | {}",
+                    err,
+                    text.chars().take(100).collect::<String>()
+                );
+                let failed = self.fail(
+                    salvage_request_id(&text).as_ref(),
+                    ErrorCode::BadRequest,
+                    format!("invalid frame: {err}"),
+                    None,
+                );
+                return if failed.is_err() {
+                    Flow::Stop
+                } else {
+                    Flow::Continue
+                };
+            }
+        };
+        match self.handle(parsed).await {
+            Ok(flow) => flow,
+            Err(e) => {
+                error!(client_id = %self.client_id, "error handling message: {}", e);
+                let _ = self.fail(None, ErrorCode::Internal, "internal server error", None);
+                Flow::Close(CloseCode::InternalError)
+            }
+        }
+    }
+
+    /// Locks the session's auth state, recovering it if a holder panicked.
+    ///
+    /// Returns:
+    ///     The guard.
+    fn auth_state(&self) -> std::sync::MutexGuard<'_, AuthState> {
+        self.auth.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Works out when to warn about, and when to act on, the token expiring.
+    ///
+    /// Returns:
+    ///     The warning deadline (once per token, `AUTH_EXPIRY_WARNING`
+    ///     before expiry) and the expiry deadline, each `None` when there is
+    ///     no token or nothing left to do.
+    fn token_deadlines(&self) -> (Option<Instant>, Option<Instant>) {
+        let state = self.auth_state();
+        let Some(expires_at_ms) = state.expires_at_ms else {
+            return (None, None);
+        };
+        let warning_ms = i64::try_from(AUTH_EXPIRY_WARNING.as_millis()).unwrap_or(i64::MAX);
+        let warn_at = (!state.warned).then(|| deadline(expires_at_ms.saturating_sub(warning_ms)));
+        (warn_at, Some(deadline(expires_at_ms)))
+    }
+
+    /// Sends `auth_expiring` for the current token and remembers that it did.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When the frame can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn warn_token_expiring(&self) -> Result<()> {
+        let expires_at_ms = {
+            let mut state = self.auth_state();
+            state.warned = true;
+            state.expires_at_ms
+        };
+        match expires_at_ms {
+            Some(expires_at_ms) => self.reply(None, ServerMessage::AuthExpiring { expires_at_ms }),
+            None => Ok(()),
+        }
+    }
+
+    /// Records the expiry of a newly accepted token.
+    ///
+    /// Args:
+    ///     exp_secs: The token's `exp` claim, in seconds since the Unix epoch.
+    fn set_token_expiry(&self, exp_secs: usize) {
+        let mut state = self.auth_state();
+        state.expires_at_ms = Some(
+            i64::try_from(exp_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000),
+        );
+        state.warned = false;
+    }
+
     /// Dispatches a parsed client frame to its handler.
     ///
     /// Args:
@@ -536,21 +766,25 @@ impl Session {
     /// Returns the authenticated user, or tells the client to authenticate first.
     ///
     /// Every handler except `register`, `login` and `auth` starts here. A
-    /// client that is no longer registered, or hasn't authenticated, gets no
-    /// user back and its connection should be closed; the second also gets
-    /// an `unauthenticated` error.
+    /// client that hasn't authenticated gets an `unauthenticated` error and
+    /// its connection is closed with `CloseCode::Unauthenticated`; one that
+    /// is no longer registered (taken over) is stopped without another close.
     ///
     /// Args:
     ///     id: The id of the request being handled.
     ///     action: What the client tried to do, for the log.
     ///
     /// Returns:
-    ///     The username, or `None` when the connection should close.
+    ///     The username, or the flow to end the connection with.
     ///
     /// Raises:
     ///     PopSubError::Serialization: When the error frame can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    fn require_user(&self, id: Option<&RequestId>, action: &str) -> Result<Option<String>> {
+    fn require_user(
+        &self,
+        id: Option<&RequestId>,
+        action: &str,
+    ) -> Result<std::result::Result<String, Flow>> {
         let state = self.server.broker.with(|broker| {
             broker
                 .clients
@@ -560,7 +794,7 @@ impl Session {
         match state {
             None => {
                 warn!(client_id = %self.client_id, action, "client not registered");
-                Ok(None)
+                Ok(Err(Flow::Stop))
             }
             Some((false, _)) => {
                 warn!(client_id = %self.client_id, action, "request before authentication");
@@ -570,9 +804,9 @@ impl Session {
                     "must authenticate first",
                     None,
                 )?;
-                Ok(None)
+                Ok(Err(Flow::Close(CloseCode::Unauthenticated)))
             }
-            Some((true, username)) => Ok(Some(username.unwrap_or_default())),
+            Some((true, username)) => Ok(Ok(username.unwrap_or_default())),
         }
     }
 
@@ -700,11 +934,17 @@ impl Session {
     /// and attaches the durable session if one is named.
     ///
     /// The reply is `authenticated` with the protocol version and the
-    /// server's limits. These get an error and close the connection: an
-    /// unsupported `protocol` (`unsupported_protocol`), an invalid or expired
-    /// token (`auth_failed`), an invalid `session_id` (`invalid_session_id`),
-    /// a session store that can't be reached (`session_unavailable`), and a
-    /// client that is no longer registered (no reply).
+    /// server's limits. These get an error and close the connection with the
+    /// matching `CloseCode`: an unsupported `protocol` (`unsupported_protocol`),
+    /// an invalid or expired token (`auth_failed`), an invalid `session_id`
+    /// (`invalid_session_id`, closed as `AuthFailed`), and a session store
+    /// that can't be reached (`session_unavailable`). A client that is no
+    /// longer registered is stopped with no reply.
+    ///
+    /// On a connection that is already authenticated, this only refreshes
+    /// the token; see `refresh_token`. The token's expiry is recorded so the
+    /// connection loop can warn about it and close the connection when it
+    /// passes.
     ///
     /// With a `session_id`, the session is bound to the token's user (another
     /// user's identical id is a different session), any other connection
@@ -743,16 +983,29 @@ impl Session {
                 format!("this server speaks protocol {PROTOCOL_VERSION}, not {version}"),
                 None,
             )?;
-            return Ok(Flow::Close);
+            return Ok(Flow::Close(CloseCode::UnsupportedProtocol));
         }
         let claims = match self.server.auth.validate_token(token) {
             Ok(claims) => claims,
             Err(e) => {
                 warn!(client_id = %self.client_id, "authentication failed: {}", e);
                 self.fail(id, ErrorCode::AuthFailed, "authentication failed", None)?;
-                return Ok(Flow::Close);
+                return Ok(Flow::Close(CloseCode::AuthFailed));
             }
         };
+        let current = self.server.broker.with(|broker| {
+            broker
+                .clients
+                .get(&self.client_id)
+                .map(|client| (client.authenticated, client.username.clone()))
+        });
+        match current {
+            None => return Ok(Flow::Stop),
+            Some((true, Some(user))) => {
+                return self.refresh_token(id, &user, &claims.sub, claims.exp);
+            }
+            Some(_) => {}
+        }
         if let Some(session_id) = session_id
             && !valid_session_id(session_id)
         {
@@ -765,7 +1018,7 @@ impl Session {
                 ),
                 None,
             )?;
-            return Ok(Flow::Close);
+            return Ok(Flow::Close(CloseCode::AuthFailed));
         }
         let username = claims.sub;
         let registered = self.server.broker.with(|broker| {
@@ -780,9 +1033,11 @@ impl Session {
         });
         if !registered {
             warn!(client_id = %self.client_id, "client not registered");
-            return Ok(Flow::Close);
+            return Ok(Flow::Stop);
         }
-        let limits = self.server.broker.limits();
+        self.set_token_expiry(claims.exp);
+        self.auth_state().session_id = session_id.map(str::to_string);
+        let limits = self.server.limits();
         let Some(session_id) = session_id else {
             info!(client_id = %self.client_id, username, "authenticated successfully");
             self.reply(
@@ -813,7 +1068,7 @@ impl Session {
                     "can't open the session, try again",
                     None,
                 )?;
-                return Ok(Flow::Close);
+                return Ok(Flow::Close(CloseCode::SessionUnavailable));
             }
         };
         let mut resumed = Vec::new();
@@ -866,6 +1121,58 @@ impl Session {
         Ok(Flow::Continue)
     }
 
+    /// Accepts a new token on an already authenticated connection.
+    ///
+    /// The token must be for the same user, or the client gets `auth_failed`
+    /// and keeps its current authentication. Otherwise its expiry replaces
+    /// the old one and the reply is `authenticated` with the current session
+    /// id and an empty `resumed`. Nothing else about the connection changes:
+    /// `session_id` and `clean_start` in the frame are ignored.
+    ///
+    /// Args:
+    ///     id: The request id.
+    ///     current_user: The user the connection is authenticated as.
+    ///     token_user: The new token's subject.
+    ///     exp_secs: The new token's `exp` claim.
+    ///
+    /// Returns:
+    ///     Always `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn refresh_token(
+        &self,
+        id: Option<&RequestId>,
+        current_user: &str,
+        token_user: &str,
+        exp_secs: usize,
+    ) -> Result<Flow> {
+        if token_user != current_user {
+            warn!(client_id = %self.client_id, current_user, token_user, "refusing a token for a different user");
+            self.fail(
+                id,
+                ErrorCode::AuthFailed,
+                "the token is for a different user",
+                None,
+            )?;
+            return Ok(Flow::Continue);
+        }
+        self.set_token_expiry(exp_secs);
+        let session_id = self.auth_state().session_id.clone();
+        info!(client_id = %self.client_id, current_user, "token refreshed");
+        self.reply(
+            id,
+            ServerMessage::Authenticated {
+                protocol: PROTOCOL_VERSION,
+                session_id,
+                resumed: Vec::new(),
+                limits: self.server.limits(),
+            },
+        )?;
+        Ok(Flow::Continue)
+    }
+
     /// Subscribes the connection to a topic if its user may read it.
     ///
     /// A user without permission gets `not_authorized` and stays connected.
@@ -882,7 +1189,7 @@ impl Session {
     ///     from: Where replay starts.
     ///
     /// Returns:
-    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     A closing flow when the client isn't authenticated, otherwise
     ///     `Flow::Continue`.
     ///
     /// Raises:
@@ -894,8 +1201,9 @@ impl Session {
         topic: &str,
         from: StartFrom,
     ) -> Result<Flow> {
-        let Some(username) = self.require_user(id, "subscribe")? else {
-            return Ok(Flow::Close);
+        let username = match self.require_user(id, "subscribe")? {
+            Ok(username) => username,
+            Err(flow) => return Ok(flow),
         };
         if !self.server.auth.can_subscribe(&username, topic).await {
             warn!(client_id = %self.client_id, username, topic, "subscribe denied");
@@ -951,15 +1259,16 @@ impl Session {
     ///     topic: The topic to leave.
     ///
     /// Returns:
-    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     A closing flow when the client isn't authenticated, otherwise
     ///     `Flow::Continue`.
     ///
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn unsubscribe(&self, id: Option<&RequestId>, topic: &str) -> Result<Flow> {
-        let Some(username) = self.require_user(id, "unsubscribe")? else {
-            return Ok(Flow::Close);
+        let username = match self.require_user(id, "unsubscribe")? {
+            Ok(username) => username,
+            Err(flow) => return Ok(flow),
         };
         if let Err(e) = self.server.broker.unsubscribe(topic, &self.client_id).await {
             error!(client_id = %self.client_id, username, topic, %e, "removing a stored subscription failed");
@@ -1002,7 +1311,7 @@ impl Session {
     ///     qos: The delivery level, 0 or 1. Defaults to 0.
     ///
     /// Returns:
-    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     A closing flow when the client isn't authenticated, otherwise
     ///     `Flow::Continue`.
     ///
     /// Raises:
@@ -1016,8 +1325,9 @@ impl Session {
         message_id: Option<String>,
         qos: Option<u8>,
     ) -> Result<Flow> {
-        let Some(username) = self.require_user(id, "publish")? else {
-            return Ok(Flow::Close);
+        let username = match self.require_user(id, "publish")? {
+            Ok(username) => username,
+            Err(flow) => return Ok(flow),
         };
         if !self.server.auth.can_publish(&username, topic).await {
             warn!(client_id = %self.client_id, username, topic, "publish denied");
@@ -1093,15 +1403,15 @@ impl Session {
     ///     seq: The record's `seq`.
     ///
     /// Returns:
-    ///     `Flow::Close` when the client isn't authenticated, otherwise
+    ///     A closing flow when the client isn't authenticated, otherwise
     ///     `Flow::Continue`.
     ///
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn ack(&self, topic: &str, seq: u64) -> Result<Flow> {
-        if self.require_user(None, "ack")?.is_none() {
-            return Ok(Flow::Close);
+        if let Err(flow) = self.require_user(None, "ack")? {
+            return Ok(flow);
         }
         if !self.server.broker.ack(&self.client_id, topic, seq).await {
             info!(client_id = %self.client_id, topic, seq, "ignored an ACK for a record not in flight to this client");

@@ -27,12 +27,12 @@ use popsub_storage::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
-use tungstenite::protocol::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::engine::Broker;
+use crate::frame::close_message;
 use crate::writer::{Command, Published, SubscribeOutcome, TopicWriter};
-use popsub_protocol::{Limits, RequestId, StartFrom};
+use popsub_protocol::{CloseCode, RequestId, StartFrom};
 
 /// How often `run_retry_loop` looks for overdue QoS 1 records.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -176,15 +176,41 @@ impl SharedBroker {
         })
     }
 
-    /// The limits clients are told about in `authenticated`.
+    /// The window size subscriptions get, for the limits clients are told about.
     ///
     /// Returns:
-    ///     The window size and the session expiry.
-    pub fn limits(&self) -> Limits {
-        Limits {
-            max_inflight: self.with(|broker| broker.max_inflight()) as u64,
-            session_expiry_secs: self.log.session_expiry.as_secs(),
-        }
+    ///     The most unacknowledged QoS 1 records per subscription.
+    pub fn max_inflight(&self) -> usize {
+        self.with(|broker| broker.max_inflight())
+    }
+
+    /// How long a durable session outlives its last connection, for the
+    /// limits clients are told about.
+    ///
+    /// Returns:
+    ///     The session expiry.
+    pub fn session_expiry(&self) -> Duration {
+        self.log.session_expiry
+    }
+
+    /// Sends every connected client a close frame, for a graceful shutdown.
+    ///
+    /// The clients' send loops write the frame and then end; their
+    /// connections clean up as usual.
+    ///
+    /// Args:
+    ///     code: Why the connections are being closed, usually `GoingAway`.
+    ///
+    /// Returns:
+    ///     How many clients were sent the close frame.
+    pub fn close_all(&self, code: CloseCode) -> usize {
+        self.with(|broker| {
+            broker
+                .clients
+                .values()
+                .filter(|client| client.sender.send(close_message(code)).is_ok())
+                .count()
+        })
     }
 
     /// Runs `f` with exclusive access to the broker and returns its result.
@@ -344,8 +370,8 @@ impl SharedBroker {
 
     /// Binds a durable session to a connected client.
     ///
-    /// Another connection already holding the session is closed and removed
-    /// first, so a client that reconnects before the server noticed its old
+    /// Another connection already holding the session is sent a close frame
+    /// with `CloseCode::SessionTakenOver` and removed first, so a client that reconnects before the server noticed its old
     /// connection drop takes the session over. The session is touched for
     /// expiry. With `clean_start`, its stored subscriptions are discarded.
     ///
@@ -371,7 +397,7 @@ impl SharedBroker {
                 && old != client_id
             {
                 if let Some(sender) = broker.client_sender(&old) {
-                    let _ = sender.send(WsMessage::Close(None));
+                    let _ = sender.send(close_message(CloseCode::SessionTakenOver));
                 }
                 broker.cleanup_client(&old);
                 info!(old_client = %old, client = %client_id, "session taken over by a new connection");

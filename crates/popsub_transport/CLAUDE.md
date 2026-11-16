@@ -7,7 +7,8 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 - `src/websocket.rs`:
   - `Server`: what every connection shares (a `SharedBroker`, the auth service, `RateLimiters`). Build with `Server::new` or `Server::from_settings`, swap limits with `with_rate_limiters`, then `listen(addr)` or `serve(listener)`.
   - `Session`: one connection. `handle` dispatches a `ClientFrame` to one method per message type, passing the request `id`; `require_user` is the single "is this connection logged in" check; `reply(id, ...)` and `fail(id, code, ...)` queue frames on the session's own channel.
-  - `RateLimiters` and its defaults, the prune task, `registration_role` and `registration_error_message`.
+  - `RateLimiters` and its defaults, `Heartbeat` (`with_heartbeat`), the prune task, `registration_role` and `registration_error_message`.
+  - `run_connection`: the per-connection loop. It selects over client frames (`Session::on_frame`), the heartbeat tick, the token expiry warning and the token expiry, and ends with a `Flow`: `Continue`, `Close(CloseCode)` (send a close frame, wait up to `CLOSE_GRACE` for the reply) or `Stop` (no close frame).
 - `src/websocket_tests.rs`: starts a real server on port 0 with `MemoryStorage` and drives it with `tokio-tungstenite`. `settle` waits until the server has handled a connection's earlier frames.
 
 ## Invariants
@@ -22,14 +23,15 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 - Publish checks the topic permission before the rate limit, so denied publishes don't spend a user's allowance.
 - Failed logins are limited per `address|username` and per address; registration per address; publishing per username. See `docs/DESIGN.md` section 10.
 - Registration errors go through `registration_error_message`, which hides whether a username is taken.
+- A repeat `auth` on an authenticated connection only refreshes the token (`refresh_token`), and only for the same user.
+- Token expiry is enforced per connection from the token's `exp`, with no leeway; `auth_expiring` goes out `AUTH_EXPIRY_WARNING` before.
 
 ## Gotchas
 
 - `message`, `truncated`, `subscribed` and `stalled` frames are written by the broker, not by `Session::reply`. The matching `ServerMessage` variants wrap the broker's structs so clients parse everything through one enum.
 - Session ids are checked by `valid_session_id` (1 to 128 characters, no control characters) before anything is attached.
 - Limits use the socket address, so behind a proxy every client shares one.
-- JWT expiry is checked only at `auth`.
 
 ## Tests
 
-- `make test-crate CRATE=popsub_transport`. Tests bind port 0 and pass the bound listener to `Server::serve`, so there is no port race and no startup sleep. Use `wait_for_no_clients` rather than asserting on cleanup straight after a close.
+- `make test-crate CRATE=popsub_transport`. Lifecycle tests use `start_server_with` for a fast heartbeat, `short_token` for tokens that expire in seconds, and `next_close` to read close codes. Tests bind port 0 and pass the bound listener to `Server::serve`, so there is no port race and no startup sleep. Use `wait_for_no_clients` rather than asserting on cleanup straight after a close.
