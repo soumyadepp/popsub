@@ -9,6 +9,7 @@ use crate::RequestId;
 /// On the wire the `id` sits beside `type` in the same object, for example
 /// `{"type":"subscribe","id":7,"topic":"chat"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ClientFrame {
     /// Echoed in the reply, if given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +52,7 @@ impl ClientFrame {
 /// Only `login`, `register` and `auth` are accepted before the connection
 /// has authenticated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// Authenticates the connection with a JWT from `login`. Answered with
@@ -129,6 +131,7 @@ pub enum ClientMessage {
 /// On the wire this is `"resume"`, `"new"`, `{"last": 50}`,
 /// `{"since_ms": 1794800000000}` or `{"seq": 1200}`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StartFrom {
     /// One past the stored cursor of this session's subscription to the

@@ -1,0 +1,501 @@
+{
+  "$defs": {
+    "Delivery": {
+      "description": "A record delivered to a subscriber, live or replayed.",
+      "properties": {
+        "message_id": {
+          "description": "The publisher's id for the message.",
+          "type": "string"
+        },
+        "payload": {
+          "description": "The message body.",
+          "type": "string"
+        },
+        "published_at_ms": {
+          "description": "When the message was published, in milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "qos": {
+          "description": "The delivery level the publisher asked for: 0 or 1.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "The record's position in the topic log. Consumers deduplicate by\n`(topic, seq)`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "topic": {
+          "description": "The topic the record was published to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic",
+        "seq",
+        "message_id",
+        "payload",
+        "qos",
+        "published_at_ms"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Why a request failed. New codes may be added within a protocol version;\nclients should treat an unknown code like `internal`.",
+      "oneOf": [
+        {
+          "const": "bad_request",
+          "description": "The frame isn't valid JSON, has an unknown `type`, or misses a field.",
+          "type": "string"
+        },
+        {
+          "const": "unauthenticated",
+          "description": "The request needs `auth` first. The connection is closed.",
+          "type": "string"
+        },
+        {
+          "const": "auth_failed",
+          "description": "The token was invalid or expired. The connection is closed.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_credentials",
+          "description": "The username or password was wrong.",
+          "type": "string"
+        },
+        {
+          "const": "locked_out",
+          "description": "Too many failed logins; wait `retry_after` seconds.",
+          "type": "string"
+        },
+        {
+          "const": "rate_limited",
+          "description": "Too many requests; wait `retry_after` seconds.",
+          "type": "string"
+        },
+        {
+          "const": "not_authorized",
+          "description": "The user may not use this topic.",
+          "type": "string"
+        },
+        {
+          "const": "registration_failed",
+          "description": "The account couldn't be created; `message` says why when it is safe to.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_session_id",
+          "description": "The `session_id` is empty, too long or has control characters.",
+          "type": "string"
+        },
+        {
+          "const": "session_unavailable",
+          "description": "The session store couldn't be reached. The connection is closed.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_protocol",
+          "description": "The server doesn't speak the requested protocol version. The\nconnection is closed.",
+          "type": "string"
+        },
+        {
+          "const": "storage_unavailable",
+          "description": "The message store couldn't be reached; retry later.",
+          "type": "string"
+        },
+        {
+          "const": "payload_too_large",
+          "description": "The payload is longer than `Limits::max_payload_bytes`.",
+          "type": "string"
+        },
+        {
+          "const": "invalid_topic",
+          "description": "The topic name is empty, longer than `Limits::max_topic_bytes`, or\nhas control characters or the wildcard characters `+` and `#`.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "Anything else went wrong on the server.",
+          "type": "string"
+        }
+      ]
+    },
+    "Limits": {
+      "description": "Limits the server advertises in `authenticated`.",
+      "properties": {
+        "heartbeat_secs": {
+          "description": "How often the server sends a WebSocket ping, in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "idle_timeout_secs": {
+          "description": "How long the server waits for anything from the client, a pong\nincluded, before closing with `CloseCode::IdleTimeout`, in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_inflight": {
+          "description": "The most QoS 1 records a subscription may have unacknowledged.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_payload_bytes": {
+          "description": "The longest payload a publish may carry, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_topic_bytes": {
+          "description": "The longest topic name, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_expiry_secs": {
+          "description": "How long a durable session is kept after its last connection, in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_inflight",
+        "session_expiry_secs",
+        "heartbeat_secs",
+        "idle_timeout_secs",
+        "max_payload_bytes",
+        "max_topic_bytes"
+      ],
+      "type": "object"
+    },
+    "RequestId": {
+      "anyOf": [
+        {
+          "description": "A numeric id, such as a counter.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "A string id, such as a UUID.",
+          "type": "string"
+        }
+      ],
+      "description": "The id a client attaches to a request, echoed in the reply.\n\nEither a number or a string, and given back in the same form."
+    },
+    "Stalled": {
+      "description": "Tells a subscriber that a QoS 1 record ran out of retries.",
+      "properties": {
+        "seq": {
+          "description": "The record that was never acknowledged.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "Subscribed": {
+      "description": "Confirms a subscription and says which records are history.\n\nThe range is empty when `replay_from` is greater than `replay_to`.",
+      "properties": {
+        "replay_from": {
+          "description": "The first `seq` that will be sent.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replay_to": {
+          "description": "The newest `seq` in the log when the subscription started.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic",
+        "replay_from",
+        "replay_to"
+      ],
+      "type": "object"
+    },
+    "Truncated": {
+      "description": "Tells a subscriber that records it expected were trimmed.",
+      "properties": {
+        "first_available": {
+          "description": "The oldest `seq` still available. Delivery continues from here.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic",
+        "first_available"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/soumyadepp/popsub/blob/main/docs/protocol/server.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Every frame a PopSub server sends.",
+  "oneOf": [
+    {
+      "description": "The JWT issued for a `login`.",
+      "properties": {
+        "token": {
+          "description": "The token to send in `auth`.",
+          "type": "string"
+        },
+        "type": {
+          "const": "logged_in",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "token"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The account from a `register` was created.",
+      "properties": {
+        "type": {
+          "const": "registered",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "An `auth` was accepted. On an already authenticated connection,\n`auth` with a new token for the same user only refreshes the token,\nand the reply's `resumed` is empty.",
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/Limits",
+          "description": "Limits the client should respect."
+        },
+        "protocol": {
+          "description": "The protocol version the connection uses from now on.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resumed": {
+          "description": "Topics whose stored subscriptions are being restored. Each is\nfollowed by its own `subscribed` frame.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "description": "The durable session held, echoed from `auth`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "const": "authenticated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "limits"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Subscribed",
+      "description": "A subscription started. Records `replay_from` to `replay_to` are\nhistory; later ones are live.",
+      "properties": {
+        "type": {
+          "const": "subscribed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The connection no longer receives the topic.",
+      "properties": {
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        },
+        "type": {
+          "const": "unsubscribed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A QoS 1 publish is stored. A retried publish gets the original `seq`.",
+      "properties": {
+        "message_id": {
+          "description": "The id it was stored under, generated if the publish had none.",
+          "type": "string"
+        },
+        "seq": {
+          "description": "Its position in the topic log.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "const": "published",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "message_id",
+        "seq"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Delivery",
+      "description": "A record from a subscribed topic, live or replayed.",
+      "properties": {
+        "type": {
+          "const": "message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Truncated",
+      "description": "Records the subscriber expected were trimmed before it got them.",
+      "properties": {
+        "type": {
+          "const": "truncated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "The connection's token expires soon. Send `auth` with a new token\nbefore `expires_at_ms`, or the connection is closed with\n`CloseCode::TokenExpired`.",
+      "properties": {
+        "expires_at_ms": {
+          "description": "When the token expires, in milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "type": {
+          "const": "auth_expiring",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "expires_at_ms"
+      ],
+      "type": "object"
+    },
+    {
+      "$ref": "#/$defs/Stalled",
+      "description": "A QoS 1 record ran out of retries; delivery on the topic is paused\nuntil the client acknowledges something or subscribes again.",
+      "properties": {
+        "type": {
+          "const": "stalled",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A request failed.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode",
+          "description": "What went wrong, for programs."
+        },
+        "message": {
+          "description": "What went wrong, for people.",
+          "type": "string"
+        },
+        "retry_after": {
+          "description": "Seconds to wait before trying again, for rate limits and lockouts.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "const": "error",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "code",
+        "message"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RequestId"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The `id` of the request this answers."
+    }
+  },
+  "title": "ServerFrame",
+  "type": "object",
+  "x-protocol-version": 1
+}

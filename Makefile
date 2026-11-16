@@ -12,7 +12,7 @@ SERVER_ENV := SERVER_HOST=$(HOST) SERVER_PORT=$(PORT)
 .DEFAULT_GOAL := help
 
 .PHONY: help setup build release server server-release client demo \
-	test test-crate fmt fmt-check lint ci doc watch coverage reset-data clean
+	test test-crate fmt fmt-check lint ci schema schema-check doc watch coverage reset-data clean
 
 help:
 	@printf "PopSub make targets\n\n"
@@ -29,7 +29,8 @@ help:
 	@printf "    make test-crate      Run one crate's tests, e.g. CRATE=popsub_broker\n"
 	@printf "    make fmt             Format the code\n"
 	@printf "    make lint            Clippy with warnings as errors\n"
-	@printf "    make ci              Exactly what GitHub Actions runs: fmt check, clippy, tests\n"
+	@printf "    make ci              Exactly what GitHub Actions runs: fmt check, clippy, tests, schema check\n"
+	@printf "    make schema          Regenerate docs/protocol/*.json from the protocol types\n"
 	@printf "    make coverage        Coverage report (cargo-llvm-cov)\n\n"
 	@printf "  Housekeeping\n"
 	@printf "    make build           Debug build\n"
@@ -85,7 +86,13 @@ fmt-check:
 lint:
 	$(CARGO) clippy --workspace --all-targets --all-features $(JOBS_FLAG) -- -D warnings
 
-ci: fmt-check lint test
+ci: fmt-check lint test schema-check
+
+schema:
+	POPSUB_UPDATE_SCHEMA=1 $(CARGO) test -p popsub_protocol --features schema $(JOBS_FLAG) schema_files_match_the_types
+
+schema-check:
+	$(CARGO) test -p popsub_protocol --features schema $(JOBS_FLAG)
 
 doc:
 	$(CARGO) doc --workspace --no-deps --open

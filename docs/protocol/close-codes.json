@@ -1,0 +1,61 @@
+{
+  "close_codes": [
+    {
+      "code": 1001,
+      "reason": "going_away",
+      "should_reconnect": true
+    },
+    {
+      "code": 1009,
+      "reason": "message_too_big",
+      "should_reconnect": true
+    },
+    {
+      "code": 1011,
+      "reason": "internal_error",
+      "should_reconnect": true
+    },
+    {
+      "code": 4001,
+      "reason": "auth_failed",
+      "should_reconnect": false
+    },
+    {
+      "code": 4002,
+      "reason": "unauthenticated",
+      "should_reconnect": true
+    },
+    {
+      "code": 4003,
+      "reason": "session_taken_over",
+      "should_reconnect": false
+    },
+    {
+      "code": 4004,
+      "reason": "token_expired",
+      "should_reconnect": true
+    },
+    {
+      "code": 4005,
+      "reason": "idle_timeout",
+      "should_reconnect": true
+    },
+    {
+      "code": 4006,
+      "reason": "unsupported_protocol",
+      "should_reconnect": false
+    },
+    {
+      "code": 4007,
+      "reason": "session_unavailable",
+      "should_reconnect": true
+    },
+    {
+      "code": 4008,
+      "reason": "slow_consumer",
+      "should_reconnect": true
+    }
+  ],
+  "description": "WebSocket close codes a PopSub server sends, with whether a client should reconnect on its own.",
+  "x-protocol-version": 1
+}

@@ -85,7 +85,7 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 
 ## 4. Protocol
 
-All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`).
+All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`). A JSON Schema generated from those types is in `docs/protocol/` for SDKs in other languages; CI fails if it falls out of date.
 
 - **Request ids.** Any client frame may carry an `id`, a number or a string. The reply carries the same `id`. Frames the server sends on its own have none.
 - **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
@@ -347,7 +347,7 @@ Remaining:
 
 ### Phase 3: adoptable
 
-- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Also done: payload, frame, topic and message id limits. Also done: a byte budget for each connection's outbound queue, with slow subscribers caught up from the log. Next: a JSON Schema generated from the types for other languages.
+- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Also done: payload, frame, topic and message id limits. Also done: a byte budget for each connection's outbound queue, with slow subscribers caught up from the log. Also done: a JSON Schema in `docs/protocol/`, generated from the types and checked in CI. Next: the Rust SDK.
 - JavaScript and Python client libraries with reconnection and ACK handling built in.
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.

@@ -10,6 +10,7 @@ use crate::RequestId;
 /// server sends on its own (`message`, `truncated`, `stalled`, and the
 /// `subscribed` frames for subscriptions a session restores) have none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ServerFrame {
     /// The `id` of the request this answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +47,7 @@ impl ServerFrame {
 
 /// A server frame, tagged by its `type` field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// The JWT issued for a `login`.
@@ -115,6 +117,7 @@ pub enum ServerMessage {
 /// Why a request failed. New codes may be added within a protocol version;
 /// clients should treat an unknown code like `internal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The frame isn't valid JSON, has an unknown `type`, or misses a field.
@@ -153,6 +156,7 @@ pub enum ErrorCode {
 
 /// Limits the server advertises in `authenticated`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Limits {
     /// The most QoS 1 records a subscription may have unacknowledged.
     pub max_inflight: u64,
@@ -171,6 +175,7 @@ pub struct Limits {
 
 /// A record delivered to a subscriber, live or replayed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Delivery {
     /// The topic the record was published to.
     pub topic: String,
@@ -189,6 +194,7 @@ pub struct Delivery {
 
 /// Tells a subscriber that records it expected were trimmed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Truncated {
     /// The topic.
     pub topic: String,
@@ -200,6 +206,7 @@ pub struct Truncated {
 ///
 /// The range is empty when `replay_from` is greater than `replay_to`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Subscribed {
     /// The topic.
     pub topic: String,
@@ -211,6 +218,7 @@ pub struct Subscribed {
 
 /// Tells a subscriber that a QoS 1 record ran out of retries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Stalled {
     /// The topic.
     pub topic: String,
