@@ -46,13 +46,20 @@ pub struct ServerSettings {
     /// How long a connection may send nothing, not even a pong, before it is
     /// closed, in seconds. Should be a few heartbeats long.
     pub idle_timeout_secs: u64,
+    /// The longest payload a publish may carry, in bytes. WebSocket frames
+    /// longer than twice this plus 64 KiB are refused outright.
+    pub max_payload_bytes: usize,
+    /// The most bytes one connection may have queued for sending. Above a
+    /// sixteenth of this, deliveries wait and are caught up from the log;
+    /// going over it closes the connection as a slow consumer.
+    pub outbound_queue_bytes: usize,
 }
 
 impl Default for ServerSettings {
     /// Builds the server defaults: loopback on port 8080, a published JWT
     /// secret and admin password (fine only for local development), 24 hour
-    /// tokens, registration off, a ping every 30 seconds and a 90 second idle
-    /// timeout.
+    /// tokens, registration off, a ping every 30 seconds, a 90 second idle
+    /// timeout, 1 MiB payloads and a 16 MiB outbound queue per connection.
     ///
     /// Returns:
     ///     The default `[server]` section.
@@ -68,6 +75,8 @@ impl Default for ServerSettings {
             registration_role: "none".to_string(),
             heartbeat_secs: 30,
             idle_timeout_secs: 90,
+            max_payload_bytes: 1024 * 1024,
+            outbound_queue_bytes: 16 * 1024 * 1024,
         }
     }
 }

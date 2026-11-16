@@ -10,6 +10,9 @@
 pub enum CloseCode {
     /// 1001: the server is shutting down. Reconnect with backoff.
     GoingAway,
+    /// 1009: the client sent a frame larger than the server accepts. Reconnect,
+    /// but don't resend that frame.
+    MessageTooBig,
     /// 1011: the server hit an unexpected error. Reconnect with backoff.
     InternalError,
     /// 4001: the token or `session_id` in `auth` was rejected. Log in again
@@ -33,12 +36,17 @@ pub enum CloseCode {
     /// 4007: the session store couldn't be reached during `auth`. Reconnect
     /// with backoff.
     SessionUnavailable,
+    /// 4008: the client read so slowly that its outgoing queue passed the
+    /// server's hard limit. Reconnect; a durable session resumes from its
+    /// cursor.
+    SlowConsumer,
 }
 
 impl CloseCode {
     /// Every close code, for docs and tests.
-    pub const ALL: [CloseCode; 9] = [
+    pub const ALL: [CloseCode; 11] = [
         CloseCode::GoingAway,
+        CloseCode::MessageTooBig,
         CloseCode::InternalError,
         CloseCode::AuthFailed,
         CloseCode::Unauthenticated,
@@ -47,15 +55,17 @@ impl CloseCode {
         CloseCode::IdleTimeout,
         CloseCode::UnsupportedProtocol,
         CloseCode::SessionUnavailable,
+        CloseCode::SlowConsumer,
     ];
 
     /// The numeric WebSocket close code.
     ///
     /// Returns:
-    ///     1001 or 1011 for the standard codes, 4001 to 4007 for PopSub's own.
+    ///     1001, 1009 or 1011 for the standard codes, 4001 to 4008 for PopSub's own.
     pub fn code(self) -> u16 {
         match self {
             CloseCode::GoingAway => 1001,
+            CloseCode::MessageTooBig => 1009,
             CloseCode::InternalError => 1011,
             CloseCode::AuthFailed => 4001,
             CloseCode::Unauthenticated => 4002,
@@ -64,6 +74,7 @@ impl CloseCode {
             CloseCode::IdleTimeout => 4005,
             CloseCode::UnsupportedProtocol => 4006,
             CloseCode::SessionUnavailable => 4007,
+            CloseCode::SlowConsumer => 4008,
         }
     }
 
@@ -74,6 +85,7 @@ impl CloseCode {
     pub fn reason(self) -> &'static str {
         match self {
             CloseCode::GoingAway => "going_away",
+            CloseCode::MessageTooBig => "message_too_big",
             CloseCode::InternalError => "internal_error",
             CloseCode::AuthFailed => "auth_failed",
             CloseCode::Unauthenticated => "unauthenticated",
@@ -82,6 +94,7 @@ impl CloseCode {
             CloseCode::IdleTimeout => "idle_timeout",
             CloseCode::UnsupportedProtocol => "unsupported_protocol",
             CloseCode::SessionUnavailable => "session_unavailable",
+            CloseCode::SlowConsumer => "slow_consumer",
         }
     }
 

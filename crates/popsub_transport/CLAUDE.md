@@ -23,6 +23,9 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 - Publish checks the topic permission before the rate limit, so denied publishes don't spend a user's allowance.
 - Failed logins are limited per `address|username` and per address; registration per address; publishing per username. See `docs/DESIGN.md` section 10.
 - Registration errors go through `registration_error_message`, which hides whether a username is taken.
+- Topic names are checked by `valid_topic` on subscribe and publish (1 to `MAX_TOPIC_BYTES`, no control characters, `+` or `#`). Publishes check the topic, payload size and `message_id` length before permissions and the rate limit.
+- Each connection gets an `Outbox` with `queue_limits` (from `server.outbound_queue_bytes`). The send loop writes `Outgoing::Frame`s and stops after an `Outgoing::Close`; the connection loop also ends when the `Outbox` starts closing from elsewhere, and then does the close handshake.
+- Connections are accepted with `websocket_config`, which caps a frame at twice the payload limit plus `FRAME_OVERHEAD_BYTES`; a larger frame closes the connection with `MessageTooBig`.
 - A repeat `auth` on an authenticated connection only refreshes the token (`refresh_token`), and only for the same user.
 - Token expiry is enforced per connection from the token's `exp`, with no leeway; `auth_expiring` goes out `AUTH_EXPIRY_WARNING` before.
 

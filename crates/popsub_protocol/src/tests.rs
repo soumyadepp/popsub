@@ -188,10 +188,12 @@ fn replies_serialise_with_type_and_id() {
                         session_expiry_secs: 86_400,
                         heartbeat_secs: 30,
                         idle_timeout_secs: 90,
+                        max_payload_bytes: 1_048_576,
+                        max_topic_bytes: 120,
                     },
                 },
             ),
-            json!({"type": "authenticated", "id": 3, "protocol": 1, "limits": {"max_inflight": 100, "session_expiry_secs": 86400, "heartbeat_secs": 30, "idle_timeout_secs": 90}}),
+            json!({"type": "authenticated", "id": 3, "protocol": 1, "limits": {"max_inflight": 100, "session_expiry_secs": 86400, "heartbeat_secs": 30, "idle_timeout_secs": 90, "max_payload_bytes": 1048576, "max_topic_bytes": 120}}),
         ),
         (
             ServerFrame::reply(
@@ -205,10 +207,12 @@ fn replies_serialise_with_type_and_id() {
                         session_expiry_secs: 60,
                         heartbeat_secs: 1,
                         idle_timeout_secs: 3,
+                        max_payload_bytes: 10,
+                        max_topic_bytes: 20,
                     },
                 },
             ),
-            json!({"type": "authenticated", "id": "s", "protocol": 1, "session_id": "phone", "resumed": ["chat"], "limits": {"max_inflight": 5, "session_expiry_secs": 60, "heartbeat_secs": 1, "idle_timeout_secs": 3}}),
+            json!({"type": "authenticated", "id": "s", "protocol": 1, "session_id": "phone", "resumed": ["chat"], "limits": {"max_inflight": 5, "session_expiry_secs": 60, "heartbeat_secs": 1, "idle_timeout_secs": 3, "max_payload_bytes": 10, "max_topic_bytes": 20}}),
         ),
         (
             ServerFrame::reply(
@@ -356,6 +360,8 @@ fn error_codes_are_snake_case() {
         (ErrorCode::SessionUnavailable, "session_unavailable"),
         (ErrorCode::UnsupportedProtocol, "unsupported_protocol"),
         (ErrorCode::StorageUnavailable, "storage_unavailable"),
+        (ErrorCode::PayloadTooLarge, "payload_too_large"),
+        (ErrorCode::InvalidTopic, "invalid_topic"),
         (ErrorCode::Internal, "internal"),
     ];
     for (code, name) in names {
@@ -375,6 +381,7 @@ fn close_codes_are_stable_and_say_whether_to_reconnect() {
         codes,
         vec![
             (1001, "going_away", true),
+            (1009, "message_too_big", true),
             (1011, "internal_error", true),
             (4001, "auth_failed", false),
             (4002, "unauthenticated", true),
@@ -383,6 +390,7 @@ fn close_codes_are_stable_and_say_whether_to_reconnect() {
             (4005, "idle_timeout", true),
             (4006, "unsupported_protocol", false),
             (4007, "session_unavailable", true),
+            (4008, "slow_consumer", true),
         ]
     );
     for code in CloseCode::ALL {

@@ -1425,6 +1425,7 @@ dependencies = [
 name = "popsub_client"
 version = "0.1.0"
 dependencies = [
+ "popsub_protocol",
  "tokio",
  "tungstenite",
  "uuid",

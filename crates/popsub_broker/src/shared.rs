@@ -30,7 +30,6 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::engine::Broker;
-use crate::frame::close_message;
 use crate::writer::{Command, Published, SubscribeOutcome, TopicWriter};
 use popsub_protocol::{CloseCode, RequestId, StartFrom};
 
@@ -193,22 +192,26 @@ impl SharedBroker {
         self.log.session_expiry
     }
 
-    /// Sends every connected client a close frame, for a graceful shutdown.
+    /// Closes every connected client's outgoing queue, for a graceful shutdown.
     ///
-    /// The clients' send loops write the frame and then end; their
-    /// connections clean up as usual.
+    /// Each send loop writes what is already queued, then a close frame with
+    /// the code; the connections clean up as usual.
     ///
     /// Args:
     ///     code: Why the connections are being closed, usually `GoingAway`.
     ///
     /// Returns:
-    ///     How many clients were sent the close frame.
+    ///     How many clients were open and are now closing.
     pub fn close_all(&self, code: CloseCode) -> usize {
         self.with(|broker| {
             broker
                 .clients
                 .values()
-                .filter(|client| client.sender.send(close_message(code)).is_ok())
+                .filter(|client| {
+                    let open = client.sender.closing().is_none();
+                    client.sender.close(code);
+                    open
+                })
                 .count()
         })
     }
@@ -397,7 +400,7 @@ impl SharedBroker {
                 && old != client_id
             {
                 if let Some(sender) = broker.client_sender(&old) {
-                    let _ = sender.send(close_message(CloseCode::SessionTakenOver));
+                    sender.close(CloseCode::SessionTakenOver);
                 }
                 broker.cleanup_client(&old);
                 info!(old_client = %old, client = %client_id, "session taken over by a new connection");

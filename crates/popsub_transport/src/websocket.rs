@@ -31,18 +31,18 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use popsub_auth::{AuthConfig, AuthError, AuthService, DefaultUserRole};
 use popsub_broker::{SharedBroker, close_message, session_key};
-use popsub_client::Client;
+use popsub_client::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_config::ServerSettings;
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
-use popsub_storage::NewRecord;
+use popsub_storage::{MAX_TOPIC_BYTES, NewRecord};
 use popsub_utils::error::{PopSubError, Result};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_async_with_config;
 use tracing::{error, info, warn};
 use tungstenite::protocol::Message as WsMessage;
+use tungstenite::protocol::WebSocketConfig;
 
 use popsub_protocol::{
     ClientFrame, ClientMessage, CloseCode, ErrorCode, Limits, PROTOCOL_VERSION, RequestId,
@@ -51,6 +51,16 @@ use popsub_protocol::{
 
 /// The longest `session_id` a client may choose, in characters.
 const MAX_SESSION_ID_CHARS: usize = 128;
+
+/// The longest `message_id` a publisher may choose, in characters.
+const MAX_MESSAGE_ID_CHARS: usize = 128;
+
+/// The default longest payload a publish may carry: 1 MiB.
+pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Room for everything in a publish frame besides the payload (the type,
+/// topic, ids and JSON quoting), added to the WebSocket frame size limit.
+const FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
 
 /// How long the server waits for the client's close reply after sending a
 /// close frame, before dropping the connection.
@@ -185,6 +195,10 @@ pub struct Server {
     limiters: RateLimiters,
     /// Ping interval and idle timeout for every connection.
     heartbeat: Heartbeat,
+    /// The longest payload a publish may carry, in bytes.
+    max_payload_bytes: usize,
+    /// The byte budget of each connection's outgoing queue.
+    queue_limits: QueueLimits,
 }
 
 impl Server {
@@ -203,14 +217,17 @@ impl Server {
             auth,
             limiters: RateLimiters::default(),
             heartbeat: Heartbeat::default(),
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+            queue_limits: QueueLimits::default(),
         }
     }
 
     /// Creates a server whose auth service is configured from the `[server]` settings.
     ///
     /// The JWT secret and expiry, the admin user, whether self-registration
-    /// is allowed, the role new users get (see `registration_role`) and the
-    /// heartbeat all come from `settings`. Rate limits are the defaults.
+    /// is allowed, the role new users get (see `registration_role`), the
+    /// heartbeat, the payload limit and the outbound queue budget all come
+    /// from `settings`. Rate limits are the defaults.
     ///
     /// Args:
     ///     broker: The broker every connection shares.
@@ -225,10 +242,13 @@ impl Server {
             .with_registration(settings.allow_registration)
             .with_default_role(registration_role(&settings.registration_role));
         let auth = Arc::new(AuthService::new(config).await);
-        Self::new(broker, auth).with_heartbeat(Heartbeat {
-            interval: Duration::from_secs(settings.heartbeat_secs.max(1)),
-            idle_timeout: Duration::from_secs(settings.idle_timeout_secs.max(1)),
-        })
+        Self::new(broker, auth)
+            .with_heartbeat(Heartbeat {
+                interval: Duration::from_secs(settings.heartbeat_secs.max(1)),
+                idle_timeout: Duration::from_secs(settings.idle_timeout_secs.max(1)),
+            })
+            .with_max_payload_bytes(settings.max_payload_bytes)
+            .with_queue_limits(QueueLimits::from_hard_limit(settings.outbound_queue_bytes))
     }
 
     /// Replaces the default rate limits.
@@ -255,6 +275,51 @@ impl Server {
         self
     }
 
+    /// Replaces the default payload limit.
+    ///
+    /// Args:
+    ///     max_payload_bytes: The longest payload a publish may carry. Values
+    ///         below 1 are treated as 1.
+    ///
+    /// Returns:
+    ///     The server with the new limit.
+    pub fn with_max_payload_bytes(mut self, max_payload_bytes: usize) -> Self {
+        self.max_payload_bytes = max_payload_bytes.max(1);
+        self
+    }
+
+    /// Replaces the default outbound queue budget.
+    ///
+    /// Args:
+    ///     limits: The soft and hard byte limits for each connection.
+    ///
+    /// Returns:
+    ///     The server with the new budget.
+    pub fn with_queue_limits(mut self, limits: QueueLimits) -> Self {
+        self.queue_limits = limits;
+        self
+    }
+
+    /// The WebSocket settings every connection is accepted with.
+    ///
+    /// A whole message may be up to twice the payload limit plus
+    /// `FRAME_OVERHEAD_BYTES`, enough for a payload at the limit even with
+    /// heavy JSON escaping. Anything larger is refused by the WebSocket
+    /// layer before it is buffered, and the connection is closed with
+    /// `CloseCode::MessageTooBig`.
+    ///
+    /// Returns:
+    ///     The configuration.
+    fn websocket_config(&self) -> WebSocketConfig {
+        let max = self
+            .max_payload_bytes
+            .saturating_mul(2)
+            .saturating_add(FRAME_OVERHEAD_BYTES);
+        WebSocketConfig::default()
+            .max_message_size(Some(max))
+            .max_frame_size(Some(max))
+    }
+
     /// The limits clients are told about in `authenticated`.
     ///
     /// Returns:
@@ -265,6 +330,8 @@ impl Server {
             session_expiry_secs: self.broker.session_expiry().as_secs(),
             heartbeat_secs: self.heartbeat.interval.as_secs(),
             idle_timeout_secs: self.heartbeat.idle_timeout.as_secs(),
+            max_payload_bytes: self.max_payload_bytes as u64,
+            max_topic_bytes: MAX_TOPIC_BYTES as u64,
         }
     }
 
@@ -317,8 +384,9 @@ impl Server {
     /// and a send loop starts draining the client's outgoing channel. The
     /// loop then waits for whichever comes first: a frame from the client
     /// (handled by `Session::on_frame`), the heartbeat tick, the token
-    /// expiry warning, or the token expiry. Any frame received, pongs
-    /// included, counts as the client being alive. When the server ends the
+    /// expiry warning, the token expiry, or the connection's `Outbox`
+    /// starting to close (a takeover, a slow consumer, a shutdown). Any frame
+    /// received, pongs included, counts as the client being alive. When the server ends the
     /// connection it sends a close frame with the reason's `CloseCode`, then
     /// keeps the connection open for up to `CLOSE_GRACE` until the client
     /// replies with its own close. Dropping it straight away would make a
@@ -330,7 +398,8 @@ impl Server {
     ///     stream: The accepted TCP connection.
     ///     peer: The connection's remote address, used for rate limit keys.
     async fn run_connection(self, stream: TcpStream, peer: SocketAddr) {
-        let ws_stream = match accept_async(stream).await {
+        let ws_stream = match accept_async_with_config(stream, Some(self.websocket_config())).await
+        {
             Ok(ws) => ws,
             Err(e) => {
                 warn!(%peer, %e, "WebSocket handshake failed");
@@ -338,7 +407,7 @@ impl Server {
             }
         };
         let (ws_sender, mut ws_receiver) = ws_stream.split();
-        let (outbox, rx) = mpsc::unbounded_channel::<WsMessage>();
+        let (outbox, rx) = Outbox::channel(self.queue_limits);
         let client = Client::new(outbox.clone());
         let client_id = client.id.clone();
         self.broker.with(|broker| broker.register_client(client));
@@ -363,8 +432,13 @@ impl Server {
             let never = Instant::now() + Duration::from_secs(365 * 24 * 3600);
             tokio::select! {
                 frame = ws_receiver.next() => {
-                    let Some(Ok(frame)) = frame else {
-                        break Flow::Stop;
+                    let frame = match frame {
+                        Some(Ok(frame)) => frame,
+                        Some(Err(tungstenite::Error::Capacity(e))) => {
+                            warn!(client_id = %session.client_id, %e, "frame too large");
+                            break Flow::Close(CloseCode::MessageTooBig);
+                        }
+                        _ => break Flow::Stop,
                     };
                     last_heard = Instant::now();
                     match session.on_frame(frame).await {
@@ -390,11 +464,14 @@ impl Server {
                     info!(client_id = %session.client_id, "closing a connection whose token expired");
                     break Flow::Close(CloseCode::TokenExpired);
                 }
+                code = session.outbox.closed() => {
+                    info!(client_id = %session.client_id, reason = code.reason(), "connection closed by the server");
+                    break Flow::Close(code);
+                }
             }
         };
-        if let Flow::Close(code) = ending
-            && session.outbox.send(close_message(code)).is_ok()
-        {
+        if let Flow::Close(code) = ending {
+            session.outbox.close(code);
             let _ = tokio::time::timeout(CLOSE_GRACE, async {
                 while let Some(Ok(frame)) = ws_receiver.next().await {
                     if matches!(frame, WsMessage::Close(_)) {
@@ -521,28 +598,37 @@ impl ClientCleanup {
     }
 }
 
-/// Spawns a task that forwards frames from a client's outgoing channel to its WebSocket.
+/// Spawns a task that writes a client's outgoing queue to its WebSocket.
 ///
-/// The task stops when every sender for the channel has been dropped or a
-/// write to the socket fails, then runs `cleanup`.
+/// Frames are written in order. When the `Outbox` closes, the close frame
+/// is written (after the backlog, unless it is a slow consumer) and the task
+/// stops; it also stops when a write fails or every `Outbox` is dropped.
+/// Then it runs `cleanup`.
 ///
 /// Args:
 ///     ws_sender: The write half of the client's WebSocket.
-///     rx: The receiving end of the channel the broker and session send to.
+///     rx: The receiving side of the client's `Outbox`.
 ///     client_id: The client's broker id, for logging.
 ///     cleanup: Removes the client from the broker, once.
 fn spawn_send_loop<S>(
     mut ws_sender: S,
-    mut rx: mpsc::UnboundedReceiver<WsMessage>,
+    mut rx: OutboxReceiver,
     client_id: String,
     cleanup: ClientCleanup,
 ) where
     S: futures_util::Sink<WsMessage, Error = tungstenite::Error> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Err(e) = ws_sender.send(msg).await {
+        while let Some(next) = rx.recv().await {
+            let (frame, last) = match next {
+                Outgoing::Frame(frame) => (frame, false),
+                Outgoing::Close(code) => (close_message(code), true),
+            };
+            if let Err(e) = ws_sender.send(frame).await {
                 warn!(client_id = %client_id, %e, "failed to write to socket");
+                break;
+            }
+            if last {
                 break;
             }
         }
@@ -559,8 +645,8 @@ struct Session {
     client_id: String,
     /// This connection's remote address, the key for login and registration limits.
     peer_ip: String,
-    /// This connection's outgoing channel. Replies are queued here directly.
-    outbox: mpsc::UnboundedSender<WsMessage>,
+    /// This connection's outgoing queue. Replies are queued here directly.
+    outbox: Outbox,
     /// The session id and token expiry from `auth`.
     auth: Mutex<AuthState>,
 }
@@ -732,7 +818,7 @@ impl Session {
         let json = serde_json::to_string(&ServerFrame::reply(id.cloned(), message))?;
         self.outbox
             .send(WsMessage::Text(json.into()))
-            .map_err(|_| PopSubError::Client("outgoing channel closed".to_string()))
+            .map_err(|e| PopSubError::Client(format!("outgoing queue refused a reply: {e:?}")))
     }
 
     /// Queues an `error` reply.
@@ -1175,7 +1261,8 @@ impl Session {
 
     /// Subscribes the connection to a topic if its user may read it.
     ///
-    /// A user without permission gets `not_authorized` and stays connected.
+    /// An invalid topic name gets `invalid_topic` and a user without
+    /// permission gets `not_authorized`; both stay connected.
     /// On success the broker sends `subscribed` (carrying this request's id)
     /// with the replay range, `truncated` if some of it was already trimmed,
     /// and then the history `from` asks for. For a durable session the
@@ -1205,6 +1292,10 @@ impl Session {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
         };
+        if !valid_topic(topic) {
+            self.fail(id, ErrorCode::InvalidTopic, invalid_topic_message(), None)?;
+            return Ok(Flow::Continue);
+        }
         if !self.server.auth.can_subscribe(&username, topic).await {
             warn!(client_id = %self.client_id, username, topic, "subscribe denied");
             self.fail(
@@ -1292,8 +1383,10 @@ impl Session {
 
     /// Publishes a payload to a topic if the user may write to it and is within its rate limit.
     ///
-    /// The topic permission is checked before the rate limit, so a denied
-    /// publish doesn't use up the user's allowance. A denied publish gets
+    /// The topic name, payload size and `message_id` are checked first
+    /// (`invalid_topic`, `payload_too_large`, `bad_request`), then the topic
+    /// permission, then the rate limit, so neither a malformed nor a denied
+    /// publish uses up the user's allowance. A denied publish gets
     /// `not_authorized` and a limited one `rate_limited` with `retry_after`;
     /// both keep the connection open. The broker sets the publish time,
     /// generates an id when `message_id` is missing, stores the record and
@@ -1329,6 +1422,35 @@ impl Session {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
         };
+        if !valid_topic(topic) {
+            self.fail(id, ErrorCode::InvalidTopic, invalid_topic_message(), None)?;
+            return Ok(Flow::Continue);
+        }
+        if payload.len() > self.server.max_payload_bytes {
+            self.fail(
+                id,
+                ErrorCode::PayloadTooLarge,
+                format!(
+                    "the payload is {} bytes, the limit is {}",
+                    payload.len(),
+                    self.server.max_payload_bytes
+                ),
+                None,
+            )?;
+            return Ok(Flow::Continue);
+        }
+        if message_id
+            .as_deref()
+            .is_some_and(|m| m.is_empty() || m.chars().count() > MAX_MESSAGE_ID_CHARS)
+        {
+            self.fail(
+                id,
+                ErrorCode::BadRequest,
+                format!("message_id must be 1 to {MAX_MESSAGE_ID_CHARS} characters"),
+                None,
+            )?;
+            return Ok(Flow::Continue);
+        }
         if !self.server.auth.can_publish(&username, topic).await {
             warn!(client_id = %self.client_id, username, topic, "publish denied");
             self.fail(
@@ -1433,6 +1555,29 @@ fn salvage_request_id(text: &str) -> Option<RequestId> {
     serde_json::from_value(value.get("id")?.clone()).ok()
 }
 
+/// Checks a topic name a client wants to subscribe or publish to.
+///
+/// Args:
+///     topic: The topic name.
+///
+/// Returns:
+///     True for 1 to `MAX_TOPIC_BYTES` bytes with no control characters and
+///     no `+` or `#`, which are kept for wildcard patterns.
+fn valid_topic(topic: &str) -> bool {
+    (1..=MAX_TOPIC_BYTES).contains(&topic.len())
+        && !topic
+            .chars()
+            .any(|c| c.is_control() || c == '+' || c == '#')
+}
+
+/// The error text for an invalid topic name.
+///
+/// Returns:
+///     A message stating the rules.
+fn invalid_topic_message() -> String {
+    format!("topic names are 1 to {MAX_TOPIC_BYTES} bytes, with no control characters, '+' or '#'")
+}
+
 /// Checks a client-chosen session id.
 ///
 /// Args:
@@ -1525,6 +1670,30 @@ mod limiter_tests {
                 matches!(registration_role(name), DefaultUserRole::LimitedAccess(ref topics) if topics.is_empty()),
                 "{name}"
             );
+        }
+    }
+
+    /// Checks that topic names must be non-empty, short enough and free of
+    /// control and wildcard characters.
+    #[test]
+    fn topic_names_are_checked() {
+        for topic in [
+            "chat",
+            "metrics/cpu",
+            "a.b-c_d",
+            "日本語",
+            &"x".repeat(MAX_TOPIC_BYTES),
+        ] {
+            assert!(valid_topic(topic), "{topic}");
+        }
+        for topic in [
+            "",
+            "a/+/b",
+            "a/#",
+            "tab\there",
+            &"x".repeat(MAX_TOPIC_BYTES + 1),
+        ] {
+            assert!(!valid_topic(topic), "{topic}");
         }
     }
 

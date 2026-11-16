@@ -17,6 +17,7 @@ Topic writers, the broker engine, replay, per-subscriber acknowledgement and dur
 - Storage is only touched outside the broker lock. The lock is only taken through `with`, whose closure can't await.
 - Every publish, subscribe and catch-up for a topic goes through that topic's writer. That is what gives seq-ordered delivery and gap-free replay; `concurrent_publishers_are_delivered_in_seq_order` and `replay_and_live_delivery_never_overlap_or_gap` fail without it.
 - A subscription is only sent the exact `seq` it expects next. Anything it misses is read back from the log by catch-up, never queued in memory.
+- Deliveries and catch-up check the client's `Outbox::has_room` and skip a busy client. `deliver` and `send_records` report it once (`awaiting_room`), and the writer's `catch_up_when_ready` waits on `Outbox::ready` and then queues a `CatchUp`. Without that wait a busy subscriber stalls; `a_busy_subscriber_catches_up_when_its_queue_drains` guards it.
 - ACKs are per subscription: only a record in that connection's window is accepted. `acks_are_per_subscriber` and `retries_go_only_to_the_subscriber_that_has_not_acked` guard this.
 - The cursor is derived (one below the oldest in-flight record, or below `next_seq`); never store it separately in memory.
 - Sessions are keyed by `session_key(username, session_id)`, so one user can't reach another's.

@@ -981,6 +981,8 @@ async fn replies_echo_request_ids() {
     assert_eq!(auth["limits"]["session_expiry_secs"], 86_400);
     assert_eq!(auth["limits"]["heartbeat_secs"], 30);
     assert_eq!(auth["limits"]["idle_timeout_secs"], 90);
+    assert_eq!(auth["limits"]["max_payload_bytes"], 1_048_576);
+    assert_eq!(auth["limits"]["max_topic_bytes"], 120);
     let subscribed = send_raw(
         &mut ws,
         &serde_json::json!({"type": "subscribe", "id": 2, "topic": "chat"}).to_string(),
@@ -1210,6 +1212,11 @@ fn wall_clock_ms() -> i64 {
 /// Checks that sending `auth` again with a fresh token keeps the connection
 /// open past the old token's expiry, and that a token for another user is
 /// refused without closing the connection.
+///
+/// Every password check (registration and both logins) runs before the
+/// short token is used, on another connection. Argon2 is slow in debug
+/// builds, and on a slow CI runner those checks once outlasted the short
+/// token, so only cheap token checks happen inside its lifetime.
 #[tokio::test]
 async fn re_auth_refreshes_the_token_for_the_same_user_only() {
     let mut settings = Settings::default();
@@ -1222,9 +1229,21 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
     )
     .await;
     assert_eq!(registered["type"], "registered");
+    let bob = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "bobby", "password": "password123"}"#,
+    )
+    .await;
+    let bob_token = bob["token"].as_str().expect("token").to_string();
+    let login = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    let fresh = login["token"].as_str().expect("token").to_string();
 
     let mut ws = raw_connection(addr).await;
-    let short = short_token(&settings, "admin", Duration::from_secs(2));
+    let short = short_token(&settings, "admin", Duration::from_secs(3));
     let auth = send_raw(
         &mut ws,
         &serde_json::json!({"type": "auth", "token": short}).to_string(),
@@ -1236,12 +1255,6 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
         ServerMessage::AuthExpiring { .. }
     ));
 
-    let bob = send_raw(
-        &mut ws,
-        r#"{"type": "login", "username": "bobby", "password": "password123"}"#,
-    )
-    .await;
-    let bob_token = bob["token"].as_str().expect("token").to_string();
     let refused = send_raw(
         &mut ws,
         &serde_json::json!({"type": "auth", "id": 1, "token": bob_token}).to_string(),
@@ -1252,12 +1265,6 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
         (serde_json::json!(1), serde_json::json!("auth_failed"))
     );
 
-    let login = send_raw(
-        &mut ws,
-        r#"{"type": "login", "username": "admin", "password": "password"}"#,
-    )
-    .await;
-    let fresh = login["token"].as_str().expect("token").to_string();
     let refreshed = send_raw(
         &mut ws,
         &serde_json::json!({"type": "auth", "id": 2, "token": fresh}).to_string(),
@@ -1267,7 +1274,7 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
     assert_eq!(refreshed["id"], 2);
     assert!(refreshed.get("resumed").is_none());
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
     let published = send_raw(
         &mut ws,
         r#"{"type": "publish", "topic": "chat", "payload": "x", "qos": 1}"#,
@@ -1337,4 +1344,132 @@ async fn start_server_with(
         .with_heartbeat(heartbeat);
     tokio::spawn(server.serve(listener));
     (addr, broker)
+}
+
+/// Checks that a payload at the limit is published, one byte over gets
+/// `payload_too_large`, and a frame far over the WebSocket limit closes the
+/// connection with `message_too_big`.
+#[tokio::test]
+async fn oversized_payloads_and_frames_are_refused() {
+    let mut settings = Settings::default();
+    settings.server.max_payload_bytes = 100;
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = admin_connection(addr, &settings).await;
+    let at_limit = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 1, "topic": "chat", "payload": "x".repeat(100), "qos": 1}).to_string(),
+    )
+    .await;
+    assert_eq!(at_limit["type"], "published");
+    let over = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 2, "topic": "chat", "payload": "x".repeat(101), "qos": 1}).to_string(),
+    )
+    .await;
+    assert_eq!(
+        (over["id"].clone(), over["code"].clone()),
+        (serde_json::json!(2), serde_json::json!("payload_too_large"))
+    );
+
+    let huge =
+        serde_json::json!({"type": "publish", "topic": "chat", "payload": "x".repeat(70_000)})
+            .to_string();
+    ws.send(WsMessage::Text(huge.into())).await.expect("send");
+    assert_eq!(
+        next_close(&mut ws, Duration::from_secs(2)).await,
+        (
+            CloseCode::MessageTooBig.code(),
+            "message_too_big".to_string()
+        )
+    );
+}
+
+/// Checks that invalid topic names get `invalid_topic` on subscribe and
+/// publish, and an over-long `message_id` gets `bad_request`, without
+/// closing the connection.
+#[tokio::test]
+async fn invalid_topics_and_message_ids_are_refused() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = admin_connection(addr, &settings).await;
+    let long_topic = "t".repeat(121);
+    for frame in [
+        serde_json::json!({"type": "subscribe", "id": 1, "topic": "metrics/#"}),
+        serde_json::json!({"type": "subscribe", "id": 2, "topic": "a/+/b"}),
+        serde_json::json!({"type": "publish", "id": 3, "topic": "", "payload": "x"}),
+        serde_json::json!({"type": "publish", "id": 4, "topic": long_topic, "payload": "x"}),
+    ] {
+        let reply = send_raw(&mut ws, &frame.to_string()).await;
+        assert_eq!(reply["code"], "invalid_topic", "{frame}");
+        assert_eq!(reply["id"], frame["id"]);
+    }
+    let long_id = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 5, "topic": "chat", "payload": "x", "message_id": "m".repeat(129)}).to_string(),
+    )
+    .await;
+    assert_eq!(long_id["code"], "bad_request");
+    let fine = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "publish", "id": 6, "topic": "chat", "payload": "x", "qos": 1})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(fine["type"], "published");
+}
+
+/// Checks that a subscriber that stops reading doesn't make the server queue
+/// without limit: its queue stays near the soft limit while thousands of
+/// messages are published, and when it reads again it receives every one,
+/// in order, caught up from the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_reader_is_caught_up_from_the_log_without_unbounded_queueing() {
+    let mut settings = Settings::default();
+    settings.server.outbound_queue_bytes = 1_000_000;
+    settings.storage.retention.max_messages = 10_000;
+    let limiters = RateLimiters {
+        message_limiter: Arc::new(popsub_ratelimit::TokenBucket::new(
+            100_000,
+            100_000,
+            Duration::from_secs(1),
+        )),
+        ..RateLimiters::default()
+    };
+    let (addr, broker) = start_server(&settings, limiters).await;
+    let mut reader = admin_connection(addr, &settings).await;
+    let subscribed = send_raw(
+        &mut reader,
+        &serde_json::json!({"type": "subscribe", "topic": "flood"}).to_string(),
+    )
+    .await;
+    assert_eq!(subscribed["type"], "subscribed");
+
+    let mut publisher = admin_connection(addr, &settings).await;
+    let payload = "x".repeat(1_000);
+    for n in 0..3_000 {
+        send_json(
+            &mut publisher,
+            serde_json::json!({"type": "publish", "topic": "flood", "payload": payload, "message_id": format!("m{n}")}),
+        )
+        .await;
+    }
+    settle(&mut publisher, "settle-flood").await;
+
+    let queued = broker.with(|b| {
+        b.clients
+            .values()
+            .map(|c| c.sender.queued_bytes())
+            .max()
+            .unwrap_or(0)
+    });
+    assert!(queued < 70 * 1024, "a connection queued {queued} bytes");
+
+    let mut seqs = Vec::new();
+    while seqs.len() < 3_000 {
+        match next_frame(&mut reader).await {
+            ServerMessage::Message(delivery) => seqs.push(delivery.seq),
+            other => panic!("expected only messages, got {other:?}"),
+        }
+    }
+    assert_eq!(seqs, (1..=3_000).collect::<Vec<_>>());
 }
