@@ -81,7 +81,7 @@ Configuration
 
 Protocol basics (short)
 
-The protocol is versioned (this is version 1) and its types live in the `popsub_protocol` crate. Every frame is a JSON object with a `type`. Any request may carry an `id` (a number or a string); the reply to it carries the same `id`, so a client can match replies to requests. Frames the server sends on its own (messages, `truncated`, `stalled`) have no `id`. Clients should ignore fields and frame types they don't recognise.
+The protocol is versioned (this is version 1) and its types live in the `popsub_protocol` crate. A JSON Schema of every frame, generated from those types, is in `docs/protocol/` for building clients in other languages. Every frame is a JSON object with a `type`. Any request may carry an `id` (a number or a string); the reply to it carries the same `id`, so a client can match replies to requests. Frames the server sends on its own (messages, `truncated`, `stalled`) have no `id`. Clients should ignore fields and frame types they don't recognise.
 
 Every failure is an `error` frame with a machine-readable `code`:
 

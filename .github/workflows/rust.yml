@@ -38,3 +38,5 @@ jobs:
         run: cargo build --verbose
       - name: Run tests
         run: cargo test --verbose
+      - name: Check the protocol schema is up to date
+        run: cargo test -p popsub_protocol --features schema

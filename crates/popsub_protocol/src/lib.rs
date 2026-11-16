@@ -8,7 +8,9 @@
 //! own (deliveries, `truncated`, `stalled`) have no `id`.
 //!
 //! The server and client SDKs share these types, so they can't drift apart.
-//! The crate depends only on `serde`, so any client can use it.
+//! The crate depends only on `serde`, so any client can use it. With the
+//! `schema` feature it also produces a JSON Schema of every frame (see
+//! `schema`), for SDKs in other languages.
 //!
 //! Evolution rules for `PROTOCOL_VERSION`:
 //!
@@ -18,6 +20,8 @@
 
 mod client;
 mod close;
+#[cfg(feature = "schema")]
+pub mod schema;
 mod server;
 
 #[cfg(test)]
@@ -37,6 +41,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 ///
 /// Either a number or a string, and given back in the same form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum RequestId {
     /// A numeric id, such as a counter.

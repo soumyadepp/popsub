@@ -1,0 +1,290 @@
+{
+  "$defs": {
+    "RequestId": {
+      "anyOf": [
+        {
+          "description": "A numeric id, such as a counter.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "A string id, such as a UUID.",
+          "type": "string"
+        }
+      ],
+      "description": "The id a client attaches to a request, echoed in the reply.\n\nEither a number or a string, and given back in the same form."
+    },
+    "StartFrom": {
+      "description": "Where replay starts when a client subscribes.\n\nOn the wire this is `\"resume\"`, `\"new\"`, `{\"last\": 50}`,\n`{\"since_ms\": 1794800000000}` or `{\"seq\": 1200}`.",
+      "oneOf": [
+        {
+          "const": "resume",
+          "description": "One past the stored cursor of this session's subscription to the\ntopic. For an ephemeral connection, or a session with no stored\nsubscription to the topic, the same as `New`.",
+          "type": "string"
+        },
+        {
+          "const": "new",
+          "description": "No replay. Only records published after subscribing.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The last N retained records.",
+          "properties": {
+            "last": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "last"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The first record published at or after this time, in milliseconds\nsince the Unix epoch.",
+          "properties": {
+            "since_ms": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "since_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "This `seq`, or the oldest retained one if it was trimmed.",
+          "properties": {
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "seq"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/soumyadepp/popsub/blob/main/docs/protocol/client.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Every frame a PopSub client sends.",
+  "oneOf": [
+    {
+      "description": "Authenticates the connection with a JWT from `login`. Answered with\n`authenticated`.\n\n`protocol` is the version the client speaks; omitted means 1. With a\n`session_id`, the connection holds that durable session of the user:\nits subscriptions and cursors are restored and kept after the\nconnection ends. `clean_start` discards them first.",
+      "properties": {
+        "clean_start": {
+          "default": false,
+          "description": "Whether to discard the session's stored subscriptions.",
+          "type": "boolean"
+        },
+        "protocol": {
+          "description": "The protocol version the client speaks.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_id": {
+          "description": "The durable session to hold, 1 to 128 characters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token": {
+          "description": "The JWT.",
+          "type": "string"
+        },
+        "type": {
+          "const": "auth",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "token"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Exchanges a username and password for a JWT. Answered with `logged_in`.",
+      "properties": {
+        "password": {
+          "description": "The password.",
+          "type": "string"
+        },
+        "type": {
+          "const": "login",
+          "type": "string"
+        },
+        "username": {
+          "description": "The username.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "password"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Creates an account, if the server allows it. Answered with `registered`.",
+      "properties": {
+        "password": {
+          "description": "The requested password.",
+          "type": "string"
+        },
+        "type": {
+          "const": "register",
+          "type": "string"
+        },
+        "username": {
+          "description": "The requested username.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "password"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Subscribes to a topic, replaying the history `from` asks for first.\nAnswered with `subscribed`, then history, then live records.",
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/StartFrom",
+          "default": "resume",
+          "description": "Where replay starts. Omitted means `resume`."
+        },
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        },
+        "type": {
+          "const": "subscribe",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Stops delivery of a topic. Answered with `unsubscribed`.",
+      "properties": {
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        },
+        "type": {
+          "const": "unsubscribe",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Publishes a payload. A QoS 1 publish is answered with `published`\nonce stored; QoS 0 gets no reply unless it fails.",
+      "properties": {
+        "message_id": {
+          "description": "The publisher's idempotency key; generated when omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "description": "The message body.",
+          "type": "string"
+        },
+        "qos": {
+          "description": "0 (the default) or 1.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        },
+        "type": {
+          "const": "publish",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic",
+        "payload"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Acknowledges one QoS 1 record delivered to this connection. No reply.",
+      "properties": {
+        "seq": {
+          "description": "Its `seq`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "topic": {
+          "description": "The topic it was delivered on.",
+          "type": "string"
+        },
+        "type": {
+          "const": "ack",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic",
+        "seq"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RequestId"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Echoed in the reply, if given."
+    }
+  },
+  "title": "ClientFrame",
+  "type": "object",
+  "x-protocol-version": 1
+}

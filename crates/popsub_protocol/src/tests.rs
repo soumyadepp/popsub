@@ -398,3 +398,74 @@ fn close_codes_are_stable_and_say_whether_to_reconnect() {
     }
     assert_eq!(CloseCode::from_code(1000), None);
 }
+
+/// Checks that the schema files in `docs/protocol/` match the Rust types.
+/// With `POPSUB_UPDATE_SCHEMA=1` set, rewrites them instead (`make schema`).
+#[cfg(feature = "schema")]
+#[test]
+fn schema_files_match_the_types() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/protocol");
+    let update = std::env::var("POPSUB_UPDATE_SCHEMA").is_ok_and(|v| v == "1");
+    if update {
+        std::fs::create_dir_all(&dir).expect("create docs/protocol");
+    }
+    for (name, contents) in crate::schema::schema_files() {
+        let path = dir.join(name);
+        if update {
+            std::fs::write(&path, &contents).expect("write schema file");
+            continue;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            committed == contents,
+            "{} is out of date with the protocol types; run `make schema`",
+            path.display()
+        );
+    }
+}
+
+/// Checks that real frames validate against the generated schemas and that
+/// malformed ones don't, so the schemas describe what the server accepts.
+#[cfg(feature = "schema")]
+#[test]
+fn frames_validate_against_the_schemas() {
+    let files: std::collections::HashMap<_, _> =
+        crate::schema::schema_files().into_iter().collect();
+    let client: Value = serde_json::from_str(&files["client.schema.json"]).unwrap();
+    let server: Value = serde_json::from_str(&files["server.schema.json"]).unwrap();
+    let client = jsonschema::validator_for(&client).expect("client schema compiles");
+    let server = jsonschema::validator_for(&server).expect("server schema compiles");
+    for good in [
+        json!({"type": "login", "id": 1, "username": "a", "password": "b"}),
+        json!({"type": "auth", "token": "t", "protocol": 1, "session_id": "s"}),
+        json!({"type": "subscribe", "id": "x", "topic": "chat", "from": {"last": 5}}),
+        json!({"type": "subscribe", "topic": "chat", "from": "new"}),
+        json!({"type": "publish", "topic": "chat", "payload": "hi", "qos": 1}),
+        json!({"type": "ack", "topic": "chat", "seq": 4}),
+    ] {
+        assert!(client.is_valid(&good), "{good}");
+    }
+    for bad in [
+        json!({"type": "teleport"}),
+        json!({"type": "ack", "topic": "chat"}),
+        json!({"type": "subscribe", "topic": "chat", "from": {"last": "all"}}),
+        json!({"type": "login", "id": [1], "username": "a", "password": "b"}),
+    ] {
+        assert!(!client.is_valid(&bad), "{bad}");
+    }
+    for good in [
+        json!({"type": "logged_in", "id": 1, "token": "t"}),
+        json!({"type": "authenticated", "protocol": 1, "limits": {"max_inflight": 1, "session_expiry_secs": 1, "heartbeat_secs": 1, "idle_timeout_secs": 1, "max_payload_bytes": 1, "max_topic_bytes": 1}}),
+        json!({"type": "message", "topic": "t", "seq": 1, "message_id": "m", "payload": "p", "qos": 0, "published_at_ms": 5}),
+        json!({"type": "error", "code": "rate_limited", "message": "slow", "retry_after": 1}),
+        json!({"type": "auth_expiring", "expires_at_ms": 5}),
+    ] {
+        assert!(server.is_valid(&good), "{good}");
+    }
+    for bad in [
+        json!({"type": "error", "code": "no_such_code", "message": "x"}),
+        json!({"type": "message", "topic": "t"}),
+    ] {
+        assert!(!server.is_valid(&bad), "{bad}");
+    }
+}

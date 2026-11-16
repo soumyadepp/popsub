@@ -1,6 +1,6 @@
 # popsub_protocol
 
-The WebSocket protocol: every frame clients and the server exchange. The server (transport, broker, binary) and client SDKs all use these types, so they can't drift apart. It depends only on `serde`; keep it that way so any client can use it.
+The WebSocket protocol: every frame clients and the server exchange. The server (transport, broker, binary) and client SDKs all use these types, so they can't drift apart. It depends only on `serde` by default; keep it that way so any client can use it. The `schema` feature adds `schemars` and `serde_json` for generating the JSON Schema.
 
 ## Files
 
@@ -8,7 +8,8 @@ The WebSocket protocol: every frame clients and the server exchange. The server 
 - `src/client.rs`: `ClientFrame` (an optional `id` plus a `ClientMessage`) and `StartFrom`.
 - `src/close.rs`: `CloseCode`, the WebSocket close codes the server sends, with `should_reconnect`.
 - `src/server.rs`: `ServerFrame` (an optional `id` plus a `ServerMessage`), `ErrorCode`, `Limits`, and the structs inside frames (`Delivery`, `Subscribed`, `Truncated`, `Stalled`).
-- `src/tests.rs`: the exact JSON of every frame.
+- `src/schema.rs` (feature `schema`): builds `docs/protocol/client.schema.json`, `server.schema.json` and `close-codes.json` from the types with `schemars`.
+- `src/tests.rs`: the exact JSON of every frame, plus (with `schema`) a check that the committed schema files match the types and that sample frames validate against them.
 
 ## Rules
 
@@ -20,4 +21,5 @@ The WebSocket protocol: every frame clients and the server exchange. The server 
 
 ## Tests
 
-- `make test-crate CRATE=popsub_protocol`.
+- `make test-crate CRATE=popsub_protocol`, and `make schema-check` for the schema tests.
+- Every serialisable type carries `#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]`. A new type needs it too, and `make schema` afterwards.
