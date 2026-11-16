@@ -58,7 +58,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 ## Rules for changes
 
-- **Protocol changes** touch `popsub_protocol` (types and its wire tests), the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change. Within a protocol version only add frames, fields and error codes; anything else needs a new `PROTOCOL_VERSION`.
+- **Protocol changes** touch `popsub_protocol` (types and its wire tests), section 4 of `docs/DESIGN.md`, the WebSocket tests, the regenerated `docs/protocol/` schema, and the README's example session if it shows the changed frames, in the same change. Within a protocol version only add frames, fields and error codes; anything else needs a new `PROTOCOL_VERSION`.
 - **After changing any protocol type, run `make schema`** and commit the regenerated `docs/protocol/*.json`. CI's schema check fails otherwise.
 - **Every failure a client sees is an `error` frame with an `ErrorCode`.** Don't send free-text-only errors, and echo the request's `id` in every reply.
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.

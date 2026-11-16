@@ -1,184 +1,154 @@
-# PopSub: a small WebSocket pub/sub server in Rust
+# PopSub
 
-PopSub is a small publish/subscribe server written in Rust, meant to be easy to run locally and to read end to end. It supports WebSocket clients, topic-based subscribe/publish, a small JSON protocol, per-topic logs with sequence numbers that subscribers can replay from, durable sessions that resume where they left off, and a QoS 1 option with per-subscriber acknowledgements and retries (at-least-once per subscriber while connected, and across reconnects for durable sessions; see `docs/DESIGN.md` section 6).
+A publish/subscribe broker over WebSockets, written in Rust. One binary, a data directory, and a JSON protocol any language can speak.
 
-Why this exists
+Every message gets a sequence number in its topic's log, so subscribers can replay history, resume where they left off after a disconnect or a server restart, and spot duplicates. QoS 1 messages are acknowledged per subscriber and retried until they are.
 
-- Quick to run locally for demos or simple integrations
-- Clear, minimal broker implementation you can read and modify
-- Decent starting point for experimenting with WebSockets, message replay, and simple reliability semantics
-
-What's in the workspace
-
-- `crates/popsub`: the CLI (subcommands `server` and `client`)
-- `crates/popsub_broker`: broker logic (topic writers, routing, replay, retries)
-- `crates/popsub_transport`: WebSocket protocol handling, and enforcing auth, permissions and rate limits
-- `crates/popsub_auth`: users, roles, password hashing, JWTs and topic permissions
-- `crates/popsub_sdk`: the Rust client library
-- `crates/popsub_ratelimit`: token bucket, sliding window and login lockout limiters
-- `crates/popsub_storage`: topic logs, the storage traits, the file and in-memory backends and the conformance suite
-- `crates/popsub_connection`: the server's record of one connected socket and its outgoing queue
-- `crates/popsub_config`: config loader and settings
-- `crates/popsub_utils`: shared error type and logging
-
-Quick start (five minutes)
-
-1. Build the workspace:
-
-   ```bash
-   git clone https://github.com/yourusername/popsub.git
-   cd popsub
-   cargo build --workspace
-   ```
-
-2. Start the server (from the workspace root):
-
-   ```bash
-   cargo run -p popsub -- server
-   ```
-
-3. Run the client in another terminal:
-
-   ```bash
-   cargo run -p popsub -- client --url ws://127.0.0.1:8080
-   ```
-
-The client logs in (to get a JWT), authenticates, subscribes to `chat`, publishes a message and prints it when it arrives. Pass `--username`, `--password` and `--topic` to use another account or topic.
-
-Configuration
-
-- The loader reads `config/default.toml` if present, then environment variables, which win. Single-word keys use one underscore after the section (`SERVER_HOST`, `SERVER_PORT`, `SERVER_PASSWORD`). Keys that contain an underscore need two (`SERVER__JWT_SECRET`, `SERVER__ALLOW_REGISTRATION`, `BROKER__MAX_RETRIES`), and so do nested sections (`STORAGE__RETENTION__MAX_MESSAGES`).
-- Example `config/default.toml`:
-
-  ```toml
-  [server]
-  host = "127.0.0.1"
-  port = 8080
-  jwt_secret = "a_very_secret_key"
-
-  [broker]
-  ack_timeout_ms = 5000
-  max_retries = 5
-  max_inflight = 100
-
-  [storage]
-  backend = "file"
-  path = "pubsub_data"
-  durability = "buffered"
-  session_expiry_secs = 86400
-
-  [storage.retention]
-  max_messages = 1000
-  max_age_secs = 3600
-  max_bytes = 67108864
-  ```
-
-- `backend = "file"` (the default) keeps topic history and durable sessions in the `path` directory, so they survive restarts. Only one server can use a directory at a time. `backend = "memory"` keeps everything in the process and loses it when the server stops.
-- `durability` is how firmly each publish is stored before it is confirmed: `buffered` (the default) survives the server crashing, `synced` also survives a power cut, at the cost of a disk flush per publish. The server refuses to start if the backend can't provide what you ask for.
-- `make reset-data` deletes `pubsub_data`.
-
-- The server refuses to listen on anything other than localhost while `jwt_secret` or the admin `password` still have their published default values. On localhost it starts with a warning.
-- Registration is off by default. Turn it on with `allow_registration = true` under `[server]`. `registration_role` decides what new users can do: `none` (the default, no topics until an admin grants them), `readonly` or `full`.
-
-Protocol basics (short)
-
-The protocol is versioned (this is version 1) and its types live in the `popsub_protocol` crate. A JSON Schema of every frame, generated from those types, is in `docs/protocol/` for building clients in other languages. Every frame is a JSON object with a `type`. Any request may carry an `id` (a number or a string); the reply to it carries the same `id`, so a client can match replies to requests. Frames the server sends on its own (messages, `truncated`, `stalled`) have no `id`. Clients should ignore fields and frame types they don't recognise.
-
-Every failure is an `error` frame with a machine-readable `code`:
-
-```json
-{ "type": "error", "id": 7, "code": "rate_limited", "message": "too many messages", "retry_after": 1 }
+```
+cargo run -p popsub -- server
 ```
 
-When the server closes a connection it sends a WebSocket close code saying why: `1001` shutting down, `1009` frame too large, `1011` internal error, `4001` auth failed, `4002` request before auth, `4003` session taken over by another connection (don't reconnect), `4004` token expired, `4005` idle timeout, `4006` unsupported protocol (don't reconnect), `4007` session store unavailable, `4008` slow consumer. The server pings every 30 seconds and closes a connection that sends nothing, not even a pong, for 90 seconds; WebSocket libraries answer pings by themselves.
+## What you get
 
-A client that reads slowly isn't sent messages faster than it reads: once 1 MiB is waiting for it, new messages wait in the topic log and are sent as it catches up, in order. Only if replies alone push its queue past `server.outbound_queue_bytes` (16 MiB) is it closed with `4008`; a durable session then resumes where it left off.
+- **Topic logs with sequence numbers.** Replay the last N messages, everything since a time, or everything from a `seq`. Replay and live delivery join with no gap and no repeat.
+- **Durable sessions.** Name a session when you connect, and your subscriptions and acknowledgement positions survive disconnects and server restarts.
+- **QoS 0 and QoS 1.** QoS 1 is at-least-once per subscriber. A publisher that retries with the same `message_id` doesn't create a duplicate, and gets the original `seq` back.
+- **Storage you choose.** A file backend (the default), an in-memory one, or your own through the `Storage` trait, held to a shared conformance suite.
+- **Safe defaults.** Users with per-topic permissions, Argon2id passwords, JWTs, rate limits on logins, registration and publishing, size limits, heartbeats, and backpressure for slow readers.
+- **A Rust client** (`popsub_sdk`) that handles reconnection, resubscription and deduplication for you, and a JSON Schema for building clients in other languages.
 
-The error codes are `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic` and `internal`. A frame that isn't valid JSON or has an unknown `type` gets `bad_request` and the connection stays open.
+## Quick start
 
-- Register, when the server allows it:
+You need Rust 1.89 or newer.
 
-  ```json
-  { "type": "register", "username": "alice", "password": "at-least-8-chars" }
-  ```
+```bash
+git clone https://github.com/soumyadepp/popsub.git
+cd popsub
+make server
+```
 
-  The reply is `{ "type": "registered" }`, or an error with code `registration_failed`. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`. Passwords are at least 8 characters. A taken username gets a plain "registration failed", so the endpoint can't be used to discover accounts.
+In another terminal:
 
-- Login to obtain a JWT:
+```bash
+make client
+```
 
-  ```json
-  { "type": "login", "id": 1, "username": "admin", "password": "password" }
-  ```
+The client logs in as the default admin, subscribes to `chat`, publishes a message with confirmation, and prints it when it arrives. On a fresh data directory you'll see:
 
-  The reply is `{ "type": "logged_in", "id": 1, "token": "<jwt>" }`, or `invalid_credentials`, or `locked_out` with `retry_after`.
+```
+Logged in as admin
+Authenticated
+Subscribed to chat
+Published as seq 1
+Received on chat (seq 1): Hello from popsub client
+```
 
-- Use the JWT to authenticate:
+`make demo PORT=8090` does both in one go. The default admin is `admin` / `password`, which only works on `localhost`: see [Configuration](#configuration) before exposing the server.
 
-  ```json
-  { "type": "auth", "token": "<jwt>", "protocol": 1 }
-  { "type": "auth", "token": "<jwt>", "protocol": 1, "session_id": "phone-1" }
-  ```
+## Use it from Rust
 
-  The reply is `{ "type": "authenticated", "protocol": 1, "limits": { "max_inflight": 100, "session_expiry_secs": 86400, "heartbeat_secs": 30, "idle_timeout_secs": 90, "max_payload_bytes": 1048576, "max_topic_bytes": 120 } }`. `protocol` may be left out (it means 1); a version the server doesn't speak gets `unsupported_protocol` and the connection closes. A minute before the token expires the server sends `{ "type": "auth_expiring", "expires_at_ms": ... }`; send `auth` again with a fresh token for the same user to keep the connection, or it is closed with code `4004`. With a `session_id`, the connection holds a durable session of that user: its subscriptions and how far it has acknowledged are kept after it disconnects (for `session_expiry_secs`), and restored when it authenticates with the same `session_id` again. The reply then echoes the `session_id` and lists the restored topics in `resumed`. Add `"clean_start": true` to discard what was stored. Reconnecting with a session another connection still holds closes that connection with code `4003`.
+```rust
+use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
 
-- Subscribe / Unsubscribe:
+let config = ClientConfig::new("ws://127.0.0.1:8080", Credentials::password("alice", "secret"))
+    .session("alice-laptop");
+let client = Client::connect(config).await?;
 
-  ```json
-  { "type": "subscribe", "topic": "chat" }
-  { "type": "subscribe", "topic": "chat", "from": { "last": 50 } }
-  { "type": "unsubscribe", "topic": "chat" }
-  ```
+let mut orders = client.subscribe("orders", StartFrom::Resume).await?;
+let stored = client.publish_confirmed("orders", "order 42 shipped").await?;
 
-  The reply to `unsubscribe` is `{ "type": "unsubscribed", "topic": "chat" }`. The reply to `subscribe` is `{ "type": "subscribed", "topic": "chat", "replay_from": 41, "replay_to": 90 }`: messages 41 to 90 are history, anything later is live. `from` decides where replay starts: `"resume"` (the default: continue a durable session's stored subscription, otherwise no history), `"new"` (no history), `{ "last": N }`, `{ "since_ms": <unix ms> }` or `{ "seq": S }`. Replayed and live messages arrive in `seq` order with no gap or repeat between them. If some of the requested history was already trimmed, a `{ "type": "truncated", "topic": "chat", "first_available": 1300 }` frame comes before it. A failure gets an `error` frame instead.
+while let Some(message) = orders.next().await {
+    println!("{} #{}: {}", message.topic, message.seq, message.payload);
+}
+```
 
-- Publish:
+The client logs in, refreshes its token, and reconnects with backoff. It knows from the server's close code when not to reconnect, and resubscribes from the next message it expects. It resends confirmed publishes without duplicating them, acknowledges QoS 1 messages (automatically, or when you call `message.ack()`), and never hands you the same `(topic, seq)` twice within one client. `client.events()` tells you about disconnects, truncated history and stalled subscriptions.
 
-  ```json
-  { "type": "publish", "topic": "chat", "payload": "Hello" }
+## Use it from any language
 
-  { "type": "publish", "topic": "critical", "payload": "Important", "message_id": "id-123", "qos": 1 }
-  ```
+The protocol is JSON over a WebSocket. A session looks like this (`→` is the client, `←` the server):
 
-  Payloads are limited to `max_payload_bytes` (1 MiB by default, `server.max_payload_bytes`); a longer one gets `payload_too_large`. Topic names are 1 to 120 bytes with no control characters, `+` or `#` (those are kept for wildcard permissions), or the request gets `invalid_topic`. A `message_id` is 1 to 128 characters.
+```text
+→ {"type": "login", "id": 1, "username": "alice", "password": "secret"}
+← {"type": "logged_in", "id": 1, "token": "eyJ..."}
+→ {"type": "auth", "id": 2, "token": "eyJ...", "protocol": 1, "session_id": "alice-laptop"}
+← {"type": "authenticated", "id": 2, "protocol": 1, "session_id": "alice-laptop", "limits": {...}}
+→ {"type": "subscribe", "id": 3, "topic": "orders", "from": {"last": 10}}
+← {"type": "subscribed", "id": 3, "topic": "orders", "replay_from": 33, "replay_to": 42}
+← {"type": "message", "topic": "orders", "seq": 33, "message_id": "...", "payload": "...", "qos": 1, "published_at_ms": 1794800000000}
+→ {"type": "ack", "topic": "orders", "seq": 33}
+→ {"type": "publish", "id": 4, "topic": "orders", "payload": "order 43 placed", "qos": 1}
+← {"type": "published", "id": 4, "message_id": "...", "seq": 43}
+```
 
-  A QoS 1 publish is confirmed with `{ "type": "published", "message_id": "id-123", "seq": 42 }` once it is stored. A QoS 0 publish gets no reply unless it fails; if storage fails, either QoS gets `storage_unavailable` and nothing was sent. Publishing the same `message_id` again from the same user (for example, retrying after a dropped connection) stores and delivers it once and gets the original `seq` back. When `message_id` is missing the server generates one.
+- Any request may carry an `id`, which its reply echoes.
+- Every failure is an `error` frame with a `code` such as `not_authorized` or `rate_limited`.
+- When the server closes a connection, the WebSocket close code says why and whether to reconnect.
 
-- Messages arrive as:
+Where to find the full protocol:
 
-  ```json
-  { "type": "message", "topic": "chat", "seq": 42, "message_id": "id-123", "payload": "Hello", "qos": 1, "published_at_ms": 1794800000000 }
-  ```
+- [`docs/protocol/`](docs/protocol/): JSON Schemas for every client and server frame, plus the close codes, generated from the server's own types. Generate your client's types from these.
+- [`docs/DESIGN.md`](docs/DESIGN.md) section 4: what each frame means, the error and close codes, and the connection lifecycle.
 
-  `seq` is the message's position in the topic, starting at 1. Use `(topic, seq)` to spot duplicates.
+## Delivery guarantees
 
-- Acknowledge QoS 1 messages:
+| | Guarantee |
+|---|---|
+| QoS 0 | At most once, to subscribers connected when it is published. |
+| QoS 1 | At least once to every connected subscriber, independently. Each subscriber's acknowledgement clears only its own copy. A message that runs out of retries pauses that subscription and tells the client, instead of disappearing. |
+| Durable sessions | At least once across disconnects and server restarts, as long as the session reconnects within `session_expiry_secs` and the messages are still retained. |
+| Ordering | Per topic, in `seq` order. A retry of an unacknowledged message can arrive after later ones. |
+| Duplicates | Possible, and always detectable by `(topic, seq)`. The Rust client drops them for you. |
+| Retention | Each topic keeps `max_messages`, `max_age_secs` and `max_bytes` of history. A subscriber that asks for trimmed history is told with a `truncated` frame. |
 
-  ```json
-  { "type": "ack", "topic": "chat", "seq": 42 }
-  ```
+PopSub is a single process. There is no clustering or replication, and no TLS in the process: run it behind a TLS-terminating proxy. For a production system that needs those today, use NATS or Redis Streams. PopSub is small enough to read end to end, and its guarantees are written down precisely.
 
-  Each subscriber acknowledges its own copy; one subscriber's ACK never clears another's. An unacknowledged message is resent after `ack_timeout_ms`, up to `max_retries` times. After that the subscriber gets `{ "type": "stalled", "topic": "chat", "seq": 42 }` and delivery on that topic pauses until it acknowledges something or subscribes again. At most `max_inflight` QoS 1 messages are outstanding per subscription; later ones wait until earlier ones are acknowledged.
+## Configuration
 
-Permissions and limits
+Settings come from `config/default.toml`, then environment variables, which win. A one-word key takes one underscore after its section (`SERVER_PORT=9000`). A key containing an underscore, or a nested section, takes two (`SERVER__JWT_SECRET=...`, `STORAGE__RETENTION__MAX_MESSAGES=5000`).
 
-- Each user has topic permissions. Patterns use MQTT-style wildcards: `+` matches one level and `#` matches the rest. Wildcards apply to permissions only; subscriptions still name an exact topic.
-- Failed logins are limited per address and username together (5, then a lockout that grows), and per address across all usernames (20). Registrations are limited to 5 per address per hour. Publishing is limited per user.
-- Limits use the address of the connecting socket. Behind a reverse proxy every client shares the proxy's address, so put limits at the proxy too.
+The settings you are most likely to change:
 
-Examples and testing
+| Setting | Default | |
+|---|---|---|
+| `server.host`, `server.port` | `127.0.0.1`, `8080` | Where to listen |
+| `server.jwt_secret`, `server.password` | published defaults | Change both before listening anywhere but `localhost`; the server refuses to start otherwise |
+| `server.allow_registration` | `false` | Let clients create accounts; `server.registration_role` decides what they may use |
+| `storage.backend` | `file` | `file` keeps history and sessions in `storage.path` (`pubsub_data`); `memory` loses them on restart |
+| `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
+| `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
+| `server.max_payload_bytes` | 1 MiB | Largest publish |
 
-- Run the test suite with `cargo test --workspace`.
-- Run Clippy with `cargo clippy --workspace` and format with `cargo fmt`.
+Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
 
-Make targets
+## Project layout
 
-- `make` lists every target.
-- `make demo` starts a server, runs the client against it and stops. Use `make demo PORT=8090` if 8080 is taken.
-- `make server`, `make client`, `make test`, `make lint` and `make ci` (the same checks GitHub Actions runs).
-- Add `JOBS=2` to any target if a full build runs out of memory.
+| Crate | What it is |
+|---|---|
+| `popsub` | The binary: `server` and a demo `client` |
+| `popsub_sdk` | The Rust client library |
+| `popsub_protocol` | Every frame type, shared by the server and clients |
+| `popsub_transport` | The WebSocket server: authentication, permissions, rate limits, connection lifecycle |
+| `popsub_broker` | Topic writers, delivery, replay, acknowledgements, sessions |
+| `popsub_storage` | Topic logs and sessions: the `Storage` traits, file and memory backends, the conformance suite |
+| `popsub_auth` | Users, roles, passwords, tokens, topic permissions |
+| `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
+| `popsub_connection` | The server's record of one connection and its outgoing queue |
+| `popsub_config` | Settings |
+| `popsub_utils` | Shared errors and logging |
 
-Design
+## Development
 
-- `docs/DESIGN.md` covers the protocol, delivery guarantees, persistence, known gaps and the roadmap.
+```bash
+make            # list every target
+make test       # all tests
+make ci         # what CI runs: format check, clippy, tests, schema check
+make demo       # start a server, run the client against it, stop
+make schema     # regenerate docs/protocol/ after changing a protocol type
+```
 
-### License: Apache 2.0
+Add `JOBS=2` to any target if a full build runs out of memory. Before changing code, read [`docs/STYLE.md`](docs/STYLE.md); before changing behaviour, read [`docs/DESIGN.md`](docs/DESIGN.md). The storage design is in [`docs/STORAGE.md`](docs/STORAGE.md).
+
+## License
+
+Apache 2.0. See [`LICENSE`](LICENSE).

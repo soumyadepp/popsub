@@ -200,7 +200,7 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 | Duplicates | Possible (retries, and replays of records acknowledged after the cursor was last stored) and detectable: every delivery carries the record's `seq`, so consumers deduplicate by `(topic, seq)`. A publisher retrying with the same `message_id` doesn't create a second record. |
 | Retention | History beyond `storage.retention` is trimmed. A subscriber that asks for trimmed history is told with a `truncated` frame. With the `memory` backend, all history is lost on restart. |
 
-The README and the portfolio both describe PopSub as at-least-once. That is only accurate for the single-subscriber, always-connected case, and should be stated that way until the phase 1 work lands.
+The README states these guarantees in short form. Keep the two in step when delivery behaviour changes.
 
 ## 7. Persistence
 
