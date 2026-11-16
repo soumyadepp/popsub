@@ -160,6 +160,7 @@ The settings you are most likely to change:
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
 | `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
 | `server.max_connections_per_address` | `0` (no limit) | Connections one client address may hold. Set `trusted_proxies` first if you run behind a proxy |
+| `telemetry.mask_pii` | `true` | Mask usernames, client addresses and session ids in logs and traces |
 | `telemetry.enabled`, `telemetry.sample_ratio` | `false`, `1.0` | Export metrics, traces and logs over OTLP; see [Metrics, traces and logs](#metrics-traces-and-logs) |
 | `server.health_address` | none | Serve `/healthz` and `/readyz` here, such as `0.0.0.0:9091` |
 | `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
@@ -200,6 +201,8 @@ What you get:
 - **Metrics** (every 60 seconds; `OTEL_METRIC_EXPORT_INTERVAL` in milliseconds changes it): connections (open, opened, refused and closed, with reasons), logins by outcome, error frames by code, messages published, delivered, redelivered and acknowledged, stalled subscriptions, messages in flight, topics, subscriptions, publish latency, and storage errors. The full list is in [`docs/DESIGN.md`](docs/DESIGN.md) section 3.3.
 - **Traces**: one span per client request (acknowledgements aside), named `popsub publish`, `popsub subscribe` and so on, marked as errors with the error code when the request fails.
 - **Logs**: the same events as the console, linked to the trace of the request they happened in.
+
+Personal data stays out by default. Passwords, tokens and message payloads are never logged. Usernames, client addresses and session ids are masked everywhere, console included, as `masked:3f2a9c1b`: the same value always masks the same way while the server runs, so you can still follow one user's events, but the name can't be read back. Set `telemetry.mask_pii = false` to see them while debugging. Topic names are not masked, so keep personal data out of them.
 
 ## TLS
 

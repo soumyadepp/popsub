@@ -55,5 +55,27 @@ pub enum AuthError {
     Internal(String),
 }
 
+impl AuthError {
+    /// The kind of error, without the names or text it carries, for logs
+    /// that must not record who it was about.
+    ///
+    /// Returns:
+    ///     A snake_case name, such as `user_already_exists`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AuthError::InvalidCredentials => "invalid_credentials",
+            AuthError::InvalidToken => "invalid_token",
+            AuthError::TokenExpired => "token_expired",
+            AuthError::UserNotFound(_) => "user_not_found",
+            AuthError::UserAlreadyExists(_) => "user_already_exists",
+            AuthError::PermissionDenied(_) => "permission_denied",
+            AuthError::TopicNotAuthorized { .. } => "topic_not_authorized",
+            AuthError::PasswordHashError => "password_hash_error",
+            AuthError::JwtError(_) => "jwt_error",
+            AuthError::Internal(_) => "internal",
+        }
+    }
+}
+
 /// `Result` with `AuthError` as the error type, used by every fallible auth call.
 pub type Result<T> = std::result::Result<T, AuthError>;

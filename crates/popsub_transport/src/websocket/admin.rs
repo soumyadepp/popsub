@@ -14,6 +14,7 @@ use popsub_protocol::{
     Access, ClientMessage, CloseCode, ErrorCode, RequestId, RoleKind, RoleSpec, ServerFrame,
     ServerMessage, TopicGrant, UserInfo,
 };
+use popsub_utils::pii::pii;
 use tracing::{info, warn};
 
 use super::{Flow, Session};
@@ -222,7 +223,7 @@ impl Session {
             Ok(Some(user)) if user.enabled && user.is_admin()
         );
         if !is_admin {
-            warn!(client_id = %self.client_id, caller, "admin request from a non-admin");
+            warn!(client_id = %self.client_id, caller = %pii(&caller), "admin request from a non-admin");
             self.fail(
                 id,
                 ErrorCode::Forbidden,
@@ -234,11 +235,11 @@ impl Session {
         let outcome = self.run_admin(request).await;
         match outcome {
             Ok(reply) => {
-                info!(client_id = %self.client_id, caller, "admin request done");
+                info!(client_id = %self.client_id, caller = %pii(&caller), "admin request done");
                 self.reply(id, reply)?;
             }
             Err((code, message)) => {
-                warn!(client_id = %self.client_id, caller, ?code, message, "admin request refused");
+                warn!(client_id = %self.client_id, caller = %pii(&caller), code = code.as_str(), "admin request refused");
                 self.fail(id, code, message, None)?;
             }
         }
@@ -446,7 +447,7 @@ impl Session {
                 topic: topic.clone(),
             });
             broker.with(|b| b.send_frame(&client_id, &notice));
-            info!(client_id = %client_id, username, topic, "ended a subscription the user may no longer read");
+            info!(client_id = %client_id, username = %pii(username), topic, "ended a subscription the user may no longer read");
         }
     }
 }

@@ -54,6 +54,7 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - Unit tests live in a `tests.rs` module per crate, wired with `#[cfg(test)] mod tests;`. Transport has `websocket_tests.rs` for tests that start a real server on a free port via `portpicker`.
 - Errors go through `popsub_utils::error::PopSubError`. Don't add `unwrap()` on paths that handle client input.
 - Log with `tracing` and structured fields (`client_id = %id`), not `println!`. The CLI client in `crates/popsub` is the exception.
+- Never log passwords, tokens, payloads or raw frame text. Wrap every username, client address, rate limiter key and session id in `popsub_utils::pii::pii` as a field (`username = %pii(username)`), never inside the message text, and log auth errors as `e.kind()`, not `%e`. `crates/popsub_transport/tests/pii.rs` fails if a session's logs show any of them; extend it when you add a log path that handles identities.
 - Record metrics through `popsub_utils::metrics::metrics()`, and add any new instrument there and to the table in section 3.3 of `docs/DESIGN.md`. Library crates use only the OpenTelemetry API, never the SDK.
 - Keep doc comments (`//!` and `///`) accurate when behaviour changes. Several describe guarantees the code doesn't fully meet; fix the comment or the code, never leave them disagreeing.
 

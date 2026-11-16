@@ -6,6 +6,7 @@ description = "Rate limiting utilities for PopSub"
 license = "Apache-2.0"
 
 [dependencies]
+popsub_utils = { path = "../popsub_utils" }
 # Data structures
 dashmap = "6"
 

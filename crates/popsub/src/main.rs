@@ -126,6 +126,7 @@ async fn start_server() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    popsub_utils::pii::set_masking(config.telemetry.mask_pii);
     let telemetry = match Telemetry::init(tracing::Level::INFO, &config.telemetry) {
         Ok(telemetry) => telemetry,
         Err(e) => {
@@ -134,6 +135,11 @@ async fn start_server() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if !config.telemetry.mask_pii {
+        warn!(
+            "telemetry.mask_pii is off: usernames and client addresses appear in logs and traces"
+        );
+    }
     if config.telemetry.enabled {
         info!(
             sample_ratio = config.telemetry.sample_ratio,

@@ -217,6 +217,7 @@ mod tests {
             let settings = TelemetrySettings {
                 enabled: true,
                 sample_ratio: ratio,
+                ..TelemetrySettings::default()
             };
             assert!(Telemetry::init(Level::INFO, &settings).is_err(), "{ratio}");
         }

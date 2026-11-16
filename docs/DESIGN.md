@@ -110,7 +110,7 @@ Metrics, all under the `popsub` instrumentation scope. Counters are cumulative; 
 | `popsub.publish.duration` | histogram, seconds | Append, fan-out and trim in the topic writer |
 | `popsub.storage.errors` | counter | Failed storage operations [`operation`: `append`, `trim`, `cursor`, `read`] |
 
-Gauges are read from `SharedBroker::stats` at each export (every 60 seconds by default). Traces: one span per client request except `ack`, named `popsub <type>`, with `popsub.request.type`, `popsub.client.id`, and on failure `otel.status_code = ERROR` and `error.type` set to the error code; sampled by `telemetry.sample_ratio`, always kept when the parent was. Logs: every event at `info` and above, linked to the current span's trace, except events from the exporter's own HTTP stack.
+Gauges are read from `SharedBroker::stats` at each export (every 60 seconds by default). Traces: one span per client request except `ack`, named `popsub <type>`, with `popsub.request.type`, `popsub.client.id`, and on failure `otel.status_code = ERROR` and `error.type` set to the error code; sampled by `telemetry.sample_ratio`, always kept when the parent was. Logs: every event at `info` and above, linked to the current span's trace, except events from the exporter's own HTTP stack. Identities in logs and span events are masked by default; see section 10.
 
 ## 4. Protocol
 
@@ -292,6 +292,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.proxy_protocol` | `false` | Transport. Connections from `server.trusted_proxies` must start with a PROXY protocol header (version 1 or 2), whose address is the client's. Needs `server.trusted_proxies`, or startup stops |
 | `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
 | `telemetry.enabled` | `false` | The binary. Export metrics, traces and logs over OTLP; destination and resource from the standard `OTEL_*` variables |
+| `telemetry.mask_pii` | `true` | Every crate that logs. Masks usernames, client addresses and session ids in log lines, exported logs and traces; see section 10 |
 | `telemetry.sample_ratio` | `1.0` | The binary. Share of request traces kept, 0 to 1; a value outside that stops startup |
 | `server.health_address` | empty | The binary. Where to serve `/healthz` and `/readyz` over plain HTTP, such as `127.0.0.1:9091`; empty serves neither. A port that can't be bound stops startup |
 | `server.tls_cert`, `server.tls_key` | empty | The binary. PEM certificate chain (leaf first) and private key; with both set the server serves `wss://`. Setting only one, or files that can't be read or don't match, stops startup |
@@ -330,6 +331,14 @@ Every `limits` value below 1 is treated as 1, so a limit can't be switched off b
 
 - HS256 JWTs signed with `server.jwt_secret`, carrying the username, expiry and role. Refreshing keeps the role, and refuses users who have since been removed or disabled.
 - Logging the auth service or its config never prints the secret or the admin password.
+
+**Personal data in logs and telemetry**
+
+- Passwords, tokens and message payloads are never logged. A frame that doesn't parse is logged by error kind, position and length only, because its text may hold a password.
+- Usernames, client addresses (including rate limiter keys, which contain both) and session ids are logged through `popsub_utils::pii::pii`. With `telemetry.mask_pii` on, the default, each prints as `masked:` and a keyed hash, the same within one process run so one user's events can still be followed, and the key is random per process and never written out. This applies to console lines, exported logs and span events alike, since the values are masked where they are logged. Turning it off prints them as they are, and the server warns at startup.
+- Auth errors are logged by kind (`AuthError::kind`), because their messages carry usernames.
+- Topic names are logged and exported as they are. Don't put personal data in topic names, or keep telemetry off.
+- Metric attributes are fixed values (reasons, outcomes, codes) and never carry identities. Span attributes are the request type, a random per-connection id and an error code.
 - Expiry is enforced on each connection: it is warned a minute before and closed at `exp` unless it sends a fresh `auth` (section 4.4).
 - Changing a password doesn't revoke tokens already issued; they stay valid until they expire. Disable the account to cut it off at once.
 

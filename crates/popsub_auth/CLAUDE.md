@@ -26,9 +26,9 @@ Users, roles, password hashing, JWTs and topic permission patterns. The transpor
 - `AuthService` methods take `&self` and the store locks internally, so share it as `Arc<AuthService>`; don't wrap it in another lock.
 - There is one way to build it: `with_store(config, store)` (or `new(config)`, which uses an in-memory store). Both create the configured admin if it's missing.
 - `AuthConfig`'s `Debug` redacts the secret and admin password. Keep it that way if fields are added.
+- Log usernames only through `popsub_utils::pii::pii`, as a field (`username = %pii(username)`), never inside the message text. `AuthError`'s messages carry usernames, so log `e.kind()` rather than `%e` wherever the error could be about a person.
 - `refresh_token` checks the user still exists and is enabled; `validate_token` doesn't, because permission checks look the user up anyway.
 - The Postgres store compiles in CI (`--all-features`) but is never run against a database.
-- There is no protocol message to change roles; use `update_user_role` in code.
 
 ## Tests
 

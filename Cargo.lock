@@ -1751,6 +1751,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "jsonwebtoken",
+ "popsub_utils",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -1814,6 +1815,7 @@ name = "popsub_ratelimit"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "popsub_utils",
  "tracing",
 ]
 
@@ -1882,6 +1884,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
  "tungstenite",
 ]
 

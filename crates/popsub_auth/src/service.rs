@@ -5,6 +5,7 @@
 //! answer topic access questions. `UserBuilder` is a shorthand for adding users
 //! with a role assembled from topic grants.
 
+use popsub_utils::pii::pii;
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -315,7 +316,7 @@ impl AuthService {
             .add_user(username, &self.config.default_admin_password, Role::Admin)
             .await
         {
-            Ok(()) => info!("Created default admin user: {}", username),
+            Ok(()) => info!(username = %pii(username), "created the default admin user"),
             Err(e) => warn!("Failed to create default admin: {}", e),
         }
     }
@@ -380,7 +381,7 @@ impl AuthService {
         let password_hash = hash_password(password)?;
         let user = User::new(username, password_hash, role);
         self.user_store.add_user(user).await?;
-        info!("Registered new user: {}", username);
+        info!(username = %pii(username), "registered a new user");
         Ok(())
     }
 
@@ -402,7 +403,7 @@ impl AuthService {
         let password_hash = hash_password(password)?;
         let user = User::new(username, password_hash, role);
         self.user_store.add_user(user).await?;
-        info!("Added new user: {}", username);
+        info!(username = %pii(username), "added a user");
         Ok(())
     }
 
@@ -420,7 +421,7 @@ impl AuthService {
     pub async fn remove_user(&self, username: &str) -> Result<bool> {
         let removed = self.user_store.remove_user(username).await?;
         if removed {
-            info!("Removed user: {}", username);
+            info!(username = %pii(username), "removed a user");
         }
         Ok(removed)
     }
@@ -487,7 +488,7 @@ impl AuthService {
 
         user.role = role;
         self.user_store.update_user(user).await?;
-        info!("Updated role for user: {}", username);
+        info!(username = %pii(username), "changed a user's role");
         Ok(())
     }
 
@@ -509,7 +510,7 @@ impl AuthService {
             .ok_or_else(|| AuthError::UserNotFound(username.to_string()))?;
         user.enabled = enabled;
         self.user_store.update_user(user).await?;
-        info!(username, enabled, "changed whether a user is enabled");
+        info!(username = %pii(username), enabled, "changed whether a user is enabled");
         Ok(())
     }
 
@@ -556,7 +557,7 @@ impl AuthService {
 
         user.password_hash = hash_password(new_password)?;
         self.user_store.update_user(user).await?;
-        info!("Updated password for user: {}", username);
+        info!(username = %pii(username), "changed a user's password");
         Ok(())
     }
 
@@ -587,12 +588,12 @@ impl AuthService {
             .ok_or(AuthError::InvalidCredentials)?;
 
         if !user.enabled {
-            warn!("Login attempt for disabled user: {}", username);
+            warn!(username = %pii(username), "login attempt for a disabled user");
             return Err(AuthError::InvalidCredentials);
         }
 
         if !verify_password(password, &user.password_hash)? {
-            warn!("Invalid password for user: {}", username);
+            warn!(username = %pii(username), "wrong password");
             return Err(AuthError::InvalidCredentials);
         }
 
@@ -606,7 +607,7 @@ impl AuthService {
             .jwt_service
             .generate_token_with_role(username, role_name)?;
 
-        info!("User logged in: {}", username);
+        info!(username = %pii(username), "logged in");
         Ok(token)
     }
 

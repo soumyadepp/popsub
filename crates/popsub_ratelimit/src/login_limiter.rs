@@ -6,6 +6,7 @@
 //! including its backoff history. The transport keys one limiter on
 //! `address|username` and another on the address alone.
 
+use popsub_utils::pii::pii;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -314,7 +315,7 @@ impl LoginRateLimiter {
                 state.lockout_count += 1;
                 let lockout = self.lockout_length(state.lockout_count);
                 state.locked_until = Some(now + lockout);
-                warn!(key = %key, failures = state.failures, lockout_secs = lockout.as_secs(), "locked out after too many failed logins");
+                warn!(key = %pii(key), failures = state.failures, lockout_secs = lockout.as_secs(), "locked out after too many failed logins");
             }
         });
     }
@@ -347,7 +348,7 @@ impl LoginRateLimiter {
             .read(key, |state| state.failures > 0)
             .unwrap_or(false)
         {
-            info!(key = %key, "login succeeded, clearing failed attempts");
+            info!(key = %pii(key), "login succeeded, clearing failed attempts");
         }
         self.states.remove(key);
     }
@@ -393,7 +394,7 @@ impl LoginRateLimiter {
             state.locked_until = None;
         });
         if unlocked.is_some() {
-            info!(key = %key, "login lockout lifted by hand");
+            info!(key = %pii(key), "login lockout lifted by hand");
         }
     }
 
