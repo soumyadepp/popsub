@@ -54,6 +54,7 @@ This document describes how the system works today, where its guarantees hold an
 | `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | One writer task per topic that appends to the log, fans records out in `seq` order and replays history to subscribers; the synchronous `Broker` with subscriber sets and the QoS 1 pending table; all shared through `SharedBroker`. |
+| `popsub_sdk` | The Rust client: login and token refresh, reconnection with backoff guided by close codes, resubscription without gaps, confirmed publishes resent under the same id, acknowledgements and deduplication by `(topic, seq)`. The CLI's demo client uses it. |
 | `popsub_protocol` | Every frame clients and the server exchange, the error codes and `PROTOCOL_VERSION`. Depends only on `serde`, so client SDKs can use it. |
 | `popsub_storage` | Per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite every backend must pass (`docs/STORAGE.md`). |
 | `popsub_connection` | `Client`, the server's record of one connected socket (id, `Outbox`, authenticated flag, username, durable session), and `Outbox`, its outgoing queue with a byte budget. |
@@ -347,8 +348,14 @@ Remaining:
 
 ### Phase 3: adoptable
 
-- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Also done: payload, frame, topic and message id limits. Also done: a byte budget for each connection's outbound queue, with slow subscribers caught up from the log. Also done: a JSON Schema in `docs/protocol/`, generated from the types and checked in CI. Next: the Rust SDK.
-- JavaScript and Python client libraries with reconnection and ACK handling built in.
+- Done:
+  - a versioned protocol in `popsub_protocol`, with request ids and error codes
+  - close codes, heartbeats, token expiry and re-auth on the same connection
+  - payload, frame, topic and message id limits
+  - a byte budget for each connection's outbound queue, with slow subscribers caught up from the log
+  - a JSON Schema in `docs/protocol/`, generated from the types and checked in CI
+- Done: the Rust client library, `popsub_sdk`. Next: TypeScript (types generated from `docs/protocol/`), then Python, held to one shared scenario suite against a real server.
+- `wss://` support in `popsub_sdk` (TLS through `tokio-tungstenite`).
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.
 - Published benchmarks against NATS and Redis pub/sub, including where PopSub loses.

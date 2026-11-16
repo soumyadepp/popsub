@@ -14,6 +14,7 @@ What's in the workspace
 - `crates/popsub_broker`: broker logic (topic writers, routing, replay, retries)
 - `crates/popsub_transport`: WebSocket protocol handling, and enforcing auth, permissions and rate limits
 - `crates/popsub_auth`: users, roles, password hashing, JWTs and topic permissions
+- `crates/popsub_sdk`: the Rust client library
 - `crates/popsub_ratelimit`: token bucket, sliding window and login lockout limiters
 - `crates/popsub_storage`: topic logs, the storage traits, the file and in-memory backends and the conformance suite
 - `crates/popsub_connection`: the server's record of one connected socket and its outgoing queue

@@ -1535,18 +1535,15 @@ name = "popsub"
 version = "0.1.0"
 dependencies = [
  "clap",
- "futures-util",
  "popsub_broker",
  "popsub_config",
  "popsub_connection",
  "popsub_protocol",
+ "popsub_sdk",
  "popsub_storage",
  "popsub_transport",
  "popsub_utils",
- "serde",
- "serde_json",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1621,6 +1618,26 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "tracing",
+]
+
+[[package]]
+name = "popsub_sdk"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "popsub_broker",
+ "popsub_config",
+ "popsub_protocol",
+ "popsub_storage",
+ "popsub_transport",
+ "rand 0.8.5",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

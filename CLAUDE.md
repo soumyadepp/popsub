@@ -35,6 +35,7 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_protocol` | Every frame type, error codes and `PROTOCOL_VERSION`. Depends only on `serde` |
 | `crates/popsub_transport` | WebSocket server, and enforcing auth, permissions and rate limits |
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
+| `crates/popsub_sdk` | The Rust client library: reconnection, durable sessions, acknowledgements, deduplication. The CLI's `client` uses it |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
 | `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |

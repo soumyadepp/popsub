@@ -1,0 +1,25 @@
+[package]
+name = "popsub_sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Rust client for PopSub: reconnection, durable sessions, acknowledgements and deduplication"
+license = "Apache-2.0"
+
+[dependencies]
+futures-util = "0.3.31"
+popsub_protocol = { path = "../popsub_protocol" }
+rand = "0.8"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.46.1", features = ["rt", "sync", "time", "macros", "net"] }
+tokio-tungstenite = "0.28.0"
+tracing = "0.1"
+uuid = { version = "1.8", features = ["v4"] }
+
+[dev-dependencies]
+popsub_broker = { path = "../popsub_broker" }
+popsub_config = { path = "../popsub_config" }
+popsub_storage = { path = "../popsub_storage" }
+popsub_transport = { path = "../popsub_transport" }
+tempfile = "3.20.0"
+tokio = { version = "1.46.1", features = ["full"] }
