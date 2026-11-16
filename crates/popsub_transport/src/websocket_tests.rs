@@ -1212,6 +1212,11 @@ fn wall_clock_ms() -> i64 {
 /// Checks that sending `auth` again with a fresh token keeps the connection
 /// open past the old token's expiry, and that a token for another user is
 /// refused without closing the connection.
+///
+/// Every password check (registration and both logins) runs before the
+/// short token is used, on another connection. Argon2 is slow in debug
+/// builds, and on a slow CI runner those checks once outlasted the short
+/// token, so only cheap token checks happen inside its lifetime.
 #[tokio::test]
 async fn re_auth_refreshes_the_token_for_the_same_user_only() {
     let mut settings = Settings::default();
@@ -1224,9 +1229,21 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
     )
     .await;
     assert_eq!(registered["type"], "registered");
+    let bob = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "bobby", "password": "password123"}"#,
+    )
+    .await;
+    let bob_token = bob["token"].as_str().expect("token").to_string();
+    let login = send_raw(
+        &mut other,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    let fresh = login["token"].as_str().expect("token").to_string();
 
     let mut ws = raw_connection(addr).await;
-    let short = short_token(&settings, "admin", Duration::from_secs(2));
+    let short = short_token(&settings, "admin", Duration::from_secs(3));
     let auth = send_raw(
         &mut ws,
         &serde_json::json!({"type": "auth", "token": short}).to_string(),
@@ -1238,12 +1255,6 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
         ServerMessage::AuthExpiring { .. }
     ));
 
-    let bob = send_raw(
-        &mut ws,
-        r#"{"type": "login", "username": "bobby", "password": "password123"}"#,
-    )
-    .await;
-    let bob_token = bob["token"].as_str().expect("token").to_string();
     let refused = send_raw(
         &mut ws,
         &serde_json::json!({"type": "auth", "id": 1, "token": bob_token}).to_string(),
@@ -1254,12 +1265,6 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
         (serde_json::json!(1), serde_json::json!("auth_failed"))
     );
 
-    let login = send_raw(
-        &mut ws,
-        r#"{"type": "login", "username": "admin", "password": "password"}"#,
-    )
-    .await;
-    let fresh = login["token"].as_str().expect("token").to_string();
     let refreshed = send_raw(
         &mut ws,
         &serde_json::json!({"type": "auth", "id": 2, "token": fresh}).to_string(),
@@ -1269,7 +1274,7 @@ async fn re_auth_refreshes_the_token_for_the_same_user_only() {
     assert_eq!(refreshed["id"], 2);
     assert!(refreshed.get("resumed").is_none());
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
     let published = send_raw(
         &mut ws,
         r#"{"type": "publish", "topic": "chat", "payload": "x", "qos": 1}"#,
