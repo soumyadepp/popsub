@@ -1,3 +1,3 @@
 # popsub_utils
 
-Shared utilities and error types.
+The shared `PopSubError` type, the `Result` alias and logging setup.

@@ -1,51 +1,46 @@
-//! Integration tests for popsub_auth
-//!
-//! Tests the full authentication and authorization flow.
+//! Unit tests that drive `AuthService` end to end: login, tokens, registration, roles and topic checks.
 
 use crate::permission::TopicPermission;
 use crate::service::{AuthConfig, AuthService, UserBuilder};
 use crate::user::Role;
 
+/// Checks that the configured admin can log in, gets a token with the admin role, and can use any topic.
 #[tokio::test]
 async fn test_full_auth_flow() {
     let config = AuthConfig::new("test_secret").with_admin("admin", "admin123");
 
     let auth = AuthService::new(config).await;
 
-    // Login as admin
     let token = auth.login("admin", "admin123").await.unwrap();
     assert!(!token.is_empty());
 
-    // Validate token
     let claims = auth.validate_token(&token).unwrap();
     assert_eq!(claims.sub, "admin");
     assert_eq!(claims.role, Some("admin".to_string()));
 
-    // Admin can publish/subscribe to any topic
     assert!(auth.can_subscribe("admin", "any/topic").await);
     assert!(auth.can_publish("admin", "any/topic").await);
 }
 
+/// Checks that login fails for a wrong password and for an unknown user.
 #[tokio::test]
 async fn test_invalid_login() {
     let config = AuthConfig::default();
     let auth = AuthService::new(config).await;
 
-    // Wrong password
     let result = auth.login("admin", "wrong_password").await;
     assert!(result.is_err());
 
-    // Non-existent user
     let result = auth.login("nonexistent", "password").await;
     assert!(result.is_err());
 }
 
+/// Checks that a user role grants exactly its full-access and subscribe-only patterns.
 #[tokio::test]
 async fn test_user_with_limited_permissions() {
     let config = AuthConfig::default();
     let auth = AuthService::new(config).await;
 
-    // Add a user with limited permissions
     let role = Role::User {
         allowed_topics: vec![
             TopicPermission::full_access("chat/#"),
@@ -54,12 +49,10 @@ async fn test_user_with_limited_permissions() {
     };
     auth.add_user("alice", "alice123", role).await.unwrap();
 
-    // Login
     let token = auth.login("alice", "alice123").await.unwrap();
     let claims = auth.validate_token(&token).unwrap();
     assert_eq!(claims.sub, "alice");
 
-    // Check permissions
     assert!(auth.can_subscribe("alice", "chat/room1").await);
     assert!(auth.can_publish("alice", "chat/room1").await);
     assert!(auth.can_subscribe("alice", "chat/room1/messages").await);
@@ -73,12 +66,13 @@ async fn test_user_with_limited_permissions() {
         !auth
             .can_publish("alice", "sensors/living_room/temperature")
             .await
-    ); // read-only
+    );
 
     assert!(!auth.can_subscribe("alice", "other/topic").await);
     assert!(!auth.can_publish("alice", "other/topic").await);
 }
 
+/// Checks that a read-only user can subscribe to its patterns but never publish.
 #[tokio::test]
 async fn test_readonly_user() {
     let config = AuthConfig::default();
@@ -91,10 +85,11 @@ async fn test_readonly_user() {
 
     assert!(auth.can_subscribe("reader", "news/tech").await);
     assert!(auth.can_subscribe("reader", "updates/v1").await);
-    assert!(!auth.can_publish("reader", "news/tech").await); // readonly can never publish
+    assert!(!auth.can_publish("reader", "news/tech").await);
     assert!(!auth.can_publish("reader", "updates/v1").await);
 }
 
+/// Checks that `UserBuilder` grants publish and subscribe for `allow_topic` and subscribe only for `allow_subscribe`.
 #[tokio::test]
 async fn test_user_builder() {
     let config = AuthConfig::default();
@@ -113,6 +108,7 @@ async fn test_user_builder() {
     assert!(!auth.can_publish("bob", "sensors/temp").await);
 }
 
+/// Checks that a `UserBuilder` admin can subscribe and publish on any topic.
 #[tokio::test]
 async fn test_user_builder_admin() {
     let config = AuthConfig::default();
@@ -128,6 +124,7 @@ async fn test_user_builder_admin() {
     assert!(auth.can_publish("superadmin", "anything").await);
 }
 
+/// Checks that a refreshed login token keeps the subject and the admin role claim.
 #[tokio::test]
 async fn test_token_refresh() {
     let config = AuthConfig::default();
@@ -141,6 +138,7 @@ async fn test_token_refresh() {
     assert_eq!(claims.role.as_deref(), Some("admin"));
 }
 
+/// Checks that `authorize_subscribe` and `authorize_publish` succeed on granted topics and fail elsewhere.
 #[tokio::test]
 async fn test_authorization_errors() {
     let config = AuthConfig::default();
@@ -151,7 +149,6 @@ async fn test_authorization_errors() {
     };
     auth.add_user("limited", "limited123", role).await.unwrap();
 
-    // Should succeed
     assert!(
         auth.authorize_subscribe("limited", "allowed/topic")
             .await
@@ -163,7 +160,6 @@ async fn test_authorization_errors() {
             .is_ok()
     );
 
-    // Should fail
     assert!(
         auth.authorize_subscribe("limited", "denied/topic")
             .await
@@ -176,39 +172,36 @@ async fn test_authorization_errors() {
     );
 }
 
+/// Checks adding, listing, changing the password and role of, and removing a user.
 #[tokio::test]
 async fn test_user_management() {
     let config = AuthConfig::default();
     let auth = AuthService::new(config).await;
 
-    // Add user
     auth.add_user("newuser", "password123", Role::default())
         .await
         .unwrap();
     assert!(auth.user_exists("newuser").await.unwrap());
 
-    // List users
     let users = auth.list_users().await.unwrap();
     assert!(users.contains(&"newuser".to_string()));
     assert!(users.contains(&"admin".to_string()));
 
-    // Update password
     auth.update_user_password("newuser", "newpassword")
         .await
         .unwrap();
     assert!(auth.login("newuser", "newpassword").await.is_ok());
     assert!(auth.login("newuser", "password123").await.is_err());
 
-    // Update role
     auth.update_user_role("newuser", Role::Admin).await.unwrap();
     let user = auth.get_user("newuser").await.unwrap().unwrap();
     assert!(user.is_admin());
 
-    // Remove user
     auth.remove_user("newuser").await.unwrap();
     assert!(!auth.user_exists("newuser").await.unwrap());
 }
 
+/// Checks that a disabled user cannot log in, subscribe or publish, even as an admin.
 #[tokio::test]
 async fn test_disabled_user() {
     let config = AuthConfig::default();
@@ -218,7 +211,6 @@ async fn test_disabled_user() {
         .await
         .unwrap();
 
-    // Manually disable the user
     let mut user = auth.get_user("tobedisabled").await.unwrap().unwrap();
     user.enabled = false;
     auth.user_store
@@ -226,34 +218,30 @@ async fn test_disabled_user() {
         .await
         .expect("update failed");
 
-    // Login should fail for disabled user
     assert!(auth.login("tobedisabled", "password").await.is_err());
 
-    // Permissions should be denied
     assert!(!auth.can_subscribe("tobedisabled", "any/topic").await);
     assert!(!auth.can_publish("tobedisabled", "any/topic").await);
 }
 
+/// Checks that a self-registered user can log in but gets no topics under the default role.
 #[tokio::test]
 async fn test_user_registration() {
     let config = AuthConfig::default().with_registration(true);
     let auth = AuthService::new(config).await;
 
-    // Register a new user
     auth.register_user("newuser", "password123").await.unwrap();
 
-    // User should exist
     assert!(auth.user_exists("newuser").await.unwrap());
 
-    // User should be able to login
     let token = auth.login("newuser", "password123").await.unwrap();
     assert!(!token.is_empty());
 
-    // New users get no topics until an admin grants them
     assert!(!auth.can_subscribe("newuser", "any/topic").await);
     assert!(!auth.can_publish("newuser", "any/topic").await);
 }
 
+/// Checks that the default config has registration off and refuses `register_user`.
 #[tokio::test]
 async fn test_default_config_is_closed() {
     let auth = AuthService::new(AuthConfig::default()).await;
@@ -263,6 +251,7 @@ async fn test_default_config_is_closed() {
     assert!(!auth.user_exists("newuser").await.unwrap());
 }
 
+/// Checks that registration rejects bad usernames and passwords under 8 characters and accepts valid ones.
 #[tokio::test]
 async fn test_username_and_password_rules() {
     let config = AuthConfig::default().with_registration(true);
@@ -284,31 +273,29 @@ async fn test_username_and_password_rules() {
     assert!(auth.register_user("longpass", "eight888").await.is_ok());
 }
 
+/// Checks that `register_user` fails and creates nothing when registration is turned off.
 #[tokio::test]
 async fn test_registration_disabled() {
     let config = AuthConfig::default().with_registration(false);
     let auth = AuthService::new(config).await;
 
-    // Registration should fail
     let result = auth.register_user("newuser", "password123").await;
     assert!(result.is_err());
     assert!(!auth.user_exists("newuser").await.unwrap());
 }
 
+/// Checks that registration rejects a short username, a short password, and a duplicate username.
 #[tokio::test]
 async fn test_registration_validation() {
     let config = AuthConfig::default().with_registration(true);
     let auth = AuthService::new(config).await;
 
-    // Username too short
     let result = auth.register_user("ab", "password123").await;
     assert!(result.is_err());
 
-    // Password too short
     let result = auth.register_user("validuser", "12345").await;
     assert!(result.is_err());
 
-    // Duplicate user
     auth.register_user("uniqueuser", "password123")
         .await
         .unwrap();
@@ -316,6 +303,7 @@ async fn test_registration_validation() {
     assert!(result.is_err());
 }
 
+/// Checks that the `ReadOnly` default role lets a registered user subscribe anywhere but not publish.
 #[tokio::test]
 async fn test_registration_with_readonly_role() {
     use crate::service::DefaultUserRole;
@@ -327,12 +315,11 @@ async fn test_registration_with_readonly_role() {
 
     auth.register_user("reader", "password123").await.unwrap();
 
-    // Should be able to subscribe
     assert!(auth.can_subscribe("reader", "any/topic").await);
-    // Should NOT be able to publish (read-only)
     assert!(!auth.can_publish("reader", "any/topic").await);
 }
 
+/// Checks that a `LimitedAccess` default role gives a registered user exactly the listed permissions.
 #[tokio::test]
 async fn test_registration_with_limited_role() {
     use crate::service::DefaultUserRole;
@@ -347,19 +334,17 @@ async fn test_registration_with_limited_role() {
 
     auth.register_user("limited", "password123").await.unwrap();
 
-    // Should have access to public topics
     assert!(auth.can_subscribe("limited", "public/chat").await);
     assert!(auth.can_publish("limited", "public/chat").await);
 
-    // Should have read-only access to announcements
     assert!(auth.can_subscribe("limited", "announcements/news").await);
     assert!(!auth.can_publish("limited", "announcements/news").await);
 
-    // Should NOT have access to other topics
     assert!(!auth.can_subscribe("limited", "private/secret").await);
     assert!(!auth.can_publish("limited", "private/secret").await);
 }
 
+/// Checks that `insecure_defaults` flags both published defaults and nothing once they are replaced.
 #[test]
 fn test_insecure_defaults_are_detected() {
     assert_eq!(AuthConfig::default().insecure_defaults().len(), 2);

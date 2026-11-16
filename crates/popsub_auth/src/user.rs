@@ -1,12 +1,10 @@
-//! User and Role definitions
-//!
-//! This module defines the core user model and role-based access control types.
+//! The `User` record kept by every `UserStore` and the `Role` that decides its topic access.
 
 use serde::{Deserialize, Serialize};
 
 use crate::permission::TopicPermission;
 
-/// A user in the system with credentials and role information.
+/// One account: its username, Argon2 password hash, role and enabled flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     /// Unique username (used as the primary identifier).
@@ -22,9 +20,18 @@ pub struct User {
 }
 
 impl User {
-    /// Create a new user with the given credentials and role.
+    /// Builds an enabled user stamped with the current time as `created_at`.
     ///
-    /// The password should already be hashed before calling this constructor.
+    /// The constructor stores `password_hash` as given and does not hash it, so
+    /// callers pass the output of `store::hash_password`.
+    ///
+    /// Args:
+    ///     username: The unique username.
+    ///     password_hash: An Argon2 PHC string for the user's password.
+    ///     role: The role that decides which topics the user can use.
+    ///
+    /// Returns:
+    ///     The new user with `enabled` set to `true`.
     pub fn new(username: impl Into<String>, password_hash: impl Into<String>, role: Role) -> Self {
         Self {
             username: username.into(),
@@ -35,44 +42,48 @@ impl User {
         }
     }
 
-    /// Check if the user has admin privileges.
+    /// Reports whether the user's role is `Role::Admin`.
+    ///
+    /// Returns:
+    ///     `true` for admins, `false` for every other role.
     pub fn is_admin(&self) -> bool {
         matches!(self.role, Role::Admin)
     }
 }
 
-/// User roles with associated permissions.
+/// What a user may do, serialized with a `type` tag of `admin`, `user` or `readonly`.
 ///
-/// # Role Hierarchy
-///
-/// - `Admin`: Full access to all topics and system operations
-/// - `User`: Access limited to explicitly allowed topics
-/// - `ReadOnly`: Can only subscribe (no publishing)
+/// `Admin` can subscribe and publish on every topic. `User` can do what its
+/// `TopicPermission` list allows. `ReadOnly` can subscribe to the listed
+/// patterns and can never publish.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum Role {
-    /// Administrator with full access to all topics.
+    /// Subscribe and publish on every topic.
     #[serde(rename = "admin")]
     Admin,
 
-    /// Regular user with topic-specific permissions.
+    /// Access limited to the topics granted in `allowed_topics`.
     #[serde(rename = "user")]
     User {
-        /// List of topic permissions for this user.
+        /// Patterns with their subscribe and publish flags.
         allowed_topics: Vec<TopicPermission>,
     },
 
-    /// Read-only user who can only subscribe to specified topics.
+    /// Subscribe-only access to the listed topic patterns.
     #[serde(rename = "readonly")]
     ReadOnly {
-        /// List of topics this user can subscribe to.
+        /// Topic patterns the user may subscribe to.
         allowed_topics: Vec<String>,
     },
 }
 
 impl Default for Role {
+    /// Builds a `Role::User` with no topic permissions, so the user can do nothing until granted topics.
+    ///
+    /// Returns:
+    ///     `Role::User` with an empty `allowed_topics` list.
     fn default() -> Self {
-        // Default to a user with no topic permissions
         Role::User {
             allowed_topics: Vec::new(),
         }
@@ -80,26 +91,46 @@ impl Default for Role {
 }
 
 impl Role {
-    /// Create an admin role.
+    /// Builds `Role::Admin`.
+    ///
+    /// Returns:
+    ///     The admin role.
     pub fn admin() -> Self {
         Role::Admin
     }
 
-    /// Create a user role with the given topic permissions.
+    /// Builds `Role::User` from a list of topic permissions.
+    ///
+    /// Args:
+    ///     permissions: The patterns and flags the user is granted.
+    ///
+    /// Returns:
+    ///     `Role::User` holding `permissions`.
     pub fn user(permissions: Vec<TopicPermission>) -> Self {
         Role::User {
             allowed_topics: permissions,
         }
     }
 
-    /// Create a read-only role with the given allowed topics.
+    /// Builds `Role::ReadOnly` from a list of topic patterns.
+    ///
+    /// Args:
+    ///     topics: Patterns the user may subscribe to.
+    ///
+    /// Returns:
+    ///     `Role::ReadOnly` holding `topics`.
     pub fn read_only(topics: Vec<String>) -> Self {
         Role::ReadOnly {
             allowed_topics: topics,
         }
     }
 
-    /// Create a user role with full access to all topics (wildcard).
+    /// Builds `Role::User` with one `#` permission that allows subscribe and publish on every topic.
+    ///
+    /// Unlike `Role::Admin`, the result still reports `is_admin() == false`.
+    ///
+    /// Returns:
+    ///     `Role::User` with a single full-access `#` pattern.
     pub fn user_full_access() -> Self {
         Role::User {
             allowed_topics: vec![TopicPermission::new("#", true, true)],

@@ -1,3 +1,9 @@
+//! Tests that drive the broker with parsed protocol frames, without a socket.
+//!
+//! The `handle_message` helper here is a simplified stand-in for the server's
+//! dispatcher: it skips authentication, permissions and rate limits, so these
+//! tests cover how frames map onto broker calls rather than the server itself.
+
 pub use crate::message::ClientMessage;
 pub use popsub_broker::Broker;
 use popsub_config::Settings;
@@ -8,18 +14,23 @@ use tempfile::tempdir;
 pub use tokio::sync::mpsc;
 use uuid::Uuid;
 
-// This is a helper function that simulates the message handling part of the websocket server.
+/// Parses a raw frame and applies it to the broker directly, as the server
+/// would after its auth checks.
+///
+/// `auth`, `login` and `register` frames, and frames that fail to parse, are
+/// ignored. Publish fills in the current time, a random UUID for a missing
+/// `message_id` and QoS 0 for a missing `qos`. Panics if the broker mutex is
+/// poisoned.
+///
+/// Args:
+///     broker: The broker to apply the frame to.
+///     client_id: The subscriber id to subscribe or unsubscribe.
+///     msg: The raw JSON frame.
 async fn handle_message(broker: Arc<Mutex<Broker>>, client_id: String, msg: String) {
     match serde_json::from_str::<ClientMessage>(&msg) {
-        Ok(ClientMessage::Auth { .. }) => {
-            // Auth not handled in this test helper
-        }
-        Ok(ClientMessage::Login { .. }) => {
-            // Login not handled in this test helper
-        }
-        Ok(ClientMessage::Register { .. }) => {
-            // Register not handled in this test helper
-        }
+        Ok(ClientMessage::Auth { .. }) => {}
+        Ok(ClientMessage::Login { .. }) => {}
+        Ok(ClientMessage::Register { .. }) => {}
         Ok(ClientMessage::Subscribe { topic }) => {
             let mut broker = broker.lock().unwrap();
             broker.subscribe(&topic, client_id.clone());
@@ -52,6 +63,7 @@ async fn handle_message(broker: Arc<Mutex<Broker>>, client_id: String, msg: Stri
     }
 }
 
+/// Checks that a subscribe frame adds the client to the topic's subscribers.
 #[tokio::test]
 async fn test_handle_subscribe() {
     let tmp = tempdir().unwrap();
@@ -75,6 +87,8 @@ async fn test_handle_subscribe() {
     assert!(topic.subscribers.contains(&client_id));
 }
 
+/// Checks that an unsubscribe frame removes a subscribed client from the
+/// topic.
 #[tokio::test]
 async fn test_handle_unsubscribe() {
     let tmp = tempdir().unwrap();
@@ -85,7 +99,6 @@ async fn test_handle_unsubscribe() {
     )));
     let client_id = "test_client".to_string();
 
-    // First, subscribe the client to the topic
     broker
         .lock()
         .unwrap()
@@ -104,6 +117,8 @@ async fn test_handle_unsubscribe() {
     assert!(!topic.subscribers.contains(&client_id));
 }
 
+/// Checks that a publish frame delivers the payload, id and QoS to a
+/// registered subscriber.
 #[tokio::test]
 async fn test_handle_publish() {
     let tmp = tempdir().unwrap();
@@ -146,6 +161,7 @@ async fn test_handle_publish() {
     }
 }
 
+/// Checks that a QoS 1 publish is tracked as pending and an ack frame clears it.
 #[tokio::test]
 async fn test_handle_ack() {
     let tmp = tempdir().unwrap();
@@ -176,7 +192,6 @@ async fn test_handle_ack() {
 
     handle_message(broker.clone(), client_id.clone(), publish_msg).await;
 
-    // Assert that the message is in pending_acks
     assert!(
         broker
             .lock()
@@ -185,7 +200,6 @@ async fn test_handle_ack() {
             .contains_key("ack_message_id")
     );
 
-    // Simulate client receiving and acknowledging the message
     let received_msg = rx.try_recv().unwrap();
     if let tungstenite::protocol::Message::Text(text) = received_msg {
         let received_message: popsub_broker::message::Message =
@@ -204,7 +218,6 @@ async fn test_handle_ack() {
 
     handle_message(broker.clone(), client_id.clone(), ack_msg).await;
 
-    // Assert that the message is removed from pending_acks
     assert!(
         !broker
             .lock()
@@ -214,14 +227,14 @@ async fn test_handle_ack() {
     );
 }
 
+/// Checks that a text frame sent on a client's tokio channel can be read back
+/// on another thread. It doesn't call `spawn_send_loop` itself.
 #[tokio::test]
 async fn test_send_loop_forwards_message() {
     let (tx, mut rx) = mpsc::unbounded_channel::<tungstenite::protocol::Message>();
     let (cap_tx, cap_rx) = std::sync::mpsc::sync_channel::<String>(1);
 
-    // Spawn forwarder similar to the send loop — forwards text messages into cap_tx
     std::thread::spawn(move || {
-        // synchronous thread loop reading from tokio mpsc via a small runtime
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             while let Some(msg) = rx.recv().await {

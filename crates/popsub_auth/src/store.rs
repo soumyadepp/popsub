@@ -1,37 +1,32 @@
-//! User storage abstraction
+//! The `UserStore` trait, its in-memory and PostgreSQL implementations, and Argon2 password hashing.
 //!
-//! This module provides an async trait for user storage with implementations:
-//! - [`InMemoryUserStore`] - For development and testing
-//! - [`PostgresUserStore`] - For production (requires `postgres` feature)
+//! `InMemoryUserStore` is the default and loses every account on restart.
+//! `PostgresUserStore` is compiled only with the `postgres` feature. Any other
+//! backend can be plugged into `AuthService::with_store` by implementing
+//! [`UserStore`].
 //!
-//! # Custom Database Implementation
-//!
-//! To use your own database backend, implement the [`UserStore`] trait:
+//! Example:
 //!
 //! ```rust,ignore
 //! use async_trait::async_trait;
 //! use popsub_auth::store::UserStore;
 //! use popsub_auth::user::User;
 //! use popsub_auth::error::Result;
+//! use popsub_auth::service::{AuthConfig, AuthService};
+//! use std::sync::Arc;
 //!
-//! pub struct MyDatabaseStore { /* ... */ }
+//! pub struct MyDatabaseStore;
 //!
 //! #[async_trait]
 //! impl UserStore for MyDatabaseStore {
 //!     async fn get_user(&self, username: &str) -> Result<Option<User>> {
-//!         // Query your database
 //!         todo!()
 //!     }
-//!     // ... implement other methods
 //! }
 //!
-//! // Then use it with AuthService:
-//! use popsub_auth::service::{AuthConfig, AuthService};
-//! use std::sync::Arc;
-//!
-//! let store = Arc::new(MyDatabaseStore { /* ... */ });
+//! let store = Arc::new(MyDatabaseStore);
 //! let config = AuthConfig::default();
-//! let auth_service = AuthService::with_store(config, store).await;
+//! let auth_service = AuthService::with_store(config, store);
 //! ```
 
 use std::collections::HashMap;
@@ -47,11 +42,12 @@ use rand::rngs::OsRng;
 use crate::error::{AuthError, Result};
 use crate::user::{Role, User};
 
-/// Async trait for user storage backends.
+/// Where `AuthService` keeps accounts, keyed by username.
 ///
-/// Implementations must be thread-safe (`Send + Sync`).
+/// Implementations are shared across tasks, so they must be `Send + Sync`.
+/// Backends report their own failures as `AuthError::Internal`.
 ///
-/// # Example
+/// Example:
 ///
 /// ```rust,ignore
 /// use async_trait::async_trait;
@@ -60,71 +56,134 @@ use crate::user::{Role, User};
 /// #[async_trait]
 /// impl UserStore for MyStore {
 ///     async fn get_user(&self, username: &str) -> Result<Option<User>> {
-///         // Your implementation
+///         todo!()
 ///     }
-///     // ...
 /// }
 /// ```
 #[async_trait]
 pub trait UserStore: Send + Sync {
-    /// Get a user by username.
+    /// Looks up one account.
+    ///
+    /// Args:
+    ///     username: The account to fetch.
+    ///
+    /// Returns:
+    ///     The user, or `None` when there is no such account.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the backend fails.
     async fn get_user(&self, username: &str) -> Result<Option<User>>;
 
-    /// Add a new user to the store.
+    /// Inserts a new account, refusing to overwrite an existing one.
+    ///
+    /// Args:
+    ///     user: The account to insert.
+    ///
+    /// Raises:
+    ///     AuthError::UserAlreadyExists: When the username is taken.
+    ///     AuthError::Internal: When the backend fails.
     async fn add_user(&self, user: User) -> Result<()>;
 
-    /// Update an existing user.
+    /// Replaces an existing account, matched by `user.username`.
+    ///
+    /// Args:
+    ///     user: The new state of the account.
+    ///
+    /// Raises:
+    ///     AuthError::UserNotFound: When there is no such account.
+    ///     AuthError::Internal: When the backend fails.
     async fn update_user(&self, user: User) -> Result<()>;
 
-    /// Remove a user from the store.
+    /// Deletes an account if it exists.
+    ///
+    /// Args:
+    ///     username: The account to delete.
+    ///
+    /// Returns:
+    ///     `true` if an account was deleted, `false` if none existed.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the backend fails.
     async fn remove_user(&self, username: &str) -> Result<bool>;
 
-    /// Check if a user exists.
+    /// Reports whether an account exists.
+    ///
+    /// Args:
+    ///     username: The username to look for.
+    ///
+    /// Returns:
+    ///     `true` if the account exists.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the backend fails.
     async fn user_exists(&self, username: &str) -> Result<bool>;
 
-    /// List all usernames.
+    /// Lists every username in the store, in an order the backend chooses.
+    ///
+    /// Returns:
+    ///     All usernames.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the backend fails.
     async fn list_usernames(&self) -> Result<Vec<String>>;
 
-    /// Get the total number of users.
+    /// Counts the accounts in the store.
+    ///
+    /// Returns:
+    ///     The number of accounts.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the backend fails.
     async fn user_count(&self) -> Result<usize>;
 }
 
-// ============================================================================
-// In-Memory Implementation
-// ============================================================================
-
-/// In-memory user store implementation.
+/// A `UserStore` backed by a `HashMap` behind a `std::sync::RwLock`.
 ///
-/// Suitable for development and testing. For production, use [`PostgresUserStore`]
-/// or implement your own database-backed store.
+/// Accounts live only as long as the process. Locks are never held across an
+/// `.await`. Use `PostgresUserStore` or another backend when accounts must
+/// survive a restart.
 #[derive(Debug)]
 pub struct InMemoryUserStore {
     users: Arc<RwLock<HashMap<String, User>>>,
 }
 
 impl Default for InMemoryUserStore {
+    /// Builds an empty store, same as `InMemoryUserStore::new`.
+    ///
+    /// Returns:
+    ///     A store with no accounts.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl InMemoryUserStore {
-    /// Create a new empty in-memory store.
+    /// Builds an empty store.
+    ///
+    /// Returns:
+    ///     A store with no accounts.
     pub fn new() -> Self {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Create a store pre-populated with a default admin user.
+    /// Builds a store holding one admin with username `admin` and password `password`.
     ///
-    /// The admin user has username "admin" and password "password".
-    /// **This is for development only - change credentials in production!**
+    /// Those credentials are published with PopSub, so this is for local
+    /// development only. The admin is inserted through the lock directly
+    /// because this constructor is synchronous.
+    ///
+    /// Returns:
+    ///     The store with the admin account.
+    ///
+    /// Raises:
+    ///     AuthError::PasswordHashError: When hashing the password fails.
+    ///     AuthError::Internal: When the store's lock is poisoned.
     pub fn with_default_admin() -> Result<Self> {
         let store = Self::new();
         let password_hash = hash_password("password")?;
         let admin = User::new("admin", password_hash, Role::Admin);
-        // Use blocking add for initialization
         {
             let mut users = store
                 .users
@@ -135,7 +194,18 @@ impl InMemoryUserStore {
         Ok(store)
     }
 
-    /// Create a store with a custom admin user.
+    /// Builds a store holding one admin with the given credentials.
+    ///
+    /// Args:
+    ///     username: The admin's username.
+    ///     password: The admin's plain text password, hashed before it is stored.
+    ///
+    /// Returns:
+    ///     The store with the admin account.
+    ///
+    /// Raises:
+    ///     AuthError::PasswordHashError: When hashing the password fails.
+    ///     AuthError::Internal: When the store's lock is poisoned.
     pub fn with_admin(username: &str, password: &str) -> Result<Self> {
         let store = Self::new();
         let password_hash = hash_password(password)?;
@@ -153,6 +223,16 @@ impl InMemoryUserStore {
 
 #[async_trait]
 impl UserStore for InMemoryUserStore {
+    /// Clones the account out of the map under a read lock.
+    ///
+    /// Args:
+    ///     username: The account to fetch.
+    ///
+    /// Returns:
+    ///     A copy of the user, or `None` when there is no such account.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the store's lock is poisoned.
     async fn get_user(&self, username: &str) -> Result<Option<User>> {
         let users = self
             .users
@@ -161,6 +241,14 @@ impl UserStore for InMemoryUserStore {
         Ok(users.get(username).cloned())
     }
 
+    /// Inserts the account under a write lock unless the username is taken.
+    ///
+    /// Args:
+    ///     user: The account to insert.
+    ///
+    /// Raises:
+    ///     AuthError::UserAlreadyExists: When the username is taken.
+    ///     AuthError::Internal: When the store's lock is poisoned.
     async fn add_user(&self, user: User) -> Result<()> {
         let mut users = self
             .users
@@ -175,6 +263,14 @@ impl UserStore for InMemoryUserStore {
         Ok(())
     }
 
+    /// Overwrites an existing account under a write lock.
+    ///
+    /// Args:
+    ///     user: The new state of the account.
+    ///
+    /// Raises:
+    ///     AuthError::UserNotFound: When there is no such account.
+    ///     AuthError::Internal: When the store's lock is poisoned.
     async fn update_user(&self, user: User) -> Result<()> {
         let mut users = self
             .users
@@ -189,6 +285,16 @@ impl UserStore for InMemoryUserStore {
         Ok(())
     }
 
+    /// Removes the account from the map under a write lock.
+    ///
+    /// Args:
+    ///     username: The account to delete.
+    ///
+    /// Returns:
+    ///     `true` if an account was deleted, `false` if none existed.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the store's lock is poisoned.
     async fn remove_user(&self, username: &str) -> Result<bool> {
         let mut users = self
             .users
@@ -197,6 +303,16 @@ impl UserStore for InMemoryUserStore {
         Ok(users.remove(username).is_some())
     }
 
+    /// Checks the map for the username under a read lock.
+    ///
+    /// Args:
+    ///     username: The username to look for.
+    ///
+    /// Returns:
+    ///     `true` if the account exists.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the store's lock is poisoned.
     async fn user_exists(&self, username: &str) -> Result<bool> {
         let users = self
             .users
@@ -205,6 +321,13 @@ impl UserStore for InMemoryUserStore {
         Ok(users.contains_key(username))
     }
 
+    /// Copies the map's keys under a read lock.
+    ///
+    /// Returns:
+    ///     All usernames, in no particular order.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the store's lock is poisoned.
     async fn list_usernames(&self) -> Result<Vec<String>> {
         let users = self
             .users
@@ -213,6 +336,13 @@ impl UserStore for InMemoryUserStore {
         Ok(users.keys().cloned().collect())
     }
 
+    /// Reads the map's length under a read lock.
+    ///
+    /// Returns:
+    ///     The number of accounts.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the store's lock is poisoned.
     async fn user_count(&self) -> Result<usize> {
         let users = self
             .users
@@ -222,28 +352,21 @@ impl UserStore for InMemoryUserStore {
     }
 }
 
-// ============================================================================
-// PostgreSQL Implementation (requires `postgres` feature)
-// ============================================================================
-
 #[cfg(feature = "postgres")]
 mod postgres_store {
     use super::*;
     use sqlx::Row;
     use sqlx::postgres::PgPool;
 
-    /// PostgreSQL-backed user store for production use.
+    /// A `UserStore` backed by a PostgreSQL `users` table, available with the `postgres` feature.
     ///
-    /// # Setup
+    /// Roles are stored as a `role_type` string plus a JSONB `role_data`
+    /// column holding the role's topic list. Create the table with
+    /// `run_migrations` or `migrations/001_create_users_table.sql` before use.
+    /// CI compiles this store but does not run it against a database.
     ///
-    /// 1. Enable the `postgres` feature in your `Cargo.toml`:
-    /// ```toml
-    /// popsub_auth = { version = "0.1", features = ["postgres"] }
-    /// ```
+    /// Example:
     ///
-    /// 2. Run the migrations (see `migrations/` folder)
-    ///
-    /// 3. Create and use the store:
     /// ```rust,ignore
     /// use sqlx::postgres::PgPoolOptions;
     /// use popsub_auth::store::PostgresUserStore;
@@ -262,19 +385,32 @@ mod postgres_store {
     }
 
     impl PostgresUserStore {
-        /// Create a new PostgreSQL store with the given connection pool.
+        /// Wraps a connection pool without touching the database.
+        ///
+        /// Args:
+        ///     pool: The pool to run queries on.
+        ///
+        /// Returns:
+        ///     The store.
         pub fn new(pool: PgPool) -> Self {
             Self { pool }
         }
 
-        /// Get a reference to the connection pool.
+        /// Exposes the connection pool so callers can run their own queries.
+        ///
+        /// Returns:
+        ///     The store's pool.
         pub fn pool(&self) -> &PgPool {
             &self.pool
         }
 
-        /// Run database migrations to create the required tables.
+        /// Creates the `users` table and its two indexes if they are missing.
         ///
-        /// Creates the `users` table if it doesn't exist.
+        /// Unlike the SQL file in `migrations/`, this does not install the
+        /// trigger that keeps `updated_at` current; `update_user` sets it instead.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When the statements fail.
         pub async fn run_migrations(&self) -> Result<()> {
             sqlx::query(
                 r#"
@@ -299,14 +435,32 @@ mod postgres_store {
             Ok(())
         }
 
-        /// Create the store and run migrations.
+        /// Wraps a connection pool and runs `run_migrations` on it.
+        ///
+        /// Args:
+        ///     pool: The pool to run queries on.
+        ///
+        /// Returns:
+        ///     The store, with the table in place.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When the migration fails.
         pub async fn new_with_migrations(pool: PgPool) -> Result<Self> {
             let store = Self::new(pool);
             store.run_migrations().await?;
             Ok(store)
         }
 
-        /// Serialize role to database format.
+        /// Splits a role into its `role_type` column value and its JSONB `role_data`.
+        ///
+        /// A topic list that fails to serialize is stored as JSON `null`.
+        ///
+        /// Args:
+        ///     role: The role to store.
+        ///
+        /// Returns:
+        ///     The role type (`admin`, `user` or `readonly`) and the topic list
+        ///     as JSON, or `None` for admins.
         fn serialize_role(role: &Role) -> (String, Option<serde_json::Value>) {
             match role {
                 Role::Admin => ("admin".to_string(), None),
@@ -321,7 +475,20 @@ mod postgres_store {
             }
         }
 
-        /// Deserialize role from database format.
+        /// Rebuilds a role from its `role_type` and `role_data` columns.
+        ///
+        /// A missing `role_data` gives an empty topic list.
+        ///
+        /// Args:
+        ///     role_type: The stored role type.
+        ///     role_data: The stored topic list, if any.
+        ///
+        /// Returns:
+        ///     The role.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When `role_data` does not fit the role or the
+        ///         role type is unknown.
         fn deserialize_role(role_type: &str, role_data: Option<serde_json::Value>) -> Result<Role> {
             match role_type {
                 "admin" => Ok(Role::Admin),
@@ -356,6 +523,20 @@ mod postgres_store {
 
     #[async_trait]
     impl UserStore for PostgresUserStore {
+        /// Selects one row by username and turns it into a `User`.
+        ///
+        /// `created_at` is not read from the row, so the returned user's
+        /// `created_at` is the time of this call.
+        ///
+        /// Args:
+        ///     username: The account to fetch.
+        ///
+        /// Returns:
+        ///     The user, or `None` when there is no such row.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When the query fails or the stored role
+        ///         cannot be decoded.
         async fn get_user(&self, username: &str) -> Result<Option<User>> {
             let row = sqlx::query(
                 r#"
@@ -387,6 +568,17 @@ mod postgres_store {
             }
         }
 
+        /// Inserts a row for the account. `created_at` is set by the database.
+        ///
+        /// Duplicates are detected by looking for "duplicate key" or "unique"
+        /// in the database error text.
+        ///
+        /// Args:
+        ///     user: The account to insert.
+        ///
+        /// Raises:
+        ///     AuthError::UserAlreadyExists: When the username is taken.
+        ///     AuthError::Internal: When the query fails.
         async fn add_user(&self, user: User) -> Result<()> {
             let (role_type, role_data) = Self::serialize_role(&user.role);
 
@@ -414,6 +606,14 @@ mod postgres_store {
             Ok(())
         }
 
+        /// Updates the account's hash, role and enabled flag and sets `updated_at` to now.
+        ///
+        /// Args:
+        ///     user: The new state of the account.
+        ///
+        /// Raises:
+        ///     AuthError::UserNotFound: When no row has this username.
+        ///     AuthError::Internal: When the query fails.
         async fn update_user(&self, user: User) -> Result<()> {
             let (role_type, role_data) = Self::serialize_role(&user.role);
 
@@ -440,6 +640,16 @@ mod postgres_store {
             Ok(())
         }
 
+        /// Deletes the account's row.
+        ///
+        /// Args:
+        ///     username: The account to delete.
+        ///
+        /// Returns:
+        ///     `true` if a row was deleted, `false` if none matched.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When the query fails.
         async fn remove_user(&self, username: &str) -> Result<bool> {
             let result = sqlx::query("DELETE FROM users WHERE username = $1")
                 .bind(username)
@@ -450,6 +660,16 @@ mod postgres_store {
             Ok(result.rows_affected() > 0)
         }
 
+        /// Checks for a row with this username.
+        ///
+        /// Args:
+        ///     username: The username to look for.
+        ///
+        /// Returns:
+        ///     `true` if the row exists.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When the query fails.
         async fn user_exists(&self, username: &str) -> Result<bool> {
             let row = sqlx::query("SELECT 1 FROM users WHERE username = $1")
                 .bind(username)
@@ -460,6 +680,13 @@ mod postgres_store {
             Ok(row.is_some())
         }
 
+        /// Selects every username, sorted alphabetically.
+        ///
+        /// Returns:
+        ///     All usernames in ascending order.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When the query fails.
         async fn list_usernames(&self) -> Result<Vec<String>> {
             let rows = sqlx::query("SELECT username FROM users ORDER BY username")
                 .fetch_all(&self.pool)
@@ -469,6 +696,13 @@ mod postgres_store {
             Ok(rows.iter().map(|r| r.get("username")).collect())
         }
 
+        /// Counts the rows in the `users` table.
+        ///
+        /// Returns:
+        ///     The number of accounts.
+        ///
+        /// Raises:
+        ///     AuthError::Internal: When the query fails.
         async fn user_count(&self) -> Result<usize> {
             let row = sqlx::query("SELECT COUNT(*) as count FROM users")
                 .fetch_one(&self.pool)
@@ -484,11 +718,16 @@ mod postgres_store {
 #[cfg(feature = "postgres")]
 pub use postgres_store::PostgresUserStore;
 
-// ============================================================================
-// Password Hashing Utilities
-// ============================================================================
-
-/// Hash a password using Argon2.
+/// Hashes a password with Argon2id (the `argon2` crate's defaults) and a random salt.
+///
+/// Args:
+///     password: The plain text password.
+///
+/// Returns:
+///     The hash as a PHC string, which embeds the salt and parameters.
+///
+/// Raises:
+///     AuthError::PasswordHashError: When hashing fails.
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -500,7 +739,17 @@ pub fn hash_password(password: &str) -> Result<String> {
     Ok(hash.to_string())
 }
 
-/// Verify a password against a hash.
+/// Checks a plain text password against a stored PHC hash string.
+///
+/// Args:
+///     password: The password to check.
+///     hash: The stored hash from `hash_password`.
+///
+/// Returns:
+///     `true` when the password matches, `false` when it does not.
+///
+/// Raises:
+///     AuthError::PasswordHashError: When `hash` is not a valid PHC string.
 pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
     let parsed_hash = PasswordHash::new(hash).map_err(|_| AuthError::PasswordHashError)?;
 
@@ -510,15 +759,12 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
         .is_ok())
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod store_tests {
     use super::*;
     use crate::permission::TopicPermission;
 
+    /// Checks that a hashed password verifies and a different password does not.
     #[test]
     fn test_hash_and_verify_password() {
         let password = "secure_password123";
@@ -528,6 +774,7 @@ mod store_tests {
         assert!(!verify_password("wrong_password", &hash).unwrap());
     }
 
+    /// Checks that an added user can be read back with its role intact.
     #[tokio::test]
     async fn test_add_and_get_user() {
         let store = InMemoryUserStore::new();
@@ -542,6 +789,7 @@ mod store_tests {
         assert!(retrieved.is_admin());
     }
 
+    /// Checks that adding a second user with the same username returns `UserAlreadyExists`.
     #[tokio::test]
     async fn test_duplicate_user() {
         let store = InMemoryUserStore::new();
@@ -556,6 +804,7 @@ mod store_tests {
         assert!(matches!(result, Err(AuthError::UserAlreadyExists(_))));
     }
 
+    /// Checks that a removed user no longer exists in the store.
     #[tokio::test]
     async fn test_remove_user() {
         let store = InMemoryUserStore::new();
@@ -570,17 +819,18 @@ mod store_tests {
         assert!(!store.user_exists("to_remove").await.unwrap());
     }
 
+    /// Checks that `with_default_admin` stores an admin whose password is `password`.
     #[test]
     fn test_with_default_admin() {
         let store = InMemoryUserStore::with_default_admin().unwrap();
 
-        // Use blocking access for sync test
         let users = store.users.read().unwrap();
         let admin = users.get("admin").unwrap();
         assert!(admin.is_admin());
         assert!(verify_password("password", &admin.password_hash).unwrap());
     }
 
+    /// Checks that a user role keeps all of its topic permissions through a store round trip.
     #[tokio::test]
     async fn test_user_with_topic_permissions() {
         let store = InMemoryUserStore::new();

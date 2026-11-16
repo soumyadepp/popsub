@@ -1,6 +1,6 @@
-# PopSub — a tiny WebSocket pub/sub server in Rust
+# PopSub: a small WebSocket pub/sub server in Rust
 
-PopSub is a small, practical Pub/Sub server written in Rust. It’s meant to be simple to run locally and easy to study or extend. It supports WebSocket clients, topic-based subscribe/publish, a small JSON protocol, a replay buffer for recent messages, and a QoS=1 (at-least-once) delivery option with acknowledgements.
+PopSub is a small publish/subscribe server written in Rust, meant to be easy to run locally and to read end to end. It supports WebSocket clients, topic-based subscribe/publish, a small JSON protocol, a replay buffer for recent messages, and a QoS 1 option with acknowledgements and retries (at-least-once for a single subscriber that stays connected; see `docs/DESIGN.md` section 6).
 
 Why this exists
 
@@ -8,15 +8,17 @@ Why this exists
 - Clear, minimal broker implementation you can read and modify
 - Decent starting point for experimenting with WebSockets, message replay, and simple reliability semantics
 
-What’s in the workspace
+What's in the workspace
 
-- `crates/popsub` — the small CLI (subcommands: `server`, `client`)
-- `crates/popsub_broker` — in-memory broker logic (topics, routing, retries)
-- `crates/popsub_transport` — WebSocket protocol handling
-- `crates/popsub_persistence` — optional sled-based persistence
-- `crates/popsub_client` — client helpers and example code
-- `crates/popsub_config` — config loader and settings
-- `crates/popsub_utils` — small utilities (logging, errors)
+- `crates/popsub`: the CLI (subcommands `server` and `client`)
+- `crates/popsub_broker`: in-memory broker logic (topics, routing, retries)
+- `crates/popsub_transport`: WebSocket protocol handling, and enforcing auth, permissions and rate limits
+- `crates/popsub_auth`: users, roles, password hashing, JWTs and topic permissions
+- `crates/popsub_ratelimit`: token bucket, sliding window and login lockout limiters
+- `crates/popsub_persistence`: sled storage of recent messages per topic
+- `crates/popsub_client`: the server-side record of one connection (not a client library)
+- `crates/popsub_config`: config loader and settings
+- `crates/popsub_utils`: shared error type and logging
 
 Quick start (five minutes)
 

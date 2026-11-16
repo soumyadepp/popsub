@@ -1,52 +1,59 @@
-//! Authentication errors
-//!
-//! Custom error types for the auth module.
+//! Error type and `Result` alias shared by every part of the auth crate.
 
 use thiserror::Error;
 
-/// Authentication and authorization errors.
+/// Every failure the auth crate reports, from bad credentials to store errors.
 #[derive(Error, Debug)]
 pub enum AuthError {
-    /// Invalid username or password during login.
+    /// Login failed because the user is unknown, disabled, or gave the wrong password.
     #[error("invalid credentials")]
     InvalidCredentials,
 
-    /// The provided JWT token is invalid or expired.
+    /// The token is malformed or its signature does not verify. Not produced
+    /// inside this crate today; decode failures surface as `JwtError`.
     #[error("invalid or expired token")]
     InvalidToken,
 
-    /// Token has expired.
+    /// The token decoded but its `exp` time has passed.
     #[error("token has expired")]
     TokenExpired,
 
-    /// User does not exist.
+    /// No user with the given username exists in the store.
     #[error("user not found: {0}")]
     UserNotFound(String),
 
-    /// User already exists (during registration).
+    /// A user with the given username is already in the store.
     #[error("user already exists: {0}")]
     UserAlreadyExists(String),
 
-    /// User is not authorized to perform the requested action.
+    /// The action is not allowed. Also used when registration is disabled or
+    /// a username or password breaks the registration rules.
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
-    /// User is not authorized to access the topic.
+    /// The user may not perform `action` on `topic`.
     #[error("not authorized to {action} on topic '{topic}'")]
-    TopicNotAuthorized { topic: String, action: String },
+    TopicNotAuthorized {
+        /// The topic the user tried to use.
+        topic: String,
+        /// The refused action, `"subscribe"` or `"publish"`.
+        action: String,
+    },
 
-    /// Password hashing error.
+    /// Argon2 could not hash a password or parse a stored hash.
     #[error("password hashing error")]
     PasswordHashError,
 
-    /// JWT encoding/decoding error.
+    /// The `jsonwebtoken` crate failed to encode or decode a token, including
+    /// a bad signature or an `exp` already past at decode time.
     #[error("JWT error: {0}")]
     JwtError(#[from] jsonwebtoken::errors::Error),
 
-    /// Internal error.
+    /// A store failed for a reason outside the auth rules, such as a poisoned
+    /// lock or a database error.
     #[error("internal auth error: {0}")]
     Internal(String),
 }
 
-/// Result type alias for auth operations.
+/// `Result` with `AuthError` as the error type, used by every fallible auth call.
 pub type Result<T> = std::result::Result<T, AuthError>;

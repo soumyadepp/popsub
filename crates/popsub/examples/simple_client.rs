@@ -1,14 +1,18 @@
-//! Simple PopSub client example demonstrating the authentication flow.
+//! Standalone example of one PopSub session over WebSocket.
 //!
-//! This example shows how to:
-//! 1. Connect to the WebSocket server
-//! 2. Register a new user (optional)
-//! 3. Login with credentials
-//! 4. Authenticate with JWT token
-//! 5. Subscribe to topics and publish messages
+//! It connects to `ws://127.0.0.1:8080` and walks through the session in six
+//! printed steps: log in as `admin`, authenticate with the returned JWT,
+//! subscribe to `chat`, publish a QoS 1 message to `chat`, wait for a
+//! delivered message and acknowledge it, then unsubscribe. A self-registered
+//! user (when `server.allow_registration` is on) would send a register frame
+//! before logging in; this example doesn't.
 //!
-//! Run the server first: `cargo run --bin popsub server`
-//! Then run this example: `cargo run --example simple_client`
+//! The frames here use an externally tagged shape such as
+//! `{"Login": {"username": ..., "password": ...}}`, while `run_client` in the
+//! binary sends the `type`-tagged shape such as `{"type": "login", ...}`.
+//!
+//! Run the server first with `cargo run --bin popsub server`, then this
+//! example with `cargo run --example simple_client`.
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -16,6 +20,14 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
+/// Runs the example session against a server on `127.0.0.1:8080`.
+///
+/// After login it reads one reply and looks for the token under
+/// `LoginResponse.token`; without one it prints an error and returns. After
+/// publishing it reads frames until one has a `Message` key, sends an `Ack`
+/// for its `message_id` if present, and stops waiting, or until the server
+/// closes the connection. Panics if the connection can't be opened, a frame
+/// can't be sent, or the login reply is not valid JSON.
 #[tokio::main]
 async fn main() {
     let url = Url::parse("ws://127.0.0.1:8080").unwrap();
@@ -25,20 +37,6 @@ async fn main() {
 
     println!("Connected to PopSub server!\n");
 
-    // ===========================================
-    // Option A: Register a new user (if enabled)
-    // ===========================================
-    // Uncomment the following to register a new user:
-    //
-    // let register = json!({"Register": {"username": "alice", "password": "alice123"}});
-    // ws_stream.send(WsMessage::Text(register.to_string().into())).await.unwrap();
-    // if let Some(Ok(WsMessage::Text(msg))) = ws_stream.next().await {
-    //     println!("Register response: {msg}");
-    // }
-
-    // ===========================================
-    // Step 1: Login with credentials
-    // ===========================================
     println!("Step 1: Logging in...");
     let login = json!({"Login": {"username": "admin", "password": "password"}});
     ws_stream
@@ -46,11 +44,9 @@ async fn main() {
         .await
         .unwrap();
 
-    // Read LoginResponse and extract token
     let token = if let Some(Ok(WsMessage::Text(msg))) = ws_stream.next().await {
         println!("Login response: {msg}");
         let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
-        // Response format: {"LoginResponse": {"token": "..."}}
         v.get("LoginResponse")
             .and_then(|lr| lr.get("token"))
             .and_then(|t| t.as_str())
@@ -64,9 +60,6 @@ async fn main() {
         return;
     };
 
-    // ===========================================
-    // Step 2: Authenticate with JWT token
-    // ===========================================
     println!("\nStep 2: Authenticating with token...");
     let auth = json!({"Auth": {"token": token}});
     ws_stream
@@ -78,9 +71,6 @@ async fn main() {
         println!("Auth response: {auth_resp}");
     }
 
-    // ===========================================
-    // Step 3: Subscribe to a topic
-    // ===========================================
     println!("\nStep 3: Subscribing to 'chat' topic...");
     let subscribe = json!({"Subscribe": {"topic": "chat"}});
     ws_stream
@@ -88,9 +78,6 @@ async fn main() {
         .await
         .unwrap();
 
-    // ===========================================
-    // Step 4: Publish a message
-    // ===========================================
     println!("\nStep 4: Publishing message to 'chat' topic...");
     let publish = json!({
         "Publish": {
@@ -104,19 +91,14 @@ async fn main() {
         .await
         .unwrap();
 
-    // ===========================================
-    // Step 5: Receive messages
-    // ===========================================
     println!("\nStep 5: Waiting for messages...");
     while let Some(Ok(msg)) = ws_stream.next().await {
         match msg {
             WsMessage::Text(text) => {
                 println!("Received: {text}");
-                // Parse and check if it's our published message
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
                     && v.get("Message").is_some()
                 {
-                    // Acknowledge QoS 1 messages
                     if let Some(msg_id) = v
                         .get("Message")
                         .and_then(|m| m.get("message_id"))
@@ -129,7 +111,7 @@ async fn main() {
                             .unwrap();
                         println!("Sent ACK for message: {msg_id}");
                     }
-                    break; // Exit after receiving our message
+                    break;
                 }
             }
             WsMessage::Close(_) => {
@@ -140,9 +122,6 @@ async fn main() {
         }
     }
 
-    // ===========================================
-    // Step 6: Unsubscribe (optional)
-    // ===========================================
     println!("\nStep 6: Unsubscribing from 'chat' topic...");
     let unsubscribe = json!({"Unsubscribe": {"topic": "chat"}});
     ws_stream

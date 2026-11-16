@@ -1,5 +1,9 @@
+//! Unit tests for settings defaults, the insecure-default checks and loading
+//! from environment variables.
+
 pub use super::settings::Settings;
 
+/// Checks the default host, port, connection cap and message TTL.
 #[test]
 fn test_default_settings() {
     let settings = Settings::default();
@@ -9,6 +13,7 @@ fn test_default_settings() {
     assert_eq!(settings.broker.message_ttl_secs, 3600);
 }
 
+/// Checks that the defaults report both published values, bind to loopback and keep registration off.
 #[test]
 fn shipped_defaults_are_reported() {
     let settings = Settings::default();
@@ -17,6 +22,7 @@ fn shipped_defaults_are_reported() {
     assert!(!settings.server.allow_registration);
 }
 
+/// Checks that changed secrets clear the warnings and that only loopback hosts count as loopback.
 #[test]
 fn changed_secrets_pass_and_public_hosts_are_detected() {
     let mut settings = Settings::default();
@@ -34,6 +40,7 @@ fn changed_secrets_pass_and_public_hosts_are_detected() {
     }
 }
 
+/// Checks that double-underscore variables set multi-word keys while `SERVER_PORT` still works with one.
 #[test]
 fn multi_word_keys_load_from_double_underscore_variables() {
     let env = std::collections::HashMap::from([

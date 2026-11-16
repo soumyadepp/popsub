@@ -1,7 +1,10 @@
+//! Unit tests for `Client`.
+
 use super::pubsub_client::Client;
 use tokio::sync::mpsc;
 use tungstenite::protocol::Message as WsMessage;
 
+/// Checks that a new client gets a non-empty id.
 #[test]
 fn test_client_new() {
     let (tx, _) = mpsc::unbounded_channel::<WsMessage>();

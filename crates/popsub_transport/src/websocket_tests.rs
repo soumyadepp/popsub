@@ -1,3 +1,9 @@
+//! End-to-end tests that start a real server on a free port and talk to it
+//! over a WebSocket.
+//!
+//! Each test gets its own server, broker and temporary persistence directory,
+//! configured from `Settings::default()`.
+
 use crate::message::{ClientMessage, ServerMessage};
 use crate::websocket::start_websocket_server;
 use futures_util::{SinkExt, StreamExt};
@@ -8,6 +14,18 @@ use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+/// Starts a server on a free local port and opens a TCP connection to it.
+///
+/// The server is built with `start_websocket_server` from default settings and
+/// a broker whose persistence lives in a new temporary directory. The function
+/// waits 100 milliseconds for the server to start listening before connecting.
+/// Panics if no port is free, the directory or store can't be created, or the
+/// connection fails.
+///
+/// Returns:
+///     The connected stream (before the WebSocket handshake), the settings the
+///     server uses, the temporary directory (kept alive so the store isn't
+///     deleted) and the server's broker.
 async fn setup_server_and_client() -> (
     tokio::net::TcpStream,
     Settings,
@@ -33,7 +51,6 @@ async fn setup_server_and_client() -> (
         settings.clone(),
     ));
 
-    // Give the server a moment to start up
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let stream = tokio::net::TcpStream::connect(&addr)
@@ -42,6 +59,8 @@ async fn setup_server_and_client() -> (
     (stream, settings, temp_dir, broker)
 }
 
+/// Checks that logging in with the default admin credentials returns a token
+/// that `auth` accepts.
 #[tokio::test]
 async fn test_login_success() {
     let (stream, _settings, _temp_dir, _) = setup_server_and_client().await;
@@ -49,7 +68,6 @@ async fn test_login_success() {
         .await
         .expect("WebSocket handshake failed");
 
-    // 1. Send Login message
     let login_msg = ClientMessage::Login {
         username: "admin".to_string(),
         password: "password".to_string(),
@@ -61,7 +79,6 @@ async fn test_login_success() {
         .await
         .expect("Failed to send login message");
 
-    // 2. Receive LoginResponse
     let response = ws_stream
         .next()
         .await
@@ -77,7 +94,6 @@ async fn test_login_success() {
         _ => panic!("Expected LoginResponse, got {server_msg:?}"),
     };
 
-    // 3. Send Auth message with the received token
     let auth_msg = ClientMessage::Auth { token };
     ws_stream
         .send(WsMessage::Text(
@@ -86,7 +102,6 @@ async fn test_login_success() {
         .await
         .expect("Failed to send auth message");
 
-    // 4. Receive Auth success message
     let auth_response = ws_stream
         .next()
         .await
@@ -103,6 +118,8 @@ async fn test_login_success() {
     };
 }
 
+/// Checks that a login with unknown credentials gets an `invalid credentials`
+/// error.
 #[tokio::test]
 async fn test_login_failure() {
     let (stream, _settings, _temp_dir, _) = setup_server_and_client().await;
@@ -110,7 +127,6 @@ async fn test_login_failure() {
         .await
         .expect("WebSocket handshake failed");
 
-    // 1. Send Login message with incorrect credentials
     let login_msg = ClientMessage::Login {
         username: "wrong_user".to_string(),
         password: "wrong_password".to_string(),
@@ -122,7 +138,6 @@ async fn test_login_failure() {
         .await
         .expect("Failed to send login message");
 
-    // 2. Receive Login failure message
     let response = ws_stream
         .next()
         .await
@@ -141,6 +156,8 @@ async fn test_login_failure() {
     };
 }
 
+/// Checks that `auth` with a malformed token gets an `authentication failed`
+/// error.
 #[tokio::test]
 async fn test_auth_failure_invalid_token() {
     let (stream, _settings, _temp_dir, _) = setup_server_and_client().await;
@@ -148,7 +165,6 @@ async fn test_auth_failure_invalid_token() {
         .await
         .expect("WebSocket handshake failed");
 
-    // 1. Send Auth message with an invalid token
     let auth_msg = ClientMessage::Auth {
         token: "invalid.token.here".to_string(),
     };
@@ -159,7 +175,6 @@ async fn test_auth_failure_invalid_token() {
         .await
         .expect("Failed to send auth message");
 
-    // 2. Receive Auth failure message
     let response = ws_stream
         .next()
         .await
@@ -178,6 +193,8 @@ async fn test_auth_failure_invalid_token() {
     };
 }
 
+/// Checks that subscribing before `auth` gets a `must authenticate first`
+/// error and the client is removed from the broker once the socket closes.
 #[tokio::test]
 async fn test_action_before_auth_fails() {
     let (stream, _settings, _temp_dir, broker) = setup_server_and_client().await;
@@ -185,7 +202,6 @@ async fn test_action_before_auth_fails() {
         .await
         .expect("WebSocket handshake failed");
 
-    // 1. Send a Subscribe message before authentication
     let subscribe_msg = ClientMessage::Subscribe {
         topic: "test".to_string(),
     };
@@ -196,7 +212,6 @@ async fn test_action_before_auth_fails() {
         .await
         .expect("Failed to send subscribe message");
 
-    // 2. Receive error message and connection close
     let response = ws_stream
         .next()
         .await
@@ -214,23 +229,31 @@ async fn test_action_before_auth_fails() {
         _ => panic!("Expected Error, got {server_msg:?}"),
     };
 
-    // Explicitly close the WebSocket stream
     ws_stream
         .close(None)
         .await
         .expect("Failed to close WebSocket");
 
-    // Attempt to send another message and assert that it fails
     let res = ws_stream
         .send(WsMessage::Text("should not send".to_string().into()))
         .await;
     assert!(res.is_err());
 
-    // Assert that the client has been cleaned up from the broker
     let broker_lock = broker.lock().unwrap();
     assert!(broker_lock.clients.is_empty());
 }
 
+/// Sends one client frame and waits for the next server frame.
+///
+/// Panics if the send fails, the connection closes first, or the reply isn't a
+/// `ServerMessage`.
+///
+/// Args:
+///     ws_stream: The client's WebSocket connection.
+///     msg: The frame to send.
+///
+/// Returns:
+///     The server's reply.
 async fn send_and_receive(
     ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     msg: &ClientMessage,
@@ -249,6 +272,8 @@ async fn send_and_receive(
         .unwrap_or_else(|e| panic!("Failed to deserialize ServerMessage from {raw:?}: {e}"))
 }
 
+/// Checks that `register` is refused with `user registration is disabled`
+/// under the default settings.
 #[tokio::test]
 async fn registration_is_disabled_by_default() {
     let (stream, _settings, _temp_dir, _) = setup_server_and_client().await;
@@ -274,6 +299,8 @@ async fn registration_is_disabled_by_default() {
     }
 }
 
+/// Checks that five failed logins lock out that username from this address
+/// while the admin can still log in from the same connection.
 #[tokio::test]
 async fn locking_out_one_username_leaves_others_usable() {
     let (stream, settings, _temp_dir, _) = setup_server_and_client().await;

@@ -1,31 +1,27 @@
 # popsub_transport
 
-The WebSocket edge. Accepts connections, speaks the JSON protocol, handles login and JWT auth, and turns requests into broker calls.
+The WebSocket edge. Accepts connections, speaks the JSON protocol, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls.
 
 ## Files
 
-- `src/message.rs`: `ClientMessage` and `ServerMessage` (serde, tagged by `type`) and JWT `Claims`. This is the protocol.
-- `src/websocket.rs`: `start_websocket_server`. Per connection: a reader loop, a send loop draining the client's channel, and cleanup.
+- `src/message.rs`: `ClientMessage` and `ServerMessage` (serde, tagged by `type`). This is the protocol.
+- `src/websocket.rs`: the server. `start_websocket_server(settings)` is what the binary calls; it builds the `AuthService` from settings and delegates to `start_websocket_server_with_auth` and `start_websocket_server_with_rate_limiting`. One `handle_*` function per message type, `RateLimiters` and its defaults, the prune task, and `registration_role`.
 - `src/tests.rs`: message serialisation tests.
 - `src/websocket_tests.rs`: starts a real server on a free port (`portpicker`) and drives it with `tokio-tungstenite`.
 
-## How a frame is handled
-
-1. Parse JSON outside the broker lock.
-2. Take the lock, find this connection's `Client`, run `handle_parsed_message` for login, auth and the auth gate. It returns whether to keep the connection and an optional `BrokerAction`.
-3. Release the lock, then take it again to apply the `BrokerAction` (subscribe, unsubscribe, publish, ack).
-
 ## Invariants
 
-- Nothing but `login` and `auth` is accepted before `client.authenticated` is true. Failing `auth`, or sending anything else first, closes the connection. A failed `login` does not.
-- Never hold the broker lock across an `.await`. Sends to the client go through its unbounded `mpsc` channel, which is synchronous.
-- Cleanup runs once per connection, guarded by an `AtomicBool`, whichever side notices the disconnect first.
+- `register`, `login` and `auth` are accepted before authentication. Anything else before a successful `auth` gets an error and closes the connection. A failed `auth` closes it. Permission denials and publish rate limits send an error and keep it open.
+- Handlers never hold the broker lock and the auth lock together: read client state under the broker lock, release it, check permissions under the auth lock, release that, then take the broker lock again to act.
+- Never hold the broker lock across an `.await`.
+- Failed logins are limited per `address|username` and per address; registration per address; publishing per username. See `docs/DESIGN.md` section 10.
+- Registration errors go through `registration_error_message`, which hides whether a username is taken.
 
 ## Gotchas
 
-- Delivered messages are the broker's `Message` serialised directly, with no `type` field. `ServerMessage::Message` is defined but unused. If you fix this, it is a protocol change: update the README, `docs/DESIGN.md` section 4 and the tests together.
-- Credentials are a single username and password from config. JWT expiry is checked only at `auth`.
-- The unmerged `feat/add-auth` branch rewrites most of `websocket.rs`. Rebase carefully if you touch this file.
+- Delivered messages are the broker's `Message` serialised directly, with no `type` field. `ServerMessage::Message` is defined but unused. Fixing this is a protocol change: update the README, `docs/DESIGN.md` section 4 and the tests together.
+- Limits use the socket address, so behind a proxy every client shares one.
+- JWT expiry is checked only at `auth`.
 
 ## Tests
 

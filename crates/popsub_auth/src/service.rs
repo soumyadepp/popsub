@@ -1,7 +1,9 @@
-//! Authentication service
+//! `AuthService`, its configuration, and the registration rules for usernames and passwords.
 //!
-//! The main entry point for authentication and authorization operations.
-//! Combines JWT handling, user storage, and permission checking.
+//! The service is the crate's entry point: it combines `JwtService`, a
+//! `UserStore` and `PermissionChecker` to log users in, manage accounts and
+//! answer topic access questions. `UserBuilder` is a shorthand for adding users
+//! with a role assembled from topic grants.
 
 use std::sync::Arc;
 
@@ -13,20 +15,19 @@ use crate::permission::{PermissionChecker, TopicPermission};
 use crate::store::{InMemoryUserStore, UserStore, hash_password, verify_password};
 use crate::user::{Role, User};
 
-/// Configuration for the authentication service.
-/// Shortest password accepted at registration.
+/// Shortest password, in characters, that `register_user` accepts.
 pub const MIN_PASSWORD_LENGTH: usize = 8;
 
-/// Username length limits accepted at registration.
+/// Allowed username length, in characters, for `register_user`.
 pub const USERNAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=32;
 
-/// Checks a username is 3 to 32 characters of letters, digits, `_`, `.` or `-`.
+/// Checks a username is 3 to 32 characters of ASCII letters, digits, `_`, `.` or `-`.
 ///
 /// Args:
-///   username: The requested username.
+///     username: The requested username.
 ///
 /// Raises:
-///   AuthError::PermissionDenied: When the username breaks either rule.
+///     AuthError::PermissionDenied: When the username breaks either rule.
 pub fn validate_username(username: &str) -> Result<()> {
     if !USERNAME_LENGTH.contains(&username.chars().count()) {
         return Err(AuthError::PermissionDenied(format!(
@@ -44,13 +45,13 @@ pub fn validate_username(username: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks a password meets the minimum length.
+/// Checks a password has at least `MIN_PASSWORD_LENGTH` characters.
 ///
 /// Args:
-///   password: The requested password.
+///     password: The requested password.
 ///
 /// Raises:
-///   AuthError::PermissionDenied: When the password is too short.
+///     AuthError::PermissionDenied: When the password is too short.
 pub fn validate_password(password: &str) -> Result<()> {
     if password.chars().count() < MIN_PASSWORD_LENGTH {
         return Err(AuthError::PermissionDenied(format!(
@@ -60,34 +61,45 @@ pub fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
+/// Settings for `AuthService`: JWT secret and lifetime, the bootstrap admin, and registration.
+///
+/// `Default` uses published values for the secret and admin password, which
+/// `insecure_defaults` reports. Registration is off by default and new users
+/// get no topics.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
-    /// Secret key for JWT signing.
+    /// HMAC secret used to sign and verify tokens.
     pub jwt_secret: String,
-    /// JWT token expiration time in hours.
+    /// Lifetime of issued tokens, in hours.
     pub jwt_expiration_hours: u64,
-    /// Default admin username (created on startup if store is empty).
+    /// Username of the admin that `AuthService::new` and
+    /// `AuthService::with_store_and_admin` create when it does not exist.
     pub default_admin_username: String,
-    /// Default admin password.
+    /// Password for that admin.
     pub default_admin_password: String,
-    /// Whether to allow public user registration.
+    /// Whether `AuthService::register_user` accepts new accounts.
     pub allow_registration: bool,
-    /// Default role for newly registered users.
+    /// Role given to accounts created by `AuthService::register_user`.
     pub default_user_role: DefaultUserRole,
 }
 
-/// Default role configuration for new user registrations.
+/// Which role `AuthService::register_user` gives to a self-registered user.
 #[derive(Debug, Clone)]
 pub enum DefaultUserRole {
-    /// Full access to all topics (subscribe + publish).
+    /// Subscribe and publish on every topic, as `Role::user_full_access`.
     FullAccess,
-    /// Read-only access to all topics.
+    /// Subscribe to every topic (a `#` pattern), never publish.
     ReadOnly,
-    /// Access to specific topic patterns.
+    /// A `Role::User` with exactly these permissions. An empty list, the
+    /// default, grants nothing.
     LimitedAccess(Vec<TopicPermission>),
 }
 
 impl Default for AuthConfig {
+    /// Builds a config with published secrets, a 24 hour token lifetime, admin `admin`, and registration off.
+    ///
+    /// Returns:
+    ///     The default config. Only suitable for local use.
     fn default() -> Self {
         Self {
             jwt_secret: "change_me_in_production".to_string(),
@@ -114,7 +126,7 @@ impl AuthConfig {
     /// Lists settings that still use values published with PopSub.
     ///
     /// Returns:
-    ///   A description of each insecure setting, empty when there are none.
+    ///     A description of each insecure setting, empty when there are none.
     pub fn insecure_defaults(&self) -> Vec<&'static str> {
         let mut found = Vec::new();
         if PUBLISHED_SECRETS.contains(&self.jwt_secret.as_str()) {
@@ -126,13 +138,20 @@ impl AuthConfig {
         found
     }
 
+    /// Logs a warning for each setting `insecure_defaults` reports.
     fn warn_if_insecure(&self) {
         for problem in self.insecure_defaults() {
             warn!("{problem}; set your own before exposing this service");
         }
     }
 
-    /// Create a new config with the given JWT secret.
+    /// Builds the default config with a caller-supplied JWT secret.
+    ///
+    /// Args:
+    ///     jwt_secret: The HMAC secret for signing tokens.
+    ///
+    /// Returns:
+    ///     The config, with every other field at its default.
     pub fn new(jwt_secret: impl Into<String>) -> Self {
         Self {
             jwt_secret: jwt_secret.into(),
@@ -140,43 +159,80 @@ impl AuthConfig {
         }
     }
 
-    /// Set the JWT expiration hours.
+    /// Sets the token lifetime.
+    ///
+    /// Args:
+    ///     hours: Hours until issued tokens expire.
+    ///
+    /// Returns:
+    ///     The updated config.
     pub fn with_expiration(mut self, hours: u64) -> Self {
         self.jwt_expiration_hours = hours;
         self
     }
 
-    /// Set the default admin credentials.
+    /// Sets the username and password of the bootstrap admin.
+    ///
+    /// Args:
+    ///     username: The admin's username.
+    ///     password: The admin's plain text password, hashed when the admin is created.
+    ///
+    /// Returns:
+    ///     The updated config.
     pub fn with_admin(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.default_admin_username = username.into();
         self.default_admin_password = password.into();
         self
     }
 
-    /// Enable or disable public user registration.
+    /// Turns self-registration through `register_user` on or off.
+    ///
+    /// Args:
+    ///     enabled: Whether registration is allowed.
+    ///
+    /// Returns:
+    ///     The updated config.
     pub fn with_registration(mut self, enabled: bool) -> Self {
         self.allow_registration = enabled;
         self
     }
 
-    /// Set the default role for newly registered users.
+    /// Sets the role given to self-registered users.
+    ///
+    /// Args:
+    ///     role: The role to assign at registration.
+    ///
+    /// Returns:
+    ///     The updated config.
     pub fn with_default_role(mut self, role: DefaultUserRole) -> Self {
         self.default_user_role = role;
         self
     }
 }
 
-/// Main authentication service.
+/// Logs users in, issues and checks tokens, manages accounts, and decides topic access.
 ///
-/// Provides login, token validation, and authorization operations.
+/// Its `Debug` output includes the config (and so the JWT secret and admin
+/// password) but not the store.
 pub struct AuthService {
     jwt_service: JwtService,
-    /// The user store backend. Public for testing purposes.
+    /// The store holding every account. Public so tests and callers can edit
+    /// users directly, for example to disable one.
     pub user_store: Arc<dyn UserStore>,
     config: AuthConfig,
 }
 
 impl std::fmt::Debug for AuthService {
+    /// Writes the JWT service and config, leaving out the user store.
+    ///
+    /// Args:
+    ///     f: The formatter to write to.
+    ///
+    /// Returns:
+    ///     The formatter's result.
+    ///
+    /// Raises:
+    ///     std::fmt::Error: When the formatter fails to write.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthService")
             .field("jwt_service", &self.jwt_service)
@@ -186,9 +242,16 @@ impl std::fmt::Debug for AuthService {
 }
 
 impl AuthService {
-    /// Create a new auth service with the given configuration.
+    /// Builds a service on a fresh in-memory store and adds the configured admin.
     ///
-    /// Uses an in-memory user store and creates a default admin user.
+    /// Logs a warning for each published default in `config`. If creating the
+    /// admin fails, the failure is logged and the service is still returned.
+    ///
+    /// Args:
+    ///     config: Secret, token lifetime, admin credentials and registration settings.
+    ///
+    /// Returns:
+    ///     The service, holding only the admin account.
     pub async fn new(config: AuthConfig) -> Self {
         config.warn_if_insecure();
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
@@ -200,7 +263,6 @@ impl AuthService {
             config: config.clone(),
         };
 
-        // Create default admin user
         if let Err(e) = service
             .add_user(
                 &config.default_admin_username,
@@ -220,11 +282,18 @@ impl AuthService {
         service
     }
 
-    /// Create a new auth service with a custom user store.
+    /// Builds a service on an existing store without creating any users.
     ///
-    /// Note: This does NOT create a default admin user. You should either:
-    /// 1. Pre-populate the store with an admin user, or
-    /// 2. Call `add_user()` after creation to add an admin
+    /// The configured admin is not created, so the store must already hold an
+    /// admin or the caller must add one with `add_user`. Logs a warning for
+    /// each published default in `config`.
+    ///
+    /// Args:
+    ///     config: Secret, token lifetime and registration settings.
+    ///     store: The user store to read and write accounts in.
+    ///
+    /// Returns:
+    ///     The service.
     pub fn with_store(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
         config.warn_if_insecure();
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
@@ -236,7 +305,20 @@ impl AuthService {
         }
     }
 
-    /// Create a new auth service with a custom store and initialize the default admin.
+    /// Builds a service on an existing store and adds the configured admin if it is missing.
+    ///
+    /// An existing account with the admin's username is left as it is, even if
+    /// its role or password differ from the config. If the existence check
+    /// fails, creation is attempted anyway. A failure to create the admin is
+    /// logged and the service is still returned. Logs a warning for each
+    /// published default in `config`.
+    ///
+    /// Args:
+    ///     config: Secret, token lifetime, admin credentials and registration settings.
+    ///     store: The user store to read and write accounts in.
+    ///
+    /// Returns:
+    ///     The service.
     pub async fn with_store_and_admin(config: AuthConfig, store: Arc<dyn UserStore>) -> Self {
         config.warn_if_insecure();
         let jwt_service = JwtService::new(&config.jwt_secret, config.jwt_expiration_hours);
@@ -247,7 +329,6 @@ impl AuthService {
             config: config.clone(),
         };
 
-        // Create default admin user if it doesn't exist
         if !service
             .user_exists(&config.default_admin_username)
             .await
@@ -273,26 +354,39 @@ impl AuthService {
         service
     }
 
-    /// Get a reference to the JWT service.
+    /// Exposes the JWT service so callers can sign or decode tokens directly.
+    ///
+    /// Returns:
+    ///     The service's `JwtService`.
     pub fn jwt_service(&self) -> &JwtService {
         &self.jwt_service
     }
 
-    /// Check if registration is enabled.
+    /// Reports whether `register_user` accepts new accounts.
+    ///
+    /// Returns:
+    ///     The config's `allow_registration` flag.
     pub fn is_registration_enabled(&self) -> bool {
         self.config.allow_registration
     }
 
-    // ========================
-    // User Management
-    // ========================
-
-    /// Register a new user via public registration.
+    /// Creates an account through self-registration, with the configured default role.
     ///
-    /// This method respects the `allow_registration` config setting and
-    /// assigns the configured default role to new users.
+    /// Unlike `add_user`, this enforces the registration switch and the
+    /// username and password rules. The existence check and the insert are not
+    /// atomic, but the store still refuses a duplicate on insert.
     ///
-    /// Returns an error if registration is disabled or the user already exists.
+    /// Args:
+    ///     username: The requested username.
+    ///     password: The plain text password, hashed before it is stored.
+    ///
+    /// Raises:
+    ///     AuthError::PermissionDenied: When registration is disabled, or the
+    ///         username or password breaks the registration rules.
+    ///     AuthError::UserAlreadyExists: When the username is taken.
+    ///     AuthError::PasswordHashError: When hashing the password fails.
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn register_user(&self, username: &str, password: &str) -> Result<()> {
         if !self.config.allow_registration {
             return Err(AuthError::PermissionDenied(
@@ -303,12 +397,10 @@ impl AuthService {
         validate_username(username)?;
         validate_password(password)?;
 
-        // Check if user already exists
         if self.user_store.user_exists(username).await? {
             return Err(AuthError::UserAlreadyExists(username.to_string()));
         }
 
-        // Determine role based on config
         let role = match &self.config.default_user_role {
             DefaultUserRole::FullAccess => Role::user_full_access(),
             DefaultUserRole::ReadOnly => Role::ReadOnly {
@@ -326,7 +418,20 @@ impl AuthService {
         Ok(())
     }
 
-    /// Add a new user with the given credentials and role.
+    /// Creates an account with any role, skipping the registration switch and rules.
+    ///
+    /// This is the admin path: usernames and passwords are not validated.
+    ///
+    /// Args:
+    ///     username: The new account's username.
+    ///     password: The plain text password, hashed before it is stored.
+    ///     role: The account's role.
+    ///
+    /// Raises:
+    ///     AuthError::PasswordHashError: When hashing the password fails.
+    ///     AuthError::UserAlreadyExists: When the username is taken.
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn add_user(&self, username: &str, password: &str, role: Role) -> Result<()> {
         let password_hash = hash_password(password)?;
         let user = User::new(username, password_hash, role);
@@ -335,7 +440,17 @@ impl AuthService {
         Ok(())
     }
 
-    /// Remove a user by username.
+    /// Deletes an account. Tokens already issued to it stay valid until they expire.
+    ///
+    /// Args:
+    ///     username: The account to delete.
+    ///
+    /// Returns:
+    ///     `true` if an account was removed, `false` if none existed.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn remove_user(&self, username: &str) -> Result<bool> {
         let removed = self.user_store.remove_user(username).await?;
         if removed {
@@ -344,22 +459,59 @@ impl AuthService {
         Ok(removed)
     }
 
-    /// Get a user by username.
+    /// Looks up an account in the store.
+    ///
+    /// Args:
+    ///     username: The account to fetch.
+    ///
+    /// Returns:
+    ///     The user, or `None` if there is no such account.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn get_user(&self, username: &str) -> Result<Option<User>> {
         self.user_store.get_user(username).await
     }
 
-    /// Check if a user exists.
+    /// Reports whether an account with this username is in the store.
+    ///
+    /// Args:
+    ///     username: The username to look for.
+    ///
+    /// Returns:
+    ///     `true` if the account exists.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn user_exists(&self, username: &str) -> Result<bool> {
         self.user_store.user_exists(username).await
     }
 
-    /// List all usernames.
+    /// Lists the username of every account in the store.
+    ///
+    /// Returns:
+    ///     All usernames. The in-memory store returns them in no set order;
+    ///     the PostgreSQL store sorts them.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn list_users(&self) -> Result<Vec<String>> {
         self.user_store.list_usernames().await
     }
 
-    /// Update a user's role.
+    /// Replaces an account's role. Takes effect on the user's next permission check.
+    ///
+    /// Args:
+    ///     username: The account to change.
+    ///     role: The new role.
+    ///
+    /// Raises:
+    ///     AuthError::UserNotFound: When there is no such account.
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn update_user_role(&self, username: &str, role: Role) -> Result<()> {
         let mut user = self
             .user_store
@@ -373,7 +525,19 @@ impl AuthService {
         Ok(())
     }
 
-    /// Update a user's password.
+    /// Replaces an account's password, without applying the registration length rule.
+    ///
+    /// Existing tokens are not revoked.
+    ///
+    /// Args:
+    ///     username: The account to change.
+    ///     new_password: The new plain text password, hashed before it is stored.
+    ///
+    /// Raises:
+    ///     AuthError::UserNotFound: When there is no such account.
+    ///     AuthError::PasswordHashError: When hashing the password fails.
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn update_user_password(&self, username: &str, new_password: &str) -> Result<()> {
         let mut user = self
             .user_store
@@ -387,11 +551,25 @@ impl AuthService {
         Ok(())
     }
 
-    // ========================
-    // Authentication
-    // ========================
-
-    /// Authenticate a user and return a JWT token.
+    /// Checks a username and password and issues a token carrying the user's role name.
+    ///
+    /// Unknown users, disabled users and wrong passwords all return the same
+    /// error, so callers cannot tell which one failed.
+    ///
+    /// Args:
+    ///     username: The account to log in as.
+    ///     password: The plain text password to check.
+    ///
+    /// Returns:
+    ///     A signed token valid for the configured lifetime.
+    ///
+    /// Raises:
+    ///     AuthError::InvalidCredentials: When the user is unknown, disabled,
+    ///         or the password is wrong.
+    ///     AuthError::PasswordHashError: When the stored hash cannot be parsed.
+    ///     AuthError::JwtError: When signing the token fails.
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn login(&self, username: &str, password: &str) -> Result<String> {
         let user = self
             .user_store
@@ -423,21 +601,53 @@ impl AuthService {
         Ok(token)
     }
 
-    /// Validate a JWT token and return the claims.
+    /// Verifies a token's signature and expiry and decodes its claims.
+    ///
+    /// Only the token is checked. The user may since have been removed or disabled.
+    ///
+    /// Args:
+    ///     token: The encoded token.
+    ///
+    /// Returns:
+    ///     The decoded claims.
+    ///
+    /// Raises:
+    ///     AuthError::JwtError: When the token is malformed, badly signed, or
+    ///         expired by more than the 60 second decode leeway.
+    ///     AuthError::TokenExpired: When it expired within that leeway.
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
         self.jwt_service.validate_token(token)
     }
 
-    /// Refresh a JWT token.
+    /// Issues a new token with a full lifetime for the holder of a still valid one.
+    ///
+    /// The user store is not consulted, so removed or disabled users can refresh.
+    ///
+    /// Args:
+    ///     token: The token to refresh.
+    ///
+    /// Returns:
+    ///     The new token, with the same subject and role claim.
+    ///
+    /// Raises:
+    ///     AuthError::JwtError: When the token is malformed, badly signed,
+    ///         expired by more than the 60 second decode leeway, or the new
+    ///         token cannot be signed.
+    ///     AuthError::TokenExpired: When it expired within that leeway.
     pub fn refresh_token(&self, token: &str) -> Result<String> {
         self.jwt_service.refresh_token(token)
     }
 
-    // ========================
-    // Authorization
-    // ========================
-
-    /// Check if a user can subscribe to a topic.
+    /// Decides whether a user may subscribe to a topic, using the role in the store.
+    ///
+    /// Unknown users and store errors both count as a refusal.
+    ///
+    /// Args:
+    ///     username: The account to check.
+    ///     topic: The topic to subscribe to.
+    ///
+    /// Returns:
+    ///     `true` when the user exists, is enabled and its role allows subscribing.
     pub async fn can_subscribe(&self, username: &str, topic: &str) -> bool {
         match self.user_store.get_user(username).await {
             Ok(Some(user)) => self.check_subscribe_permission(&user, topic),
@@ -445,7 +655,16 @@ impl AuthService {
         }
     }
 
-    /// Check if a user can publish to a topic.
+    /// Decides whether a user may publish to a topic, using the role in the store.
+    ///
+    /// Unknown users and store errors both count as a refusal.
+    ///
+    /// Args:
+    ///     username: The account to check.
+    ///     topic: The topic to publish to.
+    ///
+    /// Returns:
+    ///     `true` when the user exists, is enabled and its role allows publishing.
     pub async fn can_publish(&self, username: &str, topic: &str) -> bool {
         match self.user_store.get_user(username).await {
             Ok(Some(user)) => self.check_publish_permission(&user, topic),
@@ -453,7 +672,18 @@ impl AuthService {
         }
     }
 
-    /// Check subscribe permission for a user object.
+    /// Decides whether an already loaded user may subscribe to a topic.
+    ///
+    /// Disabled users are refused. Admins may subscribe anywhere, `Role::User`
+    /// needs a matching permission with `can_subscribe`, and `Role::ReadOnly`
+    /// needs a matching pattern.
+    ///
+    /// Args:
+    ///     user: The user to check.
+    ///     topic: The topic to subscribe to.
+    ///
+    /// Returns:
+    ///     `true` when the subscription is allowed.
     pub fn check_subscribe_permission(&self, user: &User, topic: &str) -> bool {
         if !user.enabled {
             return false;
@@ -470,7 +700,18 @@ impl AuthService {
         }
     }
 
-    /// Check publish permission for a user object.
+    /// Decides whether an already loaded user may publish to a topic.
+    ///
+    /// Disabled users are refused. Admins may publish anywhere, `Role::User`
+    /// needs a matching permission with `can_publish`, and `Role::ReadOnly`
+    /// users can never publish.
+    ///
+    /// Args:
+    ///     user: The user to check.
+    ///     topic: The topic to publish to.
+    ///
+    /// Returns:
+    ///     `true` when publishing is allowed.
     pub fn check_publish_permission(&self, user: &User, topic: &str) -> bool {
         if !user.enabled {
             return false;
@@ -479,11 +720,20 @@ impl AuthService {
         match &user.role {
             Role::Admin => true,
             Role::User { allowed_topics } => PermissionChecker::can_publish(allowed_topics, topic),
-            Role::ReadOnly { .. } => false, // Read-only users can never publish
+            Role::ReadOnly { .. } => false,
         }
     }
 
-    /// Authorize a subscribe action, returning an error if not permitted.
+    /// Same check as `can_subscribe`, but reports a refusal as an error.
+    ///
+    /// Args:
+    ///     username: The account to check.
+    ///     topic: The topic to subscribe to.
+    ///
+    /// Raises:
+    ///     AuthError::TopicNotAuthorized: When the user is unknown, disabled,
+    ///         not allowed to subscribe, or the store lookup fails. `action`
+    ///         is `"subscribe"`.
     pub async fn authorize_subscribe(&self, username: &str, topic: &str) -> Result<()> {
         if self.can_subscribe(username, topic).await {
             Ok(())
@@ -495,7 +745,16 @@ impl AuthService {
         }
     }
 
-    /// Authorize a publish action, returning an error if not permitted.
+    /// Same check as `can_publish`, but reports a refusal as an error.
+    ///
+    /// Args:
+    ///     username: The account to check.
+    ///     topic: The topic to publish to.
+    ///
+    /// Raises:
+    ///     AuthError::TopicNotAuthorized: When the user is unknown, disabled,
+    ///         not allowed to publish, or the store lookup fails. `action` is
+    ///         `"publish"`.
     pub async fn authorize_publish(&self, username: &str, topic: &str) -> Result<()> {
         if self.can_publish(username, topic).await {
             Ok(())
@@ -508,7 +767,9 @@ impl AuthService {
     }
 }
 
-/// Builder for creating users with specific permissions.
+/// Collects a username, password and topic grants, then adds the user through `AuthService::add_user`.
+///
+/// `admin` wins over `read_only`, which wins over the plain topic grants.
 pub struct UserBuilder {
     username: String,
     password: String,
@@ -518,7 +779,14 @@ pub struct UserBuilder {
 }
 
 impl UserBuilder {
-    /// Start building a new user.
+    /// Starts a builder for a non-admin user with no topic grants.
+    ///
+    /// Args:
+    ///     username: The new account's username.
+    ///     password: The plain text password.
+    ///
+    /// Returns:
+    ///     The builder.
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             username: username.into(),
@@ -529,43 +797,81 @@ impl UserBuilder {
         }
     }
 
-    /// Make this user an admin (overrides other permissions).
+    /// Marks the user as an admin, so every topic grant is ignored.
+    ///
+    /// Returns:
+    ///     The updated builder.
     pub fn admin(mut self) -> Self {
         self.is_admin = true;
         self
     }
 
-    /// Make this user read-only (can only subscribe, not publish).
+    /// Marks the user as read-only, so it may subscribe to every granted pattern and never publish.
+    ///
+    /// Every grant's pattern becomes subscribable, including patterns added with
+    /// `allow_publish`.
+    ///
+    /// Returns:
+    ///     The updated builder.
     pub fn read_only(mut self) -> Self {
         self.is_readonly = true;
         self
     }
 
-    /// Allow full access (subscribe + publish) to a topic pattern.
+    /// Grants subscribe and publish on a topic pattern.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern to grant.
+    ///
+    /// Returns:
+    ///     The updated builder.
     pub fn allow_topic(mut self, pattern: impl Into<String>) -> Self {
         self.permissions.push(TopicPermission::full_access(pattern));
         self
     }
 
-    /// Allow subscribe-only access to a topic pattern.
+    /// Grants subscribe only on a topic pattern.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern to grant.
+    ///
+    /// Returns:
+    ///     The updated builder.
     pub fn allow_subscribe(mut self, pattern: impl Into<String>) -> Self {
         self.permissions.push(TopicPermission::read_only(pattern));
         self
     }
 
-    /// Allow publish-only access to a topic pattern.
+    /// Grants publish only on a topic pattern.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern to grant.
+    ///
+    /// Returns:
+    ///     The updated builder.
     pub fn allow_publish(mut self, pattern: impl Into<String>) -> Self {
         self.permissions.push(TopicPermission::write_only(pattern));
         self
     }
 
-    /// Add a custom permission.
+    /// Adds a permission with caller-chosen flags.
+    ///
+    /// Args:
+    ///     permission: The permission to grant.
+    ///
+    /// Returns:
+    ///     The updated builder.
     pub fn with_permission(mut self, permission: TopicPermission) -> Self {
         self.permissions.push(permission);
         self
     }
 
-    /// Build the role for this user.
+    /// Turns the collected flags and grants into a role.
+    ///
+    /// Returns:
+    ///     `Role::Admin` if `admin` was called, otherwise `Role::ReadOnly` with
+    ///     every granted pattern if `read_only` was called, otherwise
+    ///     `Role::User` with the grants.
     pub fn build_role(self) -> Role {
         if self.is_admin {
             Role::Admin
@@ -580,7 +886,18 @@ impl UserBuilder {
         }
     }
 
-    /// Register this user with an auth service.
+    /// Adds the user to an auth service with the built role, through `add_user`.
+    ///
+    /// The registration switch and the username and password rules do not apply.
+    ///
+    /// Args:
+    ///     auth: The service to add the user to.
+    ///
+    /// Raises:
+    ///     AuthError::PasswordHashError: When hashing the password fails.
+    ///     AuthError::UserAlreadyExists: When the username is taken.
+    ///     AuthError::Internal: When the user store fails, such as a poisoned
+    ///         lock or a database error.
     pub async fn register(self, auth: &AuthService) -> Result<()> {
         let username = self.username.clone();
         let password = self.password.clone();

@@ -5,5 +5,5 @@ This crate builds the `popsub` server binary and wires together the broker, tran
 Run locally:
 
 ```bash
-cargo run -p popsub
+cargo run -p popsub -- server
 ```

@@ -7,6 +7,7 @@ Despite the name, this is not a client library. `Client` is the server's record 
 - `id`: a new UUID per connection. Reconnecting produces a different id, which is why subscriptions don't survive a disconnect.
 - `sender`: an unbounded `mpsc` sender of `tungstenite` messages. The broker and transport push frames into it, and the transport's send loop writes them to the socket.
 - `authenticated`: set by the transport after a valid JWT.
+- `username`: set alongside `authenticated`; the transport uses it for permission checks and the publish rate limit.
 
 ## Gotchas
 

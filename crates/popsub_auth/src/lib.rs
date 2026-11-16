@@ -1,13 +1,10 @@
-//! popsub_auth
+//! Authentication and topic authorization for the PopSub broker.
 //!
-//! Authentication and authorization module for PopSub. This crate provides:
-//!
-//! - **JWT token generation and validation** via the `JwtService`
-//! - **User management** with the `User` struct and `Role`-based permissions
-//! - **Role-Based Access Control (RBAC)** for topic-level authorization
-//! - **Pluggable user storage** via the `UserStore` trait (InMemory or PostgreSQL)
-//!
-//! # Architecture
+//! The crate issues and checks JWTs (`JwtService`), stores users behind the
+//! `UserStore` trait (in memory by default, PostgreSQL with the `postgres`
+//! feature), and decides per topic whether a user may subscribe or publish
+//! (`PermissionChecker`). `AuthService` ties the three together and is what the
+//! broker calls.
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -22,18 +19,16 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Example
+//! Example:
 //!
 //! ```rust,ignore
 //! use popsub_auth::{AuthService, AuthConfig, Role, TopicPermission};
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     // Create auth service with default in-memory store
 //!     let config = AuthConfig::default();
 //!     let auth = AuthService::new(config).await;
 //!
-//!     // Add a user with publish/subscribe permissions
 //!     auth.add_user(
 //!         "alice",
 //!         "secure_password",
@@ -45,23 +40,21 @@
 //!         },
 //!     ).await.unwrap();
 //!
-//!     // Authenticate and get a token
 //!     let token = auth.login("alice", "secure_password").await.unwrap();
 //!
-//!     // Validate token and check permissions
 //!     let claims = auth.validate_token(&token).unwrap();
 //!     assert!(auth.can_publish(&claims.sub, "chat/room1").await);
-//!     assert!(!auth.can_publish(&claims.sub, "sensors/temp").await); // read-only
+//!     assert!(!auth.can_publish(&claims.sub, "sensors/temp").await);
 //! }
 //! ```
 //!
-//! # PostgreSQL Support
-//!
-//! Enable the `postgres` feature for production database support:
+//! To store users in PostgreSQL, enable the `postgres` feature:
 //!
 //! ```toml
 //! popsub_auth = { version = "0.1", features = ["postgres"] }
 //! ```
+//!
+//! Example:
 //!
 //! ```rust,ignore
 //! use sqlx::postgres::PgPoolOptions;
@@ -90,7 +83,6 @@ pub mod service;
 pub mod store;
 pub mod user;
 
-// Re-export main types for convenience
 pub use error::AuthError;
 pub use jwt::{Claims, JwtService};
 pub use permission::{PermissionChecker, TopicPermission};

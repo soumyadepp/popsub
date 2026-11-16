@@ -4,11 +4,11 @@ Authentication and authorization module for PopSub.
 
 ## Features
 
-- **JWT Token Management**: Secure token generation, validation, and refresh
-- **Password Hashing**: Argon2-based password hashing for secure credential storage
-- **Role-Based Access Control (RBAC)**: Fine-grained permissions for topics
-- **Wildcard Topic Patterns**: MQTT-style wildcards (`+` and `#`) for flexible authorization
-- **Pluggable User Storage**: Trait-based storage abstraction with in-memory default
+- **JWT Token Management**: HS256 token generation, validation, and refresh
+- **Password Hashing**: Argon2id hashes with a random salt per password
+- **Role-Based Access Control (RBAC)**: Subscribe and publish flags per topic pattern
+- **Wildcard Topic Patterns**: MQTT-style wildcards (`+` and `#`) in topic grants
+- **Pluggable User Storage**: A `UserStore` trait, with an in-memory store by default
 
 ## Architecture
 
@@ -212,11 +212,11 @@ impl UserStore for PostgresUserStore {
 
 | Backend    | Status      | Notes                             |
 | ---------- | ----------- | --------------------------------- |
-| In-Memory  | ✅ Built-in | Default, for dev/testing          |
-| PostgreSQL | ✅ Built-in | `PostgresUserStore`, behind the `postgres` feature |
-| SQLite     | 📝 Example  | Implement with `rusqlite`         |
-| Redis      | 📝 Example  | Implement with `redis-rs`         |
-| Sled       | 📝 Example  | Use existing `popsub_persistence` |
+| In-Memory  | Built in    | Default, for development and tests |
+| PostgreSQL | Built in    | `PostgresUserStore`, behind the `postgres` feature |
+| SQLite     | Example     | Implement with `rusqlite`         |
+| Redis      | Example     | Implement with `redis-rs`         |
+| Sled       | Example     | Use existing `popsub_persistence` |
 
 ### PostgreSQL setup
 
@@ -238,9 +238,9 @@ Usernames must be 3 to 32 letters, digits, `_`, `.` or `-`. Passwords must be at
 
 ## Security Considerations
 
-- **Password Hashing**: Argon2id is used for password hashing (OWASP recommended)
-- **JWT Secrets**: Use strong, randomly generated secrets in production
-- **Token Expiration**: Configure appropriate expiration times
+- **Password Hashing**: Passwords are hashed with Argon2id, the algorithm OWASP recommends
+- **JWT Secrets**: Use a long random secret. The published defaults are reported by `AuthConfig::insecure_defaults`
+- **Token Expiration**: Tokens last 24 hours by default; set `with_expiration` to suit your clients. Removing or disabling a user does not revoke tokens already issued, but topic checks refuse that user straight away
 - **HTTPS**: Always use TLS in production to protect tokens in transit
 
 ## License

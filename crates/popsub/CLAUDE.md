@@ -1,6 +1,6 @@
 # popsub (binary)
 
-The CLI. Loads config, builds the broker, spawns the retry loop and runs the WebSocket server until Ctrl+C. Also has a `client` subcommand and `examples/simple_client.rs` that walk through login, auth, subscribe and publish.
+The CLI. Loads config, refuses to start on a non-loopback host while published default secrets are set (warns on localhost), builds the broker, spawns the retry loop and runs the WebSocket server until Ctrl+C. Also has a `client` subcommand and `examples/simple_client.rs` that walk through login, auth, subscribe and publish.
 
 ## Structure
 
