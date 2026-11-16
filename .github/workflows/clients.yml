@@ -46,3 +46,42 @@ jobs:
           npm pack --dry-run
       - name: Run the scenario suite
         run: target/debug/popsub-scenarios --driver "node clients/typescript/dist/driver.js"
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-scenarios-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-scenarios-
+      - name: Build the scenario suite
+        run: cargo build -p popsub_scenarios
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Format, lint, type check and test
+        working-directory: clients/python
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+          uv run pytest
+      - name: Build the package
+        working-directory: clients/python
+        run: uv build
+      - name: Run the scenario suite
+        run: target/debug/popsub-scenarios --driver "uv run --project clients/python python -m popsub._driver"

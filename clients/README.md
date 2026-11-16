@@ -4,6 +4,7 @@
 |---|---|---|
 | Rust | [`crates/popsub_sdk`](../crates/popsub_sdk) | Passes the scenario suite |
 | TypeScript (browsers, Node 22+) | [`clients/typescript`](typescript) | Passes the scenario suite |
+| Python 3.10+ | [`clients/python`](python) | Passes the scenario suite |
 
 Each client's README covers installing it, its API, and its own checks. CI (`.github/workflows/clients.yml`) runs every client's lint, type check and tests and the whole scenario suite against it, on the oldest and newest language versions it supports.
 
@@ -11,6 +12,7 @@ Each client's README covers installing it, its API, and its own checks. CI (`.gi
 |---|---|
 | Rust | `target/debug/popsub-sdk-driver` |
 | TypeScript | `node clients/typescript/dist/driver.js` (build it with `npm run build` in `clients/typescript`) |
+| Python | `uv run --project clients/python python -m popsub._driver` |
 
 Every client library behaves the same way, and proves it by passing one shared scenario suite (below). The wire protocol is in [`docs/DESIGN.md`](../docs/DESIGN.md) section 4, with JSON Schemas in [`docs/protocol/`](../docs/protocol).
 
