@@ -71,7 +71,6 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - The JWT secret default differs between code (`default_secret`), `config/default.toml` (`a_very_secret_key`) and the auth crate (`change_me_in_production`). All three are treated as published; the server refuses them on non-loopback hosts.
 - Rate limits key on the socket address. Behind a proxy every client shares one address.
 - There's no protocol message to grant topics, so self-registered users with the default `none` role can do nothing until their role is changed in code.
-- `popsub_utils` depends on `config` 0.13 while `popsub_config` uses 0.15.
 - Locally, port 8080 is often taken by another dev server. Use `PORT=8090`.
 
 ## Git

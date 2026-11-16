@@ -13,7 +13,7 @@ use clap::Parser;
 use popsub_broker::{Broker, SharedBroker};
 use popsub_config::load_config;
 use popsub_persistence::Persistence;
-use popsub_transport::Server;
+use popsub_transport::{ClientMessage, Server, ServerMessage};
 use tracing::{error, info, warn};
 
 /// Where the server keeps its message history, relative to the working directory.
@@ -28,11 +28,20 @@ const MAX_MESSAGES_PER_TOPIC: usize = 1000;
 enum Command {
     /// Start the WebSocket server
     Server,
-    /// Run the example client (connects, login, auth, subscribe, publish)
+    /// Log in, subscribe to a topic, publish to it and print what comes back
     Client {
-        /// WebSocket server URL to connect to (default: ws://127.0.0.1:8080)
+        /// WebSocket URL of the server
         #[arg(long, default_value = "ws://127.0.0.1:8080")]
         url: String,
+        /// Username to log in as
+        #[arg(long, default_value = "admin")]
+        username: String,
+        /// Password to log in with
+        #[arg(long, default_value = "password")]
+        password: String,
+        /// Topic to subscribe and publish to
+        #[arg(long, default_value = "chat")]
+        topic: String,
     },
 }
 
@@ -48,7 +57,12 @@ async fn main() -> ExitCode {
 
     let result = match Command::parse() {
         Command::Server => run_server().await,
-        Command::Client { url } => run_client(&url).await,
+        Command::Client {
+            url,
+            username,
+            password,
+            topic,
+        } => run_client(&url, &username, &password, &topic).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -95,10 +109,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let ttl = i64::try_from(config.broker.message_ttl_secs).unwrap_or(i64::MAX);
     let persistence = Persistence::new(DATA_DIR, Some(ttl), Some(MAX_MESSAGES_PER_TOPIC))
         .map_err(|e| format!("can't open the message store in {DATA_DIR}: {e}. Is another PopSub server running from this directory?"))?;
-    let broker = SharedBroker::new(Broker::new_with_persistence(
-        persistence,
-        config.broker.clone(),
-    ));
+    let broker = SharedBroker::new(Broker::new(persistence, config.broker.clone()));
     tokio::spawn(broker.clone().run_retry_loop());
     let server = Server::from_settings(broker, &config.server).await;
 
@@ -109,67 +120,137 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Runs a short demo session against a PopSub server and prints the replies.
+/// Runs a short session against a PopSub server and prints each reply.
 ///
-/// Logs in as `admin` with password `password` (these match only the default
-/// settings), reads one reply, and if it carries a `token`, authenticates with
-/// it, prints the auth reply, subscribes to `chat`, publishes `Hello from
-/// example` to `chat` at QoS 0 and prints the next text frame. If the login
-/// reply has no token, it returns without doing anything else. The steps are
-/// the same as `examples/simple_client.rs`, which uses a different frame
-/// shape and also acknowledges and unsubscribes.
+/// Logs in, authenticates with the returned token, subscribes to `topic`,
+/// publishes `Hello from popsub client` to it at QoS 0, and prints the
+/// delivered message. Frames are built from the transport's own message
+/// types, so the client always speaks the current protocol. The defaults
+/// match the default server settings; pass `--username` and `--password` for
+/// any other account.
 ///
 /// Args:
 ///     url: WebSocket URL of the server, such as `ws://127.0.0.1:8080`.
-///
-/// Returns:
-///     Unit once the session has run.
+///     username: The account to log in as.
+///     password: The account's password.
+///     topic: The topic to subscribe and publish to.
 ///
 /// Raises:
-///     tungstenite::Error::Url: When `url` is not a valid WebSocket URL.
-///     tungstenite::Error::Io: When the connection can't be opened.
-///     tungstenite::Error::ConnectionClosed: When a frame is sent after the server closed the connection.
-///     serde_json::Error: When the login reply is not valid JSON.
-async fn run_client(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use futures_util::{SinkExt, StreamExt};
-    use serde_json::json;
-    use tokio_tungstenite::connect_async;
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
+///     tungstenite::Error: When the connection can't be opened or drops.
+///     serde_json::Error: When a frame can't be encoded or decoded.
+///     String: When login, auth or subscribe is refused, or the server closes
+///         the connection before replying.
+async fn run_client(
+    url: &str,
+    username: &str,
+    password: &str,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut ws, _response) = tokio_tungstenite::connect_async(url).await?;
 
-    let (mut ws_stream, _response) = connect_async(url).await?;
+    let reply = request(
+        &mut ws,
+        &ClientMessage::Login {
+            username: username.to_string(),
+            password: password.to_string(),
+        },
+    )
+    .await?;
+    let ServerMessage::LoginResponse { token } = reply else {
+        return Err(format!("login refused: {reply:?}").into());
+    };
+    println!("Logged in as {username}");
 
-    let login = json!({ "type": "login", "username": "admin", "password": "password" });
-    ws_stream
-        .send(WsMessage::Text(login.to_string().into()))
+    let reply = request(&mut ws, &ClientMessage::Auth { token }).await?;
+    if !matches!(reply, ServerMessage::Authenticated {}) {
+        return Err(format!("auth refused: {reply:?}").into());
+    }
+    println!("Authenticated");
+
+    send(
+        &mut ws,
+        &ClientMessage::Subscribe {
+            topic: topic.to_string(),
+        },
+    )
+    .await?;
+    send(
+        &mut ws,
+        &ClientMessage::Publish {
+            topic: topic.to_string(),
+            payload: "Hello from popsub client".to_string(),
+            message_id: None,
+            qos: Some(0),
+        },
+    )
+    .await?;
+    let delivered = next_text(&mut ws).await?;
+    if delivered.contains("\"type\":\"error\"") {
+        return Err(format!("subscribe or publish refused: {delivered}").into());
+    }
+    println!("Received on {topic}: {delivered}");
+    Ok(())
+}
+
+/// The client side of a WebSocket connection, as returned by `connect_async`.
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Sends one protocol frame.
+///
+/// Args:
+///     ws: The connection to send on.
+///     msg: The frame to send.
+///
+/// Raises:
+///     serde_json::Error: When the frame can't be encoded.
+///     tungstenite::Error: When the connection drops.
+async fn send(ws: &mut Socket, msg: &ClientMessage) -> Result<(), Box<dyn std::error::Error>> {
+    use futures_util::SinkExt;
+    let text = serde_json::to_string(msg)?;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
         .await?;
+    Ok(())
+}
 
-    if let Some(Ok(WsMessage::Text(msg))) = ws_stream.next().await {
-        println!("Login response: {msg}");
-        let v: serde_json::Value = serde_json::from_str(&msg)?;
-        if let Some(token) = v.get("token").and_then(|t| t.as_str()) {
-            let auth = json!({ "type": "auth", "token": token });
-            ws_stream
-                .send(WsMessage::Text(auth.to_string().into()))
-                .await?;
-            if let Some(Ok(WsMessage::Text(auth_resp))) = ws_stream.next().await {
-                println!("Auth response: {auth_resp}");
-            }
-
-            let subscribe = json!({ "type": "subscribe", "topic": "chat" });
-            ws_stream
-                .send(WsMessage::Text(subscribe.to_string().into()))
-                .await?;
-
-            let publish = json!({ "type": "publish", "topic": "chat", "payload": "Hello from example", "qos": 0 });
-            ws_stream
-                .send(WsMessage::Text(publish.to_string().into()))
-                .await?;
-
-            if let Some(Ok(WsMessage::Text(incoming))) = ws_stream.next().await {
-                println!("Incoming: {incoming}");
-            }
+/// Waits for the next text frame, skipping pings and other control frames.
+///
+/// Args:
+///     ws: The connection to read from.
+///
+/// Returns:
+///     The frame's text.
+///
+/// Raises:
+///     tungstenite::Error: When the connection drops.
+///     String: When the server closes the connection first.
+async fn next_text(ws: &mut Socket) -> Result<String, Box<dyn std::error::Error>> {
+    use futures_util::StreamExt;
+    while let Some(frame) = ws.next().await {
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = frame? {
+            return Ok(text.to_string());
         }
     }
+    Err("the server closed the connection".into())
+}
 
-    Ok(())
+/// Sends a frame and decodes the server's reply.
+///
+/// Args:
+///     ws: The connection to use.
+///     msg: The frame to send.
+///
+/// Returns:
+///     The server's reply.
+///
+/// Raises:
+///     serde_json::Error: When a frame can't be encoded or decoded.
+///     tungstenite::Error: When the connection drops.
+///     String: When the server closes the connection before replying.
+async fn request(
+    ws: &mut Socket,
+    msg: &ClientMessage,
+) -> Result<ServerMessage, Box<dyn std::error::Error>> {
+    send(ws, msg).await?;
+    Ok(serde_json::from_str(&next_text(ws).await?)?)
 }

@@ -34,10 +34,7 @@ async fn start_server(
     let temp_dir = tempdir().expect("Failed to create temp dir");
     let persistence = Persistence::new(temp_dir.path().to_str().unwrap(), None, None)
         .expect("Failed to create persistence");
-    let broker = SharedBroker::new(Broker::new_with_persistence(
-        persistence,
-        settings.broker.clone(),
-    ));
+    let broker = SharedBroker::new(Broker::new(persistence, settings.broker.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");

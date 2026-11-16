@@ -14,7 +14,7 @@ mod tests;
 #[cfg(test)]
 mod websocket_tests;
 
-pub use message::{Claims, ClientMessage, ServerMessage};
+pub use message::{ClientMessage, ServerMessage};
 pub use websocket::{RateLimiters, Server, registration_role};
 
 pub use popsub_auth::service::UserBuilder;

@@ -547,8 +547,8 @@ impl Session {
     ///     PopSubError::Client: When the outgoing channel is closed.
     async fn register(&self, username: &str, password: &str) -> Result<Flow> {
         let limiter = &self.server.limiters.register_limiter;
-        if !limiter.try_acquire(&self.peer_ip).await {
-            let retry_after = limiter.retry_after(&self.peer_ip).await.unwrap_or(1);
+        if !limiter.try_acquire(&self.peer_ip) {
+            let retry_after = limiter.retry_after(&self.peer_ip).unwrap_or(1);
             warn!(client_id = %self.client_id, peer_ip = %self.peer_ip, retry_after, "registration rate limited");
             self.reply(ServerMessage::RegisterResponse {
                 success: false,
@@ -601,9 +601,9 @@ impl Session {
     async fn login(&self, username: &str, password: &str) -> Result<Flow> {
         let limiters = &self.server.limiters;
         let pair_key = format!("{}|{username}", self.peer_ip);
-        let lockout = match limiters.ip_login_limiter.check_status(&self.peer_ip).await {
+        let lockout = match limiters.ip_login_limiter.check_status(&self.peer_ip) {
             LoginStatus::LockedOut { retry_after } => Some(retry_after),
-            _ => match limiters.login_limiter.check_status(&pair_key).await {
+            _ => match limiters.login_limiter.check_status(&pair_key) {
                 LoginStatus::LockedOut { retry_after } => Some(retry_after),
                 _ => None,
             },
@@ -620,17 +620,14 @@ impl Session {
         match result {
             Ok(token) => {
                 info!(client_id = %self.client_id, username, "login successful");
-                limiters.login_limiter.record_success(&pair_key).await;
+                limiters.login_limiter.record_success(&pair_key);
                 self.reply(ServerMessage::LoginResponse { token })?;
             }
             Err(e) => {
                 warn!(client_id = %self.client_id, username, "login failed: {}", e);
                 if matches!(e, AuthError::InvalidCredentials) {
-                    limiters.login_limiter.record_failure(&pair_key).await;
-                    limiters
-                        .ip_login_limiter
-                        .record_failure(&self.peer_ip)
-                        .await;
+                    limiters.login_limiter.record_failure(&pair_key);
+                    limiters.ip_login_limiter.record_failure(&self.peer_ip);
                 }
                 self.reply_error("invalid credentials")?;
             }
@@ -778,13 +775,7 @@ impl Session {
             self.reply_error(format!("not authorized to publish to '{topic}'"))?;
             return Ok(Flow::Continue);
         }
-        if !self
-            .server
-            .limiters
-            .message_limiter
-            .try_acquire(&username)
-            .await
-        {
+        if !self.server.limiters.message_limiter.try_acquire(&username) {
             warn!(client_id = %self.client_id, username, "message rate limited");
             self.reply_error("Rate limited. Too many messages.")?;
             return Ok(Flow::Continue);
@@ -912,10 +903,10 @@ mod limiter_tests {
 
     /// Checks that a fresh message bucket survives the default prune but is
     /// dropped once its idle limit is zero.
-    #[tokio::test]
-    async fn pruning_forgets_idle_message_buckets() {
+    #[test]
+    fn pruning_forgets_idle_message_buckets() {
         let limiters = RateLimiters::default();
-        limiters.message_limiter.try_acquire("alice").await;
+        limiters.message_limiter.try_acquire("alice");
         assert_eq!(limiters.message_limiter.tracked_keys(), 1);
         assert_eq!(limiters.prune_idle(), 0);
         assert_eq!(limiters.message_limiter.prune_idle(Duration::ZERO), 1);

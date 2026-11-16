@@ -2,19 +2,20 @@
 //!
 //! After `max_attempts` failures a key is locked out for `lockout_duration`.
 //! With exponential backoff on, each further lockout doubles that duration
-//! up to `max_lockout_duration`. A successful login clears the failures and
-//! the backoff history. The transport keys it on `address|username`.
+//! up to `max_lockout_duration`. A successful login forgets the key entirely,
+//! including its backoff history. The transport keys one limiter on
+//! `address|username` and another on the address alone.
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use tracing::{info, warn};
 
-/// Result of checking whether a key may attempt a login.
+use crate::keyed::KeyedState;
+
+/// Whether a key may attempt a login now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginStatus {
-    /// The key is not locked out.
+    /// The key may attempt a login.
     Allowed,
     /// The key is locked out.
     LockedOut {
@@ -23,37 +24,67 @@ pub enum LoginStatus {
     },
 }
 
-/// Failure and lockout history for one key.
+/// One key's failure history.
 #[derive(Default)]
 struct LoginState {
-    /// Failed attempts in the current cycle. Reset by the first failure after a lockout ends.
+    /// Failures since the last lockout ended or the last success.
     failures: u32,
-    /// Lockouts so far, used as the exponent for backoff. Cleared only by a successful login.
+    /// How many times the key has been locked out, for backoff.
     lockout_count: u32,
-    /// Time of the last failure, used by `prune_idle` to decide whether the key is idle.
+    /// When the last failure happened, used to find idle keys.
     last_failure: Option<Instant>,
-    /// When the current lockout ends, if the key has been locked out.
+    /// When the current lockout ends, if there is one.
     locked_until: Option<Instant>,
 }
 
-/// Settings for `LoginRateLimiter`.
+impl LoginState {
+    /// The lockout end time if it is still in the future.
+    ///
+    /// Args:
+    ///     now: The current time.
+    ///
+    /// Returns:
+    ///     When the active lockout ends, or `None` when there isn't one.
+    fn active_lockout(&self, now: Instant) -> Option<Instant> {
+        self.locked_until.filter(|&until| now < until)
+    }
+
+    /// Failures that still count towards the next lockout.
+    ///
+    /// A lockout that has ended wipes the slate, even before the next
+    /// failure is recorded.
+    ///
+    /// Args:
+    ///     now: The current time.
+    ///
+    /// Returns:
+    ///     The failure count in effect now.
+    fn effective_failures(&self, now: Instant) -> u32 {
+        match self.locked_until {
+            Some(until) if now >= until => 0,
+            _ => self.failures,
+        }
+    }
+}
+
+/// Settings for a `LoginRateLimiter`.
 #[derive(Debug, Clone)]
 pub struct LoginRateLimiterConfig {
-    /// Failed attempts that trigger a lockout.
+    /// Failures allowed before a lockout.
     pub max_attempts: u32,
-    /// Length of the first lockout, and of every lockout without backoff.
+    /// Length of the first lockout.
     pub lockout_duration: Duration,
     /// Whether each further lockout doubles in length.
     pub exponential_backoff: bool,
-    /// Upper limit on a lockout's length when backoff is on.
+    /// The longest a lockout can grow to with backoff.
     pub max_lockout_duration: Duration,
 }
 
 impl Default for LoginRateLimiterConfig {
-    /// Returns 5 attempts, a 5 minute lockout, backoff on and a 1 hour maximum lockout.
+    /// Builds the defaults: 5 attempts, a 5 minute lockout, backoff on, capped at 1 hour.
     ///
     /// Returns:
-    ///     The default configuration.
+    ///     The default config.
     fn default() -> Self {
         Self {
             max_attempts: 5,
@@ -64,30 +95,29 @@ impl Default for LoginRateLimiterConfig {
     }
 }
 
-/// Builder for `LoginRateLimiter`, starting from `LoginRateLimiterConfig::default()`.
+/// Builds a `LoginRateLimiter` one setting at a time, starting from the defaults.
+#[derive(Default)]
 pub struct LoginRateLimiterBuilder {
-    /// The configuration being built.
+    /// The settings so far.
     config: LoginRateLimiterConfig,
 }
 
 impl LoginRateLimiterBuilder {
-    /// Creates a builder holding the default configuration.
+    /// Starts from `LoginRateLimiterConfig::default()`.
     ///
     /// Returns:
-    ///     A new builder.
+    ///     A builder with the default settings.
     pub fn new() -> Self {
-        Self {
-            config: LoginRateLimiterConfig::default(),
-        }
+        Self::default()
     }
 
-    /// Sets how many failed attempts trigger a lockout.
+    /// Sets how many failures are allowed before a lockout.
     ///
     /// Args:
-    ///     attempts: The number of failures allowed before the key is locked out.
+    ///     attempts: The failure limit.
     ///
     /// Returns:
-    ///     The builder, for chaining.
+    ///     The builder.
     pub fn max_attempts(mut self, attempts: u32) -> Self {
         self.config.max_attempts = attempts;
         self
@@ -96,472 +126,300 @@ impl LoginRateLimiterBuilder {
     /// Sets the length of the first lockout.
     ///
     /// Args:
-    ///     duration: How long a key stays locked out the first time, and every time without backoff.
+    ///     duration: The lockout length.
     ///
     /// Returns:
-    ///     The builder, for chaining.
+    ///     The builder.
     pub fn lockout_duration(mut self, duration: Duration) -> Self {
         self.config.lockout_duration = duration;
         self
     }
 
-    /// Turns exponential backoff on or off.
+    /// Turns doubling of repeated lockouts on or off.
     ///
     /// Args:
     ///     enabled: Whether each further lockout doubles in length.
     ///
     /// Returns:
-    ///     The builder, for chaining.
+    ///     The builder.
     pub fn exponential_backoff(mut self, enabled: bool) -> Self {
         self.config.exponential_backoff = enabled;
         self
     }
 
-    /// Sets the upper limit on a lockout's length when backoff is on.
+    /// Sets the longest a lockout can grow to with backoff.
     ///
     /// Args:
-    ///     duration: The longest a single lockout can last.
+    ///     duration: The cap.
     ///
     /// Returns:
-    ///     The builder, for chaining.
+    ///     The builder.
     pub fn max_lockout_duration(mut self, duration: Duration) -> Self {
         self.config.max_lockout_duration = duration;
         self
     }
 
-    /// Creates the limiter from the configuration built so far.
+    /// Builds the limiter.
     ///
     /// Returns:
-    ///     A limiter that tracks no keys yet.
+    ///     A limiter with these settings and no keys.
     pub fn build(self) -> LoginRateLimiter {
-        LoginRateLimiter {
-            config: self.config,
-            states: DashMap::new(),
-        }
+        LoginRateLimiter::with_config(self.config)
     }
 }
 
-impl Default for LoginRateLimiterBuilder {
-    /// Creates a builder holding the default configuration.
-    ///
-    /// Returns:
-    ///     A new builder.
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Login rate limiter that locks a key out after repeated failures.
+/// Counts failed logins per key and locks keys out after too many.
 ///
-/// Callers check the key before each attempt and record the outcome after
-/// it. Every method that takes a key starts tracking it if it is new, so
-/// call `prune_idle` periodically.
+/// Call `check_status` before an attempt, `record_failure` after a failed
+/// one and `record_success` after a successful one. The read methods never
+/// create state for a key they haven't seen.
 ///
 /// Example:
 ///
-/// ```rust,ignore
+/// ```rust
 /// use popsub_ratelimit::LoginRateLimiter;
 /// use std::time::Duration;
 ///
 /// let limiter = LoginRateLimiter::builder()
-///     .max_attempts(5)
+///     .max_attempts(2)
 ///     .lockout_duration(Duration::from_secs(300))
-///     .exponential_backoff(true)
 ///     .build();
-///
-/// let allowed = limiter.check_allowed("username").await;
-/// limiter.record_failure("username").await;
-/// limiter.record_success("username").await;
+/// limiter.record_failure("alice");
+/// limiter.record_failure("alice");
+/// assert!(!limiter.check_allowed("alice"));
 /// ```
 pub struct LoginRateLimiter {
-    /// Attempt limit and lockout settings.
+    /// The limits.
     config: LoginRateLimiterConfig,
-    /// Failure and lockout history by key.
-    states: DashMap<String, Mutex<LoginState>>,
+    /// Every key's failure history.
+    states: KeyedState<LoginState>,
+}
+
+impl Default for LoginRateLimiter {
+    /// Builds a limiter with `LoginRateLimiterConfig::default()`.
+    ///
+    /// Returns:
+    ///     A limiter with no keys.
+    fn default() -> Self {
+        Self::with_config(LoginRateLimiterConfig::default())
+    }
 }
 
 impl LoginRateLimiter {
-    /// Creates a limiter with the default configuration.
+    /// Builds a limiter with the default settings.
     ///
     /// Returns:
-    ///     A limiter that tracks no keys yet.
+    ///     A limiter with no keys.
     pub fn new() -> Self {
-        Self::builder().build()
+        Self::default()
     }
 
-    /// Creates a builder for a custom configuration.
+    /// Starts a builder from the default settings.
     ///
     /// Returns:
-    ///     A builder holding the default configuration.
+    ///     A builder.
     pub fn builder() -> LoginRateLimiterBuilder {
         LoginRateLimiterBuilder::new()
     }
 
-    /// Creates a limiter with the given configuration.
+    /// Builds a limiter with the given settings.
     ///
     /// Args:
-    ///     config: The attempt limit and lockout settings.
+    ///     config: The limits to apply.
     ///
     /// Returns:
-    ///     A limiter that tracks no keys yet.
+    ///     A limiter with no keys.
     pub fn with_config(config: LoginRateLimiterConfig) -> Self {
         Self {
             config,
-            states: DashMap::new(),
+            states: KeyedState::new(),
         }
     }
 
-    /// Returns the state for `key`, inserting an empty one if the key is new.
+    /// Forgets keys that aren't locked out and haven't failed for `max_idle`.
     ///
-    /// Uses the map's entry API so a concurrent `prune_idle` can't remove the
-    /// key between the lookup and the insert.
-    ///
-    /// Args:
-    ///     key: The key to look up.
-    ///
-    /// Returns:
-    ///     A read guard on the key's map entry.
-    fn get_or_create_state(
-        &self,
-        key: &str,
-    ) -> dashmap::mapref::one::Ref<'_, String, Mutex<LoginState>> {
-        self.states
-            .entry(key.to_string())
-            .or_insert_with(|| Mutex::new(LoginState::default()))
-            .downgrade()
-    }
-
-    /// Forgets keys that are not locked out and have had no failure for
-    /// `max_idle`.
-    ///
-    /// Without this, every username or address ever tried stays in memory.
-    /// Pruning also forgets the exponential backoff history for that key, so
-    /// choose `max_idle` at least as long as the maximum lockout. Panics if a
-    /// key's mutex is poisoned.
+    /// Pruning also forgets the key's backoff history, so choose `max_idle`
+    /// at least as long as the maximum lockout.
     ///
     /// Args:
     ///     max_idle: How long a key must have been quiet before it is removed.
     ///
     /// Returns:
     ///     How many fewer keys are tracked afterwards. Approximate when other
-    ///     tasks add keys at the same time.
+    ///     threads add keys at the same time.
     pub fn prune_idle(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
-        let before = self.states.len();
-        self.states.retain(|_, state| {
-            let state = state.get_mut().unwrap();
-            let locked = state.locked_until.is_some_and(|until| now < until);
+        self.states.retain(|state| {
             let recent = state
                 .last_failure
                 .is_some_and(|last| now.duration_since(last) < max_idle);
-            locked || recent
-        });
-        before.saturating_sub(self.states.len())
+            state.active_lockout(now).is_some() || recent
+        })
     }
 
-    /// Reports how many keys the limiter currently holds state for.
+    /// Number of keys currently tracked.
     ///
     /// Returns:
-    ///     The number of tracked keys.
+    ///     The key count.
     pub fn tracked_keys(&self) -> usize {
         self.states.len()
     }
 
-    /// Reports whether `key` may attempt a login now.
+    /// Whether the key may attempt a login now.
     ///
     /// Args:
     ///     key: The key to check.
     ///
     /// Returns:
-    ///     `true` if the key is not locked out, `false` if it is.
-    pub async fn check_allowed(&self, key: &str) -> bool {
-        matches!(self.check_status(key).await, LoginStatus::Allowed)
+    ///     `true` unless the key is locked out.
+    pub fn check_allowed(&self, key: &str) -> bool {
+        self.check_status(key) == LoginStatus::Allowed
     }
 
-    /// Reports whether `key` is locked out and for how long.
-    ///
-    /// Panics if the key's mutex is poisoned.
+    /// Whether the key may attempt a login now, and if not, for how long.
     ///
     /// Args:
     ///     key: The key to check.
     ///
     /// Returns:
-    ///     `LoginStatus::Allowed`, or `LoginStatus::LockedOut` with the
-    ///     seconds left, rounded down and at least 1.
-    pub async fn check_status(&self, key: &str) -> LoginStatus {
-        let state_ref = self.get_or_create_state(key);
-        let state = state_ref.lock().unwrap();
-
-        if let Some(locked_until) = state.locked_until {
-            let now = Instant::now();
-            if now < locked_until {
-                let retry_after = (locked_until - now).as_secs().max(1);
-                return LoginStatus::LockedOut { retry_after };
-            }
-        }
-
-        LoginStatus::Allowed
-    }
-
-    /// Records a failed login for `key` and locks it out once it reaches `max_attempts`.
-    ///
-    /// If a previous lockout has ended, the failure count starts again from
-    /// zero but the lockout count is kept, so each new lockout cycle gets a
-    /// fresh `max_attempts` while backoff still grows. Once the count reaches
-    /// `max_attempts` the lockout count goes up and the key is locked for
-    /// `lockout_duration`, or with backoff for `lockout_duration` times
-    /// 2 to the power of (lockout count minus 1), capped at
-    /// `max_lockout_duration`. A failure recorded while the key is still
-    /// locked also counts, and starts a new lockout from now (a longer one
-    /// when backoff is on). Panics
-    /// if the key's mutex is poisoned.
-    ///
-    /// Args:
-    ///     key: The key the failed attempt belongs to.
-    pub async fn record_failure(&self, key: &str) {
-        let state_ref = self.get_or_create_state(key);
-        let mut state = state_ref.lock().unwrap();
+    ///     `Allowed`, or `LockedOut` with the whole seconds left.
+    pub fn check_status(&self, key: &str) -> LoginStatus {
         let now = Instant::now();
+        self.states
+            .read(key, |state| state.active_lockout(now))
+            .flatten()
+            .map_or(LoginStatus::Allowed, |until| LoginStatus::LockedOut {
+                retry_after: (until - now).as_secs().max(1),
+            })
+    }
 
-        if let Some(locked_until) = state.locked_until
-            && now >= locked_until
+    /// Records a failed login and locks the key out if it has reached the limit.
+    ///
+    /// A lockout that has already ended resets the failure count first, so
+    /// each lockout is followed by a fresh set of attempts, while the backoff
+    /// count keeps growing.
+    ///
+    /// Args:
+    ///     key: The key that failed.
+    pub fn record_failure(&self, key: &str) {
+        let now = Instant::now();
+        self.states.update(key, LoginState::default, |state| {
+            if state.locked_until.is_some() && state.active_lockout(now).is_none() {
+                state.locked_until = None;
+                state.failures = 0;
+            }
+            state.failures += 1;
+            state.last_failure = Some(now);
+            if state.failures >= self.config.max_attempts {
+                state.lockout_count += 1;
+                let lockout = self.lockout_length(state.lockout_count);
+                state.locked_until = Some(now + lockout);
+                warn!(key = %key, failures = state.failures, lockout_secs = lockout.as_secs(), "locked out after too many failed logins");
+            }
+        });
+    }
+
+    /// The length of the `count`th lockout, applying backoff and the cap.
+    ///
+    /// Args:
+    ///     count: Which lockout this is, starting at 1.
+    ///
+    /// Returns:
+    ///     How long the lockout lasts.
+    fn lockout_length(&self, count: u32) -> Duration {
+        if !self.config.exponential_backoff {
+            return self.config.lockout_duration;
+        }
+        let factor = 2_u32.saturating_pow(count.saturating_sub(1));
+        self.config
+            .lockout_duration
+            .saturating_mul(factor)
+            .min(self.config.max_lockout_duration)
+    }
+
+    /// Records a successful login by forgetting the key, failures and backoff included.
+    ///
+    /// Args:
+    ///     key: The key that succeeded.
+    pub fn record_success(&self, key: &str) {
+        if self
+            .states
+            .read(key, |state| state.failures > 0)
+            .unwrap_or(false)
         {
-            state.locked_until = None;
-            state.failures = 0;
+            info!(key = %key, "login succeeded, clearing failed attempts");
         }
-
-        state.failures += 1;
-        state.last_failure = Some(now);
-
-        if state.failures >= self.config.max_attempts {
-            state.lockout_count += 1;
-
-            let lockout_duration = if self.config.exponential_backoff {
-                let base_millis = self.config.lockout_duration.as_millis() as u64;
-                let exponential_millis = base_millis
-                    .saturating_mul(2_u64.saturating_pow(state.lockout_count.saturating_sub(1)));
-                let max_millis = self.config.max_lockout_duration.as_millis() as u64;
-                Duration::from_millis(exponential_millis.min(max_millis))
-            } else {
-                self.config.lockout_duration
-            };
-
-            state.locked_until = Some(now + lockout_duration);
-            warn!(
-                key = %key,
-                failures = state.failures,
-                lockout_secs = lockout_duration.as_secs(),
-                "Account locked due to too many failed attempts"
-            );
-        }
+        self.states.remove(key);
     }
 
-    /// Records a successful login for `key`.
-    ///
-    /// Clears the failure count, the lockout count and any lockout, so the
-    /// next lockout starts again at `lockout_duration`. Panics if the key's
-    /// mutex is poisoned.
-    ///
-    /// Args:
-    ///     key: The key that logged in.
-    pub async fn record_success(&self, key: &str) {
-        let state_ref = self.get_or_create_state(key);
-        let mut state = state_ref.lock().unwrap();
-
-        if state.failures > 0 || state.lockout_count > 0 {
-            info!(key = %key, previous_failures = state.failures, lockout_count = state.lockout_count, "Login successful, resetting failure count");
-        }
-
-        state.failures = 0;
-        state.lockout_count = 0;
-        state.last_failure = None;
-        state.locked_until = None;
-    }
-
-    /// Reports the failures recorded for `key` in the current cycle.
-    ///
-    /// After a lockout ends the old count is still reported until the next
-    /// failure resets it. Panics if the key's mutex is poisoned.
+    /// Failures that count towards the key's next lockout.
     ///
     /// Args:
     ///     key: The key to check.
     ///
     /// Returns:
-    ///     The number of failed attempts.
-    pub async fn failure_count(&self, key: &str) -> u32 {
-        let state_ref = self.get_or_create_state(key);
-        let state = state_ref.lock().unwrap();
-        state.failures
+    ///     The failure count, 0 for an unknown key or once a lockout has ended.
+    pub fn failure_count(&self, key: &str) -> u32 {
+        let now = Instant::now();
+        self.states
+            .read(key, |state| state.effective_failures(now))
+            .unwrap_or(0)
     }
 
-    /// Reports how many more failures `key` can have before it is locked out.
-    ///
-    /// After a lockout ends this still reports 0 until the next failure
-    /// starts a new cycle. Panics if the key's mutex is poisoned.
+    /// Failures the key can still make before it is locked out.
     ///
     /// Args:
     ///     key: The key to check.
     ///
     /// Returns:
-    ///     `max_attempts` minus the current failure count, at least 0.
-    pub async fn remaining_attempts(&self, key: &str) -> u32 {
-        let state_ref = self.get_or_create_state(key);
-        let state = state_ref.lock().unwrap();
-        self.config.max_attempts.saturating_sub(state.failures)
+    ///     The remaining attempts.
+    pub fn remaining_attempts(&self, key: &str) -> u32 {
+        self.config
+            .max_attempts
+            .saturating_sub(self.failure_count(key))
     }
 
-    /// Lifts any lockout on `key` and clears its failure count, as an admin action.
+    /// Lifts a lockout and clears the failures, keeping the backoff count.
     ///
-    /// The lockout count is kept, so a later lockout still uses the longer
-    /// backoff duration. Panics if the key's mutex is poisoned.
+    /// Keeping the backoff count means a key that is unlocked by hand and
+    /// keeps failing still gets longer lockouts. Unknown keys are ignored.
     ///
     /// Args:
     ///     key: The key to unlock.
-    pub async fn unlock(&self, key: &str) {
-        let state_ref = self.get_or_create_state(key);
-        let mut state = state_ref.lock().unwrap();
-        state.failures = 0;
-        state.last_failure = None;
-        state.locked_until = None;
-        info!(key = %key, "Account manually unlocked");
+    pub fn unlock(&self, key: &str) {
+        let unlocked = self.states.update_existing(key, |state| {
+            state.failures = 0;
+            state.last_failure = None;
+            state.locked_until = None;
+        });
+        if unlocked.is_some() {
+            info!(key = %key, "login lockout lifted by hand");
+        }
     }
 
-    /// Reports whether `key` is locked out now.
-    ///
-    /// Panics if the key's mutex is poisoned.
+    /// Whether the key is locked out now.
     ///
     /// Args:
     ///     key: The key to check.
     ///
     /// Returns:
-    ///     `true` if a lockout is in force.
-    pub async fn is_locked(&self, key: &str) -> bool {
-        let state_ref = self.get_or_create_state(key);
-        let state = state_ref.lock().unwrap();
-
-        if let Some(locked_until) = state.locked_until {
-            Instant::now() < locked_until
-        } else {
-            false
-        }
+    ///     `true` during a lockout.
+    pub fn is_locked(&self, key: &str) -> bool {
+        !self.check_allowed(key)
     }
 
-    /// Reports how long the lockout on `key` has left.
-    ///
-    /// Panics if the key's mutex is poisoned.
+    /// How long the key's lockout has left.
     ///
     /// Args:
     ///     key: The key to check.
     ///
     /// Returns:
-    ///     The time left, or `None` if the key is not locked out.
-    pub async fn lockout_remaining(&self, key: &str) -> Option<Duration> {
-        let state_ref = self.get_or_create_state(key);
-        let state = state_ref.lock().unwrap();
-
-        if let Some(locked_until) = state.locked_until {
-            let now = Instant::now();
-            if now < locked_until {
-                return Some(locked_until - now);
-            }
-        }
-        None
-    }
-}
-
-impl Default for LoginRateLimiter {
-    /// Creates a limiter with the default configuration.
-    ///
-    /// Returns:
-    ///     A limiter that tracks no keys yet.
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! Unit tests for `LoginRateLimiter`.
-
-    use super::*;
-
-    /// Checks that a lockout on one key does not affect another key.
-    #[tokio::test]
-    async fn test_separate_keys() {
-        let limiter = LoginRateLimiter::builder().max_attempts(2).build();
-
-        limiter.record_failure("user1").await;
-        limiter.record_failure("user1").await;
-
-        assert!(!limiter.check_allowed("user1").await);
-        assert!(limiter.check_allowed("user2").await);
-    }
-
-    /// Checks that `remaining_attempts` starts at `max_attempts` and drops by one per failure.
-    #[tokio::test]
-    async fn test_remaining_attempts() {
-        let limiter = LoginRateLimiter::builder().max_attempts(5).build();
-
-        assert_eq!(limiter.remaining_attempts("user").await, 5);
-        limiter.record_failure("user").await;
-        assert_eq!(limiter.remaining_attempts("user").await, 4);
-    }
-
-    /// Checks that `unlock` lifts an active lockout.
-    #[tokio::test]
-    async fn test_manual_unlock() {
-        let limiter = LoginRateLimiter::builder()
-            .max_attempts(1)
-            .lockout_duration(Duration::from_secs(3600))
-            .build();
-
-        limiter.record_failure("user").await;
-        assert!(!limiter.check_allowed("user").await);
-
-        limiter.unlock("user").await;
-        assert!(limiter.check_allowed("user").await);
-    }
-
-    /// Checks that the second lockout lasts longer than the first when backoff is on.
-    #[tokio::test]
-    async fn test_exponential_backoff() {
-        let limiter = LoginRateLimiter::builder()
-            .max_attempts(1)
-            .lockout_duration(Duration::from_millis(10))
-            .exponential_backoff(true)
-            .max_lockout_duration(Duration::from_secs(100))
-            .build();
-
-        limiter.record_failure("user").await;
-        assert!(!limiter.check_allowed("user").await);
-
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        assert!(limiter.check_allowed("user").await);
-
-        limiter.record_failure("user").await;
-        let remaining = limiter.lockout_remaining("user").await;
-        assert!(remaining.is_some());
-        assert!(remaining.unwrap() > Duration::from_millis(10));
-    }
-
-    /// Checks that `check_status` reports `Allowed`, then `LockedOut` with a retry time within the lockout.
-    #[tokio::test]
-    async fn test_login_status_details() {
-        let limiter = LoginRateLimiter::builder()
-            .max_attempts(1)
-            .lockout_duration(Duration::from_secs(60))
-            .build();
-
-        assert_eq!(limiter.check_status("user").await, LoginStatus::Allowed);
-
-        limiter.record_failure("user").await;
-
-        match limiter.check_status("user").await {
-            LoginStatus::LockedOut { retry_after } => {
-                assert!(retry_after > 0);
-                assert!(retry_after <= 60);
-            }
-            _ => panic!("Expected LockedOut status"),
-        }
+    ///     The time left, or `None` when the key isn't locked out.
+    pub fn lockout_remaining(&self, key: &str) -> Option<Duration> {
+        let now = Instant::now();
+        self.states
+            .read(key, |state| state.active_lockout(now))
+            .flatten()
+            .map(|until| until - now)
     }
 }

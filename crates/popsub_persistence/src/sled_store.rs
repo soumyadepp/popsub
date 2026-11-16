@@ -213,18 +213,3 @@ impl std::fmt::Debug for Persistence {
             .finish()
     }
 }
-
-impl Default for Persistence {
-    /// Opens `pubsub_db` in the working directory with a 3600 second TTL and
-    /// a cap of 1000 messages per topic.
-    ///
-    /// Panics if the database can't be opened, for example when another
-    /// process holds its lock.
-    ///
-    /// Returns:
-    ///     A handle to the default database.
-    fn default() -> Self {
-        Self::new("pubsub_db", Some(3600), Some(1000))
-            .expect("Failed to create default persistence")
-    }
-}

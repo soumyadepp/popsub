@@ -14,5 +14,7 @@ popsub_config = { path = "../popsub_config" }
 popsub_persistence = { path = "../popsub_persistence" }
 tokio = { version = "1.46.1", features = ["full"] }
 tungstenite = "0.28.0"
-tempfile = "3.20.0"
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.20.0"

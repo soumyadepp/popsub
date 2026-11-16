@@ -11,19 +11,18 @@ SERVER_ENV := SERVER_HOST=$(HOST) SERVER_PORT=$(PORT)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup build release server server-release client example demo \
+.PHONY: help setup build release server server-release client demo \
 	test test-crate fmt fmt-check lint ci doc watch coverage reset-data clean
 
 help:
 	@printf "PopSub make targets\n\n"
 	@printf "  Getting started\n"
 	@printf "    make setup           Install rustfmt, clippy and the pre-commit hooks\n"
-	@printf "    make demo            Start a server, run the example client against it, stop\n\n"
+	@printf "    make demo            Start a server, run the client against it, stop\n\n"
 	@printf "  Running\n"
 	@printf "    make server          Run the broker (HOST=$(HOST) PORT=$(PORT))\n"
 	@printf "    make server-release  Run an optimised build of the broker\n"
 	@printf "    make client          Run the CLI client against URL=$(URL)\n"
-	@printf "    make example         Run the simple_client example\n"
 	@printf "    make watch           Rebuild and restart the server on every change (cargo-watch)\n\n"
 	@printf "  Quality\n"
 	@printf "    make test            Run every test in the workspace\n"
@@ -60,9 +59,6 @@ server-release:
 
 client:
 	$(CARGO) run -p popsub $(JOBS_FLAG) -- client --url $(URL)
-
-example:
-	$(CARGO) run -p popsub --example simple_client $(JOBS_FLAG)
 
 demo: build
 	@set -e; \
