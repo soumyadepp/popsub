@@ -14,7 +14,7 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
 
 - `seq` starts at 1, increases by exactly 1 per topic and is never reused, even after every record is trimmed. `LogBounds` keeps `last_seq` for that reason.
 - Publish times never decrease along a log; `append` raises a late record's time to the previous one's. `seq_at` relies on it.
-- A repeated `(topic, publisher, message_id)` returns the original `seq` while that record is retained. Once trimmed, the same id appends a new record.
+- `append` returns the record as stored. A repeated `(topic, publisher, message_id)` returns the original record while it is retained; callers spot a duplicate by its `seq` being at or below the `last_seq` they saw before. Once trimmed, the same id appends a new record.
 - Cursors only move forward. Acks for subscriptions that don't exist are ignored, not errors.
 - Trimming always goes through `Retention::must_trim`, so every backend applies the same rules.
 - A durability level above `capabilities().max_durability` is refused with `Unsupported`, never silently downgraded.

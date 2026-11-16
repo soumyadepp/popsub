@@ -102,7 +102,8 @@ async fn append_many(storage: &impl Storage, topic: &str, count: u64) -> Vec<u64
         let seq = storage
             .append(topic, record(&format!("m{n}"), n as i64), Durability::None)
             .await
-            .expect("append");
+            .expect("append")
+            .seq;
         seqs.push(seq);
     }
     seqs
@@ -161,7 +162,8 @@ pub async fn seq_is_never_reused_after_trim<F: Fixture>(fixture: F) {
     let seq = storage
         .append("t", record("later", 20), Durability::None)
         .await
-        .expect("append");
+        .expect("append")
+        .seq;
     assert_eq!(seq, 4);
 }
 
@@ -274,40 +276,50 @@ pub async fn duplicate_message_id_returns_original_seq<F: Fixture>(fixture: F) {
     let first = storage
         .append("t", record("same", 1), Durability::None)
         .await
-        .expect("append");
+        .expect("append")
+        .seq;
     let again = storage
         .append("t", record("same", 2), Durability::None)
         .await
-        .expect("append");
+        .expect("append")
+        .seq;
     assert_eq!(first, again);
+    let original = storage.read("t", first, 1).await.expect("read");
+    assert_eq!(original[0].published_at_ms, 1);
     let mut from_bob = record("same", 3);
     from_bob.publisher = "bob".to_string();
     let other = storage
         .append("t", from_bob, Durability::None)
         .await
-        .expect("append");
+        .expect("append")
+        .seq;
     assert_eq!(other, first + 1);
     let elsewhere = storage
         .append("u", record("same", 4), Durability::None)
         .await
-        .expect("append");
+        .expect("append")
+        .seq;
     assert_eq!(elsewhere, 1);
     assert_eq!(all_seqs(&storage, "t").await, vec![1, 2]);
 }
 
-/// Checks that publish times never decrease along a log and that `seq_at`
-/// finds the first record at or after a time.
+/// Checks that publish times never decrease along a log, that `append`
+/// returns the time actually stored, and that `seq_at` finds the first
+/// record at or after a time.
 ///
 /// Args:
 ///     fixture: Opens the backend.
 pub async fn publish_times_never_decrease_and_seq_at_finds_them<F: Fixture>(fixture: F) {
     let storage = fixture.open().await;
+    let mut returned = Vec::new();
     for (id, at) in [("a", 100), ("b", 200), ("c", 150), ("d", 300)] {
-        storage
+        let stored = storage
             .append("t", record(id, at), Durability::None)
             .await
             .expect("append");
+        returned.push(stored.published_at_ms);
     }
+    assert_eq!(returned, vec![100, 200, 200, 300]);
     let times: Vec<i64> = storage
         .read("t", 1, 10)
         .await
@@ -520,12 +532,14 @@ pub async fn records_survive_reopen<F: Fixture>(fixture: F) {
     let again = storage
         .append("t", record("m2", 9), caps.max_durability)
         .await
-        .expect("append");
+        .expect("append")
+        .seq;
     assert_eq!(again, 2);
     let next = storage
         .append("t", record("m4", 9), caps.max_durability)
         .await
-        .expect("append");
+        .expect("append")
+        .seq;
     assert_eq!(next, 4);
 }
 

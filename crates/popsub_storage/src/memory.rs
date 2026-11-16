@@ -120,17 +120,26 @@ impl MessageLog for MemoryStorage {
     ///     durability: Must be `Durability::None`.
     ///
     /// Returns:
-    ///     The record's `seq`.
+    ///     The stored record, or the original one for a duplicate.
     ///
     /// Raises:
     ///     StorageError::Unsupported: When `durability` is stronger than `None`.
-    async fn append(&self, topic: &str, record: NewRecord, durability: Durability) -> Result<u64> {
+    async fn append(
+        &self,
+        topic: &str,
+        record: NewRecord,
+        durability: Durability,
+    ) -> Result<Record> {
         CAPABILITIES.check(durability)?;
         let mut logs = self.logs();
         let log = logs.entry(topic.to_string()).or_default();
         let key = (record.publisher.clone(), record.message_id.clone());
         if let Some(&seq) = log.ids.get(&key) {
-            return Ok(seq);
+            let first = log.bounds().first_seq;
+            let index = usize::try_from(seq - first).unwrap_or(usize::MAX);
+            if let Some(original) = log.records.get(index) {
+                return Ok(original.clone());
+            }
         }
         let seq = log.last_seq + 1;
         let published_at_ms = record.published_at_ms.max(log.last_published_at_ms);
@@ -139,8 +148,8 @@ impl MessageLog for MemoryStorage {
         log.last_seq = seq;
         log.last_published_at_ms = published_at_ms;
         log.ids.insert(key, seq);
-        log.records.push_back(stored);
-        Ok(seq)
+        log.records.push_back(stored.clone());
+        Ok(stored)
     }
 
     /// Copies up to `max` records out of the log, starting at `from`.

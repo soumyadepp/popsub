@@ -92,9 +92,10 @@ A new crate, `popsub_storage`, owns the types above, the traits below, the built
 ```rust
 #[async_trait]
 pub trait MessageLog: Send + Sync {
-    /// Appends a record and returns its seq, or the existing seq if
-    /// (topic, publisher, message_id) was already appended.
-    async fn append(&self, topic: &str, record: NewRecord, durability: Durability) -> Result<u64>;
+    /// Appends a record and returns it as stored (with its seq and final
+    /// publish time), or the original record if (topic, publisher,
+    /// message_id) is still retained.
+    async fn append(&self, topic: &str, record: NewRecord, durability: Durability) -> Result<Record>;
 
     /// Returns up to `max` records with seq >= from, in seq order.
     async fn read(&self, topic: &str, from: u64, max: usize) -> Result<Vec<Record>>;

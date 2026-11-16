@@ -180,13 +180,25 @@ fn duplicate_after_trim_is_a_new_record() {
             qos: 1,
             published_at_ms: 1,
         };
-        assert_eq!(storage.append("t", new(), Durability::None).await, Ok(1));
+        assert_eq!(
+            storage
+                .append("t", new(), Durability::None)
+                .await
+                .map(|r| r.seq),
+            Ok(1)
+        );
         let keep_none = Retention {
             max_messages: Some(0),
             ..Retention::default()
         };
         assert_eq!(storage.trim("t", &keep_none, 2).await, Ok(1));
-        assert_eq!(storage.append("t", new(), Durability::None).await, Ok(2));
+        assert_eq!(
+            storage
+                .append("t", new(), Durability::None)
+                .await
+                .map(|r| r.seq),
+            Ok(2)
+        );
         assert!(!storage.capabilities().persistent);
     });
 }

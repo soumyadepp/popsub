@@ -106,12 +106,15 @@ impl Retention {
 /// Append-only, per-topic logs of numbered records.
 #[async_trait]
 pub trait MessageLog: Send + Sync {
-    /// Appends a record and returns its sequence number.
+    /// Appends a record and returns it as stored.
     ///
     /// If the same `(topic, publisher, message_id)` is still retained, nothing
-    /// is appended and the original `seq` is returned, so a publisher retrying
-    /// after a lost confirmation doesn't create a duplicate. The record's
-    /// `published_at_ms` is raised to the previous record's if it is lower.
+    /// is appended and the original record is returned, so a publisher
+    /// retrying after a lost confirmation doesn't create a duplicate. A caller
+    /// tells the two apart by comparing the returned `seq` with the log's
+    /// `last_seq` before the call. The record's `published_at_ms` is raised to
+    /// the previous record's if it is lower, and the returned record carries
+    /// the time actually stored.
     ///
     /// Args:
     ///     topic: The topic to append to. Its log is created if needed.
@@ -119,12 +122,17 @@ pub trait MessageLog: Send + Sync {
     ///     durability: How firmly the record must be stored before this returns.
     ///
     /// Returns:
-    ///     The record's `seq`.
+    ///     The stored record, with its `seq` and final publish time.
     ///
     /// Raises:
     ///     StorageError::Unsupported: When the backend can't honour `durability`.
     ///     StorageError::Unavailable: When the backend can't store the record now.
-    async fn append(&self, topic: &str, record: NewRecord, durability: Durability) -> Result<u64>;
+    async fn append(
+        &self,
+        topic: &str,
+        record: NewRecord,
+        durability: Durability,
+    ) -> Result<Record>;
 
     /// Reads records in `seq` order, starting at `from`.
     ///
