@@ -2,7 +2,8 @@
 //!
 //! The broker and transport push outgoing frames into the client's channel,
 //! and the transport's send loop writes them to the socket. The transport
-//! sets `authenticated` and `username` once a JWT has been validated.
+//! sets `authenticated` and `username` once a JWT has been validated, and
+//! `session` when the client named a durable session in its `auth`.
 
 use tokio::sync::mpsc::UnboundedSender;
 use tungstenite::protocol::Message as WsMessage;
@@ -22,6 +23,10 @@ pub struct Client {
     pub authenticated: bool,
     /// The username of the authenticated user (populated after auth).
     pub username: Option<String>,
+    /// The storage key of the durable session this connection holds, or
+    /// `None` for an ephemeral connection. Built from the username and the
+    /// client's `session_id`, so one user can't claim another's session.
+    pub session: Option<String>,
 }
 
 impl Client {
@@ -32,13 +37,14 @@ impl Client {
     ///         client's socket.
     ///
     /// Returns:
-    ///     A client with no username and `authenticated` set to false.
+    ///     A client with no username or session and `authenticated` set to false.
     pub fn new(sender: UnboundedSender<WsMessage>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             sender,
             authenticated: false,
             username: None,
+            session: None,
         }
     }
 }

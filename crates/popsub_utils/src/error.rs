@@ -29,10 +29,6 @@ pub enum PopSubError {
     #[error("Client error: {0}")]
     Client(String),
 
-    /// The message store failed, with the storage backend's message.
-    #[error("Persistence error: {0}")]
-    Persistence(String),
-
     /// Settings couldn't be loaded or had the wrong type.
     #[error("Configuration error: {0}")]
     Config(#[from] config::ConfigError),

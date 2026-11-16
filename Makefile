@@ -3,7 +3,7 @@ PORT ?= 8080
 URL ?= ws://$(HOST):$(PORT)
 CRATE ?=
 JOBS ?=
-DATA_DIR ?= pubsub_db
+DATA_DIR ?= pubsub_data
 
 CARGO ?= cargo
 JOBS_FLAG := $(if $(JOBS),-j $(JOBS),)
@@ -35,7 +35,7 @@ help:
 	@printf "    make build           Debug build\n"
 	@printf "    make release         Release build\n"
 	@printf "    make doc             Build and open the API docs\n"
-	@printf "    make reset-data      Delete stored messages ($(DATA_DIR))\n"
+	@printf "    make reset-data      Delete stored messages and sessions ($(DATA_DIR), and the old pubsub_db)\n"
 	@printf "    make clean           cargo clean plus reset-data\n\n"
 	@printf "  Options: HOST, PORT, URL, CRATE, JOBS (parallel build jobs, lower it if builds run out of memory)\n"
 
@@ -99,7 +99,7 @@ coverage:
 	$(CARGO) llvm-cov --workspace --html --open
 
 reset-data:
-	rm -rf $(DATA_DIR)
+	rm -rf $(DATA_DIR) pubsub_db
 
 clean: reset-data
 	$(CARGO) clean

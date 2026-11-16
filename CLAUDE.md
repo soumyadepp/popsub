@@ -1,6 +1,6 @@
 # PopSub
 
-A single-process WebSocket publish/subscribe broker in Rust, with users, per-topic permissions and rate limits. Read `docs/DESIGN.md` before changing behaviour: it describes the protocol, the delivery guarantees as they really are, and the planned direction. Read `docs/STYLE.md` before writing any code or docs.
+A single-process WebSocket publish/subscribe broker in Rust, with users, per-topic permissions and rate limits. Read `docs/DESIGN.md` before changing behaviour: it describes the protocol, the delivery guarantees as they really are, and the planned direction. Read `docs/STYLE.md` before writing any code or docs. `docs/STORAGE.md` is the proposed direction for storage; check it before changing persistence, acks or replay.
 
 ## Style rules (enforced, read before every change)
 
@@ -32,18 +32,19 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | Crate | Owns |
 |---|---|
 | `crates/popsub` | The binary and CLI wiring |
-| `crates/popsub_transport` | WebSocket server, JSON protocol, and enforcing auth, permissions and rate limits |
+| `crates/popsub_protocol` | Every frame type, error codes and `PROTOCOL_VERSION`. Depends only on `serde` |
+| `crates/popsub_transport` | WebSocket server, and enforcing auth, permissions and rate limits |
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
-| `crates/popsub_broker` | Topics, routing, QoS 1 retries, replay |
-| `crates/popsub_persistence` | `sled` storage of recent messages per topic |
+| `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
+| `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
 | `crates/popsub_client` | `Client`, the server-side record of one connection (not a client library) |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
 | `crates/popsub_utils` | `PopSubError`, `Result`, logging |
 
 Each crate has its own `CLAUDE.md` with its invariants and gotchas.
 
-Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then persistence and client, with config and utils at the bottom. Never make a lower crate depend on a higher one. The broker must not know about sockets or JSON protocol messages.
+Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then client and config, with storage and utils at the bottom. Never make a lower crate depend on a higher one. `popsub_protocol` sits beside them and is used by transport, broker and binary. The broker writes protocol frames to channels but must not know about sockets or the transport's types.
 
 ## Conventions
 
@@ -56,18 +57,23 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 ## Rules for changes
 
-- **Protocol changes** touch `popsub_transport/src/message.rs`, the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change.
+- **Protocol changes** touch `popsub_protocol` (types and its wire tests), the README protocol section, section 4 of `docs/DESIGN.md`, and the WebSocket tests, in the same change. Within a protocol version only add frames, fields and error codes; anything else needs a new `PROTOCOL_VERSION`.
+- **Every failure a client sees is an `error` frame with an `ErrorCode`.** Don't send free-text-only errors, and echo the request's `id` in every reply.
 - **Delivery semantics changes** must update the table in section 6 of `docs/DESIGN.md` and come with a test that demonstrates the new guarantee, written to fail first.
-- **Reach the broker only through `SharedBroker::with`.** Its closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
+- **Reach the broker only through `SharedBroker::with`** (inside the broker crate, `BrokerCell::with`, which it wraps). The closure can't await, so the lock can't be held across an `.await`. Don't add another way to lock it.
+- **Storage I/O belongs in the topic writer**, never under the broker lock. Publishes and subscribes for a topic go through its writer so they are handled one at a time; don't add a path that appends or replays around it.
 - **New settings** go in `popsub_config/src/settings.rs` (the field and its struct's `Default`), `config/default.toml`, and section 9 of the design doc. Keys containing an underscore are set from the environment with a double underscore after the section (`SERVER__JWT_SECRET`).
 - **Security defaults stay closed.** Registration off, new users with no topics, published secrets refused on public addresses. Don't loosen these without a setting that defaults to the closed behaviour.
-- Don't commit generated or local files: `target/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.
+- Don't commit generated or local files: `target/`, `pubsub_data/`, `pubsub_db/`, coverage output such as `*.profraw` and `cobertura.xml`, or `.env`.
 
 ## Gotchas
 
-- Delivered messages have no `type` field, unlike every other server frame. Clients detect them by its absence. See design doc section 4.2.
-- QoS 1 is only at-least-once for a single subscriber that stays connected. Don't describe it more strongly in docs or READMEs.
-- `broker.max_connections` is loaded but not used. The store path (`pubsub_db`) and per-topic cap are constants in the binary. Two servers can't share a working directory: the second exits because the store is locked.
+- Deliveries, `subscribed`, `truncated` and `stalled` are written by the broker, not the transport, using the same `popsub_protocol::ServerFrame`.
+- A subscribe is answered by a `subscribed` frame from the broker, but a QoS 0 publish and an `ack` have no reply. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
+- Durable sessions are keyed by `session_key(username, session_id)`. Never key them by the client's `session_id` alone, or one user could attach to another's session.
+- QoS 1 is at-least-once per subscriber while connected, and across reconnects only for durable sessions whose records are still retained. With the `file` backend (the default) sessions and history survive restarts; with `memory` nothing does. Don't describe it more strongly in docs or READMEs.
+- `broker.max_connections` is loaded but not used.
+- The `file` backend locks `storage.path` (`pubsub_data` by default). Two servers can't share a working directory: the second exits. Tests use a temporary directory or `MemoryStorage`, never `pubsub_data`.
 - The JWT secret default differs between code (`default_secret`), `config/default.toml` (`a_very_secret_key`) and the auth crate (`change_me_in_production`). All three are treated as published; the server refuses them on non-loopback hosts.
 - Rate limits key on the socket address. Behind a proxy every client shares one address.
 - There's no protocol message to grant topics, so self-registered users with the default `none` role can do nothing until their role is changed in code.

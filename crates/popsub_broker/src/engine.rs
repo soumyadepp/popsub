@@ -1,60 +1,75 @@
-//! The `Broker` engine: topic routing, delivery to client channels, QoS 1 retries and replay.
+//! The `Broker` engine: connected clients, topic subscriptions and each
+//! subscription's in-flight window, acknowledgements and retries.
 //!
-//! The broker is synchronous and has no locking of its own. The server shares
-//! it through one `SharedBroker`, whose `with` method runs a closure under the
-//! lock, so the lock can't be held across an `.await`. Delivery pushes
-//! `tungstenite` messages into each client's unbounded channel, so no call
-//! here waits on the network. Calls that touch persistence (`publish` and
-//! `subscribe`) do disk work while the caller holds the lock.
+//! The broker is synchronous, has no locking of its own and does no I/O
+//! beyond pushing `tungstenite` messages into unbounded channels, so nothing
+//! here waits. Storage is not reached from here: each topic's writer (see
+//! `writer`) reads and appends to the log without the lock, then calls into
+//! the broker under it. The server shares the broker through
+//! `SharedBroker`, whose `with` runs a closure under the lock.
 //!
-//! QoS 1 messages are kept in `pending_acks`, keyed by message id only. One
-//! ACK from any subscriber clears the message for all of them, and every
-//! retry goes to every current subscriber of the topic. `retry_overdue`
-//! resends unacknowledged messages and drops them after `max_retries`
-//! resends; `SharedBroker::run_retry_loop` calls it on a timer.
+//! Every subscription has its own delivery state (see `topic`). A record is
+//! sent to a subscription only when it is the next `seq` that subscription
+//! expects and its window has room; otherwise the subscription has fallen
+//! behind and the writer catches it up from the log once acks free the
+//! window. QoS 1 records stay in the subscription's window until that
+//! subscription acknowledges them, so an ACK from one subscriber never
+//! clears a record for another. A record that runs out of retries stalls
+//! its subscription instead of being dropped silently.
+//!
+//! Methods that move a durable session's cursor return `CursorUpdate`s for
+//! the caller to write to the subscription store outside the lock.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use crate::message::Message;
-use crate::topic::{SubscriberId, Topic};
 use popsub_client::Client;
 use popsub_config::settings::BrokerSettings;
-use popsub_persistence::Persistence;
-use std::time::Duration;
-use tracing::{error, info, warn};
+use popsub_storage::Record;
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{debug, info, warn};
 use tungstenite::protocol::Message as WsMessage;
-use uuid::Uuid;
 
-/// A QoS 1 message the broker keeps until it is acknowledged or dropped.
-///
-/// There is one entry per message id, shared by all subscribers of the topic.
-#[derive(Debug, Clone)]
-pub struct PendingMessage {
-    /// The message as it was published, resent unchanged on each retry.
-    pub message: Message,
-    /// When the message was last sent, in milliseconds since the UNIX epoch.
-    pub sent_at: i64,
-    /// How many times the retry loop has resent the message.
-    pub retries: u8,
-}
+use popsub_protocol::{ServerFrame, ServerMessage, Stalled};
 
-/// The in-memory broker: topics, connected clients and unacknowledged QoS 1 messages.
+use crate::frame::{delivery, to_ws};
+use crate::topic::{CursorUpdate, DeliveryState, InFlight, SubscriberId, Topic};
+
+/// The broker: connected clients and topic subscriptions with their delivery state.
 ///
-/// All methods take `&self` or `&mut self` and never block on the network.
-/// The server shares one instance behind a mutex; see the module docs for
-/// what that implies.
+/// All methods take `&self` or `&mut self` and never block. The server
+/// shares one instance through `SharedBroker`; see the module docs.
 #[derive(Debug)]
 pub struct Broker {
-    /// Topics by name. A topic is created on its first subscribe and never removed.
+    /// Topics by name. A topic is created on its first subscriber and never removed.
     pub topics: HashMap<String, Topic>,
     /// Connected clients by id, used to reach each subscriber's channel.
     pub clients: HashMap<SubscriberId, Client>,
-    /// Unacknowledged QoS 1 messages by message id, shared by all subscribers.
-    pub pending_acks: HashMap<String, PendingMessage>,
-    /// Store that published messages are written to and replayed from.
-    persistence: Persistence,
-    /// ACK timeout and retry limit used by the retry loop.
+    /// ACK timeout, retry limit and window size.
     settings: BrokerSettings,
+}
+
+/// What an `ack` did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AckOutcome {
+    /// Whether the record was in flight to this client on this topic.
+    /// Anything else (a record sent to someone else, a repeat ACK, an
+    /// unknown topic) is ignored.
+    pub accepted: bool,
+    /// The cursor to store, when the ACK moved a durable session's cursor.
+    pub cursor: Option<CursorUpdate>,
+    /// Whether the subscription has room again and records waiting in the
+    /// log, so the topic's writer should catch it up.
+    pub catch_up: bool,
+}
+
+/// What one `Broker::retry_overdue` pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryOutcome {
+    /// Records sent again to the one subscription that hadn't acknowledged them.
+    pub resent: usize,
+    /// Subscriptions that ran out of retries and were paused.
+    pub stalled: usize,
 }
 
 impl Broker {
@@ -63,31 +78,23 @@ impl Broker {
     /// Only tests read this. The retry loop uses `settings.ack_timeout_ms`,
     /// so the two can differ if either default changes.
     pub const ACK_TIMEOUT: Duration = Duration::from_millis(5000);
-}
 
-impl Broker {
-    /// Creates an empty broker backed by the given persistence store.
-    ///
-    /// The caller opens the store, so it chooses the path, TTL and per-topic
-    /// cap, and can report a failure to open it instead of panicking.
+    /// Creates an empty broker.
     ///
     /// Args:
-    ///     persistence: The store to write published messages to and replay from.
-    ///     settings: ACK timeout and retry limit for QoS 1 messages.
+    ///     settings: ACK timeout, retry limit and window size.
     ///
     /// Returns:
-    ///     A broker with no topics, clients or pending messages.
-    pub fn new(persistence: Persistence, settings: BrokerSettings) -> Self {
+    ///     A broker with no topics or clients.
+    pub fn new(settings: BrokerSettings) -> Self {
         Self {
             topics: HashMap::new(),
             clients: HashMap::new(),
-            pending_acks: HashMap::new(),
-            persistence,
             settings,
         }
     }
 
-    /// Registers a connected client so messages can be delivered to its channel.
+    /// Registers a connected client so records can be delivered to its channel.
     ///
     /// A client registered under an existing id replaces the old entry.
     ///
@@ -107,274 +114,385 @@ impl Broker {
         self.clients.remove(client_id);
     }
 
-    /// Subscribes a client to a topic and replays the topic's stored history to it.
+    /// Returns a copy of a registered client's outgoing channel.
     ///
-    /// The topic is created if it does not exist. If the client is registered,
-    /// every message the store holds for the topic is sent to it as QoS 0 with
-    /// a fresh message id and the timestamp the store recorded. The replay
-    /// happens on every call, including when the client was already
-    /// subscribed. The store is read while the caller holds the broker lock.
-    /// A failed read is logged and failed sends are ignored.
+    /// Args:
+    ///     client_id: The client to look up.
+    ///
+    /// Returns:
+    ///     The channel, or `None` if the client isn't registered.
+    pub fn client_sender(&self, client_id: &str) -> Option<UnboundedSender<WsMessage>> {
+        self.clients.get(client_id).map(|c| c.sender.clone())
+    }
+
+    /// The window size subscriptions get, as configured.
+    ///
+    /// Returns:
+    ///     The most unacknowledged QoS 1 records per subscription, at least 1.
+    pub fn max_inflight(&self) -> usize {
+        self.settings.max_inflight.max(1)
+    }
+
+    /// Returns the durable session a registered client holds.
+    ///
+    /// Args:
+    ///     client_id: The client to look up.
+    ///
+    /// Returns:
+    ///     The session's storage key, or `None` for an ephemeral or unknown client.
+    pub fn client_session(&self, client_id: &str) -> Option<String> {
+        self.clients.get(client_id)?.session.clone()
+    }
+
+    /// Finds the connected client holding a durable session.
+    ///
+    /// Args:
+    ///     session: The session's storage key.
+    ///
+    /// Returns:
+    ///     The client's id, or `None` when no connection holds it.
+    pub fn session_holder(&self, session: &str) -> Option<SubscriberId> {
+        self.clients
+            .values()
+            .find(|c| c.session.as_deref() == Some(session))
+            .map(|c| c.id.clone())
+    }
+
+    /// Lists the storage keys of every connected durable session.
+    ///
+    /// Returns:
+    ///     The keys, in no particular order.
+    pub fn connected_sessions(&self) -> Vec<String> {
+        self.clients
+            .values()
+            .filter_map(|c| c.session.clone())
+            .collect()
+    }
+
+    /// Queues a frame for one client.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     frame: The frame to send.
+    ///
+    /// Returns:
+    ///     False when the client isn't registered or its channel is closed.
+    pub fn send_frame(&self, client_id: &str, frame: &ServerFrame) -> bool {
+        let (Some(client), Some(ws)) = (self.clients.get(client_id), to_ws(frame)) else {
+            return false;
+        };
+        client.sender.send(ws).is_ok()
+    }
+
+    /// Adds a subscription for a registered client, creating the topic.
+    ///
+    /// Replaces any subscription the client already had to the topic, which
+    /// discards its in-flight records. Nothing is sent here; the topic's
+    /// writer replays from `start_seq` afterwards.
     ///
     /// Args:
     ///     topic: The topic name.
-    ///     subscriber: The id of the client to subscribe.
-    pub fn subscribe(&mut self, topic: &str, subscriber: SubscriberId) {
-        let subscriber_clone = subscriber.clone();
-
+    ///     subscriber: The id of the client.
+    ///     start_seq: The first `seq` to send it.
+    ///     log_last_seq: The newest `seq` in the topic log right now.
+    ///
+    /// Returns:
+    ///     False, without changing anything, when the client isn't registered.
+    pub fn add_subscriber(
+        &mut self,
+        topic: &str,
+        subscriber: SubscriberId,
+        start_seq: u64,
+        log_last_seq: u64,
+    ) -> bool {
+        let Some(client) = self.clients.get(&subscriber) else {
+            return false;
+        };
+        let state = DeliveryState::new(start_seq, client.session.clone());
         let topic = self
             .topics
             .entry(topic.to_string())
             .or_insert_with(|| Topic::new(topic));
-
-        topic.subscribe(subscriber);
-
-        if let Some(client) = self.clients.get(&subscriber_clone) {
-            match self.persistence.load_messages(topic.name.as_str()) {
-                Ok(stored_messages) => {
-                    for stored in stored_messages {
-                        let replay_msg = Message {
-                            topic: stored.topic.clone(),
-                            payload: stored.payload.clone(),
-                            timestamp: stored.timestamp,
-                            message_id: Uuid::new_v4().to_string(),
-                            qos: 0,
-                        };
-                        if let Ok(json) = serde_json::to_string(&replay_msg) {
-                            let _ = client.sender.send(WsMessage::text(json));
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to load messages for topic {}: {}", topic.name, e);
-                }
-            }
-        }
+        topic.last_seq = topic.last_seq.max(log_last_seq);
+        topic.subscribe(subscriber, state);
+        true
     }
 
-    /// Sends a WebSocket frame to every subscriber of a topic.
+    /// Removes a client's subscription to a topic.
     ///
-    /// A send to a closed channel is logged, and a subscriber id with no
-    /// registered client is logged as a warning. Neither removes the
-    /// subscriber; that happens in `cleanup_client`.
-    ///
-    /// Args:
-    ///     ws_msg: The frame to send. It is cloned for each subscriber.
-    ///     topic: The topic whose subscribers receive the frame.
-    fn send_text_to_subscribers(&self, ws_msg: &WsMessage, topic: &Topic) {
-        for sub_id in &topic.subscribers {
-            if let Some(client) = self.clients.get(sub_id) {
-                if let Err(e) = client.sender.send(ws_msg.clone()) {
-                    error!(client = %sub_id, %e, "Failed to send to subscriber");
-                }
-            } else {
-                warn!(client = %sub_id, "No client registered with id");
-            }
-        }
-    }
-
-    /// Finds pending messages whose ACK timeout has passed.
-    ///
-    /// A message is due once more than `settings.ack_timeout_ms` has passed
-    /// since it was last sent. Due messages that have already been resent
-    /// `settings.max_retries` times are marked for dropping; the rest are
-    /// marked for resending. Nothing is changed.
-    ///
-    /// Args:
-    ///     now_ms: The current time in milliseconds since the UNIX epoch.
-    ///
-    /// Returns:
-    ///     A pair `(to_resend, to_drop)` of message ids.
-    pub(crate) fn collect_retry_candidates(&self, now_ms: i64) -> (Vec<String>, Vec<String>) {
-        let mut to_resend = Vec::new();
-        let mut to_drop = Vec::new();
-
-        for (message_id, pending_msg) in &self.pending_acks {
-            if now_ms - pending_msg.sent_at > self.settings.ack_timeout_ms as i64 {
-                if pending_msg.retries >= self.settings.max_retries {
-                    to_drop.push(message_id.clone());
-                } else {
-                    to_resend.push(message_id.clone());
-                }
-            }
-        }
-
-        (to_resend, to_drop)
-    }
-
-    /// Resends a pending message to every current subscriber of its topic.
-    ///
-    /// The entry's `sent_at` is set to `now_ms` and its retry count is
-    /// incremented before sending. Subscribers that joined after the original
-    /// publish receive the retry too. If the topic no longer exists, or the
-    /// message fails to serialise, nothing is sent but the retry still counts.
-    ///
-    /// Args:
-    ///     message_id: The id of the pending message.
-    ///     now_ms: The current time in milliseconds since the UNIX epoch.
-    ///
-    /// Returns:
-    ///     `true` if the message was pending, `false` if it was not found.
-    pub(crate) fn resend_pending_message(&mut self, message_id: &str, now_ms: i64) -> bool {
-        if let Some(pending_msg) = self.pending_acks.get_mut(message_id) {
-            pending_msg.sent_at = now_ms;
-            pending_msg.retries += 1;
-
-            let msg_to_resend = pending_msg.message.clone();
-            let topic_name = msg_to_resend.topic.clone();
-
-            if let Some(topic) = self.topics.get(&topic_name) {
-                let text = match serde_json::to_string(&msg_to_resend) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        error!(%e, "Failed to serialize message for re-send");
-                        return true;
-                    }
-                };
-                let ws_msg = WsMessage::text(text);
-                self.send_text_to_subscribers(&ws_msg, topic);
-            }
-
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Removes a client from a topic's subscribers.
-    ///
-    /// Does nothing if the topic does not exist. The topic itself is kept
-    /// even when it has no subscribers left.
+    /// Does nothing if the topic or subscription doesn't exist. The topic
+    /// itself is kept even when it has no subscribers left.
     ///
     /// Args:
     ///     topic: The topic name.
     ///     subscriber: The id of the client to remove.
-    pub fn unsubscribe(&mut self, topic: &str, subscriber: &SubscriberId) {
-        if let Some(t) = self.topics.get_mut(topic) {
-            t.unsubscribe(subscriber);
-        }
+    ///
+    /// Returns:
+    ///     The session whose stored subscription should also be removed, if
+    ///     the subscription belonged to a durable session.
+    pub fn unsubscribe(&mut self, topic: &str, subscriber: &SubscriberId) -> Option<String> {
+        self.topics.get_mut(topic)?.unsubscribe(subscriber)?.session
     }
 
-    /// Publishes a message to every current subscriber of its topic.
+    /// Sends a newly stored record to every subscription that is up to date.
     ///
-    /// The timestamp is overwritten with the current time and an empty
-    /// `message_id` is replaced with a new UUID. A QoS 1 message is added to
-    /// `pending_acks` before delivery, even when the topic has no
-    /// subscribers. The payload is then written to the persistence store
-    /// while the caller holds the broker lock, so a slow disk delays every
-    /// other broker call. A store failure is logged and delivery goes ahead.
-    /// Publishing to a topic nobody has subscribed to stores the message and
-    /// logs "Topic not found".
+    /// Only the topic's writer calls this, once per record and in `seq`
+    /// order. Subscriptions that are behind, stalled or out of window room
+    /// are skipped; the writer catches them up from the log later.
     ///
     /// Args:
-    ///     msg: The message to publish.
-    pub fn publish(&mut self, mut msg: Message) {
-        msg.timestamp = chrono::Utc::now().timestamp_millis();
-
-        if msg.message_id.is_empty() {
-            msg.message_id = Uuid::new_v4().to_string();
-        }
-
-        if msg.qos == 1 {
-            self.pending_acks.insert(
-                msg.message_id.clone(),
-                PendingMessage {
-                    message: msg.clone(),
-                    sent_at: chrono::Utc::now().timestamp_millis(),
-                    retries: 0,
-                },
-            );
-        }
-
-        if let Err(e) = self.persistence.store_message(&msg.topic, &msg.payload) {
-            error!("Failed to store message: {}", e);
-        }
-
-        if let Some(topic) = self.topics.get(&msg.topic) {
-            let text = match serde_json::to_string(&msg) {
-                Ok(json) => json,
-                Err(e) => {
-                    error!(%e, "Failed to serialize message");
-                    return;
-                }
+    ///     record: The record as the log stored it.
+    ///     now_ms: The current time, recorded as the send time for retries.
+    ///
+    /// Returns:
+    ///     The cursors that moved, to be stored.
+    pub fn deliver(&mut self, record: &Record, now_ms: i64) -> Vec<CursorUpdate> {
+        let max_inflight = self.settings.max_inflight;
+        let Some(topic) = self.topics.get_mut(&record.topic) else {
+            return Vec::new();
+        };
+        topic.last_seq = topic.last_seq.max(record.seq);
+        let mut updates = Vec::new();
+        for (client_id, state) in topic.subscribers.iter_mut() {
+            let Some(client) = self.clients.get(client_id) else {
+                continue;
             };
-            let ws_msg = WsMessage::text(text);
-
-            self.send_text_to_subscribers(&ws_msg, topic);
-        } else {
-            info!(topic = %msg.topic, "Topic not found");
+            if send_one(state, &client.sender, record, now_ms, max_inflight)
+                && let Some(update) = state.take_update(&topic.name)
+            {
+                updates.push(update);
+            }
         }
+        updates
     }
 
-    /// Removes a QoS 1 message from `pending_acks` when a client acknowledges it.
-    ///
-    /// Pending entries are keyed by message id only and the sender is not
-    /// checked, so the first ACK from any client stops retries for every
-    /// subscriber. An ACK for an unknown id is logged and ignored.
+    /// Reports where a subscription that has room wants records from.
     ///
     /// Args:
-    ///     message_id: The id from the client's ACK.
-    pub fn handle_ack(&mut self, message_id: &str) {
-        if self.pending_acks.remove(message_id).is_some() {
-            info!(message_id = %message_id, "ACK received");
-        } else {
-            warn!(message_id = %message_id, "Received ACK for unknown message_id");
+    ///     topic: The topic.
+    ///     client_id: The subscribed client.
+    ///
+    /// Returns:
+    ///     Its `next_seq`, or `None` when it doesn't exist, is stalled or has
+    ///     a full window.
+    pub fn wants(&self, topic: &str, client_id: &str) -> Option<u64> {
+        let state = self.topics.get(topic)?.subscribers.get(client_id)?;
+        state
+            .has_room(self.settings.max_inflight)
+            .then_some(state.next_seq)
+    }
+
+    /// Sends records read from the log to one subscription, in order.
+    ///
+    /// Stops at the first record that isn't the subscription's `next_seq`,
+    /// or when its window fills or its channel is closed.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     client_id: The subscribed client.
+    ///     records: Consecutive records from the log.
+    ///     now_ms: The current time, recorded as the send time for retries.
+    ///
+    /// Returns:
+    ///     How many records were sent, and the cursor to store if it moved.
+    pub fn send_records(
+        &mut self,
+        topic: &str,
+        client_id: &str,
+        records: &[Record],
+        now_ms: i64,
+    ) -> (usize, Option<CursorUpdate>) {
+        let max_inflight = self.settings.max_inflight;
+        let (Some(topic), Some(client)) = (self.topics.get_mut(topic), self.clients.get(client_id))
+        else {
+            return (0, None);
+        };
+        let Some(state) = topic.subscribers.get_mut(client_id) else {
+            return (0, None);
+        };
+        let sent = records
+            .iter()
+            .take_while(|record| send_one(state, &client.sender, record, now_ms, max_inflight))
+            .count();
+        (sent, state.take_update(&topic.name))
+    }
+
+    /// Moves a subscription past records that were trimmed before it got them.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     client_id: The subscribed client.
+    ///     seq: The oldest `seq` still in the log.
+    ///
+    /// Returns:
+    ///     The cursor to store if it moved.
+    pub fn skip_to(&mut self, topic: &str, client_id: &str, seq: u64) -> Option<CursorUpdate> {
+        let topic = self.topics.get_mut(topic)?;
+        let state = topic.subscribers.get_mut(client_id)?;
+        state.next_seq = state.next_seq.max(seq);
+        state.take_update(&topic.name)
+    }
+
+    /// Records a client's acknowledgement of one record.
+    ///
+    /// Only a record in flight to this client on this topic is accepted. An
+    /// accepted ACK also lifts a stall and gives the remaining in-flight
+    /// records a fresh set of retries.
+    ///
+    /// Args:
+    ///     client_id: The acknowledging client.
+    ///     topic: The topic the record was delivered on.
+    ///     seq: The acknowledged record.
+    ///     now_ms: The current time, used as the new send time when a stall is lifted.
+    ///
+    /// Returns:
+    ///     Whether it was accepted, the cursor to store, and whether the
+    ///     writer should catch the subscription up.
+    pub fn ack(&mut self, client_id: &str, topic: &str, seq: u64, now_ms: i64) -> AckOutcome {
+        let max_inflight = self.settings.max_inflight;
+        let Some(topic) = self.topics.get_mut(topic) else {
+            return AckOutcome::default();
+        };
+        let Some(state) = topic.subscribers.get_mut(client_id) else {
+            return AckOutcome::default();
+        };
+        if state.inflight.remove(&seq).is_none() {
+            debug!(client = %client_id, topic = %topic.name, seq, "ignored ACK for a record not in flight to this client");
+            return AckOutcome::default();
+        }
+        if state.stalled.take().is_some() {
+            for pending in state.inflight.values_mut() {
+                pending.retries = 0;
+                pending.sent_at = now_ms;
+            }
+        }
+        AckOutcome {
+            accepted: true,
+            cursor: state.take_update(&topic.name),
+            catch_up: state.has_room(max_inflight) && state.next_seq <= topic.last_seq,
         }
     }
 
-    /// Removes a disconnected client and unsubscribes it from every topic.
+    /// Removes a disconnected client and all its subscriptions.
     ///
-    /// Pending QoS 1 messages are not touched, and topics left with no
-    /// subscribers are kept.
+    /// In-flight records are forgotten. For a durable session they are sent
+    /// again when it reconnects, because its stored cursor is below them.
     ///
     /// Args:
     ///     client_id: The id of the client to remove.
-    pub fn cleanup_client(&mut self, client_id: &SubscriberId) {
-        self.remove_client(client_id);
-
-        for (topic, subscribers) in self.topics.iter_mut() {
-            subscribers.unsubscribe(client_id);
-            info!(client = %client_id, topic = %topic, "Unsubscribed from topic");
-        }
-
-        info!(client = %client_id, "Cleaned up client");
-    }
-
-    /// Resends overdue QoS 1 messages and drops those out of retries, in one pass.
-    ///
-    /// A message is overdue when more than `ack_timeout_ms` has passed since
-    /// it was last sent. Overdue messages that have already been resent
-    /// `max_retries` times are dropped, so each message is sent at most
-    /// `1 + max_retries` times. `SharedBroker::run_retry_loop` calls this on a
-    /// timer; tests call it directly with a chosen time.
-    ///
-    /// Args:
-    ///     now_ms: The current time in milliseconds since the UNIX epoch.
     ///
     /// Returns:
-    ///     How many messages were resent and how many were dropped.
+    ///     The durable session the client held, if any.
+    pub fn cleanup_client(&mut self, client_id: &SubscriberId) -> Option<String> {
+        let session = self.clients.remove(client_id).and_then(|c| c.session);
+        for topic in self.topics.values_mut() {
+            topic.unsubscribe(client_id);
+        }
+        info!(client = %client_id, "cleaned up client");
+        session
+    }
+
+    /// Resends overdue QoS 1 records and stalls subscriptions out of retries, in one pass.
+    ///
+    /// A record is overdue when more than `ack_timeout_ms` has passed since
+    /// it was last sent to that subscription. It is resent only to that
+    /// subscription. A record already resent `max_retries` times stalls its
+    /// subscription instead: the client is sent a `stalled` frame and
+    /// nothing more is sent to that subscription until it acknowledges
+    /// something or subscribes again. `SharedBroker::run_retry_loop` calls
+    /// this on a timer; tests call it directly with a chosen time.
+    ///
+    /// Args:
+    ///     now_ms: The current time in milliseconds since the Unix epoch.
+    ///
+    /// Returns:
+    ///     How many records were resent and how many subscriptions stalled.
     pub fn retry_overdue(&mut self, now_ms: i64) -> RetryOutcome {
-        let (to_resend, to_drop) = self.collect_retry_candidates(now_ms);
-        for message_id in &to_drop {
-            if self.pending_acks.remove(message_id).is_some() {
-                warn!(message_id = %message_id, retries = %self.settings.max_retries, "Message dropped after max retries");
+        let timeout = i64::try_from(self.settings.ack_timeout_ms).unwrap_or(i64::MAX);
+        let max_retries = self.settings.max_retries;
+        let mut outcome = RetryOutcome {
+            resent: 0,
+            stalled: 0,
+        };
+        for topic in self.topics.values_mut() {
+            for (client_id, state) in topic.subscribers.iter_mut() {
+                if state.stalled.is_some() {
+                    continue;
+                }
+                let Some(client) = self.clients.get(client_id) else {
+                    continue;
+                };
+                for (&seq, pending) in state.inflight.iter_mut() {
+                    if now_ms.saturating_sub(pending.sent_at) <= timeout {
+                        continue;
+                    }
+                    if pending.retries >= max_retries {
+                        state.stalled = Some(seq);
+                        outcome.stalled += 1;
+                        warn!(client = %client_id, topic = %topic.name, seq, "subscription stalled after max retries");
+                        let frame = ServerFrame::event(ServerMessage::Stalled(Stalled {
+                            topic: topic.name.clone(),
+                            seq,
+                        }));
+                        if let Some(ws) = to_ws(&frame) {
+                            let _ = client.sender.send(ws);
+                        }
+                        break;
+                    }
+                    pending.retries += 1;
+                    pending.sent_at = now_ms;
+                    if let Some(ws) = to_ws(&delivery(&pending.record)) {
+                        let _ = client.sender.send(ws);
+                    }
+                    outcome.resent += 1;
+                }
             }
         }
-        for message_id in &to_resend {
-            self.resend_pending_message(message_id, now_ms);
-        }
-        RetryOutcome {
-            resent: to_resend.len(),
-            dropped: to_drop.len(),
-        }
+        outcome
     }
 }
 
-/// What one `Broker::retry_overdue` pass did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryOutcome {
-    /// Messages sent again to their topic's subscribers.
-    pub resent: usize,
-    /// Messages removed after running out of retries.
-    pub dropped: usize,
+/// Sends one record to one subscription if it is the next one it expects
+/// and its window has room.
+///
+/// A QoS 1 record goes into the subscription's window; a QoS 0 record is
+/// done once sent.
+///
+/// Args:
+///     state: The subscription's delivery state.
+///     sender: The client's outgoing channel.
+///     record: The record.
+///     now_ms: The send time, for retries.
+///     max_inflight: The window size.
+///
+/// Returns:
+///     Whether the record was sent.
+fn send_one(
+    state: &mut DeliveryState,
+    sender: &UnboundedSender<WsMessage>,
+    record: &Record,
+    now_ms: i64,
+    max_inflight: usize,
+) -> bool {
+    if state.next_seq != record.seq || !state.has_room(max_inflight) {
+        return false;
+    }
+    let Some(ws) = to_ws(&delivery(record)) else {
+        return false;
+    };
+    if sender.send(ws).is_err() {
+        return false;
+    }
+    state.next_seq = record.seq + 1;
+    if record.qos == 1 {
+        state.inflight.insert(
+            record.seq,
+            InFlight {
+                record: record.clone(),
+                sent_at: now_ms,
+                retries: 0,
+            },
+        );
+    }
+    true
 }

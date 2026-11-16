@@ -1,26 +1,24 @@
 //! Command-line entry point for PopSub.
 //!
-//! The `server` subcommand loads settings, builds the broker, spawns its QoS 1
-//! retry loop and runs the WebSocket server until Ctrl+C. The `client`
-//! subcommand runs a short demo session (login, auth, subscribe, publish)
-//! against a running server, for smoke tests. Everything here is wiring; the
-//! protocol, routing and storage live in the transport, broker and
-//! persistence crates.
+//! The `server` subcommand loads settings, opens the configured storage
+//! backend, builds the broker, spawns its QoS 1 retry, retention and session
+//! expiry loops and
+//! runs the WebSocket server until Ctrl+C. The `client` subcommand runs a
+//! short demo session (login, auth, subscribe, publish) against a running
+//! server, for smoke tests. Everything here is wiring; the protocol, routing
+//! and storage live in the transport, broker and storage crates.
 
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
-use popsub_broker::{Broker, SharedBroker};
-use popsub_config::load_config;
-use popsub_persistence::Persistence;
+use popsub_broker::{Broker, LogSettings, SharedBroker};
+use popsub_config::{StorageBackend, StorageSettings, load_config};
+use popsub_protocol::{PROTOCOL_VERSION, StartFrom};
+use popsub_storage::{FileStorage, MemoryStorage, Storage};
 use popsub_transport::{ClientMessage, Server, ServerMessage};
 use tracing::{error, info, warn};
-
-/// Where the server keeps its message history, relative to the working directory.
-const DATA_DIR: &str = "pubsub_db";
-
-/// The most messages kept per topic for replay to new subscribers.
-const MAX_MESSAGES_PER_TOPIC: usize = 1000;
 
 /// Runs the PopSub WebSocket broker or a demo client against it.
 #[derive(Parser)]
@@ -78,16 +76,19 @@ async fn main() -> ExitCode {
 /// If the JWT secret or admin password still has a published default value,
 /// the server refuses to start on a non-loopback host and only logs a warning
 /// for each such setting on `localhost` or a loopback address. Otherwise it
-/// opens the message store in `DATA_DIR` (keeping messages for
-/// `broker.message_ttl_secs`), builds the broker, spawns the QoS 1 retry
-/// loop, and serves on `host:port` until Ctrl+C arrives.
+/// opens the `[storage]` backend, builds the broker (refusing a durability
+/// the backend can't provide), spawns the QoS 1 retry, retention and session
+/// expiry loops,
+/// and serves on `host:port` until Ctrl+C arrives.
 ///
 /// Raises:
 ///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
-///     ConfigError::Type: When a setting from the file or the environment has the wrong type.
+///     ConfigError::Type: When a setting from the file or the environment has
+///         the wrong type, including an unknown backend or durability name.
 ///     String: When published default secrets are set and the host is not a loopback address.
-///     String: When the message store in `DATA_DIR` can't be opened, usually
-///         because another server running from the same directory holds its lock.
+///     String: When the storage backend can't be opened, for example because
+///         another server is using its directory.
+///     String: When `storage.durability` is stronger than the backend provides.
 ///     String: When `host:port` can't be bound, with the underlying I/O error.
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
@@ -106,11 +107,23 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let ttl = i64::try_from(config.broker.message_ttl_secs).unwrap_or(i64::MAX);
-    let persistence = Persistence::new(DATA_DIR, Some(ttl), Some(MAX_MESSAGES_PER_TOPIC))
-        .map_err(|e| format!("can't open the message store in {DATA_DIR}: {e}. Is another PopSub server running from this directory?"))?;
-    let broker = SharedBroker::new(Broker::new(persistence, config.broker.clone()));
+    let storage = open_storage(&config.storage).await?;
+    let log = LogSettings {
+        durability: config.storage.durability,
+        retention: config.storage.retention.to_retention(),
+        session_expiry: Duration::from_secs(config.storage.session_expiry_secs),
+    };
+    let broker =
+        SharedBroker::new(Broker::new(config.broker.clone()), storage, log).map_err(|e| {
+            format!(
+                "can't use the {:?} storage backend: {e}",
+                config.storage.backend
+            )
+        })?;
+    info!(backend = ?config.storage.backend, durability = ?log.durability, "storage opened");
     tokio::spawn(broker.clone().run_retry_loop());
+    tokio::spawn(broker.clone().run_retention_loop());
+    tokio::spawn(broker.clone().run_session_expiry_loop());
     let server = Server::from_settings(broker, &config.server).await;
 
     tokio::select! {
@@ -120,11 +133,40 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Opens the storage backend the `[storage]` section names.
+///
+/// Args:
+///     settings: The `[storage]` section.
+///
+/// Returns:
+///     The backend, ready to share.
+///
+/// Raises:
+///     String: When the `file` backend's directory can't be opened, for
+///         example because another server is using it, or holds damaged data.
+async fn open_storage(settings: &StorageSettings) -> Result<Arc<dyn Storage>, String> {
+    match settings.backend {
+        StorageBackend::File => {
+            let storage = FileStorage::open(&settings.path)
+                .await
+                .map_err(|e| format!("can't open the message store in {}: {e}", settings.path))?;
+            info!(path = %settings.path, "file storage opened");
+            Ok(Arc::new(storage))
+        }
+        StorageBackend::Memory => {
+            warn!(
+                "storage backend is memory: topic history and sessions are lost when the server stops"
+            );
+            Ok(Arc::new(MemoryStorage::new()))
+        }
+    }
+}
+
 /// Runs a short session against a PopSub server and prints each reply.
 ///
-/// Logs in, authenticates with the returned token, subscribes to `topic`,
-/// publishes `Hello from popsub client` to it at QoS 0, and prints the
-/// delivered message. Frames are built from the transport's own message
+/// Logs in, authenticates with the returned token, subscribes to `topic`
+/// and waits for the `subscribed` reply, publishes `Hello from popsub client`
+/// to it at QoS 0, and prints the delivered message with its `seq`. Frames are built from the transport's own message
 /// types, so the client always speaks the current protocol. The defaults
 /// match the default server settings; pass `--username` and `--password` for
 /// any other account.
@@ -156,24 +198,39 @@ async fn run_client(
         },
     )
     .await?;
-    let ServerMessage::LoginResponse { token } = reply else {
+    let ServerMessage::LoggedIn { token } = reply else {
         return Err(format!("login refused: {reply:?}").into());
     };
     println!("Logged in as {username}");
 
-    let reply = request(&mut ws, &ClientMessage::Auth { token }).await?;
-    if !matches!(reply, ServerMessage::Authenticated {}) {
+    let reply = request(
+        &mut ws,
+        &ClientMessage::Auth {
+            token,
+            protocol: Some(PROTOCOL_VERSION),
+            session_id: None,
+            clean_start: false,
+        },
+    )
+    .await?;
+    if !matches!(reply, ServerMessage::Authenticated { .. }) {
         return Err(format!("auth refused: {reply:?}").into());
     }
     println!("Authenticated");
 
-    send(
+    let reply = request(
         &mut ws,
         &ClientMessage::Subscribe {
             topic: topic.to_string(),
+            from: StartFrom::New,
         },
     )
     .await?;
+    if !matches!(reply, ServerMessage::Subscribed(_)) {
+        return Err(format!("subscribe refused: {reply:?}").into());
+    }
+    println!("Subscribed to {topic}");
+
     send(
         &mut ws,
         &ClientMessage::Publish {
@@ -184,11 +241,14 @@ async fn run_client(
         },
     )
     .await?;
-    let delivered = next_text(&mut ws).await?;
-    if delivered.contains("\"type\":\"error\"") {
-        return Err(format!("subscribe or publish refused: {delivered}").into());
-    }
-    println!("Received on {topic}: {delivered}");
+    let delivered: ServerMessage = serde_json::from_str(&next_text(&mut ws).await?)?;
+    let ServerMessage::Message(delivery) = delivered else {
+        return Err(format!("publish refused: {delivered:?}").into());
+    };
+    println!(
+        "Received on {topic} (seq {}): {}",
+        delivery.seq, delivery.payload
+    );
     Ok(())
 }
 

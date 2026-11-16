@@ -3,17 +3,73 @@
 
 use std::path::Path;
 
-use crate::load_config_from;
-use crate::settings::Settings;
+use popsub_storage::Durability;
 
-/// Checks the default host, port, connection cap and message TTL.
+use crate::load_config_from;
+use crate::settings::{RetentionSettings, Settings, StorageBackend};
+
+/// Checks the default host, port, connection cap and storage settings.
 #[test]
 fn test_default_settings() {
     let settings = Settings::default();
     assert_eq!(settings.server.host, "127.0.0.1");
     assert_eq!(settings.server.port, 8080);
     assert_eq!(settings.broker.max_connections, 1000);
-    assert_eq!(settings.broker.message_ttl_secs, 3600);
+    assert_eq!(settings.storage.backend, StorageBackend::File);
+    assert_eq!(settings.storage.path, "pubsub_data");
+    assert_eq!(settings.storage.durability, Durability::Buffered);
+    assert_eq!(settings.storage.retention.max_messages, 1000);
+    assert_eq!(settings.storage.retention.max_age_secs, 3600);
+    assert_eq!(settings.storage.session_expiry_secs, 86_400);
+    assert_eq!(settings.broker.max_inflight, 100);
+}
+
+/// Checks that retention settings become a policy with every limit set and
+/// the age converted to milliseconds.
+#[test]
+fn retention_settings_convert_to_a_policy() {
+    let retention = RetentionSettings {
+        max_messages: 5,
+        max_age_secs: 2,
+        max_bytes: 100,
+    }
+    .to_retention();
+    assert_eq!(retention.max_messages, Some(5));
+    assert_eq!(retention.max_age_ms, Some(2000));
+    assert_eq!(retention.max_bytes, Some(100));
+}
+
+/// Checks that the nested storage settings load from the environment.
+#[test]
+fn storage_settings_load_from_the_environment() {
+    let env = std::collections::HashMap::from([
+        ("STORAGE__BACKEND".to_string(), "memory".to_string()),
+        ("STORAGE__DURABILITY".to_string(), "none".to_string()),
+        (
+            "STORAGE__RETENTION__MAX_MESSAGES".to_string(),
+            "50".to_string(),
+        ),
+    ]);
+    let settings = load_config_from(Path::new("no/such/config"), Some(env)).expect("load failed");
+    assert_eq!(settings.storage.retention.max_messages, 50);
+    assert_eq!(settings.storage.retention.max_age_secs, 3600);
+    assert_eq!(settings.storage.durability, Durability::None);
+    assert_eq!(settings.storage.backend, StorageBackend::Memory);
+}
+
+/// Checks that an unknown backend or durability name is an error.
+#[test]
+fn unknown_storage_names_are_errors() {
+    for (key, value) in [
+        ("STORAGE__BACKEND", "redis"),
+        ("STORAGE__DURABILITY", "sometimes"),
+    ] {
+        let env = std::collections::HashMap::from([(key.to_string(), value.to_string())]);
+        assert!(
+            load_config_from(Path::new("no/such/config"), Some(env)).is_err(),
+            "{key}={value}"
+        );
+    }
 }
 
 /// Checks that the defaults report both published values, bind to loopback and keep registration off.
@@ -75,8 +131,8 @@ fn a_partial_file_overrides_only_what_it_names() {
             host = "0.0.0.0"
             jwt_secret = "file_secret"
 
-            [broker]
-            message_ttl_secs = 60
+            [storage.retention]
+            max_age_secs = 60
         "#,
     )
     .expect("write config file");
@@ -86,7 +142,11 @@ fn a_partial_file_overrides_only_what_it_names() {
 
     assert_eq!(settings.server.host, "0.0.0.0");
     assert_eq!(settings.server.jwt_secret, "file_secret");
-    assert_eq!(settings.broker.message_ttl_secs, 60);
+    assert_eq!(settings.storage.retention.max_age_secs, 60);
+    assert_eq!(
+        settings.storage.retention.max_messages,
+        defaults.storage.retention.max_messages
+    );
     assert_eq!(settings.server.port, defaults.server.port);
     assert_eq!(settings.server.username, defaults.server.username);
     assert_eq!(settings.broker.max_retries, defaults.broker.max_retries);

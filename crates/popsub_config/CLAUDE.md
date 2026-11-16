@@ -14,7 +14,7 @@ Loads `Settings` for the server and broker.
 
 Update all of these together:
 
-- the field in `ServerSettings` or `BrokerSettings`, with a one-line docstring
+- the field in `ServerSettings`, `BrokerSettings`, `StorageSettings` or `RetentionSettings`, with a one-line docstring
 - that struct's `Default` impl
 - `config/default.toml` at the repo root
 - the table in `docs/DESIGN.md` section 9
@@ -24,5 +24,9 @@ Update all of these together:
 - `jwt_secret` defaults to `default_secret` here but `a_very_secret_key` in `config/default.toml`. `Settings::insecure_defaults` reports either, and the binary refuses them on non-loopback hosts.
 - `server.allow_registration` (default false) and `server.registration_role` (`none`, `readonly` or `full`, default `none`) are passed to the auth crate by the transport.
 - Tests pass `Some(HashMap::new())` (or their own map) as the environment so variables set on the machine running the tests can't leak in.
-- `max_connections` is loaded but nothing reads it yet. `message_ttl_secs` sets the message store's TTL.
+- `max_connections` is loaded but nothing reads it yet.
+- `broker.max_inflight` sizes each subscription's window of unacknowledged QoS 1 records; values below 1 behave as 1. `storage.session_expiry_secs` is how long a durable session outlives its last connection.
+- `[storage]` defaults to the `file` backend in `pubsub_data` with `buffered` durability. It uses typed enums: `backend` is a `StorageBackend` and `durability` is `popsub_storage::Durability`, so an unknown name is a load error. Retention limits are plain numbers (0 keeps nothing) and `RetentionSettings::to_retention` turns them into the policy the backends apply.
+- Nested keys from the environment use a double underscore at every level: `STORAGE__RETENTION__MAX_MESSAGES`.
+- This crate depends on `popsub_storage` for `Durability` and `Retention`. Storage must never depend back on config.
 - `popsub_utils` uses the same `config` version (0.15), so `PopSubError::Config` can wrap loader errors. Bump both together.

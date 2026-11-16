@@ -1,18 +1,27 @@
-//! In-memory message broker for PopSub: topics, subscriptions, delivery and QoS 1 retries.
+//! Message broker for PopSub: topic logs, subscriptions, delivery, replay,
+//! per-subscriber acknowledgement and durable sessions.
 //!
-//! The main type is `Broker`, which the WebSocket server reaches through one
-//! `SharedBroker` handle. Transport and binary crates register clients with it,
-//! forward subscribe, publish and ACK frames to it, and spawn its retry loop.
-//! Published messages are also written to `popsub_persistence` so new
-//! subscribers can be sent the topic history.
+//! Every published message is appended to its topic's log in a
+//! `popsub_storage::Storage` backend, which numbers it with a `seq`, and is
+//! then delivered to current subscribers as a tagged `message` frame. A
+//! subscriber can ask for history with a `popsub_protocol::StartFrom`; replay and live
+//! delivery are handled by one writer task per topic, so they never overlap
+//! or leave gaps. Each subscription has its own window of unacknowledged
+//! QoS 1 records, and a durable session's cursor is stored so it resumes
+//! after a reconnect or a restart. The WebSocket server reaches all of this
+//! through one `SharedBroker` handle.
 
 pub mod engine;
-pub mod message;
+mod frame;
+mod replay;
 pub mod shared;
 pub mod topic;
+mod writer;
 
-pub use engine::{Broker, RetryOutcome};
-pub use shared::SharedBroker;
+pub use engine::{AckOutcome, Broker, RetryOutcome};
+pub use shared::{LogSettings, SharedBroker, session_key};
+pub use topic::CursorUpdate;
+pub use writer::{Published, SubscribeOutcome};
 
 #[cfg(test)]
 mod tests;

@@ -20,7 +20,7 @@ These rules apply to every Rust file in the workspace, tests and examples includ
 ///     The number of subscribers the message was sent to.
 ///
 /// Raises:
-///     PopSubError::Persistence: When the message can't be stored.
+///     PopSubError::Client: When a subscriber's channel is closed.
 pub fn publish(&mut self, msg: Message) -> Result<usize> {
 ```
 
