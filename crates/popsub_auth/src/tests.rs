@@ -404,3 +404,125 @@ async fn test_debug_output_redacts_secrets() {
     assert!(!printed.contains("super-secret-signing-key"), "{printed}");
     assert!(!printed.contains("hunter2-password"), "{printed}");
 }
+
+/// Opens a `FileUserStore` behind an `AuthService` with the default admin.
+///
+/// Args:
+///     path: The users file.
+///
+/// Returns:
+///     The service.
+async fn file_backed_service(path: &std::path::Path) -> AuthService {
+    let store = crate::FileUserStore::open(path).expect("open the users file");
+    AuthService::with_store(
+        AuthConfig::new("a-test-secret").with_admin("admin", "password"),
+        std::sync::Arc::new(store),
+    )
+    .await
+}
+
+/// Checks that accounts, roles and logins survive reopening the users file,
+/// and that the admin isn't added twice.
+#[tokio::test]
+async fn file_store_accounts_survive_reopening() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("users.json");
+    let auth = file_backed_service(&path).await;
+    auth.add_user(
+        "alice",
+        "alice-password",
+        Role::read_only(vec!["news/#".into()]),
+    )
+    .await
+    .expect("add alice");
+    auth.update_user_role(
+        "alice",
+        Role::user(vec![TopicPermission::full_access("orders/#")]),
+    )
+    .await
+    .expect("change alice's role");
+    drop(auth);
+
+    let auth = file_backed_service(&path).await;
+    let mut names = auth.list_users().await.expect("list");
+    names.sort();
+    assert_eq!(names, vec!["admin".to_string(), "alice".to_string()]);
+    assert!(auth.can_publish("alice", "orders/42").await);
+    assert!(!auth.can_publish("alice", "news/today").await);
+    assert!(auth.login("alice", "alice-password").await.is_ok());
+}
+
+/// Checks that a missing file is an empty store that is created on the
+/// first change, and that removing an account persists.
+#[tokio::test]
+async fn file_store_starts_empty_and_persists_removals() {
+    use crate::store::UserStore;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("users.json");
+    let store = crate::FileUserStore::open(&path).expect("open");
+    assert_eq!(store.user_count().await.expect("count"), 0);
+    assert!(!path.exists());
+    assert!(!store.remove_user("nobody").await.expect("remove"));
+    assert!(!path.exists());
+
+    let user = crate::User::new("bob", "hash", Role::admin());
+    store.add_user(user.clone()).await.expect("add");
+    assert!(matches!(
+        store.add_user(user).await,
+        Err(AuthError::UserAlreadyExists(_))
+    ));
+    assert!(path.exists());
+    assert!(store.remove_user("bob").await.expect("remove"));
+    drop(store);
+    let store = crate::FileUserStore::open(&path).expect("reopen");
+    assert!(!store.user_exists("bob").await.expect("exists"));
+}
+
+/// Checks that a corrupt file or one from a newer format version is refused
+/// rather than treated as empty.
+#[test]
+fn file_store_refuses_unreadable_files() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let corrupt = dir.path().join("corrupt.json");
+    std::fs::write(&corrupt, b"{ not json").expect("write");
+    assert!(matches!(
+        crate::FileUserStore::open(&corrupt),
+        Err(AuthError::Internal(_))
+    ));
+    let newer = dir.path().join("newer.json");
+    std::fs::write(&newer, br#"{"version": 2, "users": []}"#).expect("write");
+    assert!(matches!(
+        crate::FileUserStore::open(&newer),
+        Err(AuthError::Internal(_))
+    ));
+}
+
+/// Checks that a change whose file can't be written is not applied.
+#[tokio::test]
+async fn file_store_changes_nothing_when_the_write_fails() {
+    use crate::store::UserStore;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("missing-dir").join("users.json");
+    let store = crate::FileUserStore::open(&path).expect("open");
+    let result = store
+        .add_user(crate::User::new("carol", "hash", Role::admin()))
+        .await;
+    assert!(matches!(result, Err(AuthError::Internal(_))));
+    assert!(!store.user_exists("carol").await.expect("exists"));
+}
+
+/// Checks that the users file, which holds password hashes, is readable by
+/// its owner only.
+#[cfg(unix)]
+#[tokio::test]
+async fn file_store_is_private_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("users.json");
+    let _auth = file_backed_service(&path).await;
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}

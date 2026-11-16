@@ -51,7 +51,7 @@ This document describes how the system works today, where its guarantees hold an
 |---|---|
 | `popsub` | Binary. Parses the CLI, loads config, refuses published default secrets on public addresses, opens the configured storage backend, starts the broker, the retry and retention loops and the WebSocket server, and exits with a failure status when any of that fails. Also contains a small demo client. |
 | `popsub_transport` | `Server` (shared state and the accept loop) and `Session` (one connection, one method per message type). Parses `ClientMessage` JSON, runs register, login and auth, checks topic permissions and rate limits, and turns requests into broker calls. |
-| `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
+| `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. Users are kept in `users.json` in the storage directory with the `file` backend (`FileUserStore`), in memory with the `memory` backend, or in Postgres behind a feature flag. |
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | One writer task per topic that appends to the log, fans records out in `seq` order and replays history to subscribers; the synchronous `Broker` with subscriber sets and the QoS 1 pending table; all shared through `SharedBroker`. |
 | `popsub_sdk` | The Rust client: login and token refresh, reconnection with backoff guided by close codes, resubscription without gaps, confirmed publishes resent under the same id, acknowledgements and deduplication by `(topic, seq)`. The CLI's demo client uses it. |
@@ -257,7 +257,7 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 
 **Identity and permissions**
 
-- Users live in a `UserStore`: in memory by default (rebuilt at each start, so self-registered users disappear on restart), or Postgres with the `postgres` feature.
+- Users live in a `UserStore`. With the `file` storage backend (the default) that is `users.json` in the storage directory: rewritten atomically on every change, readable by its owner only, and kept across restarts. With the `memory` backend accounts are lost on restart. A Postgres store exists behind the `postgres` feature. The admin from `server.username` and `server.password` is added only if no account with that name exists, so once it does, the settings no longer change its password.
 - The admin from `server.username` and `server.password` is created at startup with full access.
 - Roles: `Admin` (everything), `User` with a list of topic patterns that each allow subscribe, publish or both, and `ReadOnly` with subscribe-only patterns. Patterns use `+` for one level and `#` for the rest. `*` is not special.
 - Permissions are looked up from the store on every subscribe and publish, so disabling a user or changing their role takes effect immediately, without waiting for the token to expire.
@@ -305,7 +305,7 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | Someone guesses a user's password | That address and username pair locks out after 5 failures; the address locks out after 20 across all usernames. The real user, from another address, is unaffected. |
 | A client floods publishes | Its user's token bucket empties and further publishes get an error until it refills. |
 | A client sends a huge frame | Frames over twice `server.max_payload_bytes` plus 64 KiB are refused by the WebSocket layer before they are buffered, and the connection is closed with `message_too_big`. Smaller frames whose payload is over the limit get `payload_too_large`. |
-| The server restarts | Self-registered users are lost with the in-memory store. The admin is recreated from config. |
+| The server restarts | With the `file` backend, accounts are read back from `users.json`. With `memory`, every account but the configured admin is lost. |
 | Storage append fails | Nothing is delivered. A QoS 1 publisher gets `storage unavailable` and can retry; QoS 0 is logged and dropped. |
 | Storage read fails during a subscribe | The client gets an error and is not subscribed. It can subscribe again. |
 | A subscriber asks for history that was trimmed | It gets a `truncated` frame with the oldest available `seq`, then the rest. |

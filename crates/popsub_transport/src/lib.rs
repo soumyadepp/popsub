@@ -15,4 +15,6 @@ pub use popsub_protocol::{ClientFrame, ClientMessage, ServerFrame, ServerMessage
 pub use websocket::{RateLimiters, Server, registration_role};
 
 pub use popsub_auth::service::UserBuilder;
-pub use popsub_auth::{AuthConfig, AuthService, Role, TopicPermission};
+pub use popsub_auth::{
+    AuthConfig, AuthService, FileUserStore, InMemoryUserStore, Role, TopicPermission, UserStore,
+};

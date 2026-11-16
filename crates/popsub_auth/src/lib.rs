@@ -77,6 +77,7 @@
 //! ```
 
 pub mod error;
+pub mod file_store;
 pub mod jwt;
 pub mod permission;
 pub mod service;
@@ -84,6 +85,7 @@ pub mod store;
 pub mod user;
 
 pub use error::AuthError;
+pub use file_store::FileUserStore;
 pub use jwt::{Claims, JwtService};
 pub use permission::{PermissionChecker, TopicPermission};
 pub use service::{AuthConfig, AuthService, DefaultUserRole};
