@@ -81,7 +81,7 @@ For a protocol problem, the frames sent and received are the most useful thing y
 
 ## Security issues
 
-Please don't open a public issue for a vulnerability. Contact the maintainer privately, using the contact details on the maintainer's GitHub profile, and allow time for a fix before disclosing it.
+Please don't open a public issue for a vulnerability. Report it privately with the **Report a vulnerability** button on the repository's Security tab, and allow time for a fix before disclosing it.
 
 ## License
 
