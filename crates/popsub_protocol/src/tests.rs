@@ -6,8 +6,8 @@
 use serde_json::{Value, json};
 
 use crate::{
-    ClientFrame, ClientMessage, Delivery, ErrorCode, Limits, RequestId, ServerFrame, ServerMessage,
-    Stalled, StartFrom, Subscribed, Truncated,
+    ClientFrame, ClientMessage, CloseCode, Delivery, ErrorCode, Limits, RequestId, ServerFrame,
+    ServerMessage, Stalled, StartFrom, Subscribed, Truncated,
 };
 
 /// Parses a client frame, failing the test if it doesn't parse.
@@ -186,10 +186,12 @@ fn replies_serialise_with_type_and_id() {
                     limits: Limits {
                         max_inflight: 100,
                         session_expiry_secs: 86_400,
+                        heartbeat_secs: 30,
+                        idle_timeout_secs: 90,
                     },
                 },
             ),
-            json!({"type": "authenticated", "id": 3, "protocol": 1, "limits": {"max_inflight": 100, "session_expiry_secs": 86400}}),
+            json!({"type": "authenticated", "id": 3, "protocol": 1, "limits": {"max_inflight": 100, "session_expiry_secs": 86400, "heartbeat_secs": 30, "idle_timeout_secs": 90}}),
         ),
         (
             ServerFrame::reply(
@@ -201,10 +203,12 @@ fn replies_serialise_with_type_and_id() {
                     limits: Limits {
                         max_inflight: 5,
                         session_expiry_secs: 60,
+                        heartbeat_secs: 1,
+                        idle_timeout_secs: 3,
                     },
                 },
             ),
-            json!({"type": "authenticated", "id": "s", "protocol": 1, "session_id": "phone", "resumed": ["chat"], "limits": {"max_inflight": 5, "session_expiry_secs": 60}}),
+            json!({"type": "authenticated", "id": "s", "protocol": 1, "session_id": "phone", "resumed": ["chat"], "limits": {"max_inflight": 5, "session_expiry_secs": 60, "heartbeat_secs": 1, "idle_timeout_secs": 3}}),
         ),
         (
             ServerFrame::reply(
@@ -293,6 +297,12 @@ fn events_serialise_without_an_id() {
             }),
             json!({"type": "stalled", "topic": "chat", "seq": 5}),
         ),
+        (
+            ServerMessage::AuthExpiring {
+                expires_at_ms: 1_794_800_000_000,
+            },
+            json!({"type": "auth_expiring", "expires_at_ms": 1794800000000_i64}),
+        ),
     ];
     for (message, expected) in cases {
         assert_eq!(json_of(ServerFrame::event(message)), expected);
@@ -351,4 +361,32 @@ fn error_codes_are_snake_case() {
     for (code, name) in names {
         assert_eq!(serde_json::to_value(code).unwrap(), json!(name));
     }
+}
+
+/// Checks the numeric close codes, that each is recognised back, and which
+/// ones tell a client not to reconnect.
+#[test]
+fn close_codes_are_stable_and_say_whether_to_reconnect() {
+    let codes: Vec<(u16, &str, bool)> = CloseCode::ALL
+        .iter()
+        .map(|c| (c.code(), c.reason(), c.should_reconnect()))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            (1001, "going_away", true),
+            (1011, "internal_error", true),
+            (4001, "auth_failed", false),
+            (4002, "unauthenticated", true),
+            (4003, "session_taken_over", false),
+            (4004, "token_expired", true),
+            (4005, "idle_timeout", true),
+            (4006, "unsupported_protocol", false),
+            (4007, "session_unavailable", true),
+        ]
+    );
+    for code in CloseCode::ALL {
+        assert_eq!(CloseCode::from_code(code.code()), Some(code));
+    }
+    assert_eq!(CloseCode::from_code(1000), None);
 }

@@ -14,6 +14,8 @@ fn test_default_settings() {
     let settings = Settings::default();
     assert_eq!(settings.server.host, "127.0.0.1");
     assert_eq!(settings.server.port, 8080);
+    assert_eq!(settings.server.heartbeat_secs, 30);
+    assert_eq!(settings.server.idle_timeout_secs, 90);
     assert_eq!(settings.broker.max_connections, 1000);
     assert_eq!(settings.storage.backend, StorageBackend::File);
     assert_eq!(settings.storage.path, "pubsub_data");

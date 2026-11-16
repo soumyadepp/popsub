@@ -15,10 +15,14 @@ use std::time::Duration;
 use clap::Parser;
 use popsub_broker::{Broker, LogSettings, SharedBroker};
 use popsub_config::{StorageBackend, StorageSettings, load_config};
-use popsub_protocol::{PROTOCOL_VERSION, StartFrom};
+use popsub_protocol::{CloseCode, PROTOCOL_VERSION, StartFrom};
 use popsub_storage::{FileStorage, MemoryStorage, Storage};
 use popsub_transport::{ClientMessage, Server, ServerMessage};
 use tracing::{error, info, warn};
+
+/// How long a shutdown waits after sending every client a close frame, so
+/// the frames are written before the process exits.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 /// Runs the PopSub WebSocket broker or a demo client against it.
 #[derive(Parser)]
@@ -79,7 +83,8 @@ async fn main() -> ExitCode {
 /// opens the `[storage]` backend, builds the broker (refusing a durability
 /// the backend can't provide), spawns the QoS 1 retry, retention and session
 /// expiry loops,
-/// and serves on `host:port` until Ctrl+C arrives.
+/// and serves on `host:port` until Ctrl+C arrives. On Ctrl+C every client is
+/// sent a `going_away` close frame before the process exits.
 ///
 /// Raises:
 ///     ConfigError::FileParse: When `config/default.toml` exists but can't be parsed.
@@ -124,11 +129,15 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(broker.clone().run_retry_loop());
     tokio::spawn(broker.clone().run_retention_loop());
     tokio::spawn(broker.clone().run_session_expiry_loop());
-    let server = Server::from_settings(broker, &config.server).await;
+    let server = Server::from_settings(broker.clone(), &config.server).await;
 
     tokio::select! {
         served = server.listen(&addr) => served.map_err(|e| format!("can't serve on {addr}: {e}"))?,
-        _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
+        _ = tokio::signal::ctrl_c() => {
+            let closed = broker.close_all(CloseCode::GoingAway);
+            info!(closed, "shutdown signal received, closing connections");
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        }
     }
     Ok(())
 }

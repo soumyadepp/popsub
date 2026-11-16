@@ -4,11 +4,11 @@
 //! Each test gets its own server, broker and in-memory storage, configured
 //! from `Settings::default()` unless it says otherwise.
 
-use crate::websocket::{RateLimiters, Server};
+use crate::websocket::{Heartbeat, RateLimiters, Server};
 use futures_util::{SinkExt, StreamExt};
 use popsub_broker::{Broker, LogSettings, SharedBroker};
 use popsub_config::Settings;
-use popsub_protocol::{ClientMessage, ErrorCode, ServerMessage, StartFrom};
+use popsub_protocol::{ClientMessage, CloseCode, ErrorCode, ServerMessage, StartFrom};
 use popsub_storage::{Durability, FileStorage, MemoryStorage, Storage};
 use std::sync::Arc;
 use std::time::Duration;
@@ -332,14 +332,59 @@ async fn send_and_receive(
         .send(WsMessage::Text(serde_json::to_string(msg).unwrap().into()))
         .await
         .expect("Failed to send message");
-    let raw = ws_stream
-        .next()
-        .await
-        .expect("Did not receive response")
-        .unwrap()
-        .into_data();
-    serde_json::from_slice(&raw)
+    let raw = next_text(ws_stream).await;
+    serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("Failed to deserialize ServerMessage from {raw:?}: {e}"))
+}
+
+/// Reads the next text frame, skipping pings and pongs, failing the test
+/// after two seconds or if the connection closes first.
+///
+/// Args:
+///     ws: The connection.
+///
+/// Returns:
+///     The frame's text.
+async fn next_text(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> String {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("no frame within two seconds")
+            .expect("connection closed")
+            .expect("read failed");
+        match frame {
+            WsMessage::Text(text) => return text.to_string(),
+            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Reads until the server closes the connection, skipping anything else.
+///
+/// Args:
+///     ws: The connection.
+///     within: How long to wait for the close.
+///
+/// Returns:
+///     The close code and reason.
+async fn next_close(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    within: Duration,
+) -> (u16, String) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("the server didn't close the connection in time");
+        match frame {
+            Some(Ok(WsMessage::Close(Some(close)))) => {
+                return (u16::from(close.code), close.reason.to_string());
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    }
 }
 
 /// Checks that `register` is refused with `user registration is disabled`
@@ -577,12 +622,7 @@ async fn send_json(ws: &mut TestSocket, msg: serde_json::Value) {
 /// Returns:
 ///     The frame.
 async fn next_frame(ws: &mut TestSocket) -> ServerMessage {
-    let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
-        .await
-        .expect("no frame within two seconds")
-        .expect("connection closed")
-        .expect("read failed");
-    serde_json::from_slice(&frame.into_data()).expect("server frames parse")
+    serde_json::from_str(&next_text(ws).await).expect("server frames parse")
 }
 
 /// Reads the next frame and expects a delivered record.
@@ -907,12 +947,7 @@ async fn send_raw(ws: &mut TestSocket, text: &str) -> serde_json::Value {
     ws.send(WsMessage::Text(text.to_string().into()))
         .await
         .expect("send");
-    let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
-        .await
-        .expect("no reply within two seconds")
-        .expect("connection closed")
-        .expect("read failed");
-    serde_json::from_slice(&frame.into_data()).expect("replies are JSON")
+    serde_json::from_str(&next_text(ws).await).expect("replies are JSON")
 }
 
 /// Checks that replies carry the request's id, numeric or string, and that
@@ -944,6 +979,8 @@ async fn replies_echo_request_ids() {
     assert_eq!(auth["protocol"], 1);
     assert_eq!(auth["limits"]["max_inflight"], 100);
     assert_eq!(auth["limits"]["session_expiry_secs"], 86_400);
+    assert_eq!(auth["limits"]["heartbeat_secs"], 30);
+    assert_eq!(auth["limits"]["idle_timeout_secs"], 90);
     let subscribed = send_raw(
         &mut ws,
         &serde_json::json!({"type": "subscribe", "id": 2, "topic": "chat"}).to_string(),
@@ -1026,5 +1063,278 @@ async fn an_unsupported_protocol_version_is_refused() {
     )
     .await;
     assert_eq!(refused["code"], "unsupported_protocol");
+    assert_eq!(
+        next_close(&mut ws, Duration::from_secs(2)).await,
+        (4006, "unsupported_protocol".to_string())
+    );
     assert!(wait_for_no_clients(&broker).await);
+}
+
+/// Opens a WebSocket to a server without logging in.
+///
+/// Args:
+///     addr: The server's address.
+///
+/// Returns:
+///     The connection.
+async fn raw_connection(addr: std::net::SocketAddr) -> TestSocket {
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    tokio_tungstenite::client_async("ws://localhost/", stream)
+        .await
+        .expect("handshake")
+        .0
+}
+
+/// Signs a token for a user that expires in a few seconds, with the server's secret.
+///
+/// Args:
+///     settings: The server's settings, for the JWT secret.
+///     username: The token's subject.
+///     lifetime: How long until it expires.
+///
+/// Returns:
+///     The token.
+fn short_token(settings: &Settings, username: &str, lifetime: Duration) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &serde_json::json!({"sub": username, "iat": now, "exp": now + lifetime.as_secs()}),
+        &jsonwebtoken::EncodingKey::from_secret(settings.server.jwt_secret.as_bytes()),
+    )
+    .expect("sign a token")
+}
+
+/// Checks that a bad token and a request before `auth` close the connection
+/// with their close codes after the error.
+#[tokio::test]
+async fn auth_failures_close_with_their_codes() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut bad_token = raw_connection(addr).await;
+    let reply = send_raw(&mut bad_token, r#"{"type": "auth", "token": "nope"}"#).await;
+    assert_eq!(reply["code"], "auth_failed");
+    assert_eq!(
+        next_close(&mut bad_token, Duration::from_secs(2)).await,
+        (CloseCode::AuthFailed.code(), "auth_failed".to_string())
+    );
+    let mut too_early = raw_connection(addr).await;
+    let reply = send_raw(&mut too_early, r#"{"type": "subscribe", "topic": "chat"}"#).await;
+    assert_eq!(reply["code"], "unauthenticated");
+    assert_eq!(
+        next_close(&mut too_early, Duration::from_secs(2)).await.0,
+        CloseCode::Unauthenticated.code()
+    );
+}
+
+/// Checks that a client that keeps answering pings stays connected, and one
+/// that goes silent is closed with `idle_timeout`.
+#[tokio::test]
+async fn silent_connections_are_closed_after_the_idle_timeout() {
+    let settings = Settings::default();
+    let (addr, broker) = start_server_with(
+        &settings,
+        Heartbeat {
+            interval: Duration::from_millis(50),
+            idle_timeout: Duration::from_millis(250),
+        },
+    )
+    .await;
+    let mut attentive = raw_connection(addr).await;
+    let mut pings = 0;
+    let until = tokio::time::Instant::now() + Duration::from_millis(600);
+    while let Ok(frame) = tokio::time::timeout_at(until, attentive.next()).await {
+        match frame {
+            Some(Ok(WsMessage::Ping(_))) => pings += 1,
+            other => panic!("expected only pings, got {other:?}"),
+        }
+    }
+    assert!(pings >= 3, "only {pings} pings");
+
+    let still_there = send_raw(
+        &mut attentive,
+        &serde_json::json!({"type": "login", "username": "admin", "password": "password"})
+            .to_string(),
+    )
+    .await;
+    assert_eq!(still_there["type"], "logged_in");
+
+    let mut silent = raw_connection(addr).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        next_close(&mut silent, Duration::from_secs(2)).await,
+        (CloseCode::IdleTimeout.code(), "idle_timeout".to_string())
+    );
+    drop(broker);
+}
+
+/// Checks that a client is warned before its token expires and closed with
+/// `token_expired` when it does.
+#[tokio::test]
+async fn expiring_tokens_are_warned_about_then_closed() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = raw_connection(addr).await;
+    let token = short_token(&settings, "admin", Duration::from_secs(2));
+    let auth = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "auth", "token": token}).to_string(),
+    )
+    .await;
+    assert_eq!(auth["type"], "authenticated");
+    match next_frame(&mut ws).await {
+        ServerMessage::AuthExpiring { expires_at_ms } => {
+            assert!(expires_at_ms > wall_clock_ms());
+        }
+        other => panic!("expected auth_expiring, got {other:?}"),
+    }
+    assert_eq!(
+        next_close(&mut ws, Duration::from_secs(4)).await,
+        (CloseCode::TokenExpired.code(), "token_expired".to_string())
+    );
+}
+
+/// The current time in milliseconds since the Unix epoch.
+///
+/// Returns:
+///     The time.
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
+}
+
+/// Checks that sending `auth` again with a fresh token keeps the connection
+/// open past the old token's expiry, and that a token for another user is
+/// refused without closing the connection.
+#[tokio::test]
+async fn re_auth_refreshes_the_token_for_the_same_user_only() {
+    let mut settings = Settings::default();
+    settings.server.allow_registration = true;
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut other = raw_connection(addr).await;
+    let registered = send_raw(
+        &mut other,
+        r#"{"type": "register", "username": "bobby", "password": "password123"}"#,
+    )
+    .await;
+    assert_eq!(registered["type"], "registered");
+
+    let mut ws = raw_connection(addr).await;
+    let short = short_token(&settings, "admin", Duration::from_secs(2));
+    let auth = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "auth", "token": short}).to_string(),
+    )
+    .await;
+    assert_eq!(auth["type"], "authenticated");
+    assert!(matches!(
+        next_frame(&mut ws).await,
+        ServerMessage::AuthExpiring { .. }
+    ));
+
+    let bob = send_raw(
+        &mut ws,
+        r#"{"type": "login", "username": "bobby", "password": "password123"}"#,
+    )
+    .await;
+    let bob_token = bob["token"].as_str().expect("token").to_string();
+    let refused = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "auth", "id": 1, "token": bob_token}).to_string(),
+    )
+    .await;
+    assert_eq!(
+        (refused["id"].clone(), refused["code"].clone()),
+        (serde_json::json!(1), serde_json::json!("auth_failed"))
+    );
+
+    let login = send_raw(
+        &mut ws,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    let fresh = login["token"].as_str().expect("token").to_string();
+    let refreshed = send_raw(
+        &mut ws,
+        &serde_json::json!({"type": "auth", "id": 2, "token": fresh}).to_string(),
+    )
+    .await;
+    assert_eq!(refreshed["type"], "authenticated");
+    assert_eq!(refreshed["id"], 2);
+    assert!(refreshed.get("resumed").is_none());
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let published = send_raw(
+        &mut ws,
+        r#"{"type": "publish", "topic": "chat", "payload": "x", "qos": 1}"#,
+    )
+    .await;
+    assert_eq!(published["type"], "published");
+}
+
+/// Checks that a session taken over by a new connection closes the old one
+/// with `session_taken_over`.
+#[tokio::test]
+async fn a_taken_over_session_closes_the_old_connection() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let (mut old, _) = admin_session(addr, &settings, Some("phone")).await;
+    let (_new, _) = admin_session(addr, &settings, Some("phone")).await;
+    assert_eq!(
+        next_close(&mut old, Duration::from_secs(2)).await,
+        (
+            CloseCode::SessionTakenOver.code(),
+            "session_taken_over".to_string()
+        )
+    );
+}
+
+/// Checks that closing every connection for a shutdown sends `going_away`.
+#[tokio::test]
+async fn shutting_down_sends_going_away() {
+    let settings = Settings::default();
+    let (addr, broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = admin_connection(addr, &settings).await;
+    assert_eq!(broker.close_all(CloseCode::GoingAway), 1);
+    assert_eq!(
+        next_close(&mut ws, Duration::from_secs(2)).await,
+        (1001, "going_away".to_string())
+    );
+}
+
+/// Starts a server with default settings, default limits and a chosen heartbeat.
+///
+/// Args:
+///     settings: The settings to configure the server from.
+///     heartbeat: The ping interval and idle timeout.
+///
+/// Returns:
+///     The address to connect to and the server's broker.
+async fn start_server_with(
+    settings: &Settings,
+    heartbeat: Heartbeat,
+) -> (std::net::SocketAddr, SharedBroker) {
+    let broker = SharedBroker::new(
+        Broker::new(settings.broker.clone()),
+        Arc::new(MemoryStorage::new()),
+        LogSettings {
+            durability: Durability::None,
+            retention: settings.storage.retention.to_retention(),
+            session_expiry: Duration::from_secs(settings.storage.session_expiry_secs),
+        },
+    )
+    .expect("memory storage accepts durability none");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = Server::from_settings(broker.clone(), &settings.server)
+        .await
+        .with_heartbeat(heartbeat);
+    tokio::spawn(server.serve(listener));
+    (addr, broker)
 }

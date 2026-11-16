@@ -19,6 +19,7 @@ pub mod topic;
 mod writer;
 
 pub use engine::{AckOutcome, Broker, RetryOutcome};
+pub use frame::close_message;
 pub use shared::{LogSettings, SharedBroker, session_key};
 pub use topic::CursorUpdate;
 pub use writer::{Published, SubscribeOutcome};

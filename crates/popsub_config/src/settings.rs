@@ -41,12 +41,18 @@ pub struct ServerSettings {
     pub allow_registration: bool,
     /// Topics given to self-registered users: `none`, `readonly` or `full`.
     pub registration_role: String,
+    /// How often the server pings each connection, in seconds.
+    pub heartbeat_secs: u64,
+    /// How long a connection may send nothing, not even a pong, before it is
+    /// closed, in seconds. Should be a few heartbeats long.
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for ServerSettings {
     /// Builds the server defaults: loopback on port 8080, a published JWT
     /// secret and admin password (fine only for local development), 24 hour
-    /// tokens, and registration off.
+    /// tokens, registration off, a ping every 30 seconds and a 90 second idle
+    /// timeout.
     ///
     /// Returns:
     ///     The default `[server]` section.
@@ -60,6 +66,8 @@ impl Default for ServerSettings {
             password: DEFAULT_PASSWORD.to_string(),
             allow_registration: false,
             registration_role: "none".to_string(),
+            heartbeat_secs: 30,
+            idle_timeout_secs: 90,
         }
     }
 }

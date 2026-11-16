@@ -4,9 +4,10 @@
 //! transport and client SDKs. The broker writes deliveries, `subscribed`,
 //! `truncated` and `stalled` frames straight to subscribers' channels.
 
-use popsub_protocol::{Delivery, ServerFrame, ServerMessage};
+use popsub_protocol::{CloseCode, Delivery, ServerFrame, ServerMessage};
 use popsub_storage::Record;
 use tracing::error;
+use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::Message as WsMessage;
 
 /// Builds the frame a subscriber receives for a stored record. The
@@ -44,4 +45,18 @@ pub(crate) fn to_ws(frame: &ServerFrame) -> Option<WsMessage> {
             None
         }
     }
+}
+
+/// Builds the WebSocket close message for a close code.
+///
+/// Args:
+///     code: Why the connection is being closed.
+///
+/// Returns:
+///     A close message carrying the numeric code and its short reason.
+pub fn close_message(code: CloseCode) -> WsMessage {
+    WsMessage::Close(Some(CloseFrame {
+        code: code.code().into(),
+        reason: code.reason().into(),
+    }))
 }

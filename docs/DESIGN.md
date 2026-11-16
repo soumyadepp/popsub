@@ -109,7 +109,8 @@ All frames are JSON text, tagged with `type`. The types live in `popsub_protocol
 |---|---|
 | Registered | `{"type":"registered"}` |
 | Logged in | `{"type":"logged_in","token":"..."}` |
-| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
+| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
+| Auth expiring | `{"type":"auth_expiring","expires_at_ms":1794800000000}`, a minute before the token expires |
 | Subscribed | `{"type":"subscribed","topic":"...","replay_from":41,"replay_to":90}`. Records `replay_from` to `replay_to` are history; later ones are live. Also sent, without an `id`, for each subscription a session restores. |
 | Unsubscribed | `{"type":"unsubscribed","topic":"..."}` |
 | Published | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
@@ -127,6 +128,27 @@ All replies also carry the request's `id` when it had one. The broker writes `me
 3. `login`. Wrong credentials or a lockout produce an error and the connection stays open. Malformed frames get `bad_request` and the connection stays open too.
 4. `auth` with the token. Failure closes the connection.
 5. Any other request. Sending one before successful `auth` produces an error and closes the connection. A permission denial or a publish rate limit produces an error and the connection stays open.
+6. Before the token expires, send `auth` again with a new token for the same user to keep the connection.
+
+### 4.4 Connection lifecycle
+
+- **Heartbeat.** The server sends a WebSocket ping every `server.heartbeat_secs` (30). Anything from the client, a pong included, counts as it being alive; after `server.idle_timeout_secs` (90) with nothing, the connection is closed. WebSocket libraries answer pings on their own, so a client only has to keep reading. Both values are in `authenticated.limits`.
+- **Token expiry.** The connection remembers its token's `exp`. A minute before, the client gets `{"type":"auth_expiring","expires_at_ms":...}`; at `exp` the connection is closed unless the client has sent `auth` again. A repeat `auth` on an authenticated connection only refreshes the token: it must be for the same user (otherwise `auth_failed`, and the connection keeps its current token), and the reply is `authenticated` with an empty `resumed`.
+- **Close codes.** Every close the server starts carries a code and a short reason, so an SDK can decide what to do without parsing text. When the close follows a failed request, an `error` frame comes first. After sending a close, the server waits up to two seconds for the client's close reply before dropping the connection.
+
+| Code | Reason | When | Reconnect? |
+|---|---|---|---|
+| 1001 | `going_away` | The server is shutting down | Yes, with backoff |
+| 1011 | `internal_error` | A handler failed unexpectedly | Yes, with backoff |
+| 4001 | `auth_failed` | Bad or expired token, or a bad `session_id`, in `auth` | Only after logging in again |
+| 4002 | `unauthenticated` | A request before `auth` | Yes, and authenticate first |
+| 4003 | `session_taken_over` | Another connection authenticated with the same session | No |
+| 4004 | `token_expired` | The token expired without a new `auth` | After logging in again |
+| 4005 | `idle_timeout` | Nothing received for the idle timeout | Yes |
+| 4006 | `unsupported_protocol` | `auth` named a protocol version the server doesn't speak | No |
+| 4007 | `session_unavailable` | The session store couldn't be reached during `auth` | Yes, with backoff |
+
+The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the last column.
 
 ## 5. Message lifecycle
 
@@ -208,6 +230,8 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.username`, `server.password` | `admin`, `password` | Auth, which creates this admin user at startup |
 | `server.allow_registration` | `false` | Auth |
 | `server.registration_role` | `none` | Auth. `none`, `readonly` or `full`; anything else means `none` |
+| `server.heartbeat_secs` | `30` | Transport. How often each connection is pinged |
+| `server.idle_timeout_secs` | `90` | Transport. How long a connection may send nothing before it is closed |
 | `broker.max_connections` | `1000` | Nothing. Not enforced. |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
@@ -262,6 +286,9 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 | Event | What happens |
 |---|---|
 | Subscriber socket drops | Send loop ends, client and subscriptions are removed. An ephemeral connection's unacknowledged records are lost; a durable session gets them again when it reconnects. |
+| A connection goes half-open (the client vanished without closing) | No pongs come back, and it is closed with `idle_timeout` after `server.idle_timeout_secs`, freeing its subscriptions and session. |
+| A token expires on a long connection | The client is warned with `auth_expiring`, then closed with `token_expired` unless it sent a fresh `auth`. |
+| The server is stopped with Ctrl+C | Every client is sent `going_away` before the process exits. |
 | Subscriber reads slowly | Its channel grows without bound until memory runs out. |
 | Publisher sends to a topic nobody subscribes to | Stored in the topic log until retention trims it. |
 | A subscriber stops acknowledging | Its window fills and delivery to it pauses; after `max_retries` it gets `stalled`. Other subscribers are unaffected, and nothing is queued in memory for it. |
@@ -287,9 +314,8 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 
 1. Unbounded per-client channels. Windows bound QoS 1 records per subscription, but QoS 0 records and replies to a slow reader still queue without limit.
 2. No way to grant topics over the protocol. A self-registered user with the default `none` role can't do anything until someone changes their role through the `AuthService` API in code.
-3. Token expiry is only checked at `auth`.
-4. `max_connections` is ignored, and rate limits aren't configurable.
-5. No client libraries, release artefacts, health check or metrics.
+3. `max_connections` is ignored, and rate limits aren't configurable.
+4. No client libraries, release artefacts, health check or metrics.
 
 ## 13. Proposed direction
 
@@ -309,14 +335,13 @@ Done in #9 and #12: users and per-topic permissions, rate limits on logins, regi
 Remaining:
 
 - An admin message or CLI command to grant topics and manage users.
-- Close connections when their token expires, or re-check expiry on each request.
 - Enforce connection and message size limits, and make rate limits configurable.
 - Trust a proxy's forwarded address when configured, so limits work behind one.
 - Document running behind a TLS proxy.
 
 ### Phase 3: adoptable
 
-- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Next: close codes, heartbeats and re-auth, then message and queue size limits, then a JSON Schema generated from the types for other languages.
+- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Next: message and queue size limits, then a JSON Schema generated from the types for other languages.
 - JavaScript and Python client libraries with reconnection and ACK handling built in.
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.

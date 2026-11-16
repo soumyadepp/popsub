@@ -917,7 +917,13 @@ async fn a_new_connection_takes_over_a_session() {
         .attach_session(&new, &key, false)
         .await
         .expect("attach");
-    assert!(matches!(old_rx.try_recv(), Ok(WsMessage::Close(None))));
+    match old_rx.try_recv() {
+        Ok(WsMessage::Close(Some(frame))) => {
+            assert_eq!(u16::from(frame.code), 4003);
+            assert_eq!(frame.reason.as_str(), "session_taken_over");
+        }
+        other => panic!("expected a close frame, got {other:?}"),
+    }
     assert!(broker.with(|b| !b.clients.contains_key(&old)));
     assert_eq!(broker.with(|b| b.session_holder(&key)), Some(new));
 }
@@ -1044,7 +1050,21 @@ async fn subscribed_echoes_the_request_id_and_limits_match_settings() {
     let received = frames(&mut rx);
     assert_eq!(received[0]["type"], "subscribed");
     assert_eq!(received[0]["id"], 9);
-    let limits = broker.limits();
-    assert_eq!(limits.max_inflight, 7);
-    assert_eq!(limits.session_expiry_secs, 86_400);
+    assert_eq!(broker.max_inflight(), 7);
+    assert_eq!(broker.session_expiry(), Duration::from_secs(86_400));
+}
+
+/// Checks that `close_all` sends every connected client a going-away close frame.
+#[test]
+fn close_all_sends_every_client_a_close_frame() {
+    let broker = shared(Retention::default());
+    let (_a, mut rx_a) = broker.with(connect);
+    let (_b, mut rx_b) = broker.with(connect);
+    assert_eq!(broker.close_all(popsub_protocol::CloseCode::GoingAway), 2);
+    for rx in [&mut rx_a, &mut rx_b] {
+        match rx.try_recv() {
+            Ok(WsMessage::Close(Some(frame))) => assert_eq!(u16::from(frame.code), 1001),
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    }
 }
