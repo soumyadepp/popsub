@@ -158,6 +158,7 @@ The settings you are most likely to change:
 | `server.max_payload_bytes` | 1 MiB | Largest publish |
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
 | `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
+| `server.max_connections_per_address` | `0` (no limit) | Connections one client address may hold. Set `trusted_proxies` first if you run behind a proxy |
 | `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
@@ -185,7 +186,7 @@ location / {
 }
 ```
 
-`proxy_read_timeout` must be longer than `server.heartbeat_secs`, or the proxy will cut quiet connections. Entries in `trusted_proxies` can be CIDR ranges (`10.0.0.0/8`) for a fleet of proxies. Only list proxies you run: a client reaching PopSub directly could otherwise claim any address.
+Once the proxy is trusted, you can also cap connections per client with `server.max_connections_per_address`. `proxy_read_timeout` must be longer than `server.heartbeat_secs`, or the proxy will cut quiet connections. Entries in `trusted_proxies` can be CIDR ranges (`10.0.0.0/8`) for a fleet of proxies. Only list proxies you run: a client reaching PopSub directly could otherwise claim any address.
 
 ## Managing users
 

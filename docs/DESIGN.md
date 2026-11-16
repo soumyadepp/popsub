@@ -261,6 +261,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.outbound_queue_bytes` | `16777216` | Transport. The hard byte limit of each connection's outgoing queue; the soft limit is a sixteenth of it, at least 64 KiB |
 | `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
 | `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
+| `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
 | `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
@@ -312,7 +313,8 @@ The defaults below are set in the `[limits]` section (section 9).
 
 - Keying failed logins by address and username together means someone guessing a password from one machine locks out only themselves.
 - Limits use the client's address. By default that is the socket's peer, so behind a reverse proxy every client would share the proxy's address. List the proxies in `server.trusted_proxies` and, for connections from them only, the server reads `X-Forwarded-For` from the right, skipping trusted proxies; the first other address is the client. Addresses further left were written by the client and are ignored. A header from a peer that isn't listed is ignored entirely, so a client that reaches the server directly can't choose its own address. Only list proxies you run, and make sure they append to `X-Forwarded-For` rather than pass on what the client sent unchecked.
-- Every connection must finish its WebSocket handshake within 10 seconds, and at most `broker.max_connections` are open at once. Connections over the limit get `try_again_later` (1013).
+- Every connection must finish its WebSocket handshake within 10 seconds, and at most `broker.max_connections` are open at once. With `server.max_connections_per_address` set, one client address may hold at most that many. Connections over either limit get `try_again_later` (1013).
+- The per-address limit is off by default because, behind a proxy that isn't in `server.trusted_proxies`, every client has the proxy's address and the limit would cap the whole server.
 - Idle limiter entries are pruned every minute, so memory doesn't grow with every address or username ever tried.
 
 **Defaults and exposure**
@@ -351,6 +353,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | A cursor can't be stored | Logged. The cursor in memory still moves; after a reconnect the session may be sent records it already acknowledged. |
 | A task panics while holding the broker lock | The mutex is poisoned. The next `SharedBroker::with` logs it and carries on with the broker's state, so other connections keep working. |
 | More clients connect than `broker.max_connections` | Each one over the limit finishes its handshake and is closed with `try_again_later` (1013); clients reconnect with backoff. Connections already open are unaffected. |
+| One address opens many connections | With `server.max_connections_per_address` set, those over it are closed with `try_again_later`; other addresses are unaffected. Without it, one address can use up `broker.max_connections`. |
 | A socket connects and never sends a WebSocket handshake | It is dropped after 10 seconds, so it can't hold a connection slot. |
 | A client sends a made-up `X-Forwarded-For` | Ignored unless its socket peer is a trusted proxy. Through a trusted proxy, only the address the proxy appended counts. |
 | `accept` fails, for example out of file descriptors | Logged, and the accept loop retries after 100 ms. |
@@ -360,7 +363,6 @@ The defaults below are set in the `[limits]` section (section 9).
 
 1. No release artefacts, health check or metrics, and only a Rust client library.
 2. Changing a password doesn't revoke the account's outstanding tokens.
-3. The connection limit is server-wide: one address can open every connection. Put a per-address connection limit at the proxy.
 
 ## 13. Proposed direction
 
@@ -381,9 +383,7 @@ Done: admin requests and `popsub users` to create accounts, grant and revoke top
 
 Done: an enforced connection limit and handshake timeout, rate limits in the `[limits]` settings, `server.trusted_proxies` so limits key on the real client behind a proxy, and a documented nginx setup.
 
-Remaining:
-
-- A per-address connection limit.
+Done: a per-address connection limit, `server.max_connections_per_address`, off by default.
 
 ### Phase 3: adoptable
 

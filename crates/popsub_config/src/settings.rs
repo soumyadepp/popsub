@@ -62,14 +62,19 @@ pub struct ServerSettings {
     /// with commas.
     #[serde(deserialize_with = "list_or_commas")]
     pub trusted_proxies: Vec<String>,
+    /// The most connections one client address may hold at once; more are
+    /// closed with `try_again_later` (1013). 0 (the default) means no limit.
+    /// Behind a proxy, set `trusted_proxies` first, or every client counts
+    /// as the proxy's address.
+    pub max_connections_per_address: usize,
 }
 
 impl Default for ServerSettings {
     /// Builds the server defaults: loopback on port 8080, a published JWT
     /// secret and admin password (fine only for local development), 24 hour
     /// tokens, registration off, a ping every 30 seconds, a 90 second idle
-    /// timeout, 1 MiB payloads, a 16 MiB outbound queue per connection and
-    /// no trusted proxies.
+    /// timeout, 1 MiB payloads, a 16 MiB outbound queue per connection, no
+    /// trusted proxies and no per-address connection limit.
     ///
     /// Returns:
     ///     The default `[server]` section.
@@ -88,6 +93,7 @@ impl Default for ServerSettings {
             max_payload_bytes: 1024 * 1024,
             outbound_queue_bytes: 16 * 1024 * 1024,
             trusted_proxies: Vec::new(),
+            max_connections_per_address: 0,
         }
     }
 }

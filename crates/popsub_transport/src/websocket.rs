@@ -25,7 +25,8 @@
 
 mod admin;
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -239,6 +240,11 @@ pub struct Server {
     /// Connections open now, counted from `accept` until the connection's
     /// task ends, shared by every clone.
     open_connections: Arc<AtomicUsize>,
+    /// The most connections one client address may hold, or `None` for no limit.
+    max_per_address: Option<usize>,
+    /// Open connections per client address, after the handshake, shared by
+    /// every clone. Addresses with none are removed.
+    per_address: Arc<Mutex<HashMap<IpAddr, usize>>>,
     /// How long a new connection has to finish the WebSocket handshake.
     handshake_timeout: Duration,
 }
@@ -264,6 +270,8 @@ impl Server {
             trusted_proxies: Arc::new(TrustedProxies::default()),
             max_connections: broker.max_connections(),
             open_connections: Arc::new(AtomicUsize::new(0)),
+            max_per_address: None,
+            per_address: Arc::new(Mutex::new(HashMap::new())),
             handshake_timeout: HANDSHAKE_TIMEOUT,
             broker,
         }
@@ -289,8 +297,8 @@ impl Server {
     ///
     /// The JWT secret and expiry, the admin user, whether self-registration
     /// is allowed, the role new users get (see `registration_role`), the
-    /// heartbeat, the payload limit and the outbound queue budget all come
-    /// from `settings`. Rate limits are the defaults; pass the `[limits]`
+    /// heartbeat, the payload limit, the outbound queue budget and the
+    /// per-address connection limit all come from `settings`. Rate limits are the defaults; pass the `[limits]`
     /// section through `RateLimiters::from_settings` and `with_rate_limiters`.
     /// `server.trusted_proxies` isn't applied here, because an invalid entry
     /// must stop startup: parse it with `TrustedProxies::parse` and pass it to
@@ -324,6 +332,9 @@ impl Server {
             })
             .with_max_payload_bytes(settings.max_payload_bytes)
             .with_queue_limits(QueueLimits::from_hard_limit(settings.outbound_queue_bytes))
+            .with_max_connections_per_address(
+                Some(settings.max_connections_per_address).filter(|max| *max > 0),
+            )
     }
 
     /// Replaces the default rate limits.
@@ -360,6 +371,18 @@ impl Server {
     ///     The server with the new limit.
     pub fn with_max_connections(mut self, max_connections: Option<usize>) -> Self {
         self.max_connections = max_connections;
+        self
+    }
+
+    /// Limits how many connections one client address may hold at once.
+    ///
+    /// Args:
+    ///     max: The most per address, or `None` for no limit.
+    ///
+    /// Returns:
+    ///     The server with the new limit.
+    pub fn with_max_connections_per_address(mut self, max: Option<usize>) -> Self {
+        self.max_per_address = max;
         self
     }
 
@@ -513,8 +536,9 @@ impl Server {
     /// The handshake must finish within the handshake timeout. Its
     /// `X-Forwarded-For` headers are kept, and `TrustedProxies::client_address`
     /// decides from them and the peer which address the rate limits key on.
-    /// A connection over the server's limit is closed with `TryAgainLater`
-    /// straight after the handshake. The header callback allows
+    /// A connection over the server's limit, or over the per-address limit
+    /// for its client address, is closed with `TryAgainLater` straight after
+    /// the handshake. The header callback allows
     /// `clippy::result_large_err` because tungstenite fixes its error type.
     ///
     /// Args:
@@ -564,6 +588,13 @@ impl Server {
             refuse(&mut ws_stream, CloseCode::TryAgainLater).await;
             return;
         }
+        let Some(_address_slot) =
+            AddressSlot::take(&self.per_address, client_ip, self.max_per_address)
+        else {
+            warn!(%peer, %client_ip, "address at its connection limit, refusing a connection");
+            refuse(&mut ws_stream, CloseCode::TryAgainLater).await;
+            return;
+        };
         let (ws_sender, mut ws_receiver) = ws_stream.split();
         let (outbox, rx) = Outbox::channel(self.queue_limits);
         let client = Client::new(outbox.clone());
@@ -688,6 +719,56 @@ impl Drop for ConnectionSlot {
     /// Gives the slot back.
     fn drop(&mut self) {
         self.open.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One connection's place in its client address's connection count, given
+/// back when dropped.
+struct AddressSlot {
+    /// The shared per-address counts.
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    /// The address this connection counts against.
+    address: IpAddr,
+}
+
+impl AddressSlot {
+    /// Counts a connection against its address, unless the address is at the limit.
+    ///
+    /// Args:
+    ///     counts: The server's per-address counts.
+    ///     address: The client's address.
+    ///     max: The most connections per address, or `None` for no limit.
+    ///
+    /// Returns:
+    ///     The slot, or `None` when the address already holds `max` connections.
+    fn take(
+        counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+        address: IpAddr,
+        max: Option<usize>,
+    ) -> Option<Self> {
+        let mut map = counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = map.entry(address).or_insert(0);
+        if max.is_some_and(|max| *count >= max) {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            counts: counts.clone(),
+            address,
+        })
+    }
+}
+
+impl Drop for AddressSlot {
+    /// Gives the slot back, forgetting the address once it holds no connections.
+    fn drop(&mut self) {
+        let mut map = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = map.get_mut(&self.address) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.address);
+            }
+        }
     }
 }
 

@@ -13,6 +13,7 @@ idle_timeout_secs = 90
 max_payload_bytes = 1048576
 outbound_queue_bytes = 16777216
 trusted_proxies = []
+max_connections_per_address = 0
 
 [broker]
 max_connections = 1000

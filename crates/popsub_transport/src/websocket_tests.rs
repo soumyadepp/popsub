@@ -2095,3 +2095,49 @@ fn rate_limits_come_from_the_settings() {
         Duration::from_secs(3600)
     );
 }
+
+/// Checks that one client address can't hold more than
+/// `server.max_connections_per_address` connections, while others still can,
+/// and that the count is per forwarded address behind a trusted proxy.
+#[tokio::test]
+async fn one_address_cannot_take_every_connection() {
+    let mut settings = Settings::default();
+    settings.server.max_connections_per_address = 2;
+    let proxies = crate::TrustedProxies::parse(&["127.0.0.1"]).expect("parse");
+    let addr = start_configured(&settings, |server| server.with_trusted_proxies(proxies)).await;
+    let mut first = forwarded_connection(addr, "203.0.113.1").await;
+    let _second = forwarded_connection(addr, "203.0.113.1").await;
+    let mut third = forwarded_connection(addr, "203.0.113.1").await;
+    assert_eq!(
+        next_close(&mut third, Duration::from_secs(2)).await.0,
+        CloseCode::TryAgainLater.code()
+    );
+    let mut elsewhere = forwarded_connection(addr, "198.51.100.2").await;
+    let login = send_raw(
+        &mut elsewhere,
+        r#"{"type": "login", "username": "admin", "password": "password"}"#,
+    )
+    .await;
+    assert_eq!(login["type"], "logged_in", "{login}");
+    first.close(None).await.expect("close");
+    drop(first);
+    let mut admitted = false;
+    for _ in 0..100 {
+        let mut retry = forwarded_connection(addr, "203.0.113.1").await;
+        let sent = retry
+            .send(WsMessage::Text(
+                r#"{"type": "login", "username": "admin", "password": "password"}"#.into(),
+            ))
+            .await;
+        if sent.is_ok()
+            && let Ok(Some(Ok(WsMessage::Text(text)))) =
+                tokio::time::timeout(Duration::from_secs(2), retry.next()).await
+            && text.contains("logged_in")
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(admitted, "the address's freed slot was never reused");
+}
