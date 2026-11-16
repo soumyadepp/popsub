@@ -1,5 +1,25 @@
 {
   "$defs": {
+    "Access": {
+      "description": "What a topic grant allows.",
+      "oneOf": [
+        {
+          "const": "subscribe",
+          "description": "Subscribing only.",
+          "type": "string"
+        },
+        {
+          "const": "publish",
+          "description": "Publishing only.",
+          "type": "string"
+        },
+        {
+          "const": "both",
+          "description": "Both.",
+          "type": "string"
+        }
+      ]
+    },
     "RequestId": {
       "anyOf": [
         {
@@ -14,6 +34,46 @@
         }
       ],
       "description": "The id a client attaches to a request, echoed in the reply.\n\nEither a number or a string, and given back in the same form."
+    },
+    "RoleKind": {
+      "description": "The kinds of account.",
+      "oneOf": [
+        {
+          "const": "admin",
+          "description": "May use every topic and the admin requests.",
+          "type": "string"
+        },
+        {
+          "const": "user",
+          "description": "May use the topics its grants allow.",
+          "type": "string"
+        },
+        {
+          "const": "readonly",
+          "description": "May subscribe to the topics its grants allow, and never publish.",
+          "type": "string"
+        }
+      ]
+    },
+    "RoleSpec": {
+      "description": "What an account may do, as admins see and set it.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/RoleKind",
+          "description": "The kind of account."
+        },
+        "topics": {
+          "description": "The topic patterns it may use. Ignored for `admin`, which may use\nevery topic; every grant of a `readonly` account is `subscribe`.",
+          "items": {
+            "$ref": "#/$defs/TopicGrant"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
     },
     "StartFrom": {
       "description": "Where replay starts when a client subscribes.\n\nOn the wire this is `\"resume\"`, `\"new\"`, `{\"last\": 50}`,\n`{\"since_ms\": 1794800000000}` or `{\"seq\": 1200}`.",
@@ -73,6 +133,24 @@
           "type": "object"
         }
       ]
+    },
+    "TopicGrant": {
+      "description": "One topic pattern and what it allows.",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/Access",
+          "description": "What it allows."
+        },
+        "pattern": {
+          "description": "The pattern, with `+` for one level and a trailing `#` for the rest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "access"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://github.com/soumyadepp/popsub/blob/main/docs/protocol/client.schema.json",
@@ -267,6 +345,203 @@
         "type",
         "topic",
         "seq"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Creates an account. Answered with `user`.",
+      "properties": {
+        "password": {
+          "description": "The new password, at least 8 characters.",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/RoleSpec",
+          "description": "What the account may do."
+        },
+        "type": {
+          "const": "create_user",
+          "type": "string"
+        },
+        "username": {
+          "description": "The new username: 3 to 32 letters, digits, `_`, `.` or `-`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "password",
+        "role"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Reads one account. Answered with `user`.",
+      "properties": {
+        "type": {
+          "const": "get_user",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Lists every account. Answered with `users`.",
+      "properties": {
+        "type": {
+          "const": "list_users",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Replaces an account's role. Answered with `user`. Live\nsubscriptions the new role no longer allows are ended.",
+      "properties": {
+        "role": {
+          "$ref": "#/$defs/RoleSpec",
+          "description": "Its new role."
+        },
+        "type": {
+          "const": "set_role",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "role"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Adds (or replaces) one topic pattern in a `user` or\n`readonly` account's role. Answered with `user`.",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/Access",
+          "description": "What the pattern allows. A `readonly` account can only be granted `subscribe`."
+        },
+        "pattern": {
+          "description": "The topic pattern, with `+` for one level and a trailing `#` for the rest.",
+          "type": "string"
+        },
+        "type": {
+          "const": "grant",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "pattern",
+        "access"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Removes one topic pattern from an account's role. Answered\nwith `user`. Live subscriptions it no longer allows are ended.",
+      "properties": {
+        "pattern": {
+          "description": "The pattern, exactly as granted.",
+          "type": "string"
+        },
+        "type": {
+          "const": "revoke",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "pattern"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Sets an account's password. Answered with `user`. Tokens\nalready issued stay valid until they expire.",
+      "properties": {
+        "password": {
+          "description": "The new password, at least 8 characters.",
+          "type": "string"
+        },
+        "type": {
+          "const": "set_password",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "password"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Enables or disables an account. Answered with `user`.\nDisabling closes its connections with `CloseCode::AccountDisabled`.",
+      "properties": {
+        "enabled": {
+          "description": "Whether it may log in and use topics.",
+          "type": "boolean"
+        },
+        "type": {
+          "const": "set_enabled",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Deletes an account. Answered with `user_deleted`. Its\nconnections are closed with `CloseCode::AccountDisabled`.",
+      "properties": {
+        "type": {
+          "const": "delete_user",
+          "type": "string"
+        },
+        "username": {
+          "description": "The account.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "username"
       ],
       "type": "object"
     }

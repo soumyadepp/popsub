@@ -491,6 +491,49 @@ impl AuthService {
         Ok(())
     }
 
+    /// Enables or disables an account. A disabled account can't log in and is
+    /// refused every topic, effective on its next permission check.
+    ///
+    /// Args:
+    ///     username: The account.
+    ///     enabled: Whether it may log in and use topics.
+    ///
+    /// Raises:
+    ///     AuthError::UserNotFound: When there is no such account.
+    ///     AuthError::Internal: When the user store fails.
+    pub async fn set_user_enabled(&self, username: &str, enabled: bool) -> Result<()> {
+        let mut user = self
+            .user_store
+            .get_user(username)
+            .await?
+            .ok_or_else(|| AuthError::UserNotFound(username.to_string()))?;
+        user.enabled = enabled;
+        self.user_store.update_user(user).await?;
+        info!(username, enabled, "changed whether a user is enabled");
+        Ok(())
+    }
+
+    /// Counts the accounts that are enabled admins, so the last one can't be
+    /// disabled, deleted or demoted.
+    ///
+    /// Returns:
+    ///     The count.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the user store fails.
+    pub async fn enabled_admin_count(&self) -> Result<usize> {
+        let mut count = 0;
+        for username in self.user_store.list_usernames().await? {
+            if let Some(user) = self.user_store.get_user(&username).await?
+                && user.enabled
+                && user.is_admin()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Replaces an account's password, without applying the registration length rule.
     ///
     /// Existing tokens are not revoked.

@@ -72,7 +72,8 @@ impl Subscription {
     /// Waits for the next message.
     ///
     /// Returns:
-    ///     The message, or `None` once the client has stopped for good.
+    ///     The message, or `None` once the client has stopped for good or
+    ///     the server ended the subscription (see `Event::Unsubscribed`).
     pub async fn next(&mut self) -> Option<Message> {
         self.messages.recv().await
     }
@@ -127,6 +128,12 @@ pub enum Event {
     },
     /// The client got a new token and the connection carries on.
     AuthRefreshed,
+    /// The server ended a subscription, because the user may no longer read
+    /// the topic. Its `Subscription` ends, and the client won't resubscribe.
+    Unsubscribed {
+        /// The topic.
+        topic: String,
+    },
     /// The server reported an error that answers no request of the
     /// application, such as a failed QoS 0 publish.
     ServerError {

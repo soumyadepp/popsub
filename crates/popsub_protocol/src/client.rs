@@ -124,6 +124,183 @@ pub enum ClientMessage {
         /// Its `seq`.
         seq: u64,
     },
+    /// Admin only. Creates an account. Answered with `user`.
+    CreateUser {
+        /// The new username: 3 to 32 letters, digits, `_`, `.` or `-`.
+        username: String,
+        /// The new password, at least 8 characters.
+        password: String,
+        /// What the account may do.
+        role: RoleSpec,
+    },
+    /// Admin only. Reads one account. Answered with `user`.
+    GetUser {
+        /// The account.
+        username: String,
+    },
+    /// Admin only. Lists every account. Answered with `users`.
+    ListUsers {},
+    /// Admin only. Replaces an account's role. Answered with `user`. Live
+    /// subscriptions the new role no longer allows are ended.
+    SetRole {
+        /// The account.
+        username: String,
+        /// Its new role.
+        role: RoleSpec,
+    },
+    /// Admin only. Adds (or replaces) one topic pattern in a `user` or
+    /// `readonly` account's role. Answered with `user`.
+    Grant {
+        /// The account.
+        username: String,
+        /// The topic pattern, with `+` for one level and a trailing `#` for the rest.
+        pattern: String,
+        /// What the pattern allows. A `readonly` account can only be granted `subscribe`.
+        access: Access,
+    },
+    /// Admin only. Removes one topic pattern from an account's role. Answered
+    /// with `user`. Live subscriptions it no longer allows are ended.
+    Revoke {
+        /// The account.
+        username: String,
+        /// The pattern, exactly as granted.
+        pattern: String,
+    },
+    /// Admin only. Sets an account's password. Answered with `user`. Tokens
+    /// already issued stay valid until they expire.
+    SetPassword {
+        /// The account.
+        username: String,
+        /// The new password, at least 8 characters.
+        password: String,
+    },
+    /// Admin only. Enables or disables an account. Answered with `user`.
+    /// Disabling closes its connections with `CloseCode::AccountDisabled`.
+    SetEnabled {
+        /// The account.
+        username: String,
+        /// Whether it may log in and use topics.
+        enabled: bool,
+    },
+    /// Admin only. Deletes an account. Answered with `user_deleted`. Its
+    /// connections are closed with `CloseCode::AccountDisabled`.
+    DeleteUser {
+        /// The account.
+        username: String,
+    },
+}
+
+/// What an account may do, as admins see and set it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RoleSpec {
+    /// The kind of account.
+    pub kind: RoleKind,
+    /// The topic patterns it may use. Ignored for `admin`, which may use
+    /// every topic; every grant of a `readonly` account is `subscribe`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<TopicGrant>,
+}
+
+impl RoleSpec {
+    /// An admin, which may use every topic and the admin requests.
+    ///
+    /// Returns:
+    ///     The role.
+    pub fn admin() -> Self {
+        Self {
+            kind: RoleKind::Admin,
+            topics: Vec::new(),
+        }
+    }
+
+    /// A user that may use the topics its grants allow.
+    ///
+    /// Args:
+    ///     topics: The grants.
+    ///
+    /// Returns:
+    ///     The role.
+    pub fn user(topics: Vec<TopicGrant>) -> Self {
+        Self {
+            kind: RoleKind::User,
+            topics,
+        }
+    }
+
+    /// An account that may only subscribe, to the given patterns.
+    ///
+    /// Args:
+    ///     patterns: The patterns it may subscribe to.
+    ///
+    /// Returns:
+    ///     The role, with a `subscribe` grant per pattern.
+    pub fn readonly<I, S>(patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            kind: RoleKind::Readonly,
+            topics: patterns
+                .into_iter()
+                .map(|pattern| TopicGrant::new(pattern, Access::Subscribe))
+                .collect(),
+        }
+    }
+}
+
+/// The kinds of account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RoleKind {
+    /// May use every topic and the admin requests.
+    Admin,
+    /// May use the topics its grants allow.
+    User,
+    /// May subscribe to the topics its grants allow, and never publish.
+    Readonly,
+}
+
+/// One topic pattern and what it allows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TopicGrant {
+    /// The pattern, with `+` for one level and a trailing `#` for the rest.
+    pub pattern: String,
+    /// What it allows.
+    pub access: Access,
+}
+
+impl TopicGrant {
+    /// Builds a grant.
+    ///
+    /// Args:
+    ///     pattern: The topic pattern.
+    ///     access: What it allows.
+    ///
+    /// Returns:
+    ///     The grant.
+    pub fn new(pattern: impl Into<String>, access: Access) -> Self {
+        Self {
+            pattern: pattern.into(),
+            access,
+        }
+    }
+}
+
+/// What a topic grant allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    /// Subscribing only.
+    Subscribe,
+    /// Publishing only.
+    Publish,
+    /// Both.
+    Both,
 }
 
 /// Where replay starts when a client subscribes.

@@ -23,6 +23,8 @@
 //! await. The auth service needs no lock of its own: its methods take
 //! `&self` and its user store does its own locking.
 
+mod admin;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -828,6 +830,15 @@ impl Session {
                 qos,
             } => self.publish(id, &topic, payload, message_id, qos).await,
             ClientMessage::Ack { topic, seq } => self.ack(&topic, seq).await,
+            admin @ (ClientMessage::CreateUser { .. }
+            | ClientMessage::GetUser { .. }
+            | ClientMessage::ListUsers {}
+            | ClientMessage::SetRole { .. }
+            | ClientMessage::Grant { .. }
+            | ClientMessage::Revoke { .. }
+            | ClientMessage::SetPassword { .. }
+            | ClientMessage::SetEnabled { .. }
+            | ClientMessage::DeleteUser { .. }) => self.admin(id, admin).await,
         }
     }
 
@@ -1048,7 +1059,10 @@ impl Session {
     /// The reply is `authenticated` with the protocol version and the
     /// server's limits. These get an error and close the connection with the
     /// matching `CloseCode`: an unsupported `protocol` (`unsupported_protocol`),
-    /// an invalid or expired token (`auth_failed`), an invalid `session_id`
+    /// an invalid or expired token (`auth_failed`), a token whose account is
+    /// disabled or deleted (`auth_failed`, closed as `AccountDisabled`), a
+    /// user store that can't be read (`internal`, closed as `AuthFailed`), an
+    /// invalid `session_id`
     /// (`invalid_session_id`, closed as `AuthFailed`), and a session store
     /// that can't be reached (`session_unavailable`). A client that is no
     /// longer registered is stopped with no reply.
@@ -1105,6 +1119,24 @@ impl Session {
                 return Ok(Flow::Close(CloseCode::AuthFailed));
             }
         };
+        match self.server.auth.get_user(&claims.sub).await {
+            Ok(Some(user)) if user.enabled => {}
+            Ok(_) => {
+                warn!(client_id = %self.client_id, username = %claims.sub, "token for a disabled or deleted account");
+                self.fail(
+                    id,
+                    ErrorCode::AuthFailed,
+                    "this account is disabled or no longer exists",
+                    None,
+                )?;
+                return Ok(Flow::Close(CloseCode::AccountDisabled));
+            }
+            Err(e) => {
+                warn!(client_id = %self.client_id, "looking up the token's account failed: {}", e);
+                self.fail(id, ErrorCode::Internal, "the user store failed", None)?;
+                return Ok(Flow::Close(CloseCode::AuthFailed));
+            }
+        }
         let current = self.server.broker.with(|broker| {
             broker
                 .clients

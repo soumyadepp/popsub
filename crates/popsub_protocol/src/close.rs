@@ -40,11 +40,13 @@ pub enum CloseCode {
     /// server's hard limit. Reconnect; a durable session resumes from its
     /// cursor.
     SlowConsumer,
+    /// 4009: an admin disabled or deleted the account. Don't reconnect.
+    AccountDisabled,
 }
 
 impl CloseCode {
     /// Every close code, for docs and tests.
-    pub const ALL: [CloseCode; 11] = [
+    pub const ALL: [CloseCode; 12] = [
         CloseCode::GoingAway,
         CloseCode::MessageTooBig,
         CloseCode::InternalError,
@@ -56,12 +58,13 @@ impl CloseCode {
         CloseCode::UnsupportedProtocol,
         CloseCode::SessionUnavailable,
         CloseCode::SlowConsumer,
+        CloseCode::AccountDisabled,
     ];
 
     /// The numeric WebSocket close code.
     ///
     /// Returns:
-    ///     1001, 1009 or 1011 for the standard codes, 4001 to 4008 for PopSub's own.
+    ///     1001, 1009 or 1011 for the standard codes, 4001 to 4009 for PopSub's own.
     pub fn code(self) -> u16 {
         match self {
             CloseCode::GoingAway => 1001,
@@ -75,6 +78,7 @@ impl CloseCode {
             CloseCode::UnsupportedProtocol => 4006,
             CloseCode::SessionUnavailable => 4007,
             CloseCode::SlowConsumer => 4008,
+            CloseCode::AccountDisabled => 4009,
         }
     }
 
@@ -95,6 +99,7 @@ impl CloseCode {
             CloseCode::UnsupportedProtocol => "unsupported_protocol",
             CloseCode::SessionUnavailable => "session_unavailable",
             CloseCode::SlowConsumer => "slow_consumer",
+            CloseCode::AccountDisabled => "account_disabled",
         }
     }
 
@@ -113,12 +118,16 @@ impl CloseCode {
     ///
     /// Returns:
     ///     False when reconnecting would fail the same way or fight another
-    ///     connection: a taken-over session, an unsupported protocol, or
-    ///     rejected credentials (which need a new login first).
+    ///     connection: a taken-over session, an unsupported protocol,
+    ///     rejected credentials (which need a new login first), or a
+    ///     disabled account.
     pub fn should_reconnect(self) -> bool {
         !matches!(
             self,
-            CloseCode::SessionTakenOver | CloseCode::UnsupportedProtocol | CloseCode::AuthFailed
+            CloseCode::SessionTakenOver
+                | CloseCode::UnsupportedProtocol
+                | CloseCode::AuthFailed
+                | CloseCode::AccountDisabled
         )
     }
 }

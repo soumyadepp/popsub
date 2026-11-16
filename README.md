@@ -14,6 +14,7 @@ cargo run -p popsub -- server
 - **Durable sessions.** Name a session when you connect, and your subscriptions and acknowledgement positions survive disconnects and server restarts.
 - **QoS 0 and QoS 1.** QoS 1 is at-least-once per subscriber. A publisher that retries with the same `message_id` doesn't create a duplicate, and gets the original `seq` back.
 - **Storage you choose.** A file backend (the default), an in-memory one, or your own through the `Storage` trait, held to a shared conformance suite.
+- **Users you can manage.** Create accounts, grant and revoke topic patterns, and disable or delete accounts with `popsub users` or the admin requests. Changes reach live connections at once: a revoke ends the subscriptions it no longer allows, and disabling an account disconnects it.
 - **Safe defaults.** Users with per-topic permissions, Argon2id passwords, JWTs, rate limits on logins, registration and publishing, size limits, heartbeats, and backpressure for slow readers.
 - **A Rust client** (`popsub_sdk`) that handles reconnection, resubscription and deduplication for you, and a JSON Schema for building clients in other languages.
 
@@ -158,11 +159,41 @@ The settings you are most likely to change:
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
 
+## Managing users
+
+Accounts live in `users.json` in the data directory (with the default `file` backend) and survive restarts. Manage them on a running server as an admin:
+
+```bash
+export POPSUB_PASSWORD=password             # the admin's password; otherwise you're prompted
+popsub users add alice --topic 'orders/#' --topic 'news/+:subscribe'
+popsub users grant alice audit --access publish
+popsub users list
+popsub users revoke alice 'news/+'
+popsub users role bob readonly --topic 'metrics/#'
+popsub users passwd alice
+popsub users disable alice                  # closes her connections; `enable` lets her back in
+popsub users delete alice
+```
+
+From the source tree, run these as `cargo run -p popsub -- users ...`. New passwords come from the `POPSUB_NEW_PASSWORD` environment variable or a prompt that doesn't echo, never from an argument. Add `--url ws://host:port` for a server elsewhere and `--username` for another admin.
+
+A grant is a topic pattern (`+` matches one level, a trailing `#` the rest) with `subscribe`, `publish` or `both`. A `user` account may use what its grants allow, a `readonly` one may only subscribe, and an `admin` may use every topic and manage accounts. The last enabled admin can't be disabled, deleted or demoted.
+
+From Rust, the same requests are on `client.admin()`:
+
+```rust
+use popsub_sdk::{Access, RoleSpec, TopicGrant};
+
+let admin = client.admin();
+admin.create_user("alice", "a-long-password", RoleSpec::user(vec![TopicGrant::new("orders/#", Access::Both)])).await?;
+admin.revoke("alice", "orders/#").await?;
+```
+
 ## Project layout
 
 | Crate | What it is |
 |---|---|
-| `popsub` | The binary: `server` and a demo `client` |
+| `popsub` | The binary: `server`, a demo `client`, and `users` for managing accounts |
 | `popsub_sdk` | The Rust client library |
 | `popsub_protocol` | Every frame type, shared by the server and clients |
 | `popsub_transport` | The WebSocket server: authentication, permissions, rate limits, connection lifecycle |

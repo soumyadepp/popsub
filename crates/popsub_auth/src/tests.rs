@@ -526,3 +526,59 @@ async fn file_store_is_private_to_its_owner() {
         .mode();
     assert_eq!(mode & 0o777, 0o600);
 }
+
+/// Checks which topic patterns are accepted for a grant.
+#[test]
+fn patterns_are_validated() {
+    use crate::permission::validate_pattern;
+    for good in ["chat", "chat/#", "#", "sensors/+/temp", "+", "a.b-c_d/x"] {
+        assert!(validate_pattern(good).is_ok(), "{good}");
+    }
+    let long = "x".repeat(crate::MAX_PATTERN_BYTES + 1);
+    for bad in [
+        "",
+        "chat/#/more",
+        "chat#",
+        "a+b",
+        "chat//x",
+        "/chat",
+        "tab\there",
+        long.as_str(),
+    ] {
+        assert!(
+            matches!(validate_pattern(bad), Err(AuthError::PermissionDenied(_))),
+            "{bad}"
+        );
+    }
+}
+
+/// Checks that disabling an account refuses its logins and topics, and that
+/// enabled admins are counted.
+#[tokio::test]
+async fn disabling_an_account_refuses_it() {
+    let auth =
+        AuthService::new(AuthConfig::new("a-test-secret").with_admin("admin", "password")).await;
+    auth.add_user("erin", "erin-password", Role::user_full_access())
+        .await
+        .expect("add");
+    auth.add_user("frank", "frank-password", Role::admin())
+        .await
+        .expect("add");
+    assert_eq!(auth.enabled_admin_count().await.expect("count"), 2);
+    auth.set_user_enabled("erin", false).await.expect("disable");
+    assert!(matches!(
+        auth.login("erin", "erin-password").await,
+        Err(AuthError::InvalidCredentials)
+    ));
+    assert!(!auth.can_subscribe("erin", "anything").await);
+    auth.set_user_enabled("frank", false)
+        .await
+        .expect("disable");
+    assert_eq!(auth.enabled_admin_count().await.expect("count"), 1);
+    auth.set_user_enabled("erin", true).await.expect("enable");
+    assert!(auth.login("erin", "erin-password").await.is_ok());
+    assert!(matches!(
+        auth.set_user_enabled("nobody", true).await,
+        Err(AuthError::UserNotFound(_))
+    ));
+}

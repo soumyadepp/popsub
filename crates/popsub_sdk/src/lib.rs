@@ -31,6 +31,7 @@
 //! The protocol itself is in `popsub_protocol` and documented in the
 //! repository's `docs/DESIGN.md` section 4.
 
+mod admin;
 mod client;
 mod config;
 mod driver;
@@ -40,9 +41,12 @@ mod message;
 #[cfg(test)]
 mod tests;
 
+pub use admin::Admin;
 pub use client::Client;
 pub use config::{AckMode, ClientConfig, Credentials, ReconnectPolicy};
 pub use driver::Published;
 pub use error::Error;
 pub use message::{Event, Message, Subscription};
-pub use popsub_protocol::{CloseCode, ErrorCode, StartFrom};
+pub use popsub_protocol::{
+    Access, CloseCode, ErrorCode, RoleKind, RoleSpec, StartFrom, TopicGrant, UserInfo,
+};

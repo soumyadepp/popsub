@@ -13,7 +13,8 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::{
-    AckMode, Client, ClientConfig, Credentials, Error, Event, ReconnectPolicy, Subscription,
+    Access, AckMode, Client, ClientConfig, Credentials, Error, Event, ReconnectPolicy, RoleKind,
+    RoleSpec, Subscription, TopicGrant,
 };
 
 /// A server running in the test.
@@ -435,4 +436,165 @@ async fn dropping_a_subscription_unsubscribes() {
     );
     client.close();
     assert!(eventually(|| client.stopped().is_some()).await);
+}
+
+/// Connects as another user, reconnecting quickly.
+///
+/// Args:
+///     server: The server.
+///     username: The account.
+///     password: Its password.
+///
+/// Returns:
+///     The connected client.
+async fn connect_as(server: &TestServer, username: &str, password: &str) -> Client {
+    let config = ClientConfig::new(
+        format!("ws://{}", server.addr),
+        Credentials::password(username, password),
+    )
+    .reconnect(ReconnectPolicy {
+        initial: Duration::from_millis(20),
+        max: Duration::from_millis(200),
+        max_attempts: None,
+    })
+    .request_timeout(Duration::from_secs(10));
+    Client::connect(config).await.expect("connect")
+}
+
+/// Checks the admin calls end to end: creating, reading, listing and
+/// granting, `forbidden` for a non-admin, and a revoke ending the user's
+/// live subscription with `Event::Unsubscribed`.
+#[tokio::test]
+async fn admin_calls_manage_accounts_and_revokes_end_subscriptions() {
+    let server = TestServer::memory(&Settings::default()).await;
+    let admin = Client::connect(server.config()).await.expect("connect");
+    let created = admin
+        .admin()
+        .create_user(
+            "lena",
+            "lena-password",
+            RoleSpec::user(vec![TopicGrant::new("work/#", Access::Subscribe)]),
+        )
+        .await
+        .expect("create");
+    assert_eq!(created.username, "lena");
+    assert!(created.enabled);
+    let granted = admin
+        .admin()
+        .grant("lena", "chat", Access::Both)
+        .await
+        .expect("grant");
+    assert_eq!(granted.role.topics.len(), 2);
+    assert_eq!(admin.admin().get_user("lena").await.expect("get"), granted);
+    let names: Vec<String> = admin
+        .admin()
+        .list_users()
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|u| u.username)
+        .collect();
+    assert_eq!(names, ["admin", "lena"]);
+
+    let lena = connect_as(&server, "lena", "lena-password").await;
+    let mut events = lena.events();
+    match lena.admin().list_users().await {
+        Err(Error::Server { code, .. }) => assert_eq!(code, ErrorCode::Forbidden),
+        other => panic!("expected forbidden, got {other:?}"),
+    }
+    let mut work = lena
+        .subscribe("work/today", StartFrom::New)
+        .await
+        .expect("subscribe");
+    admin
+        .admin()
+        .revoke("lena", "work/#")
+        .await
+        .expect("revoke");
+    assert_eq!(
+        wait_for_event(&mut events, |e| matches!(e, Event::Unsubscribed { .. })).await,
+        Event::Unsubscribed {
+            topic: "work/today".to_string()
+        }
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(5), work.next())
+        .await
+        .expect("the subscription ends");
+    assert!(ended.is_none());
+    let mut chat = lena
+        .subscribe("chat", StartFrom::New)
+        .await
+        .expect("chat is still granted");
+    admin
+        .publish_confirmed("chat", "still here")
+        .await
+        .expect("publish");
+    assert_eq!(next(&mut chat).await.payload, "still here");
+}
+
+/// Checks that disabling an account stops its client for good with
+/// `AccountDisabled`, and the refusals for missing accounts and the last admin.
+#[tokio::test]
+async fn disabled_accounts_stop_their_clients() {
+    let server = TestServer::memory(&Settings::default()).await;
+    let admin = Client::connect(server.config()).await.expect("connect");
+    admin
+        .admin()
+        .create_user("mona", "mona-password", RoleSpec::readonly(["news/#"]))
+        .await
+        .expect("create");
+    let mona = connect_as(&server, "mona", "mona-password").await;
+    let disabled = admin
+        .admin()
+        .set_enabled("mona", false)
+        .await
+        .expect("disable");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.role.kind, RoleKind::Readonly);
+    assert!(eventually(|| mona.stopped().is_some()).await);
+    assert_eq!(mona.stopped(), Some(Some(CloseCode::AccountDisabled)));
+
+    admin.admin().delete_user("mona").await.expect("delete");
+    match admin.admin().get_user("mona").await {
+        Err(Error::Server { code, .. }) => assert_eq!(code, ErrorCode::UserNotFound),
+        other => panic!("expected user_not_found, got {other:?}"),
+    }
+    match admin
+        .admin()
+        .set_role("admin", RoleSpec::readonly(["x"]))
+        .await
+    {
+        Err(Error::Server { code, .. }) => assert_eq!(code, ErrorCode::BadRequest),
+        other => panic!("expected bad_request, got {other:?}"),
+    }
+}
+
+/// Checks that subscribing again straight after dropping a subscription
+/// keeps the new one: the reply to the drop's unsubscribe carries an id, so
+/// it isn't taken for the server ending the new subscription.
+#[tokio::test]
+async fn resubscribing_after_a_drop_keeps_the_new_subscription() {
+    let server = TestServer::memory(&Settings::default()).await;
+    let client = Client::connect(server.config()).await.expect("connect");
+    let mut events = client.events();
+    for round in 0..20 {
+        let old = client
+            .subscribe("chat", StartFrom::New)
+            .await
+            .expect("subscribe");
+        drop(old);
+        let mut new = client
+            .subscribe("chat", StartFrom::New)
+            .await
+            .expect("subscribe again");
+        let payload = format!("round {round}");
+        client
+            .publish_confirmed("chat", payload.clone())
+            .await
+            .expect("publish");
+        assert_eq!(next(&mut new).await.payload, payload);
+    }
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, Event::Unsubscribed { .. }), "{event:?}");
+    }
 }

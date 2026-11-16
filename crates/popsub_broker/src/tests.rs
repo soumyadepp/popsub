@@ -1158,3 +1158,41 @@ async fn replay_is_paced_by_the_subscribers_queue() {
     assert_eq!(received, (1..=200).collect::<Vec<_>>());
     assert!(peak < 1_000, "the queue peaked at {peak} bytes");
 }
+
+/// Checks that a user's live subscriptions are listed across connections,
+/// and that closing a user closes only that user's connections.
+#[test]
+fn a_users_connections_can_be_listed_and_closed() {
+    let broker = shared(Retention::default());
+    let (alice_one, mut rx_one) = broker.with(connect);
+    let (alice_two, mut rx_two) = broker.with(connect);
+    let (bob, mut rx_bob) = broker.with(connect);
+    broker.with(|b| {
+        for (id, name) in [(&alice_one, "alice"), (&alice_two, "alice"), (&bob, "bob")] {
+            b.clients.get_mut(id).expect("client").username = Some(name.to_string());
+        }
+        b.add_subscriber("news", alice_one.clone(), 1, 0);
+        b.add_subscriber("orders", alice_two.clone(), 1, 0);
+        b.add_subscriber("news", bob.clone(), 1, 0);
+    });
+    let mut subscriptions = broker.with(|b| b.subscriptions_of_user("alice"));
+    subscriptions.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        subscriptions,
+        vec![
+            (alice_one.clone(), "news".to_string()),
+            (alice_two.clone(), "orders".to_string())
+        ]
+    );
+    assert_eq!(
+        broker.close_user("alice", popsub_protocol::CloseCode::AccountDisabled),
+        2
+    );
+    for rx in [&mut rx_one, &mut rx_two] {
+        assert_eq!(
+            rx.try_recv(),
+            Some(Outgoing::Close(popsub_protocol::CloseCode::AccountDisabled))
+        );
+    }
+    assert_eq!(rx_bob.try_recv(), None);
+}
