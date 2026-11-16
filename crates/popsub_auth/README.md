@@ -206,7 +206,6 @@ impl UserStore for PostgresUserStore {
 | PostgreSQL | Built in    | `PostgresUserStore`, behind the `postgres` feature |
 | SQLite     | Example     | Implement with `rusqlite`         |
 | Redis      | Example     | Implement with `redis-rs`         |
-| Sled       | Example     | Use existing `popsub_persistence` |
 
 ### PostgreSQL setup
 

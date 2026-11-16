@@ -18,6 +18,8 @@ db
 conf
 pubsub_db
 pubsub_data
+cobertura.xml
+*.profraw
 
 # log files
 *.log

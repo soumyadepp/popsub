@@ -16,7 +16,6 @@ What's in the workspace
 - `crates/popsub_auth`: users, roles, password hashing, JWTs and topic permissions
 - `crates/popsub_ratelimit`: token bucket, sliding window and login lockout limiters
 - `crates/popsub_storage`: topic logs, the storage traits, the file and in-memory backends and the conformance suite
-- `crates/popsub_persistence`: the old `sled` store, no longer used and due to be removed
 - `crates/popsub_client`: the server-side record of one connection (not a client library)
 - `crates/popsub_config`: config loader and settings
 - `crates/popsub_utils`: shared error type and logging

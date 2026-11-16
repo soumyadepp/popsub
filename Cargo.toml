@@ -5,7 +5,6 @@ members = [
 	"crates/popsub_broker",
 	"crates/popsub_client",
 	"crates/popsub_config",
-	"crates/popsub_persistence",
 	"crates/popsub_ratelimit",
 	"crates/popsub_storage",
 	"crates/popsub_transport",

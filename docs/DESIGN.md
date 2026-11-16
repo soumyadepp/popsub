@@ -8,7 +8,7 @@
 
 ## 1. Summary
 
-PopSub is a single-process publish/subscribe broker written in Rust. Clients connect over WebSocket, log in as a user with per-topic permissions, and then subscribe to topics or publish to them using a small JSON protocol. Logins, registrations and publishing are rate limited. Messages can be sent fire-and-forget (QoS 0) or with acknowledgements and retries (QoS 1). Recent messages are stored per topic in an embedded `sled` database and replayed to new subscribers.
+PopSub is a single-process publish/subscribe broker written in Rust. Clients connect over WebSocket, log in as a user with per-topic permissions, and then subscribe to topics or publish to them using a small JSON protocol. Logins, registrations and publishing are rate limited. Messages can be sent fire-and-forget (QoS 0) or with acknowledgements and retries (QoS 1). Every message is appended to a per-topic log with a sequence number, kept in a directory on disk by default, so subscribers can replay history and durable sessions resume where they left off after a reconnect or a restart.
 
 This document describes how the system works today, where its guarantees hold and where they don't, and the changes needed before other people can depend on it.
 
@@ -53,7 +53,6 @@ This document describes how the system works today, where its guarantees hold an
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | One writer task per topic that appends to the log, fans records out in `seq` order and replays history to subscribers; the synchronous `Broker` with subscriber sets and the QoS 1 pending table; all shared through `SharedBroker`. |
 | `popsub_storage` | Per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite every backend must pass (`docs/STORAGE.md`). |
-| `popsub_persistence` | The old `sled` store. Nothing uses it any more; removed in step 6 of `docs/STORAGE.md`. |
 | `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
 | `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
 | `popsub_utils` | `PopSubError`, the shared `Result` alias, and logging setup. |
@@ -170,14 +169,14 @@ The README and the portfolio both describe PopSub as at-least-once. That is only
 
 ## 7. Persistence
 
-The design is in `docs/STORAGE.md`; rollout steps 1 to 4 are done.
+The design is in `docs/STORAGE.md`; rollout steps 1 to 4 and 6 are done, and step 5 (Postgres) is parked.
 
 - Each topic is an append-only log of records in a `popsub_storage::Storage` backend. A record keeps its topic, `seq`, message id, publisher, payload, QoS and publish time.
 - `storage.backend` picks the backend: `file` (the default) or `memory`. Any `Storage` implementation can be used by building the server in code.
 - The `file` backend keeps each topic in `storage.path/topics/t<topic in hex>/` as segment files of CRC-checked records, plus a session log. It takes an exclusive lock on the directory, so a second server pointed at it refuses to start. On startup it scans every segment, cuts off a half-written record at the end of a topic, and refuses to start if a record anywhere else is damaged. Details in `docs/STORAGE.md` section 7.2.
 - `storage.durability` is checked against the backend at startup and refused if the backend can't provide it.
 - `storage.retention` limits each topic by record count, age and bytes. Logs are trimmed after each publish and by the retention loop every minute.
-- `popsub_persistence` (the old `sled` store) is no longer used by anything and is removed in step 6.
+- The old `sled` store is gone. Data in an old `pubsub_db` directory was replay history only and is not migrated; delete it with `make reset-data`.
 
 ## 8. Concurrency
 

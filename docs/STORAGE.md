@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Being implemented. Steps 1 to 4 are done (the storage crate, the broker on the log, sessions and cursors, the `file` backend) |
+| Status | Implemented except step 5. Steps 1 to 4 and 6 are done (the storage crate, the broker on the log, sessions and cursors, the `file` backend, removing `sled`); step 5 (Postgres) is parked until clients need it |
 | Owner | Soumyadeep Ghosh |
 | Replaces | `popsub_persistence` (the `sled` replay store) and the in-memory `pending_acks` table |
 | Related | `docs/DESIGN.md` sections 6, 7, 12 and 13 (phase 1) |
@@ -372,7 +372,7 @@ Stacked pull requests, each merged on its own with tests:
 2. **Broker on the log:** per-topic writers, `seq` on every record, tagged `message` delivery frames, `subscribe` with `from`, `truncated` frames, the `[storage]` settings and the retention loop. Ephemeral connections only. Protocol change, documented in the README and design doc. Until step 4, the only backend is `memory`, so history no longer survives a restart.
 3. **Sessions and cursors:** `session_id` and `clean_start`, per-subscription in-flight windows, `ack` by `topic` and `seq`, `published` confirmations, `stalled` frames, and a `subscribed` reply carrying the replay range. Removes `pending_acks`. Tests for several subscribers, reconnects and acks from the wrong session.
 4. **`file` backend:** segments, index, recovery, group commit, crash test. Becomes the default.
-5. **`postgres` backend**, run against a real database in CI (a Postgres service container).
+5. **`postgres` backend**, run against a real database in CI. Parked: client protocol work comes first.
 6. **Remove `popsub_persistence` and `sled`.** Existing `pubsub_db` data is replay history only, so it is not migrated; the release notes say so.
 
 The delivery semantics table in `docs/DESIGN.md` section 6 is updated in PR 3, where the guarantees actually change.

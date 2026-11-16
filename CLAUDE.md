@@ -37,7 +37,6 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |
 | `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
-| `crates/popsub_persistence` | The old `sled` store. Nothing uses it; removed in step 6 of `docs/STORAGE.md` |
 | `crates/popsub_client` | `Client`, the server-side record of one connection (not a client library) |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
 | `crates/popsub_utils` | `PopSubError`, `Result`, logging |
