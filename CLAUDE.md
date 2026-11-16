@@ -1,6 +1,6 @@
 # PopSub
 
-A single-process WebSocket publish/subscribe broker in Rust, with users, per-topic permissions and rate limits. Read `docs/DESIGN.md` before changing behaviour: it describes the protocol, the delivery guarantees as they really are, and the planned direction. Read `docs/STYLE.md` before writing any code or docs.
+A single-process WebSocket publish/subscribe broker in Rust, with users, per-topic permissions and rate limits. Read `docs/DESIGN.md` before changing behaviour: it describes the protocol, the delivery guarantees as they really are, and the planned direction. Read `docs/STYLE.md` before writing any code or docs. `docs/STORAGE.md` is the proposed direction for storage; check it before changing persistence, acks or replay.
 
 ## Style rules (enforced, read before every change)
 

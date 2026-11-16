@@ -149,6 +149,8 @@ The README and the portfolio both describe PopSub as at-least-once. That is only
 
 ## 7. Persistence
 
+This section describes the current `sled` store. `docs/STORAGE.md` proposes replacing it.
+
 - One `sled` tree per topic. Key: 20-digit millisecond timestamp, underscore, UUID, so iteration is chronological. Value: JSON `{topic, payload, timestamp}`.
 - The message id and QoS level are not stored.
 - On write, if the tree exceeds `max_messages_per_topic`, the oldest keys are deleted.
@@ -255,6 +257,8 @@ Rate limits are set in code (`RateLimiters::default`), not in config.
 ## 13. Proposed direction
 
 ### Phase 1: make the guarantees true
+
+The storage proposal in `docs/STORAGE.md` covers most of this phase: per-topic logs with sequence numbers, durable per-session cursors, resume, per-subscriber acknowledgement and pluggable backends.
 
 - **Per-subscriber delivery state.** Key pending entries by `(subscriber, message_id)`. An ACK clears only its own entry, and a retry goes only to the subscriber that hasn't acknowledged.
 - **Sessions.** The client sends a stable `client_id` at `auth`. Subscriptions and pending deliveries survive a disconnect for a configurable expiry, and are restored on reconnect.
