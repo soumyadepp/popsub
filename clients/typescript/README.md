@@ -1,0 +1,130 @@
+# PopSub TypeScript client
+
+A client for [PopSub](../../README.md) that runs in browsers and in Node.js 22 or later. It uses only the global `WebSocket` and has no runtime dependencies.
+
+It does what every PopSub client does (see [`clients/README.md`](../README.md)): logs in and refreshes its token, reconnects with jittered backoff and knows from the close code when not to, resubscribes from the next `seq` it expects so nothing still in the log is missed, resends confirmed publishes under the same request id and `message_id` so the server stores them once, acknowledges QoS 1 messages, and hands each `(topic, seq)` to the application at most once. It passes the shared scenario suite.
+
+## Install
+
+The package isn't published to a registry yet. Build it and install it from this folder:
+
+```bash
+cd clients/typescript
+npm install
+npm run build
+cd /path/to/your/app
+npm install /path/to/popsub/clients/typescript
+```
+
+## Usage
+
+```ts
+import { Client, PopSubError } from "@popsub/client";
+
+const client = await Client.connect(
+  {
+    url: "ws://127.0.0.1:8080",
+    credentials: { username: "alice", password: "alice-password" },
+    sessionId: "alice-laptop",
+  },
+  (event) => {
+    if (event.type === "disconnected") {
+      console.warn("disconnected", event.code, event.reconnecting);
+    }
+  },
+);
+
+const orders = await client.subscribe("orders", "resume");
+const stored = await client.publishConfirmed("orders", "order 42 shipped");
+console.log("stored as seq", stored.seq);
+
+try {
+  for await (const message of orders) {
+    console.log(message.topic, message.seq, message.payload);
+  }
+} catch (error) {
+  if (error instanceof PopSubError) {
+    console.error(error.kind, error.code, error.closeCode);
+  }
+}
+await client.close();
+```
+
+## API
+
+### `Client`
+
+| Member                              | What it does                                                                                                                                                                                                                                                             |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Client.connect(config, listener?)` | Connects, logs in and authenticates, retrying with the reconnect policy for up to `requestTimeoutMs`. `listener` receives every event, including the first `connected`. Rejects with `invalid_credentials` (and other non-temporary refusals) at once, without retrying. |
+| `subscribe(topic, from = "resume")` | Resolves with a `Subscription` once the server confirms it. `from` is `"resume"`, `"new"`, `{ last }`, `{ sinceMs }` or `{ seq }`. Subscribing to a topic again replaces the earlier subscription.                                                                       |
+| `unsubscribe(topic)`                | Ends the topic's subscription and tells the server. While disconnected it is queued and resolves at once.                                                                                                                                                                |
+| `publish(topic, payload)`           | QoS 0. Returns at once. Up to 10,000 publishes (and unsubscribes) are held while disconnected, oldest dropped first. Server refusals arrive as `serverError` events.                                                                                                     |
+| `publishConfirmed(topic, payload)`  | QoS 1. Resolves with `{ seq, messageId }` once stored. Resent after every reconnect until confirmed.                                                                                                                                                                     |
+| `admin()`                           | An `Admin` with `createUser`, `getUser`, `listUsers`, `setRole`, `grant`, `revoke`, `setPassword`, `setEnabled` and `deleteUser`. These are never queued or resent: while disconnected, or when the connection drops before the reply, they reject with `connect`.       |
+| `on(listener)` / `off(listener)`    | Registers or removes an event listener. `on` returns a function that removes it.                                                                                                                                                                                         |
+| `close()`                           | Stops the client: closes the socket, fails pending requests with `closed`, ends every subscription, clears every timer and listener. Resolves once stopped.                                                                                                              |
+| `stopped`                           | `null` while running, then `{ code }` with the close code that stopped it (or `null`).                                                                                                                                                                                   |
+
+### `Subscription` and `Message`
+
+A `Subscription` is an async iterable of `Message`s in `seq` order. `next()` resolves with the next message, or `undefined` once the subscription has ended and is drained. It ends when the server ends it (access revoked), when the application unsubscribes, or when the client stops. `close()`, or breaking out of `for await`, unsubscribes and drops the messages not yet taken. `buffered` is how many messages wait.
+
+A `Message` has `topic`, `seq`, `messageId`, `payload`, `qos` and `publishedAtMs`. In manual mode, `ack()` acknowledges a QoS 1 message; in automatic mode and for QoS 0 it does nothing. Acknowledging twice is harmless.
+
+### Events
+
+`connected { resumed }`, `disconnected { code, reconnecting }`, `truncated { topic, firstAvailable }`, `stalled { topic, seq }`, `authExpiring { expiresAtMs }`, `authRefreshed`, `unsubscribed { topic }` (the server ended a subscription) and `serverError { code, message }` (an error that answers no request). A listener that throws doesn't stop the others; its error is rethrown from a microtask.
+
+### Errors
+
+Every failure is a `PopSubError` with `kind` (`server`, `closed`, `timeout`, `connect`, `protocol`, `config`), `code` for `server` errors (unknown codes read as `internal`), `retryAfter` for limits, `closeCode` for `closed`, and `cause` when it wraps another error. `isTemporary()` says whether retrying later might work.
+
+### Configuration
+
+| Field                | Default                                               | Meaning                                                                                                 |
+| -------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `url`                | required                                              | `ws://` or `wss://`                                                                                     |
+| `credentials`        | required                                              | `{ username, password }`, or `{ token }` (a token can't be refreshed; the client stops when it expires) |
+| `sessionId`          | `null`                                                | A durable session, 1 to 128 characters                                                                  |
+| `cleanStart`         | `false`                                               | Discard the session's stored subscriptions, on the first connection only                                |
+| `ackMode`            | `"auto"`                                              | `"auto"` or `"manual"`                                                                                  |
+| `reconnect`          | `{ initialMs: 250, maxMs: 30000, maxAttempts: null }` | Each wait is random between zero and a ceiling that doubles from `initialMs` up to `maxMs`              |
+| `requestTimeoutMs`   | `30000`                                               | Limit for connect, subscribe, unsubscribe, confirmed publishes and admin calls                          |
+| `subscriptionBuffer` | `1024`                                                | Messages buffered per subscription before the client holds back (below)                                 |
+
+## How it differs from the Rust client
+
+The browser `WebSocket` API offers no way to stop reading a socket and doesn't show WebSocket pings, so backpressure works differently than in `crates/popsub_sdk`, and silence is detected with the protocol's `ping` request, as [`clients/README.md`](../README.md) describes for clients that can't see pings.
+
+**Backpressure.** The Rust client stops reading the socket when a subscription's buffer is full. This client can't, so:
+
+1. While a subscription holds `subscriptionBuffer` messages or more, automatic acknowledgements of new QoS 1 messages wait until the application takes those messages. The server stops sending to a subscription whose window (`limits.max_inflight`, 100 by default) is full, QoS 0 included, so QoS 1 traffic is paced by the application. Manual mode is paced the same way by the application's own acks.
+2. If the buffer still reaches `subscriptionBuffer + max_inflight` messages, which only QoS 0 traffic can cause since no window paces it, the client drops the connection (a `disconnected` event with `code: null` and `reconnecting: true`), waits until the application has taken that buffer down to half of `subscriptionBuffer`, reconnects, and resubscribes that topic from the next `seq` it expects, so the server's log fills the gap. Messages trimmed from the log meanwhile are reported with `truncated`.
+
+So each subscription holds fewer than `subscriptionBuffer + max_inflight` messages. While acknowledgements are held back, the server may resend those messages after its ack timeout; the client drops them as duplicates and doesn't acknowledge them, and after `max_retries` the server reports `stalled` and pauses the topic until the held acknowledgements go out.
+
+**Silence detection.** Browsers and Node answer the server's WebSocket pings on their own but don't report them, so a quiet topic and a dead connection look the same. As `clients/README.md` asks of such clients, after `limits.heartbeat_secs` with nothing from the server the client sends the protocol's `ping` request with an id, and again after each further `heartbeat_secs` of silence. The server answers with `pong`, which also counts as client activity for its idle timeout. Any frame resets the silence. If nothing at all arrives within `idle_timeout_secs + heartbeat_secs`, the connection is treated as dead: the client drops it (a `disconnected` event with `code: null` and `reconnecting: true`) and reconnects.
+
+**Numbers.** `seq` values are JavaScript numbers, exact up to 2^53.
+
+## Scenarios
+
+From the repository root, with `popsub-scenarios` already built:
+
+```bash
+(cd clients/typescript && npm install && npm run build)
+target/debug/popsub-scenarios --driver "node clients/typescript/dist/driver.js"
+target/debug/popsub-scenarios --driver "node clients/typescript/dist/driver.js" --scenario reconnect_resubscribes_without_gaps
+```
+
+`npm run scenarios` in this folder builds and runs the whole suite. The driver (`src/driver.ts`) speaks the protocol in [`clients/DRIVER.md`](../DRIVER.md). It is built to `dist/driver.js` but isn't exported from the package and isn't included in it.
+
+## Development
+
+```bash
+npm install
+npm run check
+```
+
+`npm run check` runs, in order, `typecheck` (`tsc` with `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` and `noImplicitOverride`), `lint` (ESLint with typescript-eslint's strict and stylistic type-checked presets, no warnings allowed), `format:check` (Prettier) and `test` (Node's built-in test runner). The tests cover the backoff ceiling, deduplication, close codes and configuration checks, check that a silent connection is pinged and that a `ping` left unanswered leads to a reconnect, and run a client in a child process against a small in-test WebSocket server to check that a closed client leaves nothing that keeps Node running. `npm run format` rewrites files in place, and `npm run build` compiles to `dist/` with declaration files and source maps.
