@@ -40,7 +40,7 @@ This document describes how the system works today, where its guarantees hold an
  popsub_broker      popsub_auth          popsub_ratelimit
  (topics, QoS 1)    (users, JWT, RBAC)   (token bucket, sliding window, lockouts)
         |
- popsub_client (per-connection record)   popsub_config (settings loader)
+ popsub_connection (per-connection record)   popsub_config (settings loader)
         |                                        |
  popsub_utils (errors, logging)          popsub_storage (topic logs, Storage traits, backends)
 
@@ -54,9 +54,10 @@ This document describes how the system works today, where its guarantees hold an
 | `popsub_auth` | Users and roles, Argon2id password hashing, JWT issue and validation, topic permission patterns. In-memory user store by default, Postgres behind a feature flag. |
 | `popsub_ratelimit` | Token bucket, sliding window and login lockout limiters, keyed by string, with pruning of idle keys. |
 | `popsub_broker` | One writer task per topic that appends to the log, fans records out in `seq` order and replays history to subscribers; the synchronous `Broker` with subscriber sets and the QoS 1 pending table; all shared through `SharedBroker`. |
+| `popsub_sdk` | The Rust client: login and token refresh, reconnection with backoff guided by close codes, resubscription without gaps, confirmed publishes resent under the same id, acknowledgements and deduplication by `(topic, seq)`. The CLI's demo client uses it. |
 | `popsub_protocol` | Every frame clients and the server exchange, the error codes and `PROTOCOL_VERSION`. Depends only on `serde`, so client SDKs can use it. |
 | `popsub_storage` | Per-topic logs with sequence numbers, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite every backend must pass (`docs/STORAGE.md`). |
-| `popsub_client` | `Client`, the server-side record of one connection: id, outbound channel, authenticated flag and username. Despite the name it is not a client library. |
+| `popsub_connection` | `Client`, the server's record of one connected socket (id, `Outbox`, authenticated flag, username, durable session), and `Outbox`, its outgoing queue with a byte budget. |
 | `popsub_config` | Loads `Settings` from `config/default.toml` and environment variables, falling back to defaults. Reports published default secrets. |
 | `popsub_utils` | `PopSubError`, the shared `Result` alias, and logging setup. |
 
@@ -199,7 +200,7 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 | Duplicates | Possible (retries, and replays of records acknowledged after the cursor was last stored) and detectable: every delivery carries the record's `seq`, so consumers deduplicate by `(topic, seq)`. A publisher retrying with the same `message_id` doesn't create a second record. |
 | Retention | History beyond `storage.retention` is trimmed. A subscriber that asks for trimmed history is told with a `truncated` frame. With the `memory` backend, all history is lost on restart. |
 
-The README and the portfolio both describe PopSub as at-least-once. That is only accurate for the single-subscriber, always-connected case, and should be stated that way until the phase 1 work lands.
+The README states these guarantees in short form. Keep the two in step when delivery behaviour changes.
 
 ## 7. Persistence
 
@@ -216,7 +217,7 @@ The design is in `docs/STORAGE.md`; rollout steps 1 to 4 and 6 are done, and ste
 
 - Broker state (clients, subscriptions and their windows) is behind one `std::sync::Mutex`, through `SharedBroker::with`. It is held only for short, non-blocking work: fan-out, subscriber changes, ACKs, connects, disconnects and retry passes.
 - Storage I/O happens in the topic writers, outside the lock. Each topic's publishes and subscribes are handled one at a time by its writer, so a long replay delays publishes to that topic only.
-- Each connection's outgoing queue (`popsub_client::Outbox`) has a byte budget. Above the soft limit (a sixteenth of `server.outbound_queue_bytes`, at least 64 KiB) no new deliveries are queued: the subscription falls behind and is caught up from the log once the queue drains, the same way as when its QoS 1 window is full. Replies, retries and pings ignore the soft limit; if they push the queue past `server.outbound_queue_bytes`, the connection is closed as a slow consumer.
+- Each connection's outgoing queue (`popsub_connection::Outbox`) has a byte budget. Above the soft limit (a sixteenth of `server.outbound_queue_bytes`, at least 64 KiB) no new deliveries are queued: the subscription falls behind and is caught up from the log once the queue drains, the same way as when its QoS 1 window is full. Replies, retries and pings ignore the soft limit; if they push the queue past `server.outbound_queue_bytes`, the connection is closed as a slow consumer.
 - The lock is never held across an `.await`, which keeps the synchronous mutex safe inside Tokio.
 
 ## 9. Configuration
@@ -347,8 +348,14 @@ Remaining:
 
 ### Phase 3: adoptable
 
-- Done: a versioned protocol in `popsub_protocol`, with request ids and error codes. Also done: close codes, heartbeats, token expiry and re-auth on the same connection. Also done: payload, frame, topic and message id limits. Also done: a byte budget for each connection's outbound queue, with slow subscribers caught up from the log. Also done: a JSON Schema in `docs/protocol/`, generated from the types and checked in CI. Next: the Rust SDK.
-- JavaScript and Python client libraries with reconnection and ACK handling built in.
+- Done:
+  - a versioned protocol in `popsub_protocol`, with request ids and error codes
+  - close codes, heartbeats, token expiry and re-auth on the same connection
+  - payload, frame, topic and message id limits
+  - a byte budget for each connection's outbound queue, with slow subscribers caught up from the log
+  - a JSON Schema in `docs/protocol/`, generated from the types and checked in CI
+- Done: the Rust client library, `popsub_sdk`. Next: TypeScript (types generated from `docs/protocol/`), then Python, held to one shared scenario suite against a real server.
+- `wss://` support in `popsub_sdk` (TLS through `tokio-tungstenite`).
 - Release binaries, a Docker image and crates.io packages.
 - `/healthz` and Prometheus metrics: connections, queue depths, pending ACKs, retries and drops.
 - Published benchmarks against NATS and Redis pub/sub, including where PopSub loses.
