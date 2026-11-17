@@ -35,9 +35,12 @@ func (m Message) Ack() {
 	}
 }
 
-// Subscription is the messages of one subscribed topic, in seq order.
+// Subscription is the messages of one subscription. For a topic they
+// arrive in seq order. For a pattern they are the messages of every
+// matching topic, in seq order within each topic. For a shared
+// subscription they are this member's share, not in strict seq order.
 type Subscription struct {
-	// topic is the subscribed topic.
+	// topic is the subscribed topic or pattern.
 	topic string
 	// messages is where the client puts the topic's messages; closed by the
 	// engine alone.
@@ -60,7 +63,8 @@ func newSubscription(topic string, buffer int) *Subscription {
 	}
 }
 
-// Topic returns the subscribed topic.
+// Topic returns the subscribed topic, or the pattern for a wildcard
+// subscription.
 func (s *Subscription) Topic() string {
 	return s.topic
 }
@@ -153,8 +157,10 @@ type AuthExpiringEvent struct {
 type AuthRefreshedEvent struct{}
 
 // UnsubscribedEvent reports that the server ended a subscription, because
-// the user may no longer read the topic. Its Subscription's channel is
-// closed, and the client won't resubscribe.
+// the user may no longer read the topic. The client won't resubscribe. A
+// topic subscribed by name has its Subscription's channel closed; for a
+// topic joined through a pattern only that topic stops, and the pattern's
+// Subscription carries on.
 type UnsubscribedEvent struct {
 	// Topic is the topic.
 	Topic string

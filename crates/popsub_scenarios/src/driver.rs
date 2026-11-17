@@ -233,6 +233,37 @@ impl Driver {
     }
 }
 
+impl Driver {
+    /// Collects `message` events on any topic for a while.
+    ///
+    /// Args:
+    ///     count: Stop after this many.
+    ///     within: The longest to wait.
+    ///
+    /// Returns:
+    ///     Each message's topic and `seq`, in arrival order. Other events
+    ///     are discarded.
+    pub async fn messages_on_any(&self, count: usize, within: Duration) -> Vec<(String, u64)> {
+        let mut events = self.events.lock().await;
+        let deadline = tokio::time::Instant::now() + within;
+        let mut seen = Vec::new();
+        while seen.len() < count {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(event)) => {
+                    if event["event"] == "message" {
+                        seen.push((
+                            event["topic"].as_str().unwrap_or_default().to_string(),
+                            event["seq"].as_u64().unwrap_or(0),
+                        ));
+                    }
+                }
+                _ => break,
+            }
+        }
+        seen
+    }
+}
+
 /// Builds `connect` arguments with fast reconnects.
 ///
 /// Args:

@@ -52,6 +52,20 @@ export interface WireUser {
   created_at_ms: number;
 }
 
+/** A topic as the server describes it in `topic_info` and `topics` frames. */
+export interface WireTopicInfo {
+  /** The topic's name. */
+  name: string;
+  /** The oldest `seq` still kept, or `last_seq + 1` when nothing is kept. */
+  first_seq: number;
+  /** The newest `seq` ever published. */
+  last_seq: number;
+  /** How many records are kept now. */
+  messages: number;
+  /** How many live subscriptions it has. */
+  subscribers: number;
+}
+
 /** The admin requests, which are never queued or resent. */
 export type AdminRequest =
   | { type: "create_user"; username: string; password: string; role: RoleSpec }
@@ -62,7 +76,10 @@ export type AdminRequest =
   | { type: "revoke"; username: string; pattern: string }
   | { type: "set_password"; username: string; password: string }
   | { type: "set_enabled"; username: string; enabled: boolean }
-  | { type: "delete_user"; username: string };
+  | { type: "delete_user"; username: string }
+  | { type: "list_topics" }
+  | { type: "get_topic"; topic: string }
+  | { type: "purge_topic"; topic: string };
 
 /** Every frame this client sends, without its request id. */
 export type ClientMessage =
@@ -74,7 +91,7 @@ export type ClientMessage =
       session_id?: string;
       clean_start?: boolean;
     }
-  | { type: "subscribe"; topic: string; from?: WireStartFrom }
+  | { type: "subscribe"; topic: string; from?: WireStartFrom; group?: string }
   | { type: "unsubscribe"; topic: string }
   | {
       type: "publish";
@@ -133,6 +150,8 @@ export type ServerMessage =
   | { type: "users"; users: WireUser[] }
   | { type: "user_deleted"; username: string }
   | { type: "pong" }
+  | { type: "topic_info"; topic: WireTopicInfo }
+  | { type: "topics"; topics: WireTopicInfo[] }
   | { type: "error"; code: string; message: string; retry_after?: number | null };
 
 /** A server frame: a message plus the id of the request it answers, if any. */
@@ -157,6 +176,7 @@ export const ERROR_CODES = [
   "forbidden",
   "user_not_found",
   "user_exists",
+  "topic_not_found",
   "internal",
 ] as const;
 
@@ -248,6 +268,8 @@ const REQUIRED_FIELDS: Readonly<Record<ServerMessage["type"], Readonly<Record<st
   users: { users: "object" },
   user_deleted: { username: "string" },
   pong: {},
+  topic_info: { topic: "object" },
+  topics: { topics: "object" },
   error: { code: "string", message: "string" },
 };
 

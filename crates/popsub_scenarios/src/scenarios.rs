@@ -57,6 +57,15 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
         Box::pin(revoked_access_ends_the_subscription(d))
     }),
     ("admin_round_trip", |d| Box::pin(admin_round_trip(d))),
+    ("topic_admin_round_trip", |d| {
+        Box::pin(topic_admin_round_trip(d))
+    }),
+    ("wildcard_subscription_follows_topics", |d| {
+        Box::pin(wildcard_subscription_follows_topics(d))
+    }),
+    ("shared_subscription_splits_messages", |d| {
+        Box::pin(shared_subscription_splits_messages(d))
+    }),
 ];
 
 /// Fails the scenario unless a condition holds.
@@ -730,4 +739,180 @@ async fn admin_round_trip(command: String) -> Outcome {
     check(gone["code"] == "user_not_found", || {
         format!("expected user_not_found after delete, got {gone}")
     })
+}
+
+/// Checks the topic admin calls: listing topics, describing one, purging
+/// one (its numbering carries on), and `topic_not_found`.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn topic_admin_round_trip(command: String) -> Outcome {
+    let server = ScenarioServer::start(Backend::Memory).await?;
+    for n in 1..=3 {
+        server.publish("orders", &format!("o{n}"), 0).await?;
+    }
+    server.publish("audit", "a1", 0).await?;
+    let boss = admin(&command, &server, "admin").await?;
+    let call = |method: &str, params: Value| json!({"method": method, "params": params});
+    let listed = boss.ok("admin", call("list_topics", json!({}))).await?;
+    check(
+        listed["result"]
+            == json!([
+                {"name": "audit", "first_seq": 1, "last_seq": 1, "messages": 1, "subscribers": 0},
+                {"name": "orders", "first_seq": 1, "last_seq": 3, "messages": 3, "subscribers": 0},
+            ]),
+        || format!("unexpected topic list {listed}"),
+    )?;
+    let described = boss
+        .ok("admin", call("get_topic", json!({"topic": "orders"})))
+        .await?;
+    check(described["result"]["messages"] == 3, || {
+        format!("unexpected topic {described}")
+    })?;
+    let purged = boss
+        .ok("admin", call("purge_topic", json!({"topic": "orders"})))
+        .await?;
+    check(
+        purged["result"]
+            == json!({"name": "orders", "first_seq": 4, "last_seq": 3, "messages": 0, "subscribers": 0}),
+        || format!("unexpected purged topic {purged}"),
+    )?;
+    let next = server.publish("orders", "o4", 0).await?;
+    check(next == 4, || {
+        format!("numbering restarted at {next} after a purge")
+    })?;
+    let missing = boss
+        .fails(
+            "admin",
+            call("get_topic", json!({"topic": "no-such-topic"})),
+        )
+        .await?;
+    check(
+        missing["kind"] == "server" && missing["code"] == "topic_not_found",
+        || format!("expected topic_not_found, got {missing}"),
+    )
+}
+
+/// Checks a wildcard subscription: an existing topic is replayed as asked,
+/// a topic created later arrives from its first message, and after a
+/// disconnect the client gets what it missed on a known topic and
+/// everything on a topic created while it was away, each once, then
+/// nothing after unsubscribing the pattern.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn wildcard_subscription_follows_topics(command: String) -> Outcome {
+    let mut server = ScenarioServer::start(Backend::Memory).await?;
+    server.publish("orders/a", "a1", 1).await?;
+    server.publish("elsewhere", "e1", 1).await?;
+    let client = admin(&command, &server, "client").await?;
+    client
+        .ok(
+            "subscribe",
+            json!({"topic": "orders/#", "from": {"last": 5}}),
+        )
+        .await?;
+    let replayed = client.messages_on_any(1, WAIT).await;
+    check(replayed == [("orders/a".to_string(), 1)], || {
+        format!("expected orders/a 1 replayed, got {replayed:?}")
+    })?;
+    server.publish("orders/b", "b1", 1).await?;
+    let created = client.messages_on_any(1, WAIT).await;
+    check(created == [("orders/b".to_string(), 1)], || {
+        format!("expected the new topic orders/b from seq 1, got {created:?}")
+    })?;
+    server.pause().await;
+    client
+        .event(WAIT, "a disconnected event", |e| {
+            e["event"] == "disconnected"
+        })
+        .await?;
+    server.publish("orders/b", "b2", 1).await?;
+    server.publish("orders/c", "c1", 1).await?;
+    server.publish("orders/c", "c2", 1).await?;
+    server.resume().await?;
+    client
+        .event(WAIT, "a connected event", |e| e["event"] == "connected")
+        .await?;
+    let mut missed = client.messages_on_any(3, WAIT).await;
+    missed.sort();
+    check(
+        missed
+            == [
+                ("orders/b".to_string(), 2),
+                ("orders/c".to_string(), 1),
+                ("orders/c".to_string(), 2),
+            ],
+        || format!("expected orders/b 2 and orders/c 1, 2 after reconnecting, got {missed:?}"),
+    )?;
+    let extra = client.messages_on_any(1, QUIET).await;
+    check(extra.is_empty(), || {
+        format!("unexpected extra messages {extra:?}")
+    })?;
+    client
+        .ok("unsubscribe", json!({"topic": "orders/#"}))
+        .await?;
+    server.publish("orders/a", "a2", 1).await?;
+    server.publish("orders/d", "d1", 1).await?;
+    let after = client.messages_on_any(1, QUIET).await;
+    check(after.is_empty(), || {
+        format!("got {after:?} after unsubscribing the pattern")
+    })?;
+    nothing_in_flight(&server).await
+}
+
+/// Checks a shared subscription: two members split a topic's messages with
+/// no overlap, and when one closes without acknowledging, the other gets
+/// its messages and can acknowledge them.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn shared_subscription_splits_messages(command: String) -> Outcome {
+    let server = ScenarioServer::start(Backend::Memory).await?;
+    let mut args = connect_args(&server.url(), "admin", "password");
+    args["ack_mode"] = json!("manual");
+    let first = connected(&command, "first", args.clone()).await?;
+    let second = connected(&command, "second", args).await?;
+    let join = json!({"topic": "jobs", "from": "new", "group": "workers"});
+    first.ok("subscribe", join.clone()).await?;
+    second.ok("subscribe", join).await?;
+    for n in 1..=6 {
+        server.publish("jobs", &format!("job {n}"), 1).await?;
+    }
+    let mine = first.messages("jobs", 3, WAIT).await;
+    let theirs = second.messages("jobs", 3, WAIT).await;
+    let mut all = [mine.clone(), theirs.clone()].concat();
+    all.sort();
+    check(
+        mine.len() == 3 && theirs.len() == 3 && all == [1, 2, 3, 4, 5, 6],
+        || format!("expected six messages split three and three, got {mine:?} and {theirs:?}"),
+    )?;
+    for seq in &mine {
+        first
+            .ok("ack", json!({"topic": "jobs", "seq": seq}))
+            .await?;
+    }
+    second.ok("close", json!({})).await?;
+    let mut handed_over = first.messages("jobs", 3, WAIT).await;
+    handed_over.sort();
+    let mut expected = theirs.clone();
+    expected.sort();
+    check(handed_over == expected, || {
+        format!("expected the closed member's {expected:?} to be handed over, got {handed_over:?}")
+    })?;
+    for seq in &handed_over {
+        first
+            .ok("ack", json!({"topic": "jobs", "seq": seq}))
+            .await?;
+    }
+    nothing_in_flight(&server).await
 }

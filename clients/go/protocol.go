@@ -216,6 +216,8 @@ type subscribeRequest struct {
 	Topic string `json:"topic"`
 	// From is where replay starts.
 	From StartFrom `json:"from"`
+	// Group is the shared subscription to join, omitted for none.
+	Group string `json:"group,omitempty"`
 }
 
 // unsubscribeRequest is the unsubscribe frame.
@@ -259,10 +261,51 @@ type usernameRequest struct {
 	Username string `json:"username"`
 }
 
-// listUsersRequest is the list_users frame.
-type listUsersRequest struct {
-	// Type is "list_users".
+// bareRequest is an admin frame with no fields: list_users and list_topics.
+type bareRequest struct {
+	// Type is the frame type.
 	Type string `json:"type"`
+}
+
+// topicRequest is an admin frame that names only a topic: get_topic and
+// purge_topic.
+type topicRequest struct {
+	// Type is the frame type.
+	Type string `json:"type"`
+	// Topic is the topic.
+	Topic string `json:"topic"`
+}
+
+// TopicInfo describes a topic's log, as the topic admin requests return it.
+type TopicInfo struct {
+	// Name is the topic.
+	Name string `json:"name"`
+	// FirstSeq is the oldest seq still stored; one past LastSeq when the
+	// log is empty.
+	FirstSeq uint64 `json:"first_seq"`
+	// LastSeq is the newest seq ever stored.
+	LastSeq uint64 `json:"last_seq"`
+	// Messages is how many records the log holds.
+	Messages uint64 `json:"messages"`
+	// Subscribers is how many live subscriptions the topic has.
+	Subscribers uint64 `json:"subscribers"`
+}
+
+// topicField is a frame's "topic" field, which is a topic name in most
+// frames and a topic object in topic_info.
+type topicField struct {
+	// name is the topic name, or empty when the field is not a string.
+	name string
+	// raw is the field as it arrived.
+	raw json.RawMessage
+}
+
+// UnmarshalJSON keeps the raw field and reads it as a name when it is a string.
+func (t *topicField) UnmarshalJSON(data []byte) error {
+	t.raw = append(t.raw[:0], data...)
+	t.name = ""
+	_ = json.Unmarshal(data, &t.name)
+	return nil
 }
 
 // createUserRequest is the create_user frame.
@@ -365,9 +408,11 @@ type serverFrame struct {
 	Resumed []string `json:"resumed"`
 	// ExpiresAtMs is when the token expires, in auth_expiring.
 	ExpiresAtMs int64 `json:"expires_at_ms"`
-	// Topic is the topic, in message, subscribed, unsubscribed, truncated
-	// and stalled.
-	Topic string `json:"topic"`
+	// Topic is the topic's name, in message, subscribed, unsubscribed,
+	// truncated and stalled, and the topic object in topic_info.
+	Topic topicField `json:"topic"`
+	// Topics are the topic objects, in topics.
+	Topics json.RawMessage `json:"topics"`
 	// ReplayFrom is the first history record, in subscribed.
 	ReplayFrom uint64 `json:"replay_from"`
 	// Seq is the record's seq, in message, published and stalled.

@@ -21,7 +21,7 @@
  * @module
  */
 
-export { Admin, type User } from "./admin.js";
+export { Admin, type TopicInfo, type User } from "./admin.js";
 export { Client, type StartFrom } from "./client.js";
 export type {
   AckMode,

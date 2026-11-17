@@ -100,6 +100,9 @@ const (
 	CodeUserNotFound ErrorCode = "user_not_found"
 	// CodeUserExists is a create_user for a name that is taken.
 	CodeUserExists ErrorCode = "user_exists"
+	// CodeTopicNotFound is an admin request naming a topic nothing was
+	// ever published to.
+	CodeTopicNotFound ErrorCode = "topic_not_found"
 	// CodeInternal is a failure inside the server, or a code this client
 	// does not know.
 	CodeInternal ErrorCode = "internal"
@@ -113,7 +116,8 @@ var knownCodes = map[ErrorCode]bool{
 	CodeNotAuthorized: true, CodeRegistrationFailed: true, CodeInvalidSessionID: true,
 	CodeSessionUnavailable: true, CodeUnsupportedProtocol: true, CodeStorageUnavailable: true,
 	CodePayloadTooLarge: true, CodeInvalidTopic: true, CodeForbidden: true,
-	CodeUserNotFound: true, CodeUserExists: true, CodeInternal: true,
+	CodeUserNotFound: true, CodeUserExists: true, CodeTopicNotFound: true,
+	CodeInternal: true,
 }
 
 // normalizeCode maps a code from the wire to an ErrorCode, treating codes

@@ -22,6 +22,44 @@ ACK_MEMORY = 4096
 T = TypeVar("T")
 
 
+def is_pattern(topic: str) -> bool:
+    """Says whether a subscribe target is a wildcard pattern.
+
+    Args:
+        topic: The topic or pattern.
+
+    Returns:
+        True when it contains `+` or `#`.
+    """
+    return "+" in topic or "#" in topic
+
+
+def matches_pattern(pattern: str, topic: str) -> bool:
+    """Says whether a topic matches a wildcard pattern.
+
+    Levels are separated by `/`. A `+` level matches any one level, and a
+    trailing `#` matches the rest, including nothing (`orders/#` matches
+    `orders`). Every other level must be equal.
+
+    Args:
+        pattern: The pattern, such as `orders/#` or `sensors/+/temp`.
+        topic: The topic name.
+
+    Returns:
+        True when the topic matches.
+    """
+    wanted = pattern.split("/")
+    levels = topic.split("/")
+    for index, level in enumerate(wanted):
+        if level == "#":
+            return index == len(wanted) - 1
+        if index >= len(levels):
+            return False
+        if level not in ("+", levels[index]):
+            return False
+    return len(wanted) == len(levels)
+
+
 class AckMemory:
     """The seqs a subscription acknowledged recently, oldest forgotten first."""
 
@@ -85,33 +123,60 @@ class Verdict:
 class TopicState:
     """What the client knows about one subscribed topic.
 
+    A shared subscription (one read through a group) gets only some of the
+    topic's messages, out of order, so it finds duplicates with the bounded
+    `seen` set and never uses `next_expected`.
+
     Attributes:
         start: Where replay started when the application subscribed.
         next_expected: The next seq the application should see; anything
             lower is a duplicate. None until the server says where the
-            subscription starts.
+            subscription starts. Unused when `shared`.
         acked: What the application (or automatic mode) acknowledged.
+        shared: Whether the topic is read through a group.
+        seen: The seqs handed to the application, for a shared subscription.
     """
 
     start: StartFrom
     next_expected: int | None = None
     acked: AckMemory = field(default_factory=AckMemory)
+    shared: bool = False
+    seen: AckMemory = field(default_factory=AckMemory)
 
     def advance(self, seq: int) -> None:
         """Moves the next expected seq forward, never back.
 
         Used for `subscribed.replay_from` and `truncated.first_available`.
+        Does nothing for a shared subscription, whose position is the
+        group's and lives on the server.
 
         Args:
             seq: The seq delivery continues from.
         """
+        if self.shared:
+            return
         if self.next_expected is None or seq > self.next_expected:
             self.next_expected = seq
+
+    def is_duplicate(self, seq: int) -> bool:
+        """Says whether the application already got a seq.
+
+        Args:
+            seq: The message's seq.
+
+        Returns:
+            For a shared subscription, whether the seq is in `seen`;
+            otherwise whether it is below the next expected seq.
+        """
+        if self.shared:
+            return seq in self.seen
+        return self.next_expected is not None and seq < self.next_expected
 
     def accept(self, seq: int, qos: int, ack_mode: AckMode) -> Verdict:
         """Decides what to do with a delivered message, updating the state.
 
-        A message below the next expected seq is a duplicate: it never
+        A message below the next expected seq (or, for a shared
+        subscription, one already in `seen`) is a duplicate: it never
         reaches the application, but a QoS 1 duplicate is acknowledged again
         when it was acknowledged before or in automatic mode, so a lost ack
         can't stall the subscription. A new QoS 1 message in automatic mode
@@ -125,10 +190,13 @@ class TopicState:
         Returns:
             Whether to deliver it and whether to acknowledge it now.
         """
-        if self.next_expected is not None and seq < self.next_expected:
+        if self.is_duplicate(seq):
             again = qos == 1 and (ack_mode == AckMode.AUTO or seq in self.acked)
             return Verdict(deliver=False, ack=again)
-        self.next_expected = seq + 1
+        if self.shared:
+            self.seen.insert(seq)
+        else:
+            self.next_expected = seq + 1
         if qos == 1 and ack_mode == AckMode.AUTO:
             self.acked.insert(seq)
             return Verdict(deliver=True, ack=True)
@@ -138,9 +206,12 @@ class TopicState:
         """Where to subscribe again after a reconnect.
 
         Returns:
+            `"resume"` for a shared subscription. Otherwise
             `{"seq": next_expected}` once the server has said where the
-            subscription starts, otherwise the original start.
+            subscription starts, or the original start before that.
         """
+        if self.shared:
+            return StartFrom.resume()
         if self.next_expected is None:
             return self.start
         return StartFrom.seq(self.next_expected)

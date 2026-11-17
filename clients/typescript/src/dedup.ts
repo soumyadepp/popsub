@@ -1,12 +1,13 @@
 /**
- * Per-topic delivery bookkeeping: the next `seq` the application expects,
- * which `seq`s it acknowledged recently, and which acknowledgements are
- * held back while its buffer is full. Pure, so it can be unit tested.
+ * Per-topic delivery bookkeeping: the next `seq` the application expects
+ * (or, for a shared subscription, the `seq`s it was handed), which `seq`s
+ * it acknowledged recently, and which acknowledgements are held back while
+ * its buffer is full. Pure, so it can be unit tested.
  *
  * @module
  */
 
-/** How many acknowledged `seq`s a topic remembers. */
+/** How many acknowledged `seq`s, and for a shared subscription delivered `seq`s, a topic remembers. */
 export const ACK_MEMORY = 4096;
 
 /**
@@ -70,10 +71,18 @@ export class AckMemory {
 /**
  * What a topic knows about its deliveries. A message whose `seq` is below
  * `nextExpected` is a duplicate and never reaches the application.
+ *
+ * A shared subscription gets only some of a topic's messages, out of
+ * order, so its tracker never uses `nextExpected`: a duplicate is a `seq`
+ * found in a bounded set of the `seq`s already handed over.
  */
 export class DeliveryTracker {
-  /** The next `seq` the application should see, or `null` before the first. */
+  /** Whether this tracks a shared subscription. */
+  readonly shared: boolean;
+  /** The next `seq` the application should see, or `null` before the first and always for a shared subscription. */
   nextExpected: number | null = null;
+  /** The `seq`s handed to the application, for a shared subscription; the oldest are forgotten first. */
+  readonly seen: AckMemory;
   /** The `seq`s acknowledged recently. */
   readonly acked: AckMemory;
   /**
@@ -86,19 +95,27 @@ export class DeliveryTracker {
   /**
    * Builds a tracker with nothing seen yet.
    *
-   * @param ackMemory - How many acknowledged `seq`s to remember.
+   * @param ackMemory - How many acknowledged `seq`s, and delivered ones
+   *   for a shared subscription, to remember.
+   * @param shared - Whether this tracks a shared subscription.
    */
-  constructor(ackMemory: number = ACK_MEMORY) {
+  constructor(ackMemory: number = ACK_MEMORY, shared = false) {
     this.acked = new AckMemory(ackMemory);
+    this.seen = new AckMemory(ackMemory);
+    this.shared = shared;
   }
 
   /**
    * Moves the next expected `seq` forward, never back. Used for
-   * `subscribed.replay_from` and `truncated.first_available`.
+   * `subscribed.replay_from` and `truncated.first_available`. Does nothing
+   * for a shared subscription, whose position is the group's, on the server.
    *
    * @param start - The `seq` delivery continues from.
    */
   moveTo(start: number): void {
+    if (this.shared) {
+      return;
+    }
     this.nextExpected = this.nextExpected === null ? start : Math.max(this.nextExpected, start);
   }
 
@@ -106,9 +123,13 @@ export class DeliveryTracker {
    * Whether a delivered `seq` was already handed to the application.
    *
    * @param seq - The delivered message.
-   * @returns True when it is below the next expected `seq`.
+   * @returns True when it is below the next expected `seq`, or, for a
+   *   shared subscription, among the remembered delivered `seq`s.
    */
   isDuplicate(seq: number): boolean {
+    if (this.shared) {
+      return this.seen.has(seq);
+    }
     return this.nextExpected !== null && seq < this.nextExpected;
   }
 
@@ -118,6 +139,10 @@ export class DeliveryTracker {
    * @param seq - The message.
    */
   accept(seq: number): void {
+    if (this.shared) {
+      this.seen.insert(seq);
+      return;
+    }
     this.nextExpected = seq + 1;
   }
 

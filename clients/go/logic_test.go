@@ -215,3 +215,152 @@ func TestReconnectPolicyLimits(t *testing.T) {
 		t.Errorf("MaxAttempts -2 should be a config error, got %v", err)
 	}
 }
+
+// TestMatchesPattern checks the pattern matcher: + is one whole level, a
+// trailing # is the rest (including nothing), and plain names match only
+// themselves.
+func TestMatchesPattern(t *testing.T) {
+	cases := []struct {
+		pattern string
+		topic   string
+		want    bool
+	}{
+		{"orders", "orders", true},
+		{"orders", "orders/eu", false},
+		{"#", "anything/at/all", true},
+		{"orders/#", "orders/eu", true},
+		{"orders/#", "orders/eu/123", true},
+		{"orders/#", "orders", true},
+		{"orders/#", "ordersx/eu", false},
+		{"orders/#", "audit", false},
+		{"sensors/+/temp", "sensors/kitchen/temp", true},
+		{"sensors/+/temp", "sensors/kitchen/humidity", false},
+		{"sensors/+/temp", "sensors/temp", false},
+		{"sensors/+/temp", "sensors/a/b/temp", false},
+		{"sensors/+", "sensors/kitchen", true},
+		{"sensors/+", "sensors", false},
+		{"sensors/+", "sensors/kitchen/temp", false},
+		{"+/+", "a/b", true},
+		{"+", "a/b", false},
+		{"+/#", "a", true},
+		{"a/+/#", "a/b/c/d", true},
+		{"a/+/#", "a", false},
+	}
+	for _, c := range cases {
+		if got := matchesPattern(c.pattern, c.topic); got != c.want {
+			t.Errorf("matchesPattern(%q, %q) = %v, want %v", c.pattern, c.topic, got, c.want)
+		}
+	}
+	if !isPattern("orders/#") || !isPattern("a/+/b") || isPattern("orders/eu") {
+		t.Error("isPattern should be true exactly for names with + or #")
+	}
+}
+
+// TestSharedSubscriptionDeduplicatesBySeenSet checks that a shared
+// subscription accepts seqs in any order, drops repeats with the usual
+// re-acknowledge rule, ignores replay_from and truncated, and rejoins
+// with resume.
+func TestSharedSubscriptionDeduplicatesBySeenSet(t *testing.T) {
+	shared := newTopicState(newSubscription("jobs", 1), FromNew)
+	shared.group = "workers"
+	for _, seq := range []uint64{5, 2, 9} {
+		if deliver, ack := shared.receive(seq, 1, AckManual); !deliver || ack {
+			t.Fatalf("seq %d out of order should be handed over unacknowledged: deliver=%v ack=%v", seq, deliver, ack)
+		}
+	}
+	if deliver, ack := shared.receive(2, 1, AckManual); deliver || ack {
+		t.Fatalf("a repeat that was never acknowledged: deliver=%v ack=%v", deliver, ack)
+	}
+	shared.acked.insert(2)
+	if deliver, ack := shared.receive(2, 1, AckManual); deliver || !ack {
+		t.Fatalf("a repeat that was acknowledged: deliver=%v ack=%v", deliver, ack)
+	}
+	shared.advance(100)
+	if deliver, _ := shared.receive(7, 1, AckManual); !deliver {
+		t.Fatal("replay_from must not make a shared subscription drop lower seqs")
+	}
+	if got := shared.resumeFrom(); got != FromResume {
+		t.Fatalf("a shared subscription rejoins with resume, got %v", got)
+	}
+	auto := newTopicState(newSubscription("jobs", 1), FromNew)
+	auto.group = "workers"
+	auto.receive(3, 1, AckAuto)
+	if deliver, ack := auto.receive(3, 1, AckAuto); deliver || !ack {
+		t.Fatalf("a repeat in auto mode: deliver=%v ack=%v", deliver, ack)
+	}
+}
+
+// TestSeenSetIsBounded checks that a shared subscription forgets the
+// oldest delivered seqs beyond its limit, so the set can't grow forever.
+func TestSeenSetIsBounded(t *testing.T) {
+	shared := newTopicState(newSubscription("jobs", 1), FromNew)
+	shared.group = "workers"
+	for seq := uint64(1); seq <= ackMemorySize+10; seq++ {
+		shared.receive(seq, 0, AckAuto)
+	}
+	if len(shared.seen.order) != ackMemorySize || shared.seen.contains(10) || !shared.seen.contains(11) {
+		t.Fatalf("expected the oldest 10 forgotten, holding %d", len(shared.seen.order))
+	}
+}
+
+// TestPatternsOwnTheTopicsTheyMatch checks adopt and release: the oldest
+// matching pattern owns a topic, an owned topic tracks its own seqs, the
+// server ending one topic leaves the pattern's subscription open, and
+// releasing a pattern releases its topics and closes its channel.
+func TestPatternsOwnTheTopicsTheyMatch(t *testing.T) {
+	e := newEngine(Config{})
+	defer e.cancel()
+	older := newSubscription("orders/#", 1)
+	newer := newSubscription("orders/+", 1)
+	byName := newSubscription("audit", 1)
+	e.addTopic("orders/#", FromNew, "", older)
+	e.addTopic("orders/+", FromNew, "", newer)
+	e.addTopic("audit", FromNew, "", byName)
+	if !e.adopt("orders/a", 4, true) || !e.adopt("orders/b", 0, false) || e.adopt("elsewhere", 1, true) {
+		t.Fatal("adopt should match orders/a and orders/b only")
+	}
+	a, b := e.topics["orders/a"], e.topics["orders/b"]
+	if a.owner != "orders/#" || a.sub != older || a.resumeFrom() != FromSeq(4) {
+		t.Fatalf("orders/a should belong to the older pattern from seq 4: %+v", a)
+	}
+	if b.owner != "orders/#" || b.hasNext || b.resumeFrom() != FromSeq(1) {
+		t.Fatalf("orders/b adopted from a message should start unknown: %+v", b)
+	}
+	if deliver, _ := a.receive(3, 0, AckAuto); deliver {
+		t.Fatal("a seq below the adopted topic's start is a duplicate")
+	}
+	if !e.endTopic("orders/a") || older.ended {
+		t.Fatal("ending one owned topic must leave the pattern's subscription open")
+	}
+	if got := e.release("orders/#", newer); got != nil {
+		t.Fatalf("release with another subscription should do nothing, got %v", got)
+	}
+	e.adopt("orders/c", 1, true)
+	names := e.release("orders/#", nil)
+	if len(names) != 3 || names[0] != "orders/#" || names[1] != "orders/b" || names[2] != "orders/c" {
+		t.Fatalf("unexpected released names %v", names)
+	}
+	if !older.ended || newer.ended || len(e.topics) != 1 {
+		t.Fatalf("releasing the pattern should close only its subscription and drop its topics: %v", e.topics)
+	}
+	if got := e.release("audit", nil); len(got) != 1 || !byName.ended {
+		t.Fatalf("releasing a topic by name should close its subscription, got %v", got)
+	}
+}
+
+// TestTopicFieldReadsNamesAndObjects checks that a frame's topic field
+// parses both as a name and as the topic_info object.
+func TestTopicFieldReadsNamesAndObjects(t *testing.T) {
+	var named, described serverFrame
+	if err := json.Unmarshal([]byte(`{"type":"message","topic":"orders","seq":2}`), &named); err != nil || named.Topic.name != "orders" {
+		t.Fatalf("unexpected %+v, %v", named, err)
+	}
+	wire := `{"id":3,"type":"topic_info","topic":{"name":"orders","first_seq":4,"last_seq":3,"messages":0,"subscribers":2}}`
+	if err := json.Unmarshal([]byte(wire), &described); err != nil || described.Topic.name != "" {
+		t.Fatalf("unexpected %+v, %v", described, err)
+	}
+	var info TopicInfo
+	if err := json.Unmarshal(described.Topic.raw, &info); err != nil || info != (TopicInfo{Name: "orders", FirstSeq: 4, LastSeq: 3, Subscribers: 2}) {
+		t.Fatalf("unexpected topic %+v, %v", info, err)
+	}
+}

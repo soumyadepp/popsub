@@ -69,12 +69,48 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 // replays nothing otherwise. Subscribing again to a topic replaces the
 // earlier Subscription, whose channel is then closed.
 //
+// The topic may be a pattern, in which + is any one whole level and a
+// trailing # is the rest (orders/#, sensors/+/temp). The one Subscription
+// then carries the messages of every matching topic the user may read,
+// including topics created later, each under its own Topic and Seq. from
+// applies to each topic that exists when subscribing; a topic created
+// later is read from its first message. If the server ends one matching
+// topic (see UnsubscribedEvent), only that topic stops. Unsubscribe with
+// the pattern ends them all.
+//
 // It fails with KindServer when the server refused (for example
 // not_authorized or invalid_topic), KindTimeout, or KindClosed.
 func (c *Client) Subscribe(ctx context.Context, topic string, from StartFrom) (*Subscription, error) {
+	return c.subscribe(ctx, topic, "", from)
+}
+
+// SubscribeShared joins a shared subscription: the members of group split
+// the topic's messages between them, so this client receives only some,
+// not in strict Seq order. Each (Topic, Seq) still reaches the application
+// at most once per client, by remembering the last 4096 delivered seqs,
+// but a message can reach a second member after the first disconnects
+// without acknowledging it. from only decides where a group starts the
+// first time it is used on a topic; after that the group's position is on
+// the server, and the client rejoins with resume after a reconnect. The
+// topic must be a plain name, not a pattern. Unsubscribe with the topic
+// leaves the group.
+//
+// It fails with KindServer when the server refused (for example
+// not_authorized, or bad_request for an invalid group or a pattern),
+// KindTimeout, or KindClosed.
+func (c *Client) SubscribeShared(ctx context.Context, topic, group string, from StartFrom) (*Subscription, error) {
+	if group == "" {
+		return nil, configError("a shared subscription needs a group")
+	}
+	return c.subscribe(ctx, topic, group, from)
+}
+
+// subscribe sends a subscribe, through a group when group is set, and
+// waits for the server to confirm it.
+func (c *Client) subscribe(ctx context.Context, topic, group string, from StartFrom) (*Subscription, error) {
 	sub := newSubscription(topic, c.cfg.SubscriptionBuffer)
 	reply := make(chan *Error, 1)
-	if !c.engine.queue.push(subscribeCommand{topic: topic, from: from, sub: sub, reply: reply}) {
+	if !c.engine.queue.push(subscribeCommand{topic: topic, from: from, group: group, sub: sub, reply: reply}) {
 		return nil, c.closedErr()
 	}
 	failure, waitErr := waitFor(ctx, c, reply)
@@ -92,8 +128,9 @@ func (c *Client) Subscribe(ctx context.Context, topic string, from StartFrom) (*
 	return sub, nil
 }
 
-// Unsubscribe unsubscribes from a topic and closes its Subscription's
-// channel. A durable session forgets the stored subscription too.
+// Unsubscribe unsubscribes from a topic, or from a pattern and every topic
+// joined through it, and closes its Subscription's channel. A durable
+// session forgets the stored subscriptions too.
 //
 // It fails with KindServer when the session store couldn't be updated,
 // KindTimeout, or KindClosed.

@@ -12,7 +12,7 @@
  */
 
 import { PopSubError } from "./errors.js";
-import type { Access, AdminRequest, RoleSpec, ServerMessage, WireUser } from "./protocol.js";
+import type { Access, AdminRequest, RoleSpec, ServerMessage, WireTopicInfo, WireUser } from "./protocol.js";
 
 /** An account, as admins see it. Never includes the password. */
 export interface User {
@@ -24,6 +24,36 @@ export interface User {
   enabled: boolean;
   /** When it was created, in milliseconds since the Unix epoch. */
   createdAtMs: number;
+}
+
+/** A topic, as admins see it. */
+export interface TopicInfo {
+  /** The topic's name. */
+  name: string;
+  /** The oldest `seq` still kept, or `lastSeq + 1` when nothing is kept. */
+  firstSeq: number;
+  /** The newest `seq` ever published. */
+  lastSeq: number;
+  /** How many records are kept now. */
+  messages: number;
+  /** How many live subscriptions it has. */
+  subscribers: number;
+}
+
+/**
+ * Converts a topic from its wire form.
+ *
+ * @param topic - The topic as the server sent it.
+ * @returns The topic.
+ */
+function topicFromWire(topic: WireTopicInfo): TopicInfo {
+  return {
+    name: topic.name,
+    firstSeq: topic.first_seq,
+    lastSeq: topic.last_seq,
+    messages: topic.messages,
+    subscribers: topic.subscribers,
+  };
 }
 
 /** Sends one admin request and returns its reply. */
@@ -199,6 +229,63 @@ export class Admin {
     if (reply.type !== "user_deleted") {
       throw unexpected(reply, "user_deleted");
     }
+  }
+
+  /**
+   * Lists every topic that has a log, sorted by name.
+   *
+   * @returns The topics.
+   * @throws PopSubError of kind `protocol` when the server answers with
+   *   something other than `topics`.
+   */
+  async listTopics(): Promise<TopicInfo[]> {
+    const reply = await this.#send({ type: "list_topics" });
+    if (reply.type !== "topics") {
+      throw unexpected(reply, "topics");
+    }
+    return reply.topics.map(topicFromWire);
+  }
+
+  /**
+   * Reads a topic's bounds, record count and live subscriptions.
+   *
+   * @param topic - The topic.
+   * @returns The topic.
+   * @throws PopSubError with code `topic_not_found` when nothing was ever
+   *   published to it.
+   */
+  getTopic(topic: string): Promise<TopicInfo> {
+    return this.#topic({ type: "get_topic", topic });
+  }
+
+  /**
+   * Removes every record a topic holds. Its numbering carries on (the next
+   * publish gets `lastSeq + 1`), live subscriptions stay, and a subscriber
+   * that hadn't caught up gets `truncated`.
+   *
+   * @param topic - The topic.
+   * @returns The topic after the purge.
+   * @throws PopSubError with code `topic_not_found` when nothing was ever
+   *   published to it.
+   */
+  purgeTopic(topic: string): Promise<TopicInfo> {
+    return this.#topic({ type: "purge_topic", topic });
+  }
+
+  /**
+   * Sends a request answered by a `topic_info` frame.
+   *
+   * @param request - The request.
+   * @returns The topic in the reply.
+   * @throws PopSubError of kind `protocol` when the server answers with
+   *   something other than `topic_info`.
+   */
+  async #topic(request: AdminRequest): Promise<TopicInfo> {
+    const reply = await this.#send(request);
+    if (reply.type !== "topic_info") {
+      throw unexpected(reply, "topic_info");
+    }
+    return topicFromWire(reply.topic);
   }
 
   /**

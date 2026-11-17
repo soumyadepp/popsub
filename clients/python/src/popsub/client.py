@@ -108,19 +108,25 @@ class Client:
         return self._engine.close_code
 
     async def subscribe(self, topic: str, start_from: StartFrom | None = None) -> Subscription:
-        """Subscribes to a topic.
+        """Subscribes to a topic, or to every topic matching a wildcard pattern.
 
-        Subscribing to a topic already subscribed replaces the earlier
-        subscription, which ends.
+        A pattern has `+` for any one level and a trailing `#` for the rest
+        (`orders/#`, `sensors/+/temp`). Its subscription yields the messages
+        of every matching topic the user may read, each under its own topic
+        and seq, including topics created later.
+
+        Subscribing to a topic or pattern already subscribed replaces the
+        earlier subscription, which ends.
 
         Args:
-            topic: The topic.
+            topic: The topic or pattern.
             start_from: Where replay starts. Defaults to `StartFrom.resume()`,
                 which continues a durable session's stored subscription and
-                replays nothing otherwise.
+                replays nothing otherwise. For a pattern it applies to each
+                topic that exists when subscribing.
 
         Returns:
-            The subscription, which yields messages in seq order.
+            The subscription. A topic's messages arrive in seq order.
 
         Raises:
             ServerError: When the server refused it, for example
@@ -128,11 +134,55 @@ class Client:
             RequestTimeoutError: When it didn't complete in time.
             ClosedError: When the client has stopped.
         """
+        return await self._subscribe(topic, start_from, None)
+
+    async def subscribe_shared(self, topic: str, group: str, start_from: StartFrom | None = None) -> Subscription:
+        """Joins a shared subscription: the group's members split the topic's messages.
+
+        Each message goes to one member, so this subscription yields only
+        some of them, not in strict seq order. A message can reach a second
+        member after the first disconnects without acknowledging it. The
+        group's position is kept on the server.
+
+        Args:
+            topic: The topic; a pattern is refused with `bad_request`.
+            group: The group, 1 to 64 letters, digits, `_`, `.` or `-`.
+            start_from: Where the group starts the first time it is used on
+                the topic (`resume`, the default, then means `new`). Ignored
+                when the group already has a position.
+
+        Returns:
+            The subscription.
+
+        Raises:
+            ServerError: When the server refused it, for example
+                `not_authorized`, `invalid_topic` or `bad_request`.
+            RequestTimeoutError: When it didn't complete in time.
+            ClosedError: When the client has stopped.
+        """
+        return await self._subscribe(topic, start_from, group)
+
+    async def _subscribe(self, topic: str, start_from: StartFrom | None, group: str | None) -> Subscription:
+        """Subscribes to a topic or pattern, alone or as a member of a group.
+
+        Args:
+            topic: The topic or pattern.
+            start_from: Where replay starts; None means `resume`.
+            group: The shared subscription to join, if any.
+
+        Returns:
+            The subscription.
+
+        Raises:
+            ServerError: When the server refused it.
+            RequestTimeoutError: When it didn't complete in time.
+            ClosedError: When the client has stopped.
+        """
         start = start_from if start_from is not None else StartFrom.resume()
         generation = next(self._generations)
         channel: Channel[Message] = Channel(self._config.subscription_buffer)
         reply: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._engine.submit(_Subscribe(topic, start, generation, channel, reply))
+        self._engine.submit(_Subscribe(topic, start, generation, channel, reply, group))
         subscription = Subscription(topic, channel, self._engine, generation)
         try:
             subscribed = await self._wait(reply)

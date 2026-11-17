@@ -38,6 +38,8 @@ type subscribeCommand struct {
 	topic string
 	// from is where replay starts.
 	from StartFrom
+	// group is the shared subscription to join, or empty.
+	group string
 	// sub is the application's subscription.
 	sub *Subscription
 	// reply gets nil once subscribed, or the error.
@@ -108,6 +110,17 @@ type requestResult struct {
 	frame *serverFrame
 	// err is the failure, if any.
 	err *Error
+}
+
+// patternState is the engine's record of one wildcard subscription. The
+// topics the server joins for it are tracked in engine.topics, each with
+// this pattern as its owner.
+type patternState struct {
+	// sub is the application's subscription, shared by every owned topic.
+	sub *Subscription
+	// order says how old the subscription is; when several patterns match
+	// a topic, the one with the lowest order owns it.
+	order uint64
 }
 
 // pendingSubscribe is a subscribe waiting for its reply; the caller waits
@@ -192,8 +205,13 @@ type engine struct {
 	cancel context.CancelFunc
 	// stopCode is the close code that stopped the engine; read after done.
 	stopCode CloseCode
-	// topics are the subscribed topics.
+	// topics are the tracked topics: those subscribed by name, and those
+	// the server joined for a wildcard subscription.
 	topics map[string]*topicState
+	// patterns are the wildcard subscriptions, by pattern.
+	patterns map[string]*patternState
+	// nextOrder numbers wildcard subscriptions by age.
+	nextOrder uint64
 	// waiters are subscribes waiting for subscribed, by topic.
 	waiters map[string]chan *Error
 	// pending are requests waiting for a reply, by request id.
@@ -225,6 +243,7 @@ func newEngine(cfg Config) *engine {
 		ctx:         ctx,
 		cancel:      cancel,
 		topics:      make(map[string]*topicState),
+		patterns:    make(map[string]*patternState),
 		waiters:     make(map[string]chan *Error),
 		pending:     make(map[uint64]any),
 		unconfirmed: make(map[uint64]publishRequest),
@@ -591,9 +610,13 @@ func (e *engine) send(conn *websocket.Conn, id uint64, message any) error {
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
-// restore prepares a new connection: it resubscribes every topic the
-// server did not restore for the session from the next seq it expects (so
-// nothing still in the log is missed), resends unconfirmed publishes in
+// restore prepares a new connection. It resubscribes every tracked topic
+// the server did not restore for the session from the next seq it expects
+// (so nothing still in the log is missed); a shared subscription always
+// rejoins its group with resume, since it is never restored. Then it sends
+// each wildcard pattern again from seq 1: the server skips topics the
+// connection holds, so that joins only topics created while it was away,
+// from their first message. Last it resends unconfirmed publishes in
 // request order under their original ids, and sends queued frames.
 func (e *engine) restore(conn *websocket.Conn, resumed []string) error {
 	restored := make(map[string]bool, len(resumed))
@@ -601,12 +624,25 @@ func (e *engine) restore(conn *websocket.Conn, resumed []string) error {
 		restored[topic] = true
 	}
 	for name, topic := range e.topics {
-		if restored[name] {
+		if topic.group == "" && restored[name] {
 			continue
 		}
 		id := e.takeID()
 		e.pending[id] = pendingSubscribe{topic: name}
-		if err := e.send(conn, id, subscribeRequest{Type: "subscribe", Topic: name, From: topic.resumeFrom()}); err != nil {
+		again := subscribeRequest{Type: "subscribe", Topic: name, From: topic.resumeFrom(), Group: topic.group}
+		if err := e.send(conn, id, again); err != nil {
+			return err
+		}
+	}
+	patterns := make([]string, 0, len(e.patterns))
+	for pattern := range e.patterns {
+		patterns = append(patterns, pattern)
+	}
+	sort.Strings(patterns)
+	for _, pattern := range patterns {
+		id := e.takeID()
+		e.pending[id] = pendingSubscribe{topic: pattern}
+		if err := e.send(conn, id, subscribeRequest{Type: "subscribe", Topic: pattern, From: FromSeq(1)}); err != nil {
 			return err
 		}
 	}
@@ -641,15 +677,20 @@ func (e *engine) flushOffline(conn *websocket.Conn) error {
 func (e *engine) queueOffline(command any) {
 	switch c := command.(type) {
 	case subscribeCommand:
-		e.addTopic(c.topic, c.from, c.sub)
+		e.addTopic(c.topic, c.from, c.group, c.sub)
 		e.setWaiter(c.topic, c.reply)
 	case unsubscribeCommand:
-		e.removeTopic(c.topic)
-		e.offline = append(e.offline, unsubscribeRequest{Type: "unsubscribe", Topic: c.topic})
+		names := e.release(c.topic, nil)
+		if len(names) == 0 {
+			names = []string{c.topic}
+		}
+		for _, name := range names {
+			e.offline = append(e.offline, unsubscribeRequest{Type: "unsubscribe", Topic: name})
+		}
 		c.reply <- nil
 	case forgetCommand:
-		if e.forget(c.topic, c.sub) {
-			e.offline = append(e.offline, unsubscribeRequest{Type: "unsubscribe", Topic: c.topic})
+		for _, name := range e.release(c.topic, c.sub) {
+			e.offline = append(e.offline, unsubscribeRequest{Type: "unsubscribe", Topic: name})
 		}
 	case publishCommand:
 		e.queuePublish(c)
@@ -690,53 +731,133 @@ func (e *engine) setWaiter(topic string, reply chan *Error) {
 	e.waiters[topic] = reply
 }
 
-// addTopic adds or replaces a subscribed topic. A replaced subscription's
-// channel is closed.
-func (e *engine) addTopic(topic string, from StartFrom, sub *Subscription) {
-	if old := e.topics[topic]; old != nil && old.sub != sub {
+// addTopic adds or replaces a subscription: a topic by name (through a
+// group when group is set), or a wildcard pattern. A replaced
+// subscription's channel is closed. A replaced pattern's topics move to the
+// new subscription; a topic a pattern owned that is now subscribed by name
+// leaves the pattern's subscription open.
+func (e *engine) addTopic(topic string, from StartFrom, group string, sub *Subscription) {
+	if isPattern(topic) {
+		if old := e.patterns[topic]; old != nil && old.sub != sub {
+			old.sub.end()
+			for _, state := range e.topics {
+				if state.owner == topic {
+					state.sub = sub
+				}
+			}
+		}
+		e.nextOrder++
+		e.patterns[topic] = &patternState{sub: sub, order: e.nextOrder}
+		return
+	}
+	if old := e.topics[topic]; old != nil && old.owner == "" && old.sub != sub {
 		old.sub.end()
 	}
-	e.topics[topic] = newTopicState(sub, from)
+	state := newTopicState(sub, from)
+	state.group = group
+	e.topics[topic] = state
 }
 
-// removeTopic drops a subscribed topic and closes its channel, reporting
-// whether it was subscribed.
-func (e *engine) removeTopic(topic string) bool {
+// adopt starts tracking a topic the server joined for one of the client's
+// wildcard subscriptions, reporting whether a pattern matched. When several
+// match, the oldest owns it. start is the first seq the server will send,
+// when known is true.
+func (e *engine) adopt(name string, start uint64, known bool) bool {
+	var owner string
+	var best *patternState
+	for pattern, state := range e.patterns {
+		if matchesPattern(pattern, name) && (best == nil || state.order < best.order) {
+			owner, best = pattern, state
+		}
+	}
+	if best == nil {
+		return false
+	}
+	from := FromSeq(1)
+	if known {
+		from = FromSeq(start)
+	}
+	state := newTopicState(best.sub, from)
+	state.owner = owner
+	if known {
+		state.advance(start)
+	}
+	e.topics[name] = state
+	return true
+}
+
+// release stops tracking a subscription and closes its channel: a topic
+// subscribed by name, or a wildcard pattern together with every topic
+// joined through it. With a non-nil sub it only releases what still
+// belongs to that subscription. It returns what to unsubscribe from on the
+// server: the name, then for a pattern the topics it owned in name order;
+// nothing when nothing was released.
+func (e *engine) release(name string, sub *Subscription) []string {
+	if pattern := e.patterns[name]; pattern != nil && (sub == nil || pattern.sub == sub) {
+		delete(e.patterns, name)
+		pattern.sub.end()
+		var owned []string
+		for topic, state := range e.topics {
+			if state.owner == name {
+				owned = append(owned, topic)
+				delete(e.topics, topic)
+			}
+		}
+		sort.Strings(owned)
+		return append([]string{name}, owned...)
+	}
+	if state := e.topics[name]; state != nil && state.owner == "" && (sub == nil || state.sub == sub) {
+		state.sub.end()
+		delete(e.topics, name)
+		return []string{name}
+	}
+	return nil
+}
+
+// endTopic stops tracking one topic the server ended, reporting whether it
+// was tracked. A topic subscribed by name has its channel closed; a topic
+// owned by a pattern just stops, and the pattern's subscription carries on.
+func (e *engine) endTopic(topic string) bool {
 	state := e.topics[topic]
 	if state == nil {
 		return false
 	}
-	state.sub.end()
+	if state.owner == "" {
+		state.sub.end()
+	}
 	delete(e.topics, topic)
 	return true
-}
-
-// forget drops a topic only if it still belongs to sub, reporting whether
-// it did.
-func (e *engine) forget(topic string, sub *Subscription) bool {
-	if state := e.topics[topic]; state != nil && state.sub == sub {
-		return e.removeTopic(topic)
-	}
-	return false
 }
 
 // onCommand acts on a command while connected.
 func (e *engine) onCommand(conn *websocket.Conn, command any) error {
 	switch c := command.(type) {
 	case subscribeCommand:
-		e.addTopic(c.topic, c.from, c.sub)
+		e.addTopic(c.topic, c.from, c.group, c.sub)
 		e.setWaiter(c.topic, c.reply)
 		id := e.takeID()
 		e.pending[id] = pendingSubscribe{topic: c.topic}
-		return e.send(conn, id, subscribeRequest{Type: "subscribe", Topic: c.topic, From: c.from})
+		return e.send(conn, id, subscribeRequest{Type: "subscribe", Topic: c.topic, From: c.from, Group: c.group})
 	case unsubscribeCommand:
-		e.removeTopic(c.topic)
-		id := e.takeID()
-		e.pending[id] = pendingUnsubscribe{reply: c.reply}
-		return e.send(conn, id, unsubscribeRequest{Type: "unsubscribe", Topic: c.topic})
+		names := e.release(c.topic, nil)
+		if len(names) == 0 {
+			names = []string{c.topic}
+		}
+		for index, name := range names {
+			id := e.takeID()
+			if index == 0 {
+				e.pending[id] = pendingUnsubscribe{reply: c.reply}
+			}
+			if err := e.send(conn, id, unsubscribeRequest{Type: "unsubscribe", Topic: name}); err != nil {
+				return err
+			}
+		}
+		return nil
 	case forgetCommand:
-		if e.forget(c.topic, c.sub) {
-			return e.send(conn, e.takeID(), unsubscribeRequest{Type: "unsubscribe", Topic: c.topic})
+		for _, name := range e.release(c.topic, c.sub) {
+			if err := e.send(conn, e.takeID(), unsubscribeRequest{Type: "unsubscribe", Topic: name}); err != nil {
+				return err
+			}
 		}
 		return nil
 	case publishCommand:
@@ -779,18 +900,22 @@ func (e *engine) onFrame(conn *websocket.Conn, frame *serverFrame) error {
 	case "message":
 		return e.deliver(conn, frame)
 	case "subscribed":
-		if topic := e.topics[frame.Topic]; topic != nil {
-			topic.advance(frame.ReplayFrom)
+		if e.patterns[frame.Topic.name] == nil {
+			if topic := e.topics[frame.Topic.name]; topic != nil {
+				topic.advance(frame.ReplayFrom)
+			} else {
+				e.adopt(frame.Topic.name, frame.ReplayFrom, true)
+			}
 		}
-		if waiter, ok := e.waiters[frame.Topic]; ok {
-			delete(e.waiters, frame.Topic)
+		if waiter, ok := e.waiters[frame.Topic.name]; ok {
+			delete(e.waiters, frame.Topic.name)
 			waiter <- nil
 		}
 	case "unsubscribed":
 		if unsubscribe, ok := pending.(pendingUnsubscribe); ok {
 			unsubscribe.reply <- nil
-		} else if frame.unprompted() && e.removeTopic(frame.Topic) {
-			e.emit(UnsubscribedEvent{Topic: frame.Topic})
+		} else if frame.unprompted() && e.endTopic(frame.Topic.name) {
+			e.emit(UnsubscribedEvent{Topic: frame.Topic.name})
 		}
 	case "published":
 		if publish, ok := pending.(pendingPublish); ok {
@@ -798,12 +923,12 @@ func (e *engine) onFrame(conn *websocket.Conn, frame *serverFrame) error {
 			publish.reply <- publishResult{published: Published{Seq: frame.Seq, MessageID: frame.MessageID}}
 		}
 	case "truncated":
-		if topic := e.topics[frame.Topic]; topic != nil {
+		if topic := e.topics[frame.Topic.name]; topic != nil {
 			topic.advance(frame.FirstAvailable)
 		}
-		e.emit(TruncatedEvent{Topic: frame.Topic, FirstAvailable: frame.FirstAvailable})
+		e.emit(TruncatedEvent{Topic: frame.Topic.name, FirstAvailable: frame.FirstAvailable})
 	case "stalled":
-		e.emit(StalledEvent{Topic: frame.Topic, Seq: frame.Seq})
+		e.emit(StalledEvent{Topic: frame.Topic.name, Seq: frame.Seq})
 	case "auth_expiring":
 		e.emit(AuthExpiringEvent{ExpiresAtMs: frame.ExpiresAtMs})
 		if e.cfg.Credentials.usesPassword() {
@@ -833,7 +958,7 @@ func (e *engine) onError(id uint64, pending any, frame *serverFrame) {
 	err := serverError(frame)
 	switch p := pending.(type) {
 	case pendingSubscribe:
-		e.removeTopic(p.topic)
+		e.release(p.topic, nil)
 		if waiter, ok := e.waiters[p.topic]; ok {
 			delete(e.waiters, p.topic)
 			waiter <- err
@@ -849,11 +974,16 @@ func (e *engine) onError(id uint64, pending any, frame *serverFrame) {
 }
 
 // deliver hands a message to its subscription, dropping duplicates and
-// acknowledging as the AckMode says. While the subscription's buffer is
+// acknowledging as the AckMode says. A message for an untracked topic that
+// matches a wildcard subscription is adopted by it first; one that matches
+// nothing is acknowledged and dropped. While the subscription's buffer is
 // full it waits, so the engine stops taking frames from the reader.
 func (e *engine) deliver(conn *websocket.Conn, frame *serverFrame) error {
-	ack := ackRequest{Type: "ack", Topic: frame.Topic, Seq: frame.Seq}
-	topic := e.topics[frame.Topic]
+	ack := ackRequest{Type: "ack", Topic: frame.Topic.name, Seq: frame.Seq}
+	topic := e.topics[frame.Topic.name]
+	if topic == nil && e.adopt(frame.Topic.name, 0, false) {
+		topic = e.topics[frame.Topic.name]
+	}
 	if topic == nil {
 		if frame.QoS == 1 {
 			return e.send(conn, 0, ack)
@@ -870,7 +1000,7 @@ func (e *engine) deliver(conn *websocket.Conn, frame *serverFrame) error {
 		return nil
 	}
 	message := Message{
-		Topic:         frame.Topic,
+		Topic:         frame.Topic.name,
 		Seq:           frame.Seq,
 		MessageID:     frame.MessageID,
 		Payload:       frame.Payload,
@@ -878,11 +1008,11 @@ func (e *engine) deliver(conn *websocket.Conn, frame *serverFrame) error {
 		PublishedAtMs: frame.PublishedAtMs,
 	}
 	if frame.QoS == 1 && e.cfg.AckMode == AckManual {
-		queue, name, seq := e.queue, frame.Topic, frame.Seq
+		queue, name, seq := e.queue, frame.Topic.name, frame.Seq
 		message.ack = func() { queue.push(ackCommand{topic: name, seq: seq}) }
 	}
 	sub := topic.sub
-	if sub.halted() || e.ctx.Err() != nil {
+	if sub.halted() || sub.ended || e.ctx.Err() != nil {
 		return nil
 	}
 	select {
@@ -923,8 +1053,13 @@ func (e *engine) stop(code CloseCode) {
 		delete(e.pending, id)
 		failPending(p, code)
 	}
-	for name := range e.topics {
-		e.removeTopic(name)
+	for name, topic := range e.topics {
+		topic.sub.end()
+		delete(e.topics, name)
+	}
+	for name, pattern := range e.patterns {
+		pattern.sub.end()
+		delete(e.patterns, name)
 	}
 	for _, command := range e.queue.close() {
 		failCommand(command, code)
