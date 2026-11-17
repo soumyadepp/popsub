@@ -48,6 +48,18 @@ pub struct Broker {
     settings: BrokerSettings,
     /// Records given up on since `take_dead_letters` was last called.
     dead: DeadLetters,
+    /// Each client's wildcard subscriptions.
+    patterns: HashMap<SubscriberId, PatternState>,
+}
+
+/// One client's wildcard subscriptions and the topics they brought in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatternState {
+    /// The patterns the client subscribed to, in order.
+    pub patterns: Vec<String>,
+    /// Topics the client is subscribed to because a pattern matched, as
+    /// opposed to topics it asked for by name.
+    pub joined: std::collections::HashSet<String>,
 }
 
 /// A QoS 1 record one subscription never acknowledged, to be copied to the
@@ -179,6 +191,7 @@ impl Broker {
             clients: HashMap::new(),
             settings,
             dead: DeadLetters::default(),
+            patterns: HashMap::new(),
         }
     }
 
@@ -361,7 +374,125 @@ impl Broker {
     ///     The session whose stored subscription should also be removed, if
     ///     the subscription belonged to a durable session.
     pub fn unsubscribe(&mut self, topic: &str, subscriber: &SubscriberId) -> Option<String> {
+        if let Some(state) = self.patterns.get_mut(subscriber) {
+            state.joined.remove(topic);
+        }
         self.topics.get_mut(topic)?.unsubscribe(subscriber)?.session
+    }
+
+    /// Records a client's wildcard subscription. Matching topics are joined
+    /// by the caller, with `mark_joined`.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     pattern: The topic pattern.
+    ///
+    /// Returns:
+    ///     False, without changing anything, when the client isn't registered.
+    pub fn add_pattern(&mut self, client_id: &SubscriberId, pattern: &str) -> bool {
+        if !self.clients.contains_key(client_id) {
+            return false;
+        }
+        let state = self.patterns.entry(client_id.clone()).or_default();
+        if !state.patterns.iter().any(|p| p == pattern) {
+            state.patterns.push(pattern.to_string());
+        }
+        true
+    }
+
+    /// Forgets a client's wildcard subscription.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     pattern: The pattern, exactly as subscribed.
+    ///
+    /// Returns:
+    ///     The topics the client joined through it that none of its other
+    ///     patterns match, for the caller to unsubscribe.
+    pub fn remove_pattern(&mut self, client_id: &SubscriberId, pattern: &str) -> Vec<String> {
+        let Some(state) = self.patterns.get_mut(client_id) else {
+            return Vec::new();
+        };
+        state.patterns.retain(|p| p != pattern);
+        let mut orphaned: Vec<String> = state
+            .joined
+            .iter()
+            .filter(|topic| {
+                !state
+                    .patterns
+                    .iter()
+                    .any(|p| popsub_protocol::topics::matches_pattern(p, topic))
+            })
+            .cloned()
+            .collect();
+        orphaned.sort();
+        orphaned
+    }
+
+    /// Notes that a client's subscription to a topic came from a pattern.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     topic: The topic.
+    pub fn mark_joined(&mut self, client_id: &SubscriberId, topic: &str) {
+        if let Some(state) = self.patterns.get_mut(client_id) {
+            state.joined.insert(topic.to_string());
+        }
+    }
+
+    /// Notes that a client asked for a topic by name, so removing a pattern
+    /// leaves that subscription alone.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     topic: The topic.
+    pub fn mark_explicit(&mut self, client_id: &SubscriberId, topic: &str) {
+        if let Some(state) = self.patterns.get_mut(client_id) {
+            state.joined.remove(topic);
+        }
+    }
+
+    /// Whether a client is subscribed to a topic.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     True when it has a subscription, by name or through a pattern.
+    pub fn is_subscribed(&self, client_id: &SubscriberId, topic: &str) -> bool {
+        self.topics
+            .get(topic)
+            .is_some_and(|t| t.subscribers.contains_key(client_id))
+    }
+
+    /// Finds the clients that should join a topic because one of their
+    /// patterns matches it and they aren't subscribed to it yet.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     Each such client with the user it is authenticated as, sorted by
+    ///     client id. Clients that aren't authenticated are left out.
+    pub fn pattern_holders(&self, topic: &str) -> Vec<(SubscriberId, String)> {
+        let mut holders: Vec<(SubscriberId, String)> = self
+            .patterns
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .patterns
+                    .iter()
+                    .any(|p| popsub_protocol::topics::matches_pattern(p, topic))
+            })
+            .filter(|(client_id, _)| !self.is_subscribed(client_id, topic))
+            .filter_map(|(client_id, _)| {
+                let username = self.clients.get(client_id)?.username.clone()?;
+                Some((client_id.clone(), username))
+            })
+            .collect();
+        holders.sort();
+        holders
     }
 
     /// Sends a newly stored record to every subscription that is up to date.
@@ -549,6 +680,7 @@ impl Broker {
     ///     The durable session the client held, if any.
     pub fn cleanup_client(&mut self, client_id: &SubscriberId) -> Option<String> {
         let session = self.clients.remove(client_id).and_then(|c| c.session);
+        self.patterns.remove(client_id);
         for topic in self.topics.values_mut() {
             topic.unsubscribe(client_id);
         }

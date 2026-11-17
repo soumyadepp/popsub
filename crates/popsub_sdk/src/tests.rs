@@ -236,7 +236,7 @@ async fn manual_ack_clears_the_message_on_the_server() {
 async fn refusals_are_typed_errors() {
     let server = TestServer::memory(&Settings::default()).await;
     let client = Client::connect(server.config()).await.expect("connect");
-    let refused = client.subscribe("metrics/#", StartFrom::New).await;
+    let refused = client.subscribe("metrics/#/x", StartFrom::New).await;
     assert!(
         matches!(
             &refused,
@@ -674,4 +674,69 @@ async fn wss_works_with_an_added_root_certificate() {
             .add_root_certificates_pem(b"not a certificate"),
         Err(Error::Config(_))
     ));
+}
+
+/// Checks a wildcard subscription: an existing topic is replayed as asked,
+/// topics created later arrive from their first message under their own
+/// names, each `(topic, seq)` arrives once across a reconnect, and
+/// unsubscribing the pattern stops all of them.
+#[tokio::test]
+async fn a_wildcard_subscription_follows_matching_topics() {
+    let server = TestServer::memory(&Settings::default()).await;
+    let client = Client::connect(server.config()).await.expect("connect");
+    client
+        .publish_confirmed("orders/eu", "old")
+        .await
+        .expect("publish");
+    client
+        .publish_confirmed("other", "ignored")
+        .await
+        .expect("publish");
+    let mut orders = client
+        .subscribe("orders/#", StartFrom::Last(5))
+        .await
+        .expect("subscribe");
+    assert_eq!(orders.topic(), "orders/#");
+    let old = next(&mut orders).await;
+    assert_eq!(
+        (old.topic.as_str(), old.seq, old.payload.as_str()),
+        ("orders/eu", 1, "old")
+    );
+
+    client
+        .publish_confirmed("orders/us", "first")
+        .await
+        .expect("publish");
+    let first = next(&mut orders).await;
+    assert_eq!((first.topic.as_str(), first.seq), ("orders/us", 1));
+
+    let mut events = client.events();
+    server.broker.close_all(CloseCode::GoingAway);
+    wait_for_event(&mut events, |e| matches!(e, Event::Connected { .. })).await;
+    client
+        .publish_confirmed("orders/us", "second")
+        .await
+        .expect("publish");
+    client
+        .publish_confirmed("orders/asia", "new")
+        .await
+        .expect("publish");
+    let mut seen = vec![next(&mut orders).await, next(&mut orders).await]
+        .into_iter()
+        .map(|m| (m.topic, m.seq))
+        .collect::<Vec<_>>();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("orders/asia".to_string(), 1), ("orders/us".to_string(), 2)]
+    );
+
+    client.unsubscribe("orders/#").await.expect("unsubscribe");
+    client
+        .publish_confirmed("orders/us", "third")
+        .await
+        .expect("publish");
+    let after = tokio::time::timeout(Duration::from_millis(300), orders.next()).await;
+    assert!(matches!(after, Ok(None)), "{after:?}");
+    assert!(eventually(|| server.broker.stats().subscriptions == 0).await);
 }

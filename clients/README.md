@@ -43,6 +43,14 @@ A client library hides the protocol's bookkeeping, so an application only sees c
 - A full application buffer pauses reading the socket, so the server's backpressure paces the connection. Never buffer without bound.
 - An `unsubscribed` frame with no `id` means the server ended the subscription (access revoked): end that subscription for the application and report it. Because of this, every `unsubscribe` the client sends carries an `id`.
 
+**Wildcard subscriptions**
+
+- `subscribe` accepts a pattern (`orders/#`, `sensors/+/temp`). The application gets one subscription for it, which yields the messages of every matching topic, each under its own topic name and `seq`.
+- The server announces each topic it joins for the pattern with a `subscribed` frame that has no `id`. The client then tracks that topic like any other (its own next expected `seq`, its own acknowledgements), owned by the pattern. A `subscribed` or `message` for a topic the client isn't tracking is matched against its patterns (the oldest matching one owns it); if none matches, a message is acknowledged and dropped as before.
+- After reconnecting: resubscribe every tracked topic that wasn't resumed from `{"seq": next_expected}` first, as usual, and then send each pattern again with `from: {"seq": 1}`. The server skips topics the connection holds, so this joins only topics created during the disconnect, from their first message.
+- Unsubscribing a pattern (or dropping its subscription) sends `unsubscribe` for the pattern and for each topic it owned, and stops tracking them.
+- When the server ends one owned topic (`unsubscribed` with no `id`), only that topic stops; the pattern's subscription carries on.
+
 **Requests**
 
 - Every request that expects a reply carries an `id`; replies and errors are matched by it. Errors surface with their `code` (and `retry_after` for limits).

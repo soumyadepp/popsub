@@ -20,6 +20,7 @@ The Rust client library. `Client` keeps a connection to a PopSub server and hand
 - The driver holds only a weak handle on its own command queue (for `Message::ack`), so it stops when every `Client` and `Subscription` is dropped.
 - An `unsubscribed` with no id means the server ended the subscription (an admin revoked access): the topic is dropped, ending its `Subscription`, and `Event::Unsubscribed` is sent. So every unsubscribe the driver sends carries an id; never send one without.
 - `wss://` goes through `tls_connector`: rustls with `ring`, the public web roots from `webpki-roots`, plus `ClientConfig::add_root_certificates_pem`. Always pass explicit providers to rustls (`builder_with_provider`); never rely on a process-wide default, which panics if two crypto backends end up compiled in.
+- A wildcard subscription is a `Pattern`; topics the server joins for it are `Topic`s with `owner` set, adopted on `subscribed` (or on a message for an untracked topic). `release` drops a pattern with its topics. `restore` resubscribes topics first, then patterns from `Seq(1)`.
 - Close codes decide reconnection: `CloseCode::should_reconnect`, except that `TokenExpired` reconnects only with password credentials.
 - A full subscription buffer blocks the driver, which stops reading the socket; the server's backpressure then paces this connection. That is deliberate.
 

@@ -112,12 +112,12 @@ impl TopicPermission {
 /// assert!(!topic_matches_pattern("chat/room1", "chat/room2"));
 /// ```
 pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
-    popsub_utils::topics::matches_pattern(pattern, topic)
+    popsub_protocol::topics::matches_pattern(pattern, topic)
 }
 
 /// The longest topic pattern a grant may hold, in bytes. Matches the longest
 /// topic name the server accepts.
-pub const MAX_PATTERN_BYTES: usize = popsub_utils::topics::MAX_PATTERN_BYTES;
+pub const MAX_PATTERN_BYTES: usize = popsub_protocol::topics::MAX_PATTERN_BYTES;
 
 /// Checks that a topic pattern is well formed before it is granted.
 ///
@@ -142,7 +142,7 @@ pub const MAX_PATTERN_BYTES: usize = popsub_utils::topics::MAX_PATTERN_BYTES;
 /// assert!(validate_pattern("a+b").is_err());
 /// ```
 pub fn validate_pattern(pattern: &str) -> crate::error::Result<()> {
-    popsub_utils::topics::validate_pattern(pattern).map_err(|why| {
+    popsub_protocol::topics::validate_pattern(pattern).map_err(|why| {
         crate::error::AuthError::PermissionDenied(format!(
             "topic pattern '{pattern}' is invalid: {why}"
         ))

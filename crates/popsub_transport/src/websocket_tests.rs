@@ -1394,8 +1394,8 @@ async fn invalid_topics_and_message_ids_are_refused() {
     let mut ws = admin_connection(addr, &settings).await;
     let long_topic = "t".repeat(121);
     for frame in [
-        serde_json::json!({"type": "subscribe", "id": 1, "topic": "metrics/#"}),
-        serde_json::json!({"type": "subscribe", "id": 2, "topic": "a/+/b"}),
+        serde_json::json!({"type": "subscribe", "id": 1, "topic": "metrics/#/x"}),
+        serde_json::json!({"type": "publish", "id": 2, "topic": "a/+/b", "payload": "x"}),
         serde_json::json!({"type": "publish", "id": 3, "topic": "", "payload": "x"}),
         serde_json::json!({"type": "publish", "id": 4, "topic": long_topic, "payload": "x"}),
     ] {
@@ -2474,4 +2474,138 @@ async fn admins_list_describe_and_purge_topics() {
     )
     .await;
     assert_eq!(refused["code"], "forbidden", "{refused}");
+}
+
+/// Reads frames until a number of them have arrived, failing after two seconds each.
+///
+/// Args:
+///     ws: The connection.
+///     count: How many frames to read.
+///
+/// Returns:
+///     The frames as JSON, in order.
+async fn frames_json(ws: &mut TestSocket, count: usize) -> Vec<serde_json::Value> {
+    let mut frames = Vec::new();
+    while frames.len() < count {
+        frames.push(serde_json::from_str(&next_text(ws).await).expect("JSON"));
+    }
+    frames
+}
+
+/// Checks that nothing arrives on a connection for a while.
+///
+/// Args:
+///     ws: The connection.
+///
+/// Returns:
+///     The first text frame that did arrive, if any.
+async fn nothing_arrives(ws: &mut TestSocket) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => return Some(text.to_string()),
+            Ok(Some(Ok(_))) => continue,
+            _ => return None,
+        }
+    }
+}
+
+/// Checks wildcard subscriptions: matching topics the user may read are
+/// joined with the requested replay, a topic created later is joined from
+/// its first message, topics the user may not read are never joined, and
+/// unsubscribing the pattern ends the topics it brought in.
+#[tokio::test]
+async fn pattern_subscriptions_join_matching_topics() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    let publish = async |admin: &mut TestSocket, topic: &str, payload: &str| {
+        let published = request(
+            admin,
+            serde_json::json!({"type": "publish", "id": 1, "topic": topic, "payload": payload, "qos": 1}),
+        )
+        .await;
+        assert_eq!(published["type"], "published", "{published}");
+    };
+    publish(&mut admin, "orders/a", "a1").await;
+    publish(&mut admin, "orders/b", "b1").await;
+    publish(&mut admin, "other/x", "x1").await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 2, "username": "wren", "password": "wren-password-1", "role": {"kind": "readonly", "topics": [{"pattern": "orders/#", "access": "subscribe"}]}}),
+    )
+    .await;
+    let (mut wren, _) = user_connection(addr, "wren", "wren-password-1").await;
+
+    let bad = request(
+        &mut wren,
+        serde_json::json!({"type": "subscribe", "id": 1, "topic": "orders/#/x"}),
+    )
+    .await;
+    assert_eq!(bad["code"], "invalid_topic", "{bad}");
+
+    send_json(
+        &mut wren,
+        serde_json::json!({"type": "subscribe", "id": 2, "topic": "#", "from": {"last": 5}}),
+    )
+    .await;
+    let frames = frames_json(&mut wren, 5).await;
+    assert_eq!(
+        frames[0],
+        serde_json::json!({"type": "subscribed", "id": 2, "topic": "#", "replay_from": 0, "replay_to": 0})
+    );
+    let summary: Vec<(String, String)> = frames[1..]
+        .iter()
+        .map(|f| {
+            (
+                f["type"].as_str().unwrap_or_default().to_string(),
+                f["topic"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("subscribed".to_string(), "orders/a".to_string()),
+            ("message".to_string(), "orders/a".to_string()),
+            ("subscribed".to_string(), "orders/b".to_string()),
+            ("message".to_string(), "orders/b".to_string()),
+        ]
+    );
+    assert!(frames[1].get("id").is_none(), "{}", frames[1]);
+
+    publish(&mut admin, "orders/c", "c1").await;
+    let joined = frames_json(&mut wren, 2).await;
+    assert_eq!(
+        joined[0],
+        serde_json::json!({"type": "subscribed", "topic": "orders/c", "replay_from": 1, "replay_to": 1})
+    );
+    assert_eq!(
+        (
+            joined[1]["topic"].clone(),
+            joined[1]["seq"].clone(),
+            joined[1]["payload"].clone()
+        ),
+        (
+            serde_json::json!("orders/c"),
+            serde_json::json!(1),
+            serde_json::json!("c1")
+        )
+    );
+    publish(&mut admin, "secret/z", "z1").await;
+    publish(&mut admin, "other/x", "x2").await;
+    assert_eq!(nothing_arrives(&mut wren).await, None);
+
+    let left = request(
+        &mut wren,
+        serde_json::json!({"type": "unsubscribe", "id": 3, "topic": "#"}),
+    )
+    .await;
+    assert_eq!(
+        left,
+        serde_json::json!({"type": "unsubscribed", "id": 3, "topic": "#"})
+    );
+    publish(&mut admin, "orders/a", "a2").await;
+    publish(&mut admin, "orders/d", "d1").await;
+    assert_eq!(nothing_arrives(&mut wren).await, None);
 }

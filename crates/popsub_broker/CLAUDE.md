@@ -13,6 +13,8 @@ Topic writers, the broker engine, replay, per-subscriber acknowledgement and dur
 - `src/frame.rs`: `delivery` (a stored record as a `message` frame) and `to_ws`. The frame types themselves come from `popsub_protocol`.
 - `src/tests.rs`: unit tests with `mpsc` channels as fake clients and `MemoryStorage` as the log and session store.
 
+- Wildcards: `Broker::add_pattern`/`remove_pattern`/`pattern_holders` track each client's patterns and which topics it joined through them (`PatternState`); `SharedBroker::join` subscribes without an id and marks the topic joined; `publish` calls `join_pattern_holders` after a topic's first record, which is what makes a concurrent pattern subscribe and first publish safe (the pattern is registered before topics are listed, and holders are read after the append). `set_authorizer` is how the transport's permission check gets in without the broker depending on auth.
+
 ## Contract
 
 - Storage is only touched outside the broker lock. The lock is only taken through `with`, whose closure can't await.

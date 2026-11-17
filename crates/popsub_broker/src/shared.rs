@@ -140,7 +140,17 @@ pub struct SharedBroker {
     /// Retention for particular topics: the first pattern a topic matches
     /// applies; topics matching none use `log.retention`.
     topic_retention: Arc<Vec<(String, Retention)>>,
+    /// Decides whether a user may read a topic, when a new topic is about
+    /// to be joined through a wildcard subscription. Unset allows everyone.
+    authorizer: Arc<std::sync::OnceLock<Authorizer>>,
 }
+
+/// Decides whether a user (first argument) may subscribe to a topic (second).
+pub type Authorizer = Arc<
+    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl fmt::Debug for SharedBroker {
     /// Shows the log settings and the storage's capabilities; the broker's
@@ -182,7 +192,76 @@ impl SharedBroker {
             writers: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(StorageHealth::default()),
             topic_retention: Arc::new(Vec::new()),
+            authorizer: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+
+    /// Sets who may read which topic, asked before a wildcard subscription
+    /// joins a newly created topic. Only the first call takes effect.
+    ///
+    /// Args:
+    ///     authorizer: The check.
+    pub fn set_authorizer(&self, authorizer: Authorizer) {
+        let _ = self.authorizer.set(authorizer);
+    }
+
+    /// The names of every topic that has a log.
+    ///
+    /// Returns:
+    ///     The topic names, sorted.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the logs can't be listed.
+    pub async fn topic_names(&self) -> StorageResult<Vec<String>> {
+        self.storage.topics().await
+    }
+
+    /// Subscribes a client to a topic because one of its wildcard
+    /// subscriptions matches it. The client gets a `subscribed` frame with
+    /// no id for the topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     client_id: The client.
+    ///     from: Where replay starts.
+    ///
+    /// Returns:
+    ///     What was replayed and whether the subscription was added.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached.
+    ///     StorageError::Corrupt: When a stored record fails its checks.
+    pub async fn join(
+        &self,
+        topic: &str,
+        client_id: &str,
+        from: StartFrom,
+    ) -> StorageResult<SubscribeOutcome> {
+        let outcome = self.subscribe_inner(topic, client_id, from, None).await?;
+        self.with(|broker| broker.mark_joined(&client_id.to_string(), topic));
+        Ok(outcome)
+    }
+
+    /// Joins a topic that just got its first record for every client with a
+    /// matching wildcard subscription that may read it, from that first record.
+    ///
+    /// Args:
+    ///     topic: The new topic.
+    async fn join_pattern_holders(&self, topic: &str) {
+        let holders = self.with(|broker| broker.pattern_holders(topic));
+        for (client_id, username) in holders {
+            let allowed = match self.authorizer.get() {
+                Some(authorizer) => authorizer(username, topic.to_string()).await,
+                None => true,
+            };
+            if !allowed {
+                continue;
+            }
+            if let Err(e) = self.join(topic, &client_id, StartFrom::Seq(1)).await {
+                warn!(topic, client = %client_id, %e, "joining a new topic for a wildcard subscription failed");
+            }
+        }
     }
 
     /// Sets retention for particular topics. Call it before the broker is
@@ -208,7 +287,7 @@ impl SharedBroker {
     pub fn retention_for(&self, topic: &str) -> Retention {
         self.topic_retention
             .iter()
-            .find(|(pattern, _)| popsub_utils::topics::matches_pattern(pattern, topic))
+            .find(|(pattern, _)| popsub_protocol::topics::matches_pattern(pattern, topic))
             .map_or(self.log.retention, |(_, retention)| *retention)
     }
 
@@ -431,11 +510,16 @@ impl SharedBroker {
         if record.message_id.is_empty() {
             record.message_id = Uuid::new_v4().to_string();
         }
-        self.request(topic, |reply| Command::Publish {
-            record: record.clone(),
-            reply,
-        })
-        .await
+        let published = self
+            .request(topic, |reply| Command::Publish {
+                record: record.clone(),
+                reply,
+            })
+            .await?;
+        if published.seq == 1 && !published.duplicate {
+            self.join_pattern_holders(topic).await;
+        }
+        Ok(published)
     }
 
     /// Subscribes a client to a topic and starts replaying the history it asked for.
@@ -459,6 +543,36 @@ impl SharedBroker {
     ///         not subscribed.
     ///     StorageError::Corrupt: When a stored record fails its checks.
     pub async fn subscribe(
+        &self,
+        topic: &str,
+        client_id: &str,
+        from: StartFrom,
+        request_id: Option<RequestId>,
+    ) -> StorageResult<SubscribeOutcome> {
+        let outcome = self
+            .subscribe_inner(topic, client_id, from, request_id)
+            .await?;
+        self.with(|broker| broker.mark_explicit(&client_id.to_string(), topic));
+        Ok(outcome)
+    }
+
+    /// Subscribes a client to a topic through the topic's writer, for both
+    /// `subscribe` (by name) and `join` (through a wildcard subscription).
+    ///
+    /// Args:
+    ///     topic: The topic to subscribe to.
+    ///     client_id: The registered client subscribing.
+    ///     from: Where replay starts.
+    ///     request_id: The subscribe request's id, echoed in `subscribed`.
+    ///
+    /// Returns:
+    ///     What was replayed and whether the subscription was added.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached.
+    ///     StorageError::Corrupt: When a stored record fails its checks.
+    async fn subscribe_inner(
         &self,
         topic: &str,
         client_id: &str,

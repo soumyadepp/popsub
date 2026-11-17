@@ -121,7 +121,7 @@ All frames are JSON text, tagged with `type`. The types live in `popsub_protocol
 - **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists`, `topic_not_found` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
 - **Evolution.** Within a version, frames, fields and error codes are only added. Clients ignore fields and frame types they don't know, and treat an unknown error code like `internal`. Removing or changing anything needs a new version, named by the client in `auth`.
 
-Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`.
+Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`. `subscribe` and `unsubscribe` also take a pattern, in which a whole level may be `+` (any one level) and the last level may be `#` (the rest); see wildcard subscriptions below. `publish` never does.
 
 ### 4.1 Client to server
 
@@ -154,6 +154,16 @@ The admin requests below need an enabled admin; anyone else gets `forbidden`. A 
 | `purge_topic` | `topic` | `topic_info` after removing every record the topic holds. Its numbering carries on (the next publish gets `last_seq + 1`), live subscriptions stay, and a subscriber that hadn't caught up gets `truncated` |
 
 Changes take effect on live connections at once. After `set_role`, `grant` or `revoke`, each of the account's subscriptions its role no longer allows is ended: the connection gets `unsubscribed` with no `id`, and a durable session forgets it. Disabling or deleting an account closes its connections with `account_disabled` (4009), and its tokens are refused at `auth` from then on.
+
+**Wildcard subscriptions.** `subscribe` with a pattern (`orders/#`, `sensors/+/temp`) subscribes the connection to every matching topic the user may read:
+
+- The reply is `subscribed` for the pattern itself, with `replay_from` and `replay_to` 0.
+- Each existing matching topic the connection isn't already subscribed to is then joined with the request's `from`, announced by its own `subscribed` frame with no `id`.
+- A matching topic created later is joined when its first message is stored, from that message, again announced by `subscribed`. The user's permission is checked at that moment.
+- Messages arrive under their own topic and `seq`, and are acknowledged with them. Replay, deduplication, windows and durable cursors all work per topic, as for a subscription by name.
+- `unsubscribe` with the pattern forgets it and ends the topics joined through it (unless another of the connection's patterns still matches them). Topics the connection subscribed to by name are left alone.
+- A pattern is not stored in a durable session; the topics joined through it are. After a reconnect the client subscribes to the pattern again. Sent with `from: {"seq": 1}`, that joins exactly the topics created while it was away, from their first message, because every topic it already holds is skipped.
+- A pattern that matches nothing the user may read is accepted and stays empty. A malformed one gets `invalid_topic`.
 
 ### 4.2 Server to client
 

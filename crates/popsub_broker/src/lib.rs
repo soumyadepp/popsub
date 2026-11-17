@@ -20,11 +20,12 @@ pub mod topic;
 mod writer;
 
 pub use engine::{
-    AckOutcome, Broker, BrokerStats, DeadLetter, DeadLetters, DeliverOutcome, RetryOutcome,
+    AckOutcome, Broker, BrokerStats, DeadLetter, DeadLetters, DeliverOutcome, PatternState,
+    RetryOutcome,
 };
 pub use frame::close_message;
 pub use health::StorageHealth;
-pub use shared::{LogSettings, SharedBroker, session_key};
+pub use shared::{Authorizer, LogSettings, SharedBroker, session_key};
 pub use topic::CursorUpdate;
 pub use writer::{Published, SubscribeOutcome};
 

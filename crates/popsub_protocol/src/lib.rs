@@ -23,6 +23,7 @@ mod close;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod server;
+pub mod topics;
 
 #[cfg(test)]
 mod tests;

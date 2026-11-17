@@ -12,7 +12,7 @@ pub const MAX_PATTERN_BYTES: usize = 120;
 /// Example:
 ///
 /// ```
-/// use popsub_utils::topics::matches_pattern;
+/// use popsub_protocol::topics::matches_pattern;
 ///
 /// assert!(matches_pattern("chat/#", "chat/room1/messages"));
 /// assert!(matches_pattern("sensors/+/temp", "sensors/attic/temp"));

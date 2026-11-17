@@ -259,7 +259,8 @@ pub struct Server {
 
 impl Server {
     /// Creates a server with the default rate limits, the broker's
-    /// connection limit and no trusted proxies.
+    /// connection limit and no trusted proxies. It also tells the broker to
+    /// ask this auth service before a wildcard subscription joins a new topic.
     ///
     /// Args:
     ///     broker: The broker every connection shares.
@@ -269,6 +270,11 @@ impl Server {
     /// Returns:
     ///     A server ready to `listen` or `serve`.
     pub fn new(broker: SharedBroker, auth: Arc<AuthService>) -> Self {
+        let readers = auth.clone();
+        broker.set_authorizer(Arc::new(move |username: String, topic: String| {
+            let readers = readers.clone();
+            Box::pin(async move { readers.can_subscribe(&username, &topic).await })
+        }));
         Self {
             auth,
             limiters: RateLimiters::default(),
@@ -1790,6 +1796,9 @@ impl Session {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
         };
+        if popsub_protocol::topics::is_pattern(topic) {
+            return self.subscribe_pattern(id, &username, topic, from).await;
+        }
         if !valid_topic(topic) {
             self.fail(id, ErrorCode::InvalidTopic, invalid_topic_message(), None)?;
             return Ok(Flow::Continue);
@@ -1835,6 +1844,91 @@ impl Session {
         Ok(Flow::Continue)
     }
 
+    /// Subscribes the connection to every topic matching a pattern.
+    ///
+    /// The pattern is recorded first, so a topic created from now on is
+    /// joined from its first record (`SharedBroker::publish` does that, asking
+    /// the server's authorizer). The reply is `subscribed` for the pattern
+    /// itself, with `replay_from` and `replay_to` 0. Then every existing
+    /// topic that matches, that the user may read and that the connection
+    /// isn't already subscribed to is joined with `from`, each announced by a
+    /// `subscribed` frame with no id. Messages arrive under their own topic
+    /// and `seq`. A malformed pattern gets `invalid_topic`. A pattern that
+    /// matches nothing the user may read is accepted and stays empty.
+    ///
+    /// Args:
+    ///     id: The request id.
+    ///     username: The authenticated user.
+    ///     pattern: The topic pattern.
+    ///     from: Where replay starts on each topic joined now.
+    ///
+    /// Returns:
+    ///     `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    async fn subscribe_pattern(
+        &self,
+        id: Option<&RequestId>,
+        username: &str,
+        pattern: &str,
+        from: StartFrom,
+    ) -> Result<Flow> {
+        if let Err(why) = popsub_protocol::topics::validate_pattern(pattern) {
+            self.fail(
+                id,
+                ErrorCode::InvalidTopic,
+                format!("invalid topic pattern: {why}"),
+                None,
+            )?;
+            return Ok(Flow::Continue);
+        }
+        let broker = &self.server.broker;
+        if !broker.with(|b| b.add_pattern(&self.client_id, pattern)) {
+            return Ok(Flow::Stop);
+        }
+        let topics = match broker.topic_names().await {
+            Ok(topics) => topics,
+            Err(e) => {
+                error!(client_id = %self.client_id, pattern, %e, "listing topics for a pattern failed");
+                broker.with(|b| b.remove_pattern(&self.client_id, pattern));
+                self.fail(
+                    id,
+                    ErrorCode::StorageUnavailable,
+                    "can't list topics, not subscribed",
+                    None,
+                )?;
+                return Ok(Flow::Continue);
+            }
+        };
+        self.reply(
+            id,
+            ServerMessage::Subscribed(popsub_protocol::Subscribed {
+                topic: pattern.to_string(),
+                replay_from: 0,
+                replay_to: 0,
+            }),
+        )?;
+        let mut joined = 0usize;
+        for topic in topics {
+            if !popsub_protocol::topics::matches_pattern(pattern, &topic)
+                || broker.with(|b| b.is_subscribed(&self.client_id, &topic))
+                || !self.server.auth.can_subscribe(username, &topic).await
+            {
+                continue;
+            }
+            match broker.join(&topic, &self.client_id, from).await {
+                Ok(_) => joined += 1,
+                Err(e) => {
+                    error!(client_id = %self.client_id, topic, %e, "joining a topic for a pattern failed");
+                }
+            }
+        }
+        info!(client_id = %self.client_id, username = %pii(username), pattern, joined, "subscribed to a pattern");
+        Ok(Flow::Continue)
+    }
+
     /// Unsubscribes the connection from a topic and replies with `unsubscribed`.
     ///
     /// No permission check is made, since leaving a topic grants nothing.
@@ -1859,6 +1953,30 @@ impl Session {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
         };
+        if popsub_protocol::topics::is_pattern(topic) {
+            let joined = self
+                .server
+                .broker
+                .with(|broker| broker.remove_pattern(&self.client_id, topic));
+            for concrete in joined {
+                if let Err(e) = self
+                    .server
+                    .broker
+                    .unsubscribe(&concrete, &self.client_id)
+                    .await
+                {
+                    warn!(client_id = %self.client_id, topic = %concrete, %e, "removing a stored subscription failed");
+                }
+            }
+            info!(client_id = %self.client_id, username = %pii(&username), pattern = topic, "unsubscribed from a pattern");
+            self.reply(
+                id,
+                ServerMessage::Unsubscribed {
+                    topic: topic.to_string(),
+                },
+            )?;
+            return Ok(Flow::Continue);
+        }
         if let Err(e) = self.server.broker.unsubscribe(topic, &self.client_id).await {
             error!(client_id = %self.client_id, username = %pii(&username), topic, %e, "removing a stored subscription failed");
             self.fail(

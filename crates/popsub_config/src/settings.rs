@@ -372,7 +372,7 @@ impl StorageSettings {
         self.topic_retention
             .iter()
             .map(|rule| {
-                popsub_utils::topics::validate_pattern(&rule.pattern).map_err(|why| {
+                popsub_protocol::topics::validate_pattern(&rule.pattern).map_err(|why| {
                     format!("storage.topic_retention pattern '{}': {why}", rule.pattern)
                 })?;
                 let merged = RetentionSettings {

@@ -288,7 +288,7 @@ async fn server_errors_have_codes(command: String) -> Outcome {
     };
     expect(
         &boss
-            .fails("subscribe", json!({"topic": "bad/#", "from": "new"}))
+            .fails("subscribe", json!({"topic": "bad/#/more", "from": "new"}))
             .await?,
         "invalid_topic",
     )?;

@@ -50,7 +50,7 @@ From here on the driver forwards the client's events (below) until it exits.
 {"id": 2, "op": "subscribe", "topic": "orders", "from": "new"}
 ```
 
-`from` is the protocol's `StartFrom`: `"resume"`, `"new"`, `{"last": 10}`, `{"since_ms": 1794800000000}` or `{"seq": 42}`. Responds `{"ok": true}` once `subscribed` arrives. From then on every message the application receives on the topic is reported as a `message` event, and the end of the subscription as `subscription_ended`.
+`topic` may be a pattern (`orders/#`); the `message` events then carry each message's own topic, and `subscription_ended` and `unsubscribe` use the pattern. `from` is the protocol's `StartFrom`: `"resume"`, `"new"`, `{"last": 10}`, `{"since_ms": 1794800000000}` or `{"seq": 42}`. Responds `{"ok": true}` once `subscribed` arrives. From then on every message the application receives on the topic is reported as a `message` event, and the end of the subscription as `subscription_ended`.
 
 ### `unsubscribe`
 
