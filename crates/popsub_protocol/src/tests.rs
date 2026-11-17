@@ -585,3 +585,19 @@ fn names_match_the_wire() {
         assert_eq!(parse(frame).message.kind(), kind);
     }
 }
+
+/// Checks the exact JSON of `ping` and `pong`.
+#[test]
+fn ping_and_pong_have_the_documented_shape() {
+    assert_eq!(
+        parse(json!({"type": "ping", "id": 9})).message,
+        ClientMessage::Ping {}
+    );
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            Some(RequestId::Number(9)),
+            ServerMessage::Pong {}
+        )),
+        json!({"type": "pong", "id": 9})
+    );
+}

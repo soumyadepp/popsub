@@ -12,7 +12,7 @@ SERVER_ENV := SERVER_HOST=$(HOST) SERVER_PORT=$(PORT)
 .DEFAULT_GOAL := help
 
 .PHONY: help setup build release server server-release client demo \
-	test test-crate fmt fmt-check lint ci schema schema-check doc watch coverage reset-data clean
+	test test-crate scenarios fmt fmt-check lint ci schema schema-check doc watch coverage reset-data clean
 
 help:
 	@printf "PopSub make targets\n\n"
@@ -27,6 +27,7 @@ help:
 	@printf "  Quality\n"
 	@printf "    make test            Run every test in the workspace\n"
 	@printf "    make test-crate      Run one crate's tests, e.g. CRATE=popsub_broker\n"
+	@printf "    make scenarios       Run the client scenario suite against DRIVER (default: the Rust client)\n"
 	@printf "    make fmt             Format the code\n"
 	@printf "    make lint            Clippy with warnings as errors\n"
 	@printf "    make ci              Exactly what GitHub Actions runs: fmt check, clippy, tests, schema check\n"
@@ -38,7 +39,7 @@ help:
 	@printf "    make doc             Build and open the API docs\n"
 	@printf "    make reset-data      Delete stored messages and sessions ($(DATA_DIR), and the old pubsub_db)\n"
 	@printf "    make clean           cargo clean plus reset-data\n\n"
-	@printf "  Options: HOST, PORT, URL, CRATE, JOBS (parallel build jobs, lower it if builds run out of memory)\n"
+	@printf "  Options: HOST, PORT, URL, CRATE, DRIVER, JOBS (parallel build jobs, lower it if builds run out of memory)\n"
 
 setup:
 	@command -v $(CARGO) >/dev/null || { echo "Rust is not installed. See https://rustup.rs"; exit 1; }
@@ -76,6 +77,12 @@ test:
 test-crate:
 	@test -n "$(CRATE)" || { echo "Usage: make test-crate CRATE=popsub_broker"; exit 1; }
 	$(CARGO) test -p $(CRATE) $(JOBS_FLAG)
+
+DRIVER ?= target/debug/popsub-sdk-driver
+
+scenarios:
+	$(CARGO) build -p popsub_scenarios $(JOBS_FLAG)
+	target/debug/popsub-scenarios --driver "$(DRIVER)"
 
 fmt:
 	$(CARGO) fmt --all

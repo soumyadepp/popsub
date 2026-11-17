@@ -104,7 +104,9 @@ The client logs in, refreshes its token, and reconnects with backoff. It knows f
 
 ## Use it from any language
 
-The protocol is JSON over a WebSocket. A session looks like this (`→` is the client, `←` the server):
+Client libraries for other languages live in [`clients/`](clients), each held to the same behaviour by one shared scenario suite (server restarts, dropped connections, duplicates, manual acks, revoked access). [`clients/README.md`](clients/README.md) says what every client must do.
+
+To write your own, the protocol is JSON over a WebSocket. A session looks like this (`→` is the client, `←` the server):
 
 ```text
 → {"type": "login", "id": 1, "username": "alice", "password": "secret"}
@@ -281,6 +283,7 @@ admin.revoke("alice", "orders/#").await?;
 |---|---|
 | `popsub` | The binary: `server`, a demo `client`, and `users` for managing accounts |
 | `popsub_sdk` | The Rust client library |
+| `popsub_scenarios` | The scenario suite every client library must pass, and the Rust client's driver for it |
 | `popsub_protocol` | Every frame type, shared by the server and clients |
 | `popsub_transport` | The WebSocket server: authentication, permissions, rate limits, connection lifecycle |
 | `popsub_broker` | Topic writers, delivery, replay, acknowledgements, sessions |

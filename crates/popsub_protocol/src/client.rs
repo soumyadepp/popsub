@@ -124,6 +124,10 @@ pub enum ClientMessage {
         /// Its `seq`.
         seq: u64,
     },
+    /// Asks the server to answer with `pong`, so a client that can't see
+    /// WebSocket pings (a browser) can tell the connection is still alive.
+    /// Accepted before `auth` too.
+    Ping {},
     /// Admin only. Creates an account. Answered with `user`.
     CreateUser {
         /// The new username: 3 to 32 letters, digits, `_`, `.` or `-`.
@@ -204,6 +208,7 @@ impl ClientMessage {
             ClientMessage::Unsubscribe { .. } => "unsubscribe",
             ClientMessage::Publish { .. } => "publish",
             ClientMessage::Ack { .. } => "ack",
+            ClientMessage::Ping { .. } => "ping",
             ClientMessage::CreateUser { .. } => "create_user",
             ClientMessage::GetUser { .. } => "get_user",
             ClientMessage::ListUsers { .. } => "list_users",

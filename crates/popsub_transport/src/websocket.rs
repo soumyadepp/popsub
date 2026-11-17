@@ -1243,6 +1243,10 @@ impl Session {
                 qos,
             } => self.publish(id, &topic, payload, message_id, qos).await,
             ClientMessage::Ack { topic, seq } => self.ack(&topic, seq).await,
+            ClientMessage::Ping {} => {
+                self.reply(id, ServerMessage::Pong {})?;
+                Ok(Flow::Continue)
+            }
             admin @ (ClientMessage::CreateUser { .. }
             | ClientMessage::GetUser { .. }
             | ClientMessage::ListUsers {}
