@@ -587,9 +587,49 @@ impl SharedBroker {
             client_id: client_id.to_string(),
             from,
             request_id: request_id.clone(),
+            group: None,
             reply,
         })
         .await
+    }
+
+    /// Adds a client to a shared subscription on a topic. Each record on
+    /// the topic goes to one member of the group; see
+    /// `TopicWriter::subscribe_group` for where the group starts.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     group: The group's name.
+    ///     client_id: The registered client joining.
+    ///     from: Where the group starts if this is its first use on the topic.
+    ///     request_id: The subscribe request's id, echoed in `subscribed`.
+    ///
+    /// Returns:
+    ///     The group's position and whether the client was added.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached.
+    ///     StorageError::Corrupt: When a stored record fails its checks.
+    pub async fn subscribe_shared(
+        &self,
+        topic: &str,
+        group: &str,
+        client_id: &str,
+        from: StartFrom,
+        request_id: Option<RequestId>,
+    ) -> StorageResult<SubscribeOutcome> {
+        let outcome = self
+            .request(topic, |reply| Command::Subscribe {
+                client_id: client_id.to_string(),
+                from,
+                request_id: request_id.clone(),
+                group: Some(group.to_string()),
+                reply,
+            })
+            .await?;
+        self.with(|broker| broker.mark_explicit(&client_id.to_string(), topic));
+        Ok(outcome)
     }
 
     /// Works out where `Resume` starts for a client and topic.
@@ -658,7 +698,10 @@ impl SharedBroker {
             self.send(
                 topic,
                 Command::CatchUp {
-                    client_id: client_id.to_string(),
+                    client_id: outcome
+                        .subscriber
+                        .clone()
+                        .unwrap_or_else(|| client_id.to_string()),
                 },
             );
         }
@@ -949,7 +992,12 @@ impl SharedBroker {
     /// Returns:
     ///     How many sessions were removed.
     pub async fn expire_sessions(&self, now_ms: i64, expiry: Duration) -> u64 {
-        for session in self.with(|broker| broker.connected_sessions()) {
+        let in_use = self.with(|broker| {
+            let mut keys = broker.connected_sessions();
+            keys.extend(broker.active_groups());
+            keys
+        });
+        for session in in_use {
             if let Err(e) = self.storage.touch(&session, now_ms).await {
                 warn!(%e, "touching a connected session failed");
             }

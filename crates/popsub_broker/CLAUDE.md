@@ -15,6 +15,8 @@ Topic writers, the broker engine, replay, per-subscriber acknowledgement and dur
 
 - Wildcards: `Broker::add_pattern`/`remove_pattern`/`pattern_holders` track each client's patterns and which topics it joined through them (`PatternState`); `SharedBroker::join` subscribes without an id and marks the topic joined; `publish` calls `join_pattern_holders` after a topic's first record, which is what makes a concurrent pattern subscribe and first publish safe (the pattern is registered before topics are listed, and holders are read after the append). `set_authorizer` is how the transport's permission check gets in without the broker depending on auth.
 
+- Shared subscriptions: `Topic::groups` maps a group's subscriber id to its `Group` (members, round-robin position, `owners`: which member each in-flight `seq` was sent to). The group's `DeliveryState` sits in `Topic::subscribers` under the same id, with that id as its session key so its cursor is stored. `add_group_member` joins (and hands waiting records to the new member), `leave_groups` hands a leaving member's records on, `ack` finds the group through `owners`, and `retry_overdue` resolves the client per record. `TopicWriter::subscribe_group` decides where a new group starts; `expire_sessions` touches active groups so their cursors don't expire.
+
 ## Contract
 
 - Storage is only touched outside the broker lock. The lock is only taken through `with`, whose closure can't await.

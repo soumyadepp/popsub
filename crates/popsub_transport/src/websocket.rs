@@ -1240,7 +1240,9 @@ impl Session {
                 self.authenticate(id, &token, protocol, session_id.as_deref(), clean_start)
                     .await
             }
-            ClientMessage::Subscribe { topic, from } => self.subscribe(id, &topic, from).await,
+            ClientMessage::Subscribe { topic, from, group } => {
+                self.subscribe(id, &topic, from, group.as_deref()).await
+            }
             ClientMessage::Unsubscribe { topic } => self.unsubscribe(id, &topic).await,
             ClientMessage::Publish {
                 topic,
@@ -1778,6 +1780,9 @@ impl Session {
     ///     id: The request id.
     ///     topic: The topic to subscribe to.
     ///     from: Where replay starts.
+    ///     group: The shared subscription to join, if any. Each record then
+    ///         goes to one member of the group. A malformed name, or a group
+    ///         together with a pattern, gets `bad_request`.
     ///
     /// Returns:
     ///     A closing flow when the client isn't authenticated, otherwise
@@ -1791,11 +1796,27 @@ impl Session {
         id: Option<&RequestId>,
         topic: &str,
         from: StartFrom,
+        group: Option<&str>,
     ) -> Result<Flow> {
         let username = match self.require_user(id, "subscribe")? {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
         };
+        if let Some(group) = group {
+            let problem = if !valid_group(group) {
+                Some(format!(
+                    "a group name is 1 to {MAX_GROUP_CHARS} letters, digits, '_', '.' or '-'"
+                ))
+            } else if popsub_protocol::topics::is_pattern(topic) {
+                Some("a shared subscription needs an exact topic, not a pattern".to_string())
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                self.fail(id, ErrorCode::BadRequest, problem, None)?;
+                return Ok(Flow::Continue);
+            }
+        }
         if popsub_protocol::topics::is_pattern(topic) {
             return self.subscribe_pattern(id, &username, topic, from).await;
         }
@@ -1813,12 +1834,21 @@ impl Session {
             )?;
             return Ok(Flow::Continue);
         }
-        match self
-            .server
-            .broker
-            .subscribe(topic, &self.client_id, from, id.cloned())
-            .await
-        {
+        let subscribed = match group {
+            Some(group) => {
+                self.server
+                    .broker
+                    .subscribe_shared(topic, group, &self.client_id, from, id.cloned())
+                    .await
+            }
+            None => {
+                self.server
+                    .broker
+                    .subscribe(topic, &self.client_id, from, id.cloned())
+                    .await
+            }
+        };
+        match subscribed {
             Ok(outcome) => {
                 info!(
                     client_id = %self.client_id,
@@ -1908,6 +1938,7 @@ impl Session {
                 topic: pattern.to_string(),
                 replay_from: 0,
                 replay_to: 0,
+                group: None,
             }),
         )?;
         let mut joined = 0usize;
@@ -2169,6 +2200,23 @@ impl Session {
 fn salvage_request_id(text: &str) -> Option<RequestId> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     serde_json::from_value(value.get("id")?.clone()).ok()
+}
+
+/// The longest shared subscription group name, in characters.
+const MAX_GROUP_CHARS: usize = 64;
+
+/// Checks a shared subscription's group name.
+///
+/// Args:
+///     group: The name.
+///
+/// Returns:
+///     True for 1 to `MAX_GROUP_CHARS` ASCII letters, digits, `_`, `.` or `-`.
+fn valid_group(group: &str) -> bool {
+    (1..=MAX_GROUP_CHARS).contains(&group.len())
+        && group
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 /// Checks a topic name a client wants to subscribe or publish to.

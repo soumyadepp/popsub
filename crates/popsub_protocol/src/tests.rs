@@ -222,6 +222,7 @@ fn replies_serialise_with_type_and_id() {
                     topic: "chat".to_string(),
                     replay_from: 4,
                     replay_to: 9,
+                    group: None,
                 }),
             ),
             json!({"type": "subscribed", "id": 3, "topic": "chat", "replay_from": 4, "replay_to": 9}),
@@ -639,5 +640,30 @@ fn topic_admin_frames_have_the_documented_shape() {
             ServerMessage::Topics { topics: vec![info] }
         ))["topics"][0]["name"],
         json!("orders")
+    );
+}
+
+/// Checks the exact JSON of a shared subscription's request and reply.
+#[test]
+fn shared_subscription_frames_have_the_documented_shape() {
+    assert_eq!(
+        parse(json!({"type": "subscribe", "topic": "jobs", "group": "workers"})).message,
+        ClientMessage::Subscribe {
+            topic: "jobs".to_string(),
+            from: StartFrom::Resume,
+            group: Some("workers".to_string()),
+        }
+    );
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            Some(RequestId::Number(1)),
+            ServerMessage::Subscribed(Subscribed {
+                topic: "jobs".to_string(),
+                replay_from: 4,
+                replay_to: 9,
+                group: Some("workers".to_string()),
+            })
+        )),
+        json!({"type": "subscribed", "id": 1, "topic": "jobs", "replay_from": 4, "replay_to": 9, "group": "workers"})
     );
 }

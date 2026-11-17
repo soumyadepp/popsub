@@ -51,6 +51,13 @@ A client library hides the protocol's bookkeeping, so an application only sees c
 - Unsubscribing a pattern (or dropping its subscription) sends `unsubscribe` for the pattern and for each topic it owned, and stops tracking them.
 - When the server ends one owned topic (`unsubscribed` with no `id`), only that topic stops; the pattern's subscription carries on.
 
+**Shared subscriptions**
+
+- Subscribing with a `group` joins a shared subscription: the client receives only some of the topic's messages (other members get the rest), not in strict `seq` order.
+- So a shared subscription doesn't use a next expected `seq`. The client remembers the `seq`s it has handed to the application (a bounded set is enough) and treats a repeat as a duplicate, with the usual re-acknowledge rule. `subscribed.replay_from` and `truncated` don't move anything.
+- After reconnecting, rejoin with the same `group` and `from: "resume"`; the group's position is on the server. A shared subscription is never in `authenticated.resumed`.
+- Acknowledgements, manual or automatic, work as for any subscription.
+
 **Requests**
 
 - Every request that expects a reply carries an `id`; replies and errors are matched by it. Errors surface with their `code` (and `retry_after` for limits).

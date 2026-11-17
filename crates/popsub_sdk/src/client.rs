@@ -82,10 +82,11 @@ impl Client {
         }
     }
 
-    /// Subscribes to a topic.
+    /// Subscribes to a topic, or with a pattern such as `orders/#` to every
+    /// matching topic, including ones created later.
     ///
     /// Args:
-    ///     topic: The topic.
+    ///     topic: The topic or pattern.
     ///     from: Where replay starts. `StartFrom::Resume` continues a
     ///         durable session's stored subscription, and replays nothing
     ///         otherwise.
@@ -103,13 +104,69 @@ impl Client {
         topic: impl Into<String>,
         from: StartFrom,
     ) -> Result<Subscription, Error> {
-        let topic = topic.into();
+        self.subscribe_as(topic.into(), from, None).await
+    }
+
+    /// Joins a shared subscription: each message on the topic goes to one
+    /// member of the group, so several workers can split a topic's messages.
+    ///
+    /// The group keeps its own position on the server. `from` only decides
+    /// where the group starts the first time it is used on the topic; later
+    /// members, and this one after a reconnect, carry on from the group's
+    /// position. A member that disconnects hands its unacknowledged
+    /// messages to the others. Messages arrive in the order the server sends
+    /// them to this member, which is not strictly `seq` order.
+    ///
+    /// Args:
+    ///     topic: The topic, by its exact name.
+    ///     group: The group's name: 1 to 64 letters, digits, `_`, `.` or `-`.
+    ///     from: Where a new group starts.
+    ///
+    /// Returns:
+    ///     The subscription, which yields this member's share.
+    ///
+    /// Raises:
+    ///     Error::Server: When the server refused it, for example
+    ///         `not_authorized`, `invalid_topic` or `bad_request`.
+    ///     Error::Timeout: When it didn't complete in time.
+    ///     Error::Closed: When the client has stopped.
+    pub async fn subscribe_shared(
+        &self,
+        topic: impl Into<String>,
+        group: impl Into<String>,
+        from: StartFrom,
+    ) -> Result<Subscription, Error> {
+        self.subscribe_as(topic.into(), from, Some(group.into()))
+            .await
+    }
+
+    /// Subscribes to a topic, alone or as a member of a group.
+    ///
+    /// Args:
+    ///     topic: The topic or pattern.
+    ///     from: Where replay starts.
+    ///     group: The shared subscription to join, if any.
+    ///
+    /// Returns:
+    ///     The subscription.
+    ///
+    /// Raises:
+    ///     Error::Server: When the server refused it.
+    ///     Error::Timeout: When it didn't complete in time.
+    ///     Error::Closed: When the client has stopped.
+    async fn subscribe_as(
+        &self,
+        topic: String,
+        from: StartFrom,
+        group: Option<String>,
+    ) -> Result<Subscription, Error> {
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let (buffer, messages) = mpsc::channel(self.config.subscription_buffer.max(1));
         let (reply, outcome) = oneshot::channel();
         self.command(Command::Subscribe {
             topic: topic.clone(),
             from,
+            group,
             generation,
             buffer,
             reply,

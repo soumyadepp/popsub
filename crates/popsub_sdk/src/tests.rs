@@ -740,3 +740,82 @@ async fn a_wildcard_subscription_follows_matching_topics() {
     assert!(matches!(after, Ok(None)), "{after:?}");
     assert!(eventually(|| server.broker.stats().subscriptions == 0).await);
 }
+
+/// Checks a shared subscription from the client: two members split a
+/// topic's messages with no overlap, and when one disconnects without
+/// acknowledging, the other gets its messages too.
+#[tokio::test]
+async fn shared_subscriptions_split_messages_between_members() {
+    let server = TestServer::memory(&Settings::default()).await;
+    let publisher = Client::connect(server.config()).await.expect("connect");
+    let first = Client::connect(server.config().ack_mode(AckMode::Manual))
+        .await
+        .expect("connect");
+    let second = Client::connect(server.config().ack_mode(AckMode::Manual))
+        .await
+        .expect("connect");
+    let mut first_jobs = first
+        .subscribe_shared("jobs", "workers", StartFrom::New)
+        .await
+        .expect("join");
+    let mut second_jobs = second
+        .subscribe_shared("jobs", "workers", StartFrom::New)
+        .await
+        .expect("join");
+    for n in 1..=6 {
+        publisher
+            .publish_confirmed("jobs", format!("job {n}"))
+            .await
+            .expect("publish");
+    }
+    let mut mine = Vec::new();
+    let mut theirs = Vec::new();
+    for _ in 0..3 {
+        let message = next(&mut first_jobs).await;
+        mine.push(message.seq);
+        message.ack();
+        theirs.push(next(&mut second_jobs).await.seq);
+    }
+    let mut all = [mine.clone(), theirs.clone()].concat();
+    all.sort();
+    assert_eq!(all, vec![1, 2, 3, 4, 5, 6]);
+
+    second.close();
+    let mut handed_over = Vec::new();
+    for _ in 0..3 {
+        let message = next(&mut first_jobs).await;
+        handed_over.push(message.seq);
+        message.ack();
+    }
+    handed_over.sort();
+    theirs.sort();
+    assert_eq!(handed_over, theirs);
+    assert!(eventually(|| server.nothing_in_flight("jobs")).await);
+
+    let refused = first
+        .subscribe_shared("jobs/#", "workers", StartFrom::New)
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(Error::Server {
+                code: ErrorCode::BadRequest,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    let bad_name = first
+        .subscribe_shared("jobs", "not a name", StartFrom::New)
+        .await;
+    assert!(
+        matches!(
+            &bad_name,
+            Err(Error::Server {
+                code: ErrorCode::BadRequest,
+                ..
+            })
+        ),
+        "{bad_name:?}"
+    );
+}

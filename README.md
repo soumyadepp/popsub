@@ -12,6 +12,7 @@ cargo run -p popsub -- server
 
 - **Topic logs with sequence numbers.** Replay the last N messages, everything since a time, or everything from a `seq`. Replay and live delivery join with no gap and no repeat.
 - **Wildcard subscriptions.** Subscribe to `orders/#` or `sensors/+/temp` and get every matching topic you may read, including ones created later, each message under its own topic and number.
+- **Shared subscriptions.** Subscribe with a group name and each message goes to one member of the group, so workers can split a queue. The group remembers its position, and a worker that dies hands its unfinished messages to the others.
 - **Durable sessions.** Name a session when you connect, and your subscriptions and acknowledgement positions survive disconnects and server restarts.
 - **QoS 0 and QoS 1.** QoS 1 is at-least-once per subscriber. A publisher that retries with the same `message_id` doesn't create a duplicate, and gets the original `seq` back.
 - **Storage you choose.** A file backend (the default), an in-memory one, or your own through the `Storage` trait, held to a shared conformance suite.

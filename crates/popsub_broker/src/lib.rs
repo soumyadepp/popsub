@@ -26,7 +26,7 @@ pub use engine::{
 pub use frame::close_message;
 pub use health::StorageHealth;
 pub use shared::{Authorizer, LogSettings, SharedBroker, session_key};
-pub use topic::CursorUpdate;
+pub use topic::{CursorUpdate, GROUP_PREFIX, Group, group_subscriber_id};
 pub use writer::{Published, SubscribeOutcome};
 
 #[cfg(test)]

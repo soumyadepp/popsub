@@ -22,6 +22,12 @@
 //! work per topic exactly as for a subscription by name. Messages from
 //! every owned topic go to the pattern's one `Subscription`.
 //!
+//! A shared subscription (a topic read through a `group`) gets only some
+//! of the topic's messages, out of order when another member's are handed
+//! over, so it remembers the `seq`s it has delivered instead of a next
+//! expected one, and after a reconnect rejoins the group with `resume`: the
+//! group's position lives on the server.
+//!
 //! When the server ends a subscription on its own (an admin revoked the
 //! user's access), it sends `unsubscribed` with no id. The driver then
 //! drops the topic, which ends its `Subscription`, and reports
@@ -86,6 +92,8 @@ pub(crate) enum Command {
         topic: String,
         /// Where replay starts.
         from: StartFrom,
+        /// The shared subscription to join, if any.
+        group: Option<String>,
         /// Identifies this subscription, so a stale `Forget` can't remove a newer one.
         generation: u64,
         /// Where the topic's messages go.
@@ -189,6 +197,12 @@ struct Topic {
     acked: AckMemory,
     /// The wildcard subscription this topic was joined through, if any.
     owner: Option<String>,
+    /// The shared subscription this topic is read through, if any. Its
+    /// messages arrive out of order and with gaps (other members get the
+    /// rest), so duplicates are found with `seen` instead of `next_expected`.
+    group: Option<String>,
+    /// The `seq`s already handed to the application, for a shared subscription.
+    seen: AckMemory,
 }
 
 /// One wildcard subscription. The topics it brings in are `Topic`s owned by it.
@@ -654,12 +668,14 @@ impl Driver {
     async fn restore(&mut self, socket: &mut Socket, resumed: &[String]) -> Result<(), ()> {
         let mut resubscribe = Vec::new();
         for (name, topic) in &self.topics {
-            if !resumed.contains(name) {
+            if topic.group.is_some() {
+                resubscribe.push((name.clone(), StartFrom::Resume, topic.group.clone()));
+            } else if !resumed.contains(name) {
                 let from = topic.next_expected.map_or(topic.from, StartFrom::Seq);
-                resubscribe.push((name.clone(), from));
+                resubscribe.push((name.clone(), from, None));
             }
         }
-        for (name, from) in resubscribe {
+        for (name, from, group) in resubscribe {
             let id = self.take_id();
             self.pending.insert(
                 id,
@@ -670,7 +686,11 @@ impl Driver {
             send(
                 socket,
                 Some(id),
-                ClientMessage::Subscribe { topic: name, from },
+                ClientMessage::Subscribe {
+                    topic: name,
+                    from,
+                    group,
+                },
             )
             .await?;
         }
@@ -687,6 +707,7 @@ impl Driver {
             let again = ClientMessage::Subscribe {
                 topic: pattern,
                 from: StartFrom::Seq(1),
+                group: None,
             };
             send(socket, Some(id), again).await?;
         }
@@ -716,11 +737,12 @@ impl Driver {
             Command::Subscribe {
                 topic,
                 from,
+                group,
                 generation,
                 buffer,
                 reply,
             } => {
-                self.add_topic(topic.clone(), from, generation, buffer);
+                self.add_topic(topic.clone(), from, group, generation, buffer);
                 self.subscribe_waiters.insert(topic, reply);
             }
             Command::Unsubscribe { topic, reply } => {
@@ -813,12 +835,14 @@ impl Driver {
     /// Args:
     ///     topic: The topic or pattern.
     ///     from: Where replay starts.
+    ///     group: The shared subscription to join, if any.
     ///     generation: Which subscription this is.
     ///     buffer: Where its messages go.
     fn add_topic(
         &mut self,
         topic: String,
         from: StartFrom,
+        group: Option<String>,
         generation: u64,
         buffer: mpsc::Sender<Message>,
     ) {
@@ -835,6 +859,8 @@ impl Driver {
                 generation,
                 acked: AckMemory::default(),
                 owner: None,
+                group,
+                seen: AckMemory::default(),
             },
         );
     }
@@ -864,6 +890,8 @@ impl Driver {
             generation: owner.generation,
             acked: AckMemory::default(),
             owner: Some(pattern.clone()),
+            group: None,
+            seen: AckMemory::default(),
         };
         self.topics.insert(name.to_string(), topic);
         true
@@ -921,11 +949,12 @@ impl Driver {
             Command::Subscribe {
                 topic,
                 from,
+                group,
                 generation,
                 buffer,
                 reply,
             } => {
-                self.add_topic(topic.clone(), from, generation, buffer);
+                self.add_topic(topic.clone(), from, group.clone(), generation, buffer);
                 self.subscribe_waiters.insert(topic.clone(), reply);
                 let id = self.take_id();
                 self.pending.insert(
@@ -934,7 +963,8 @@ impl Driver {
                         topic: topic.clone(),
                     },
                 );
-                send(socket, Some(id), ClientMessage::Subscribe { topic, from }).await
+                let subscribe = ClientMessage::Subscribe { topic, from, group };
+                send(socket, Some(id), subscribe).await
             }
             Command::Unsubscribe { topic, reply } => {
                 let mut names = self.release(&topic, None);
@@ -1030,7 +1060,10 @@ impl Driver {
                 if self.patterns.contains_key(&subscribed.topic) {
                     debug!(pattern = %subscribed.topic, "wildcard subscription accepted");
                 } else if let Some(topic) = self.topics.get_mut(&subscribed.topic) {
-                    topic.next_expected = Some(topic.next_expected.map_or(start, |n| n.max(start)));
+                    if topic.group.is_none() {
+                        topic.next_expected =
+                            Some(topic.next_expected.map_or(start, |n| n.max(start)));
+                    }
                 } else {
                     self.adopt(&subscribed.topic, Some(start));
                 }
@@ -1053,7 +1086,9 @@ impl Driver {
                 }
             }
             ServerMessage::Truncated(truncated) => {
-                if let Some(topic) = self.topics.get_mut(&truncated.topic) {
+                if let Some(topic) = self.topics.get_mut(&truncated.topic)
+                    && topic.group.is_none()
+                {
                     let first = truncated.first_available;
                     topic.next_expected = Some(topic.next_expected.map_or(first, |n| n.max(first)));
                 }
@@ -1182,7 +1217,11 @@ impl Driver {
             }
             return Ok(());
         };
-        if topic.next_expected.is_some_and(|next| delivery.seq < next) {
+        let duplicate = match topic.group {
+            Some(_) => topic.seen.contains(delivery.seq),
+            None => topic.next_expected.is_some_and(|next| delivery.seq < next),
+        };
+        if duplicate {
             let acked_before =
                 self.config.ack_mode == AckMode::Auto || topic.acked.contains(delivery.seq);
             if delivery.qos == 1 && acked_before {
@@ -1190,7 +1229,11 @@ impl Driver {
             }
             return Ok(());
         }
-        topic.next_expected = Some(delivery.seq + 1);
+        if topic.group.is_some() {
+            topic.seen.insert(delivery.seq);
+        } else {
+            topic.next_expected = Some(delivery.seq + 1);
+        }
         let mut acker = None;
         if delivery.qos == 1 {
             match self.config.ack_mode {

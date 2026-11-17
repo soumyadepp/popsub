@@ -165,6 +165,15 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 - A pattern is not stored in a durable session; the topics joined through it are. After a reconnect the client subscribes to the pattern again. Sent with `from: {"seq": 1}`, that joins exactly the topics created while it was away, from their first message, because every topic it already holds is skipped.
 - A pattern that matches nothing the user may read is accepted and stays empty. A malformed one gets `invalid_topic`.
 
+**Shared subscriptions.** `subscribe` with a `group` (1 to 64 letters, digits, `_`, `.` or `-`) joins a group on an exact topic; a group with a pattern gets `bad_request`:
+
+- Each record on the topic goes to one member of the group, in turn, skipping members whose outgoing queues are full. Subscribers outside the group, and other groups, still get every record.
+- The group has one position and one window of unacknowledged QoS 1 records (`broker.max_inflight`, for the whole group), and its position is stored under the group's name like a durable session's cursor, so it survives restarts and periods with no members. Records published while a group has no members wait for the next member.
+- `from` only decides where a group starts the first time it is used on a topic (`resume` means `new`). Later members get `subscribed` with the group's current position as `replay_from` and their `from` is ignored. The `subscribed` frame names the `group`.
+- A record is acknowledged by the member it was sent to. When a member disconnects or unsubscribes, its unacknowledged records are sent to another member at once, or wait for one. A record that times out is resent to the same member, and after `max_retries` the group stalls or the record is dead-lettered, as for any subscription.
+- A member sees only its share, not in strict `seq` order, so clients deduplicate a shared subscription by remembering delivered `seq`s rather than by a next expected one, and rejoin with `resume` after a reconnect.
+- A connection holds one subscription per topic: joining a group replaces its own subscription to that topic, and the reverse.
+
 ### 4.2 Server to client
 
 | Frame | Shape |
@@ -264,6 +273,7 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 | QoS 1, ephemeral subscriber disconnects | Not at least once. Its subscriptions and windows are discarded. |
 | QoS 1, durable session disconnects and reconnects | At least once, provided it reconnects within `session_expiry_secs` and the records are still retained. Everything after its stored cursor is replayed. Records trimmed meanwhile are reported with `truncated`. |
 | QoS 1, broker restarts | With the `file` backend (the default), durable sessions resume from their stored cursors. Records are kept as firmly as `storage.durability` says: `buffered` survives a crash of the server, `synced` also a power loss. A cursor move is lost only to a power loss, which means resending records already acknowledged. With the `memory` backend nothing survives a restart. |
+| Shared subscriptions | At least once to the group as a whole: each record is sent to one member, and one that member never acknowledges goes to another when it disconnects, or is retried to it. Two members never hold the same record at once, but a record can be delivered to a second member after the first disconnects, so workers must tolerate a repeat. Order across members is not kept. The group's stored position gives the same restart behaviour as a durable session. |
 | Ordering | Per topic, every subscriber receives new records in `seq` order, and a replay followed by live delivery has no gap or repeat. Retries are resent out of order. |
 | Duplicates | Possible (retries, and replays of records acknowledged after the cursor was last stored) and detectable: every delivery carries the record's `seq`, so consumers deduplicate by `(topic, seq)`. A publisher retrying with the same `message_id` doesn't create a second record. |
 | Retention | History beyond `storage.retention` is trimmed. A subscriber that asks for trimmed history is told with a `truncated` frame. With the `memory` backend, all history is lost on restart. |

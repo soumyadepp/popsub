@@ -1373,3 +1373,74 @@ async fn records_out_of_retries_go_to_the_dead_letter_topic() {
             .any(|frame| frame["type"] == "stalled")
     );
 }
+
+/// Checks a shared subscription: each record goes to one member in turn,
+/// a member that leaves hands its unacknowledged records to the others, the
+/// group keeps its position while it has no members, a later member picks
+/// up there whatever `from` it asks for, and an ordinary subscriber on the
+/// same topic still gets everything.
+#[tokio::test]
+async fn a_shared_subscription_gives_each_record_to_one_member() {
+    let broker = shared(Retention::default());
+    let (a, mut a_rx) = broker.with(connect);
+    let (b, mut b_rx) = broker.with(connect);
+    let (watcher, mut watcher_rx) = broker.with(connect);
+    for member in [&a, &b] {
+        let joined = broker
+            .subscribe_shared("jobs", "workers", member, StartFrom::New, None)
+            .await
+            .expect("join");
+        assert!(joined.added);
+    }
+    broker
+        .subscribe("jobs", &watcher, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    for n in 1..=4 {
+        broker
+            .publish("jobs", new_record(&format!("job-{n}"), 1))
+            .await
+            .expect("publish");
+    }
+    let a_first = seqs(&frames(&mut a_rx));
+    let b_first = seqs(&frames(&mut b_rx));
+    assert_eq!(
+        (a_first.len(), b_first.len()),
+        (2, 2),
+        "{a_first:?} {b_first:?}"
+    );
+    let mut all = [a_first.clone(), b_first.clone()].concat();
+    all.sort();
+    assert_eq!(all, vec![1, 2, 3, 4]);
+    assert_eq!(seqs(&frames(&mut watcher_rx)), vec![1, 2, 3, 4]);
+    assert_eq!(broker.stats().in_flight, 8);
+
+    for seq in &a_first {
+        assert!(broker.ack(&a, "jobs", *seq).await);
+    }
+    assert!(!broker.ack(&a, "jobs", b_first[0]).await);
+    broker.with(|inner| inner.cleanup_client(&b));
+    let mut handed_over = seqs(&frames(&mut a_rx));
+    handed_over.sort();
+    assert_eq!(handed_over, b_first);
+    for seq in &b_first {
+        assert!(broker.ack(&a, "jobs", *seq).await);
+    }
+
+    broker.with(|inner| inner.cleanup_client(&a));
+    for n in 5..=6 {
+        broker
+            .publish("jobs", new_record(&format!("job-{n}"), 1))
+            .await
+            .expect("publish");
+    }
+    let (c, mut c_rx) = broker.with(connect);
+    let joined = broker
+        .subscribe_shared("jobs", "workers", &c, StartFrom::Seq(1), None)
+        .await
+        .expect("join");
+    assert_eq!(joined.replay_from, 5);
+    let received = wait_for_messages(&mut c_rx, 2).await;
+    assert_eq!(received[0]["group"], "workers");
+    assert_eq!(seqs(&received), vec![5, 6]);
+}

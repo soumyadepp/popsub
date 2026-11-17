@@ -90,13 +90,19 @@ pub enum ClientMessage {
         password: String,
     },
     /// Subscribes to a topic, replaying the history `from` asks for first.
-    /// Answered with `subscribed`, then history, then live records.
+    /// Answered with `subscribed`, then history, then live records. The
+    /// topic may be a wildcard pattern, or the request may name a `group`
+    /// to share the subscription with other connections, but not both.
     Subscribe {
         /// The topic.
         topic: String,
         /// Where replay starts. Omitted means `resume`.
         #[serde(default)]
         from: StartFrom,
+        /// A shared subscription to join. Each message on the topic goes to
+        /// one member of the group, and the group keeps its own position.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// Stops delivery of a topic. Answered with `unsubscribed`.
     Unsubscribe {

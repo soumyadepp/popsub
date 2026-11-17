@@ -312,6 +312,10 @@ pub struct Subscribed {
     pub replay_from: u64,
     /// The newest `seq` in the log when the subscription started.
     pub replay_to: u64,
+    /// The shared subscription that was joined, when the request named one.
+    /// `replay_from` is then the group's position, not this member's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Tells a subscriber that a QoS 1 record ran out of retries.

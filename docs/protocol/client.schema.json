@@ -243,12 +243,19 @@
       "type": "object"
     },
     {
-      "description": "Subscribes to a topic, replaying the history `from` asks for first.\nAnswered with `subscribed`, then history, then live records.",
+      "description": "Subscribes to a topic, replaying the history `from` asks for first.\nAnswered with `subscribed`, then history, then live records. The\ntopic may be a wildcard pattern, or the request may name a `group`\nto share the subscription with other connections, but not both.",
       "properties": {
         "from": {
           "$ref": "#/$defs/StartFrom",
           "default": "resume",
           "description": "Where replay starts. Omitted means `resume`."
+        },
+        "group": {
+          "description": "A shared subscription to join. Each message on the topic goes to\none member of the group, and the group keeps its own position.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "topic": {
           "description": "The topic.",

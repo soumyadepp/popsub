@@ -292,6 +292,13 @@
     "Subscribed": {
       "description": "Confirms a subscription and says which records are history.\n\nThe range is empty when `replay_from` is greater than `replay_to`.",
       "properties": {
+        "group": {
+          "description": "The shared subscription that was joined, when the request named one.\n`replay_from` is then the group's position, not this member's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "replay_from": {
           "description": "The first `seq` that will be sent.",
           "format": "uint64",

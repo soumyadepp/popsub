@@ -274,6 +274,7 @@ async fn test_action_before_auth_fails() {
     let subscribe_msg = ClientMessage::Subscribe {
         topic: "test".to_string(),
         from: StartFrom::New,
+        group: None,
     };
     ws_stream
         .send(WsMessage::Text(

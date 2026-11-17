@@ -103,7 +103,11 @@ async fn handle(state: &Arc<State>, out: &Out, command: &Value) -> Result<Value,
                 .map_err(|e| failure("config", &e.to_string()))?;
             let topic = text("topic");
             state.leaving.lock().await.remove(&topic);
-            let mut subscription = client.subscribe(&topic, from).await.map_err(error)?;
+            let joined = match command["group"].as_str() {
+                Some(group) => client.subscribe_shared(&topic, group, from).await,
+                None => client.subscribe(&topic, from).await,
+            };
+            let mut subscription = joined.map_err(error)?;
             let (state, out) = (state.clone(), out.clone());
             tokio::spawn(async move {
                 while let Some(message) = subscription.next().await {
