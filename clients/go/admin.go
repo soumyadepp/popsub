@@ -71,8 +71,9 @@ func (a *Admin) Revoke(ctx context.Context, username, pattern string) (User, err
 	return a.user(ctx, revokeRequest{Type: "revoke", Username: username, Pattern: pattern})
 }
 
-// SetPassword sets an account's password. Tokens already issued stay
-// valid until they expire. It fails with CodeUserNotFound, or
+// SetPassword sets an account's password. Tokens issued before it are
+// cancelled and the account's connections are closed, so they log in
+// again. It fails with CodeUserNotFound, or
 // CodeBadRequest for a password that is too short or too long.
 func (a *Admin) SetPassword(ctx context.Context, username, password string) (User, error) {
 	return a.user(ctx, setPasswordRequest{Type: "set_password", Username: username, Password: password})

@@ -171,7 +171,7 @@ pub enum ClientMessage {
         pattern: String,
     },
     /// Admin only. Sets an account's password. Answered with `user`. Tokens
-    /// already issued stay valid until they expire.
+    /// issued before it are cancelled and the account's connections closed.
     SetPassword {
         /// The account.
         username: String,

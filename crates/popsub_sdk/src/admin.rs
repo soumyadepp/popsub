@@ -189,8 +189,8 @@ impl<'a> Admin<'a> {
         .await
     }
 
-    /// Sets an account's password. Its existing tokens stay valid until
-    /// they expire.
+    /// Sets an account's password. Tokens issued before it are cancelled,
+    /// and the account's connections are closed so they log in again.
     ///
     /// Args:
     ///     username: The account.

@@ -363,7 +363,7 @@ mod postgres_store {
     ///
     /// Postgres refuses several commands in one prepared statement, which is
     /// how `sqlx::query` sends SQL, so each statement is executed on its own.
-    const MIGRATION_STATEMENTS: [&str; 3] = [
+    const MIGRATION_STATEMENTS: [&str; 4] = [
         r#"
         CREATE TABLE IF NOT EXISTS users (
             username VARCHAR(255) PRIMARY KEY,
@@ -377,6 +377,7 @@ mod postgres_store {
         "#,
         "CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled)",
         "CREATE INDEX IF NOT EXISTS idx_users_role_type ON users(role_type)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version BIGINT NOT NULL DEFAULT 0",
     ];
 
     /// A `UserStore` backed by a PostgreSQL `users` table, available with the `postgres` feature.
@@ -547,7 +548,8 @@ mod postgres_store {
             let row = sqlx::query(
                 r#"
                 SELECT username, password_hash, role_type, role_data, enabled,
-                       EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at
+                       EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at,
+                       token_version
                 FROM users
                 WHERE username = $1
                 "#,
@@ -569,6 +571,8 @@ mod postgres_store {
                     let mut user = User::new(&username, password_hash, role);
                     user.enabled = enabled;
                     user.created_at = row.get("created_at");
+                    let version: i64 = row.get("token_version");
+                    user.token_version = u64::try_from(version).unwrap_or(0);
 
                     Ok(Some(user))
                 }
@@ -630,7 +634,8 @@ mod postgres_store {
             let result = sqlx::query(
                 r#"
                 UPDATE users
-                SET password_hash = $2, role_type = $3, role_data = $4, enabled = $5, updated_at = NOW()
+                SET password_hash = $2, role_type = $3, role_data = $4, enabled = $5,
+                    token_version = $6, updated_at = NOW()
                 WHERE username = $1
                 "#,
             )
@@ -639,6 +644,7 @@ mod postgres_store {
             .bind(&role_type)
             .bind(&role_data)
             .bind(user.enabled)
+            .bind(i64::try_from(user.token_version).unwrap_or(i64::MAX))
             .execute(&self.pool)
             .await
             .map_err(|e| AuthError::Internal(format!("Database error: {e}")))?;

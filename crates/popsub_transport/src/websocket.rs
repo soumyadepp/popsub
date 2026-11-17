@@ -1485,7 +1485,8 @@ impl Session {
     /// The reply is `authenticated` with the protocol version and the
     /// server's limits. These get an error and close the connection with the
     /// matching `CloseCode`: an unsupported `protocol` (`unsupported_protocol`),
-    /// an invalid or expired token (`auth_failed`), a token whose account is
+    /// an invalid or expired token (`auth_failed`), a token issued before the
+    /// account's last password change (`auth_failed`), a token whose account is
     /// disabled or deleted (`auth_failed`, closed as `AccountDisabled`), a
     /// user store that can't be read (`internal`, closed as `AuthFailed`), an
     /// invalid `session_id`
@@ -1546,7 +1547,17 @@ impl Session {
             }
         };
         match self.server.auth.get_user(&claims.sub).await {
-            Ok(Some(user)) if user.enabled => {}
+            Ok(Some(user)) if user.enabled && user.token_version == claims.ver => {}
+            Ok(Some(user)) if user.enabled => {
+                warn!(client_id = %self.client_id, username = %pii(&claims.sub), "token issued before a password change");
+                self.fail(
+                    id,
+                    ErrorCode::AuthFailed,
+                    "this token was cancelled by a password change; log in again",
+                    None,
+                )?;
+                return Ok(Flow::Close(CloseCode::AuthFailed));
+            }
             Ok(_) => {
                 warn!(client_id = %self.client_id, username = %pii(&claims.sub), "token for a disabled or deleted account");
                 self.fail(

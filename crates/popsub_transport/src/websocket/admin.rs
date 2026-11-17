@@ -5,7 +5,9 @@
 //! live connections straight away: disabling or deleting an account closes
 //! its connections with `CloseCode::AccountDisabled`, and a role change or
 //! revoke ends the account's live subscriptions it no longer allows (each
-//! such connection is told with an `unsubscribed` frame). The last enabled
+//! such connection is told with an `unsubscribed` frame). A password change
+//! cancels the account's tokens and closes its connections with
+//! `CloseCode::TokenExpired`, so they have to log in again. The last enabled
 //! admin can't be disabled, deleted or demoted, so the server can't be left
 //! without one.
 
@@ -326,6 +328,9 @@ impl Session {
                 auth.update_user_password(&username, &password)
                     .await
                     .map_err(|e| refusal(&e))?;
+                self.server
+                    .broker
+                    .close_user(&username, CloseCode::TokenExpired);
                 self.user_reply(&username).await
             }
             ClientMessage::SetEnabled { username, enabled } => {

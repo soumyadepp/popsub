@@ -145,7 +145,7 @@ The admin requests below need an enabled admin; anyone else gets `forbidden`. A 
 | `set_role` | `username`, `role` | `user`. Replaces the role and its grants. |
 | `grant` | `username`, `pattern`, `access` | `user`. Adds the grant, replacing one for exactly that pattern. Refused for admins, and for publishing on a `readonly` account. |
 | `revoke` | `username`, `pattern` | `user`. Removes the grant for exactly that pattern; `bad_request` if there is none. |
-| `set_password` | `username`, `password` | `user`. Tokens already issued stay valid until they expire. |
+| `set_password` | `username`, `password` | `user`. Tokens issued before it are refused at `auth` from then on, and the account's connections are closed with `token_expired` (4004), so they log in again. |
 | `set_enabled` | `username`, `enabled` | `user` |
 | `delete_user` | `username` | `user_deleted` |
 
@@ -342,7 +342,7 @@ Every `limits` value below 1 is treated as 1, so a limit can't be switched off b
 - Topic names are logged and exported as they are. Don't put personal data in topic names, or keep telemetry off.
 - Metric attributes are fixed values (reasons, outcomes, codes) and never carry identities. Span attributes are the request type, a random per-connection id and an error code.
 - Expiry is enforced on each connection: it is warned a minute before and closed at `exp` unless it sends a fresh `auth` (section 4.4).
-- Changing a password doesn't revoke tokens already issued; they stay valid until they expire. Disable the account to cut it off at once.
+- Each account has a token version, carried in its tokens (`ver`). A password change moves it on, so every token issued before is refused at `auth` and on refresh, and the account's live connections are closed with `token_expired`. Tokens issued before versions existed count as version 0.
 
 **Limits**
 
@@ -408,8 +408,7 @@ The defaults below are set in the `[limits]` section (section 9).
 
 ## 12. Known gaps, in priority order
 
-1. No release artefacts, and only a Rust client library.
-2. Changing a password doesn't revoke the account's outstanding tokens.
+1. No release artefacts, and nothing published to package registries.
 
 ## 13. Proposed direction
 

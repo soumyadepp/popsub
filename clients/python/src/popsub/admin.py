@@ -146,7 +146,8 @@ class Admin:
     async def set_password(self, username: str, password: str) -> UserInfo:
         """Sets an account's password.
 
-        Tokens already issued stay valid until they expire.
+        Tokens issued before it are cancelled, and the account's connections
+        are closed so they log in again.
 
         Args:
             username: The account.

@@ -495,7 +495,7 @@
       "type": "object"
     },
     {
-      "description": "Admin only. Sets an account's password. Answered with `user`. Tokens\nalready issued stay valid until they expire.",
+      "description": "Admin only. Sets an account's password. Answered with `user`. Tokens\nissued before it are cancelled and the account's connections closed.",
       "properties": {
         "password": {
           "description": "The new password, at least 8 characters.",

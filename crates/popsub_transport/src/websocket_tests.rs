@@ -2335,3 +2335,50 @@ async fn pings_are_answered_before_and_after_auth() {
     let late = send_raw(&mut admin, r#"{"type": "ping", "id": 2}"#).await;
     assert_eq!(late, serde_json::json!({"type": "pong", "id": 2}));
 }
+
+/// Checks that changing a password cancels the account's tokens: its live
+/// connection is closed with `token_expired`, the old token is refused at
+/// `auth`, the old password no longer logs in, and the new one does.
+#[tokio::test]
+async fn a_password_change_cancels_tokens_and_connections() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "pat", "password": "pat-password-1", "role": {"kind": "user"}}),
+    )
+    .await;
+    let (mut pat, old_token) = user_connection(addr, "pat", "pat-password-1").await;
+    let changed = request(
+        &mut admin,
+        serde_json::json!({"type": "set_password", "id": 2, "username": "pat", "password": "pat-password-2"}),
+    )
+    .await;
+    assert_eq!(changed["type"], "user", "{changed}");
+    assert_eq!(
+        next_close(&mut pat, Duration::from_secs(2)).await.0,
+        CloseCode::TokenExpired.code()
+    );
+
+    let mut stale = raw_connection(addr).await;
+    let refused = send_raw(
+        &mut stale,
+        &serde_json::json!({"type": "auth", "token": old_token}).to_string(),
+    )
+    .await;
+    assert_eq!(refused["code"], "auth_failed", "{refused}");
+    assert_eq!(
+        next_close(&mut stale, Duration::from_secs(2)).await.0,
+        CloseCode::AuthFailed.code()
+    );
+
+    let mut retry = raw_connection(addr).await;
+    let old_login = send_raw(
+        &mut retry,
+        r#"{"type": "login", "username": "pat", "password": "pat-password-1"}"#,
+    )
+    .await;
+    assert_eq!(old_login["code"], "invalid_credentials", "{old_login}");
+    user_connection(addr, "pat", "pat-password-2").await;
+}

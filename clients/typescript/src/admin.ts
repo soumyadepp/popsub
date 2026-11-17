@@ -159,7 +159,8 @@ export class Admin {
   }
 
   /**
-   * Sets an account's password. Tokens already issued stay valid until they expire.
+   * Sets an account's password. Tokens issued before it are cancelled, and
+   * the account's connections are closed so they log in again.
    *
    * @param username - The account.
    * @param password - The new password.
