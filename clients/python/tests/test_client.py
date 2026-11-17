@@ -41,6 +41,30 @@ def server() -> Iterator[FakeServer]:
     fake.stop()
 
 
+async def acks_seen(server: FakeServer, count: int, within: float = 2.0) -> list[int]:
+    """Waits for the fake server to record a number of acks.
+
+    The server runs in another thread, so an ack the client has sent may not
+    be recorded yet when the test looks.
+
+    Args:
+        server: The server.
+        count: How many acks to wait for.
+        within: The longest to wait, in seconds.
+
+    Returns:
+        The acknowledged seqs in the order the server recorded them, once
+        there are `count`, or as they stand when the time runs out.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within
+    while True:
+        acks = [frame["seq"] for frame in server.frames("ack")]
+        if len(acks) >= count or loop.time() >= deadline:
+            return acks
+        await asyncio.sleep(0.01)
+
+
 def make_config(server: FakeServer, password: str = PASSWORD) -> ClientConfig:
     """Builds a configuration with fast reconnects for the fake server.
 
@@ -87,8 +111,7 @@ async def test_messages_arrive_once_and_duplicates_are_reacked(server: FakeServe
     third = await subscription.next()
     assert third is not None
     assert third.seq == 3
-    acks = [frame["seq"] for frame in server.frames("ack")]
-    assert acks == [1, 1, 2, 2]
+    assert await acks_seen(server, 4) == [1, 1, 2, 2]
     await client.close()
 
 

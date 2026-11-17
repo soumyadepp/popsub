@@ -17,6 +17,14 @@ import {
   type ServerMessage,
 } from "./protocol.js";
 
+/**
+ * The close code reported when the socket fails without a close frame.
+ * Some runtimes (Node 22's WebSocket, for one) fire only `error`, not
+ * `close`, when a connection attempt is refused, so `error` is handled as a
+ * close with this code; whichever of the two arrives first detaches both.
+ */
+const ABNORMAL_CLOSURE = 1006;
+
 /** Why a connection attempt failed, and whether another attempt could help. */
 export class ConnectFailure extends Error {
   /** The error to report. */
@@ -123,7 +131,9 @@ export class Handshake {
     this.socket.onclose = (event: CloseEvent) => {
       this.#onClose(event.code);
     };
-    this.socket.onerror = () => undefined;
+    this.socket.onerror = () => {
+      this.#onClose(ABNORMAL_CLOSURE);
+    };
   }
 
   /**
