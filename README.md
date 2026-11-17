@@ -280,6 +280,14 @@ From the source tree, run these as `cargo run -p popsub -- users ...`. New passw
 
 A grant is a topic pattern (`+` matches one level, a trailing `#` the rest) with `subscribe`, `publish` or `both`. A `user` account may use what its grants allow, a `readonly` one may only subscribe, and an `admin` may use every topic and manage accounts. The last enabled admin can't be disabled, deleted or demoted.
 
+Admins can also look at and empty topics:
+
+```bash
+popsub topics list            # name, first and last seq, messages kept, live subscribers
+popsub topics show orders
+popsub topics purge orders    # removes its messages; numbering carries on
+```
+
 From Rust, the same requests are on `client.admin()`:
 
 ```rust
@@ -294,7 +302,7 @@ admin.revoke("alice", "orders/#").await?;
 
 | Crate | What it is |
 |---|---|
-| `popsub` | The binary: `server`, a demo `client`, and `users` for managing accounts |
+| `popsub` | The binary: `server`, a demo `client`, and `users` and `topics` for managing a running server |
 | `popsub_sdk` | The Rust client library |
 | `popsub_scenarios` | The scenario suite every client library must pass, and the Rust client's driver for it |
 | `popsub_protocol` | Every frame type, shared by the server and clients |

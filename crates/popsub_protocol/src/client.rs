@@ -124,6 +124,20 @@ pub enum ClientMessage {
         /// Its `seq`.
         seq: u64,
     },
+    /// Admin only. Lists every topic that has a log. Answered with `topics`.
+    ListTopics {},
+    /// Admin only. Describes one topic. Answered with `topic_info`.
+    GetTopic {
+        /// The topic.
+        topic: String,
+    },
+    /// Admin only. Removes every record a topic holds. Its numbering
+    /// carries on, so the next publish gets the next `seq`; subscribers
+    /// that were behind are told with `truncated`. Answered with `topic_info`.
+    PurgeTopic {
+        /// The topic.
+        topic: String,
+    },
     /// Asks the server to answer with `pong`, so a client that can't see
     /// WebSocket pings (a browser) can tell the connection is still alive.
     /// Accepted before `auth` too.
@@ -209,6 +223,9 @@ impl ClientMessage {
             ClientMessage::Publish { .. } => "publish",
             ClientMessage::Ack { .. } => "ack",
             ClientMessage::Ping { .. } => "ping",
+            ClientMessage::ListTopics { .. } => "list_topics",
+            ClientMessage::GetTopic { .. } => "get_topic",
+            ClientMessage::PurgeTopic { .. } => "purge_topic",
             ClientMessage::CreateUser { .. } => "create_user",
             ClientMessage::GetUser { .. } => "get_user",
             ClientMessage::ListUsers { .. } => "list_users",

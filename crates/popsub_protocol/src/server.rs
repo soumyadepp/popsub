@@ -122,6 +122,16 @@ pub enum ServerMessage {
         /// The account.
         username: String,
     },
+    /// One topic, in answer to `get_topic` and `purge_topic`.
+    TopicInfo {
+        /// The topic.
+        topic: TopicInfo,
+    },
+    /// Every topic, sorted by name, in answer to `list_topics`.
+    Topics {
+        /// The topics.
+        topics: Vec<TopicInfo>,
+    },
     /// A request failed.
     Error {
         /// What went wrong, for programs.
@@ -178,6 +188,8 @@ pub enum ErrorCode {
     UserNotFound,
     /// An account with that username already exists.
     UserExists,
+    /// The topic has no log: nothing was ever published to it.
+    TopicNotFound,
 }
 
 impl ErrorCode {
@@ -205,6 +217,7 @@ impl ErrorCode {
             ErrorCode::Forbidden => "forbidden",
             ErrorCode::UserNotFound => "user_not_found",
             ErrorCode::UserExists => "user_exists",
+            ErrorCode::TopicNotFound => "topic_not_found",
         }
     }
 }
@@ -221,6 +234,22 @@ pub struct UserInfo {
     pub enabled: bool,
     /// When it was created, in milliseconds since the Unix epoch.
     pub created_at_ms: i64,
+}
+
+/// A topic, as admins see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TopicInfo {
+    /// The topic's name.
+    pub name: String,
+    /// The oldest `seq` still kept, or `last_seq + 1` when nothing is kept.
+    pub first_seq: u64,
+    /// The newest `seq` ever published.
+    pub last_seq: u64,
+    /// How many records are kept now.
+    pub messages: u64,
+    /// How many live subscriptions it has.
+    pub subscribers: u64,
 }
 
 /// Limits the server advertises in `authenticated`.

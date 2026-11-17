@@ -998,7 +998,9 @@ impl Driver {
             | ServerMessage::Pong {}
             | ServerMessage::User { .. }
             | ServerMessage::Users { .. }
-            | ServerMessage::UserDeleted { .. } => {}
+            | ServerMessage::UserDeleted { .. }
+            | ServerMessage::TopicInfo { .. }
+            | ServerMessage::Topics { .. } => {}
         }
         Ok(())
     }

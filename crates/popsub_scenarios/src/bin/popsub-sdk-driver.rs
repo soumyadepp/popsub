@@ -296,6 +296,21 @@ async fn admin(client: &Client, command: &Value) -> Result<Value, Value> {
             .await
             .map(|()| json!({"result": null}))
             .map_err(error),
+        "list_topics" => admin
+            .list_topics()
+            .await
+            .map(|topics| json!({"result": topics}))
+            .map_err(error),
+        "get_topic" => admin
+            .get_topic(text("topic"))
+            .await
+            .map(|topic| json!({"result": topic}))
+            .map_err(error),
+        "purge_topic" => admin
+            .purge_topic(text("topic"))
+            .await
+            .map(|topic| json!({"result": topic}))
+            .map_err(error),
         other => Err(failure(
             "protocol",
             &format!("unknown admin method {other}"),

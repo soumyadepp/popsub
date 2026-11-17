@@ -145,6 +145,24 @@ pub async fn run(
     connection: Connection,
     command: UsersCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let client = connect(connection).await?;
+    let outcome = act(&client, command).await;
+    client.close();
+    outcome
+}
+
+/// Connects as the admin the connection options name, without retrying.
+///
+/// Args:
+///     connection: Where to connect and who to log in as.
+///
+/// Returns:
+///     The connected client.
+///
+/// Raises:
+///     popsub_sdk::Error: When connecting or logging in fails.
+///     String: When the password can't be read, or the `--ca-cert` file can't be read.
+pub async fn connect(connection: Connection) -> Result<Client, Box<dyn std::error::Error>> {
     let password = match connection.password {
         Some(password) => password,
         None => secret(
@@ -165,10 +183,7 @@ pub async fn run(
         .request_timeout(Duration::from_secs(10)),
         connection.ca_cert.as_deref(),
     )?;
-    let client = Client::connect(config).await?;
-    let outcome = act(&client, command).await;
-    client.close();
-    outcome
+    Ok(Client::connect(config).await?)
 }
 
 /// Carries out one action on a connected client and prints the result.

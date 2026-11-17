@@ -349,6 +349,55 @@
       "type": "object"
     },
     {
+      "description": "Admin only. Lists every topic that has a log. Answered with `topics`.",
+      "properties": {
+        "type": {
+          "const": "list_topics",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Describes one topic. Answered with `topic_info`.",
+      "properties": {
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        },
+        "type": {
+          "const": "get_topic",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Admin only. Removes every record a topic holds. Its numbering\ncarries on, so the next publish gets the next `seq`; subscribers\nthat were behind are told with `truncated`. Answered with `topic_info`.",
+      "properties": {
+        "topic": {
+          "description": "The topic.",
+          "type": "string"
+        },
+        "type": {
+          "const": "purge_topic",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic"
+      ],
+      "type": "object"
+    },
+    {
       "description": "Asks the server to answer with `pong`, so a client that can't see\nWebSocket pings (a browser) can tell the connection is still alive.\nAccepted before `auth` too.",
       "properties": {
         "type": {

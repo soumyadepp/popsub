@@ -19,6 +19,7 @@
 
 use crate::engine::BrokerStats;
 use crate::health::StorageHealth;
+use popsub_protocol::TopicInfo;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -226,6 +227,81 @@ impl SharedBroker {
             .bounds(topic)
             .await
             .map(|bounds| bounds.last_seq)
+    }
+
+    /// Lists every topic that has a log, with its bounds and live subscribers.
+    ///
+    /// Returns:
+    ///     The topics, sorted by name.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the logs can't be read.
+    pub async fn topic_infos(&self) -> StorageResult<Vec<TopicInfo>> {
+        let mut infos = Vec::new();
+        for name in self.storage.topics().await? {
+            if let Some(info) = self.topic_info(&name).await? {
+                infos.push(info);
+            }
+        }
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(infos)
+    }
+
+    /// Describes one topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     Its bounds, record count and live subscribers, or `None` when
+    ///     nothing was ever published to it.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log can't be read.
+    pub async fn topic_info(&self, topic: &str) -> StorageResult<Option<TopicInfo>> {
+        let bounds = self.storage.bounds(topic).await?;
+        if bounds.last_seq == 0 {
+            return Ok(None);
+        }
+        let subscribers = self.with(|broker| {
+            broker
+                .topics
+                .get(topic)
+                .map_or(0, |t| t.subscribers.len() as u64)
+        });
+        Ok(Some(TopicInfo {
+            name: topic.to_string(),
+            first_seq: bounds.first_seq,
+            last_seq: bounds.last_seq,
+            messages: (bounds.last_seq + 1).saturating_sub(bounds.first_seq),
+            subscribers,
+        }))
+    }
+
+    /// Removes every record a topic holds. Its numbering carries on, and
+    /// subscribers that hadn't caught up are told with `truncated` when they
+    /// next read.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     The topic afterwards, or `None` when nothing was ever published to it.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log can't be changed.
+    pub async fn purge_topic(&self, topic: &str) -> StorageResult<Option<TopicInfo>> {
+        if self.topic_info(topic).await?.is_none() {
+            return Ok(None);
+        }
+        let nothing = Retention {
+            max_messages: Some(0),
+            max_age_ms: None,
+            max_bytes: None,
+        };
+        let removed = self.storage.trim(topic, &nothing, now_ms()).await?;
+        info!(topic, removed, "purged a topic");
+        self.topic_info(topic).await
     }
 
     /// A snapshot of the broker's size, for gauges.

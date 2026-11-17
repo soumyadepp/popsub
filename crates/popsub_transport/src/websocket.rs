@@ -1255,7 +1255,10 @@ impl Session {
             | ClientMessage::Revoke { .. }
             | ClientMessage::SetPassword { .. }
             | ClientMessage::SetEnabled { .. }
-            | ClientMessage::DeleteUser { .. }) => self.admin(id, admin).await,
+            | ClientMessage::DeleteUser { .. }
+            | ClientMessage::ListTopics {}
+            | ClientMessage::GetTopic { .. }
+            | ClientMessage::PurgeTopic { .. }) => self.admin(id, admin).await,
         }
     }
 

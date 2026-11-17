@@ -1,4 +1,5 @@
-//! The admin requests: creating, reading, changing and deleting accounts.
+//! The admin requests: creating, reading, changing and deleting accounts,
+//! and listing, describing and purging topics.
 //!
 //! Every request first checks, against the user store, that the caller is
 //! an enabled admin; anyone else gets `forbidden`. Changes take effect on
@@ -197,6 +198,46 @@ fn refusal(error: &AuthError) -> (ErrorCode, String) {
     }
 }
 
+/// Maps a storage failure in a topic admin request to what the client gets.
+///
+/// Args:
+///     error: The storage error.
+///
+/// Returns:
+///     `storage_unavailable` with a fixed message; the detail stays in the log.
+fn storage_refusal(error: popsub_storage::StorageError) -> (ErrorCode, String) {
+    warn!(%error, "a topic admin request couldn't read storage");
+    (
+        ErrorCode::StorageUnavailable,
+        "storage unavailable".to_string(),
+    )
+}
+
+/// Builds the `topic_info` reply, or `topic_not_found`.
+///
+/// Args:
+///     found: The topic, if it has a log.
+///     topic: The name asked for.
+///
+/// Returns:
+///     The reply.
+///
+/// Raises:
+///     (ErrorCode, String): `topic_not_found` when nothing was ever published to it.
+fn topic_reply(
+    found: Option<popsub_protocol::TopicInfo>,
+    topic: &str,
+) -> std::result::Result<ServerMessage, (ErrorCode, String)> {
+    found
+        .map(|topic| ServerMessage::TopicInfo { topic })
+        .ok_or_else(|| {
+            (
+                ErrorCode::TopicNotFound,
+                format!("no topic named '{topic}'"),
+            )
+        })
+}
+
 impl Session {
     /// Handles an admin request.
     ///
@@ -356,6 +397,31 @@ impl Session {
                     .broker
                     .close_user(&username, CloseCode::AccountDisabled);
                 Ok(ServerMessage::UserDeleted { username })
+            }
+            ClientMessage::ListTopics {} => self
+                .server
+                .broker
+                .topic_infos()
+                .await
+                .map(|topics| ServerMessage::Topics { topics })
+                .map_err(storage_refusal),
+            ClientMessage::GetTopic { topic } => {
+                let found = self
+                    .server
+                    .broker
+                    .topic_info(&topic)
+                    .await
+                    .map_err(storage_refusal)?;
+                topic_reply(found, &topic)
+            }
+            ClientMessage::PurgeTopic { topic } => {
+                let purged = self
+                    .server
+                    .broker
+                    .purge_topic(&topic)
+                    .await
+                    .map_err(storage_refusal)?;
+                topic_reply(purged, &topic)
             }
             _ => Err(bad("not an admin request".to_string())),
         }

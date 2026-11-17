@@ -117,7 +117,7 @@ Gauges are read from `SharedBroker::stats` at each export (every 60 seconds by d
 All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`). A JSON Schema generated from those types is in `docs/protocol/` for SDKs in other languages; CI fails if it falls out of date.
 
 - **Request ids.** Any client frame may carry an `id`, a number or a string. The reply carries the same `id`. Frames the server sends on its own have none.
-- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
+- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists`, `topic_not_found` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
 - **Evolution.** Within a version, frames, fields and error codes are only added. Clients ignore fields and frame types they don't know, and treat an unknown error code like `internal`. Removing or changing anything needs a new version, named by the client in `auth`.
 
 Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`.
@@ -148,6 +148,9 @@ The admin requests below need an enabled admin; anyone else gets `forbidden`. A 
 | `set_password` | `username`, `password` | `user`. Tokens issued before it are refused at `auth` from then on, and the account's connections are closed with `token_expired` (4004), so they log in again. |
 | `set_enabled` | `username`, `enabled` | `user` |
 | `delete_user` | `username` | `user_deleted` |
+| `list_topics` | none | `topics`: every topic that has a log, sorted by name |
+| `get_topic` | `topic` | `topic_info`, or `topic_not_found` when nothing was ever published to it |
+| `purge_topic` | `topic` | `topic_info` after removing every record the topic holds. Its numbering carries on (the next publish gets `last_seq + 1`), live subscriptions stay, and a subscriber that hadn't caught up gets `truncated` |
 
 Changes take effect on live connections at once. After `set_role`, `grant` or `revoke`, each of the account's subscriptions its role no longer allows is ended: the connection gets `unsubscribed` with no `id`, and a durable session forgets it. Disabling or deleting an account closes its connections with `account_disabled` (4009), and its tokens are refused at `auth` from then on.
 
@@ -165,6 +168,8 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 | User | `{"type":"user","user":{"username":"...","role":{"kind":"user","topics":[...]},"enabled":true,"created_at_ms":1794800000000}}`, the reply to most admin requests. No password hash. |
 | Users | `{"type":"users","users":[...]}`, the same objects |
 | User deleted | `{"type":"user_deleted","username":"..."}` |
+| Topic info | `{"type":"topic_info","topic":{"name":"orders","first_seq":3,"last_seq":9,"messages":7,"subscribers":2}}` |
+| Topics | `{"type":"topics","topics":[...]}`, the same objects |
 | Published | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
 | Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
 | Truncated | `{"type":"truncated","topic":"...","first_available":1300}`, before records that start later than the subscriber expected |

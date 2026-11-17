@@ -2382,3 +2382,96 @@ async fn a_password_change_cancels_tokens_and_connections() {
     assert_eq!(old_login["code"], "invalid_credentials", "{old_login}");
     user_connection(addr, "pat", "pat-password-2").await;
 }
+
+/// Checks the topic admin requests: listing and describing topics, purging
+/// one (its numbering carries on and a subscriber that was behind is told
+/// with `truncated`), `topic_not_found`, and `forbidden` for non-admins.
+#[tokio::test]
+async fn admins_list_describe_and_purge_topics() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    for (topic, count) in [("orders", 3), ("audit", 1)] {
+        for n in 0..count {
+            let published = request(
+                &mut admin,
+                serde_json::json!({"type": "publish", "id": n, "topic": topic, "payload": "x", "qos": 1}),
+            )
+            .await;
+            assert_eq!(published["type"], "published", "{published}");
+        }
+    }
+    let listed = request(
+        &mut admin,
+        serde_json::json!({"type": "list_topics", "id": 10}),
+    )
+    .await;
+    assert_eq!(
+        listed["topics"],
+        serde_json::json!([
+            {"name": "audit", "first_seq": 1, "last_seq": 1, "messages": 1, "subscribers": 0},
+            {"name": "orders", "first_seq": 1, "last_seq": 3, "messages": 3, "subscribers": 0},
+        ])
+    );
+    let purged = request(
+        &mut admin,
+        serde_json::json!({"type": "purge_topic", "id": 11, "topic": "orders"}),
+    )
+    .await;
+    assert_eq!(
+        purged["topic"],
+        serde_json::json!({"name": "orders", "first_seq": 4, "last_seq": 3, "messages": 0, "subscribers": 0})
+    );
+    let next = request(
+        &mut admin,
+        serde_json::json!({"type": "publish", "id": 12, "topic": "orders", "payload": "y", "qos": 1}),
+    )
+    .await;
+    assert_eq!(next["seq"], 4, "{next}");
+    send_json(
+        &mut admin,
+        serde_json::json!({"type": "subscribe", "topic": "orders", "from": {"seq": 1}}),
+    )
+    .await;
+    let mut kinds = Vec::new();
+    while kinds.len() < 3 {
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_text(&mut admin).await).expect("JSON");
+        kinds.push((
+            frame["type"].clone(),
+            frame["first_available"].clone(),
+            frame["seq"].clone(),
+        ));
+    }
+    assert_eq!(kinds[1].0, "truncated");
+    assert_eq!(kinds[1].1, 4);
+    assert_eq!(
+        (kinds[2].0.clone(), kinds[2].2.clone()),
+        (serde_json::json!("message"), serde_json::json!(4))
+    );
+    let described = request(
+        &mut admin,
+        serde_json::json!({"type": "get_topic", "id": 13, "topic": "orders"}),
+    )
+    .await;
+    assert_eq!(described["topic"]["subscribers"], 1, "{described}");
+    let missing = request(
+        &mut admin,
+        serde_json::json!({"type": "get_topic", "id": 14, "topic": "nothing-here"}),
+    )
+    .await;
+    assert_eq!(missing["code"], "topic_not_found", "{missing}");
+
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 15, "username": "tess", "password": "tess-password-1", "role": {"kind": "user"}}),
+    )
+    .await;
+    let (mut tess, _) = user_connection(addr, "tess", "tess-password-1").await;
+    let refused = request(
+        &mut tess,
+        serde_json::json!({"type": "purge_topic", "id": 1, "topic": "orders"}),
+    )
+    .await;
+    assert_eq!(refused["code"], "forbidden", "{refused}");
+}

@@ -47,7 +47,7 @@ A client library hides the protocol's bookkeeping, so an application only sees c
 
 - Every request that expects a reply carries an `id`; replies and errors are matched by it. Errors surface with their `code` (and `retry_after` for limits).
 - `publish_confirmed` generates a `message_id` (a UUID) and resolves with `seq` and `message_id` once `published` arrives.
-- Admin requests (`create_user`, `get_user`, `list_users`, `set_role`, `grant`, `revoke`, `set_password`, `set_enabled`, `delete_user`) are never queued while disconnected and never resent: a disconnect fails them, because the server may or may not have carried them out.
+- Admin requests (`create_user`, `get_user`, `list_users`, `set_role`, `grant`, `revoke`, `set_password`, `set_enabled`, `delete_user`, `list_topics`, `get_topic`, `purge_topic`) are never queued while disconnected and never resent: a disconnect fails them, because the server may or may not have carried them out.
 - Requests time out after a configurable limit.
 
 **Reporting**

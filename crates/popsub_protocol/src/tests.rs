@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::{
     Access, ClientFrame, ClientMessage, CloseCode, Delivery, ErrorCode, Limits, RequestId,
     RoleKind, RoleSpec, ServerFrame, ServerMessage, Stalled, StartFrom, Subscribed, TopicGrant,
-    Truncated, UserInfo,
+    TopicInfo, Truncated, UserInfo,
 };
 
 /// Parses a client frame, failing the test if it doesn't parse.
@@ -366,6 +366,7 @@ fn error_codes_are_snake_case() {
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::UserNotFound, "user_not_found"),
         (ErrorCode::UserExists, "user_exists"),
+        (ErrorCode::TopicNotFound, "topic_not_found"),
         (ErrorCode::Internal, "internal"),
     ];
     for (code, name) in names {
@@ -572,6 +573,7 @@ fn names_match_the_wire() {
         ErrorCode::Forbidden,
         ErrorCode::UserNotFound,
         ErrorCode::UserExists,
+        ErrorCode::TopicNotFound,
     ] {
         assert_eq!(json!(code), json!(code.as_str()));
     }
@@ -599,5 +601,43 @@ fn ping_and_pong_have_the_documented_shape() {
             ServerMessage::Pong {}
         )),
         json!({"type": "pong", "id": 9})
+    );
+}
+
+/// Checks the exact JSON of the topic admin frames.
+#[test]
+fn topic_admin_frames_have_the_documented_shape() {
+    assert_eq!(
+        parse(json!({"type": "list_topics", "id": 1})).message,
+        ClientMessage::ListTopics {}
+    );
+    assert_eq!(
+        parse(json!({"type": "purge_topic", "topic": "orders"})).message,
+        ClientMessage::PurgeTopic {
+            topic: "orders".to_string()
+        }
+    );
+    let info = TopicInfo {
+        name: "orders".to_string(),
+        first_seq: 3,
+        last_seq: 9,
+        messages: 7,
+        subscribers: 2,
+    };
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            Some(RequestId::Number(1)),
+            ServerMessage::TopicInfo {
+                topic: info.clone()
+            }
+        )),
+        json!({"type": "topic_info", "id": 1, "topic": {"name": "orders", "first_seq": 3, "last_seq": 9, "messages": 7, "subscribers": 2}})
+    );
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            None,
+            ServerMessage::Topics { topics: vec![info] }
+        ))["topics"][0]["name"],
+        json!("orders")
     );
 }

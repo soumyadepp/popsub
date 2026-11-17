@@ -11,6 +11,7 @@
 //! transport, broker and storage crates.
 
 mod telemetry;
+mod topics;
 mod users;
 
 use std::path::Path;
@@ -68,6 +69,15 @@ enum Command {
         #[command(subcommand)]
         command: users::UsersCommand,
     },
+    /// List, inspect and purge topics on a running server, as an admin
+    Topics {
+        /// Where to connect and who to log in as
+        #[command(flatten)]
+        connection: users::Connection,
+        /// The action
+        #[command(subcommand)]
+        command: topics::TopicsCommand,
+    },
 }
 
 /// Parses the command line, starts logging and runs the chosen subcommand.
@@ -99,6 +109,13 @@ async fn main() -> ExitCode {
         } => {
             popsub_utils::logging::init("warn");
             users::run(connection, command).await
+        }
+        Command::Topics {
+            connection,
+            command,
+        } => {
+            popsub_utils::logging::init("warn");
+            topics::run(connection, command).await
         }
     };
     match result {
