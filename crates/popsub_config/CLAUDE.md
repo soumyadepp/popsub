@@ -31,6 +31,7 @@ Update all of these together:
 - `server.heartbeat_secs` and `server.idle_timeout_secs` set the transport's `Heartbeat`; values below 1 are treated as 1. `server.max_payload_bytes` sets the publish payload limit and, through it, the WebSocket frame limit. `server.outbound_queue_bytes` is each connection's hard outgoing queue limit; the soft limit is derived from it.
 - `broker.max_inflight` sizes each subscription's window of unacknowledged QoS 1 records; values below 1 behave as 1. `storage.session_expiry_secs` is how long a durable session outlives its last connection.
 - `[storage]` defaults to the `file` backend in `pubsub_data` with `buffered` durability. It uses typed enums: `backend` is a `StorageBackend` and `durability` is `popsub_storage::Durability`, so an unknown name is a load error. Retention limits are plain numbers (0 keeps nothing) and `RetentionSettings::to_retention` turns them into the policy the backends apply.
+- `storage.topic_retention` is a list of `TopicRetentionSettings`; `StorageSettings::topic_retention_rules` validates the patterns and fills missing limits from `storage.retention`. It can only be set in the config file: the environment source can't express a list of tables.
 - Nested keys from the environment use a double underscore at every level: `STORAGE__RETENTION__MAX_MESSAGES`.
 - This crate depends on `popsub_storage` for `Durability` and `Retention`. Storage must never depend back on config.
 - `popsub_utils` uses the same `config` version (0.15), so `PopSubError::Config` can wrap loader errors. Bump both together.

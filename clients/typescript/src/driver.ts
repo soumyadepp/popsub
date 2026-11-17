@@ -12,7 +12,7 @@
 
 import { createInterface } from "node:readline";
 
-import type { User } from "./admin.js";
+import type { TopicInfo, User } from "./admin.js";
 import { Client, type StartFrom } from "./client.js";
 import type { ClientConfig } from "./config.js";
 import { PopSubError } from "./errors.js";
@@ -146,6 +146,22 @@ function userJson(user: User): Json {
 }
 
 /**
+ * Describes a topic in its wire form.
+ *
+ * @param topic - The topic.
+ * @returns The wire form.
+ */
+function topicJson(topic: TopicInfo): Json {
+  return {
+    name: topic.name,
+    first_seq: topic.firstSeq,
+    last_seq: topic.lastSeq,
+    messages: topic.messages,
+    subscribers: topic.subscribers,
+  };
+}
+
+/**
  * Describes a client event as a driver event.
  *
  * @param event - The event.
@@ -256,7 +272,7 @@ async function forward(state: State, topic: string, messages: AsyncIterable<Mess
  *
  * @param client - The client.
  * @param command - The `admin` command.
- * @returns `{ result }`: an account, a list of them, or `null`.
+ * @returns `{ result }`: an account or a topic, a list of them, or `null`.
  */
 async function admin(client: Client, command: Command): Promise<Json> {
   const params = object(command, "params");
@@ -285,6 +301,12 @@ async function admin(client: Client, command: Command): Promise<Json> {
     case "delete_user":
       await calls.deleteUser(username);
       return { result: null };
+    case "list_topics":
+      return { result: (await calls.listTopics()).map(topicJson) };
+    case "get_topic":
+      return { result: topicJson(await calls.getTopic(text(params, "topic"))) };
+    case "purge_topic":
+      return { result: topicJson(await calls.purgeTopic(text(params, "topic"))) };
     default:
       throw failure("protocol", `unknown admin method ${JSON.stringify(command.method)}`);
   }
@@ -311,7 +333,11 @@ async function handle(state: State, command: Command): Promise<Json> {
     case "subscribe": {
       const from = startFrom(command.from);
       state.leaving.delete(topic);
-      const subscription = await client.subscribe(topic, from);
+      const group = command.group;
+      const subscription =
+        typeof group === "string"
+          ? await client.subscribeShared(topic, group, from)
+          : await client.subscribe(topic, from);
       void forward(state, topic, subscription);
       return {};
     }

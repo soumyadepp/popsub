@@ -23,6 +23,21 @@ pub struct Claims {
     /// from this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// The user's `token_version` when the token was issued; absent means 0.
+    /// `AuthService` refuses the token once the user's version has moved on.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ver: u64,
+}
+
+/// Whether a token version is 0, which is left out of the token.
+///
+/// Args:
+///     version: The version.
+///
+/// Returns:
+///     True for 0.
+fn is_zero(version: &u64) -> bool {
+    *version == 0
 }
 
 impl Claims {
@@ -43,6 +58,7 @@ impl Claims {
             exp: exp.timestamp() as usize,
             iat: now.timestamp() as usize,
             role: None,
+            ver: 0,
         }
     }
 
@@ -149,6 +165,31 @@ impl JwtService {
         Ok(token)
     }
 
+    /// Signs a token for `username` carrying a role name and the user's
+    /// current token version.
+    ///
+    /// Args:
+    ///     username: The subject of the token.
+    ///     role: The role name to embed.
+    ///     version: The user's `token_version`.
+    ///
+    /// Returns:
+    ///     The encoded token.
+    ///
+    /// Raises:
+    ///     AuthError::JwtError: When `jsonwebtoken` fails to encode the claims.
+    pub fn generate_token_versioned(
+        &self,
+        username: &str,
+        role: &str,
+        version: u64,
+    ) -> Result<String> {
+        let mut claims = Claims::with_role(username, self.expiration_hours, role);
+        claims.ver = version;
+        let token = encode(&Header::default(), &claims, &self.encoding_key)?;
+        Ok(token)
+    }
+
     /// Verifies a token's signature and expiry and decodes its claims.
     ///
     /// Args:
@@ -179,7 +220,7 @@ impl JwtService {
 
     /// Issues a fresh token for the subject of a still valid token.
     ///
-    /// The new token keeps the old token's role claim, if any, and gets a full
+    /// The new token keeps the old token's role claim and version, and gets a full
     /// lifetime from now. The user store is not consulted, so a removed or
     /// disabled user holding a valid token can keep refreshing it indefinitely.
     ///
@@ -196,11 +237,12 @@ impl JwtService {
     ///     AuthError::TokenExpired: When `exp` has passed but is still within
     ///         that leeway.
     pub fn refresh_token(&self, token: &str) -> Result<String> {
-        let claims = self.validate_token(token)?;
-        match claims.role.as_deref() {
-            Some(role) => self.generate_token_with_role(&claims.sub, role),
-            None => self.generate_token(&claims.sub),
-        }
+        let old = self.validate_token(token)?;
+        let mut claims = Claims::new(&old.sub, self.expiration_hours);
+        claims.role = old.role;
+        claims.ver = old.ver;
+        let token = encode(&Header::default(), &claims, &self.encoding_key)?;
+        Ok(token)
     }
 
     /// Exposes the signing key so other code can sign tokens this service accepts.

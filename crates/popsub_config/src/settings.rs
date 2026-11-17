@@ -134,6 +134,10 @@ pub struct BrokerSettings {
     /// When full, delivery to that subscription waits for acks. Values below
     /// 1 are treated as 1.
     pub max_inflight: usize,
+    /// The topic a QoS 1 record is copied to when a subscription runs out
+    /// of retries for it, after which that subscription carries on. Empty
+    /// (the default) stalls the subscription instead.
+    pub dead_letter_topic: String,
 }
 
 impl Default for BrokerSettings {
@@ -148,6 +152,7 @@ impl Default for BrokerSettings {
             ack_timeout_ms: 5000,
             max_retries: 5,
             max_inflight: 100,
+            dead_letter_topic: String::new(),
         }
     }
 }
@@ -266,6 +271,10 @@ pub struct StorageSettings {
     pub durability: Durability,
     /// How much history each topic keeps.
     pub retention: RetentionSettings,
+    /// Retention for particular topics, as `[[storage.topic_retention]]`
+    /// entries. The first entry whose pattern matches a topic applies to
+    /// it; topics matching none use `retention`.
+    pub topic_retention: Vec<TopicRetentionSettings>,
     /// How long a durable session's subscriptions and cursors are kept after
     /// its last connection ends, in seconds.
     pub session_expiry_secs: u64,
@@ -283,6 +292,7 @@ impl Default for StorageSettings {
             path: "pubsub_data".to_string(),
             durability: Durability::Buffered,
             retention: RetentionSettings::default(),
+            topic_retention: Vec::new(),
             session_expiry_secs: 86_400,
         }
     }
@@ -329,6 +339,50 @@ impl RetentionSettings {
             max_age_ms: Some(self.max_age_secs.saturating_mul(1000)),
             max_bytes: Some(self.max_bytes),
         }
+    }
+}
+
+/// One `[[storage.topic_retention]]` entry: the retention for topics
+/// matching a pattern. A limit left out is taken from `[storage.retention]`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct TopicRetentionSettings {
+    /// The topic pattern, with `+` for one level and a trailing `#` for the rest.
+    pub pattern: String,
+    /// The most records kept per matching topic.
+    #[serde(default)]
+    pub max_messages: Option<u64>,
+    /// How long a record is kept, in seconds.
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    /// The most bytes kept per matching topic.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+impl StorageSettings {
+    /// Turns the `topic_retention` entries into the rules the broker applies.
+    ///
+    /// Returns:
+    ///     Each pattern with its policy, in order, with limits an entry
+    ///     leaves out filled in from `retention`.
+    ///
+    /// Raises:
+    ///     String: Naming the first entry whose pattern is malformed.
+    pub fn topic_retention_rules(&self) -> Result<Vec<(String, Retention)>, String> {
+        self.topic_retention
+            .iter()
+            .map(|rule| {
+                popsub_protocol::topics::validate_pattern(&rule.pattern).map_err(|why| {
+                    format!("storage.topic_retention pattern '{}': {why}", rule.pattern)
+                })?;
+                let merged = RetentionSettings {
+                    max_messages: rule.max_messages.unwrap_or(self.retention.max_messages),
+                    max_age_secs: rule.max_age_secs.unwrap_or(self.retention.max_age_secs),
+                    max_bytes: rule.max_bytes.unwrap_or(self.retention.max_bytes),
+                };
+                Ok((rule.pattern.clone(), merged.to_retention()))
+            })
+            .collect()
     }
 }
 

@@ -54,6 +54,9 @@ type command struct {
 	Topic string `json:"topic"`
 	// From is the start point, for subscribe.
 	From json.RawMessage `json:"from"`
+	// Group is the shared subscription to join, for subscribe; absent or
+	// empty for none.
+	Group string `json:"group"`
 	// Payload is the body, for publish and publish_confirmed.
 	Payload string `json:"payload"`
 	// Seq is the message to acknowledge, for ack.
@@ -78,6 +81,8 @@ type adminParams struct {
 	Access popsub.Access `json:"access"`
 	// Enabled says whether the account may log in, for set_enabled.
 	Enabled *bool `json:"enabled"`
+	// Topic is a topic, for get_topic and purge_topic.
+	Topic string `json:"topic"`
 }
 
 // heldKey names a reported message by topic and seq.
@@ -278,8 +283,9 @@ func (d *driver) connect(c *command) (map[string]any, failure) {
 	return nil, nil
 }
 
-// subscribe subscribes and starts reporting the subscription's messages,
-// and its end unless the harness unsubscribed.
+// subscribe subscribes, through a group when the command names one, and
+// starts reporting the subscription's messages, and its end unless the
+// harness unsubscribed. The topic may be a pattern.
 func (d *driver) subscribe(ctx context.Context, client *popsub.Client, c *command) (map[string]any, failure) {
 	from := popsub.FromResume
 	if len(c.From) > 0 {
@@ -287,7 +293,13 @@ func (d *driver) subscribe(ctx context.Context, client *popsub.Client, c *comman
 			return nil, plain("config", err.Error())
 		}
 	}
-	sub, err := client.Subscribe(ctx, c.Topic, from)
+	var sub *popsub.Subscription
+	var err error
+	if c.Group != "" {
+		sub, err = client.SubscribeShared(ctx, c.Topic, c.Group, from)
+	} else {
+		sub, err = client.Subscribe(ctx, c.Topic, from)
+	}
 	if err != nil {
 		return nil, describe(err)
 	}
@@ -394,6 +406,12 @@ func admin(ctx context.Context, client *popsub.Client, c *command) (map[string]a
 		result, err = a.SetEnabled(ctx, params.Username, enabled)
 	case "delete_user":
 		err = a.DeleteUser(ctx, params.Username)
+	case "list_topics":
+		result, err = a.ListTopics(ctx)
+	case "get_topic":
+		result, err = a.GetTopic(ctx, params.Topic)
+	case "purge_topic":
+		result, err = a.PurgeTopic(ctx, params.Topic)
 	default:
 		return nil, plain("protocol", "unknown admin method "+c.Method)
 	}

@@ -43,7 +43,7 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
 | `crates/popsub_connection` | `Client` and `Outbox`: the server's record of one connected socket and its outgoing queue |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
-| `crates/popsub_utils` | `PopSubError`, `Result`, logging, and every OpenTelemetry metric instrument (`metrics`) |
+| `crates/popsub_utils` | `PopSubError`, `Result`, logging, every OpenTelemetry metric instrument (`metrics`), and PII masking (`pii`) |
 
 Each crate has its own `CLAUDE.md` with its invariants and gotchas.
 
@@ -79,6 +79,8 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 - A subscribe is answered by a `subscribed` frame from the broker, but a QoS 0 publish and an `ack` have no reply.
 - Connections get WebSocket pings. Test helpers that read frames must skip pings (`next_text` in `websocket_tests.rs` does), and a test client that stops reading for longer than the idle timeout will be closed.
 - Every close the server starts must go through `Flow::Close(CloseCode)` (or `close_message` in the broker), never a bare drop, so clients get a code. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
+- A wildcard subscription is server-side expansion, not a different kind of delivery: the broker records the pattern per connection and joins matching topics as ordinary per-topic subscriptions (`SharedBroker::join`), at subscribe time and when a topic gets its first record (`publish`, after the append, asking the transport's authorizer). Keep everything else per topic.
+- A shared subscription is one virtual subscriber per (topic, group), with id and storage key `$share/<group>` (`group_subscriber_id`), plus a `Group` listing its member connections and which member holds each unacknowledged record. Anything in the engine that looks up a subscriber's client must go through the group when there is one (`pick_member`, `send_to_subscriber`, `subscriber_outbox`); `self.clients.get(subscriber)` alone silently skips groups.
 - Durable sessions are keyed by `session_key(username, session_id)`. Never key them by the client's `session_id` alone, or one user could attach to another's session.
 - QoS 1 is at-least-once per subscriber while connected, and across reconnects only for durable sessions whose records are still retained. With the `file` backend (the default) sessions and history survive restarts; with `memory` nothing does. Don't describe it more strongly in docs or READMEs.
 - `broker.max_connections` is enforced by the transport, counting from `accept`; connections over it are closed with `TryAgainLater` (1013). `0` means no limit. Tests that open many connections need a higher limit.

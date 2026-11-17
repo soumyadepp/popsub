@@ -221,3 +221,40 @@ fn limits_and_trusted_proxies_load_from_a_file() {
     assert_eq!(settings.limits.registrations_per_hour, 2);
     assert_eq!(settings.limits.login_attempts, 5);
 }
+
+/// Checks that `[[storage.topic_retention]]` entries load in order, take
+/// missing limits from `[storage.retention]`, and refuse a malformed pattern.
+#[test]
+fn topic_retention_rules_load_and_fill_in_from_the_default() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("popsub.toml");
+    std::fs::write(
+        &file,
+        "[storage.retention]\nmax_messages = 10\nmax_age_secs = 60\nmax_bytes = 1000\n\n[[storage.topic_retention]]\npattern = \"audit/#\"\nmax_age_secs = 2592000\n\n[[storage.topic_retention]]\npattern = \"presence/+\"\nmax_messages = 1\n",
+    )
+    .expect("write config");
+    let settings = load_config_from(&file, Some(Default::default())).expect("load failed");
+    let rules = settings.storage.topic_retention_rules().expect("rules");
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].0, "audit/#");
+    assert_eq!(rules[0].1.max_messages, Some(10));
+    assert_eq!(rules[0].1.max_age_ms, Some(2_592_000_000));
+    assert_eq!(rules[1].1.max_messages, Some(1));
+    assert_eq!(rules[1].1.max_bytes, Some(1000));
+    assert!(
+        Settings::default()
+            .storage
+            .topic_retention_rules()
+            .expect("none")
+            .is_empty()
+    );
+
+    std::fs::write(&file, "[[storage.topic_retention]]\npattern = \"a/#/b\"\n")
+        .expect("write config");
+    let bad = load_config_from(&file, Some(Default::default())).expect("load failed");
+    let error = bad
+        .storage
+        .topic_retention_rules()
+        .expect_err("a bad pattern");
+    assert!(error.contains("a/#/b"), "{error}");
+}

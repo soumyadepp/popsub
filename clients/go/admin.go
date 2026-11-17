@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 )
 
-// Admin sends the account management requests: creating accounts,
-// granting and revoking topics, disabling and deleting accounts. Get one
-// with Client.Admin.
+// Admin sends the admin requests: creating accounts, granting and
+// revoking topics, disabling and deleting accounts, and listing,
+// describing and purging topics. Get one with Client.Admin.
 //
 // Every call fails with KindServer and CodeForbidden unless the client is
 // logged in as an enabled admin. None is queued while the client is
@@ -34,7 +34,7 @@ func (a *Admin) GetUser(ctx context.Context, username string) (User, error) {
 
 // ListUsers lists every account, sorted by name.
 func (a *Admin) ListUsers(ctx context.Context) ([]User, error) {
-	frame, err := a.client.request(ctx, listUsersRequest{Type: "list_users"})
+	frame, err := a.client.request(ctx, bareRequest{Type: "list_users"})
 	if err != nil {
 		return nil, err
 	}
@@ -71,8 +71,9 @@ func (a *Admin) Revoke(ctx context.Context, username, pattern string) (User, err
 	return a.user(ctx, revokeRequest{Type: "revoke", Username: username, Pattern: pattern})
 }
 
-// SetPassword sets an account's password. Tokens already issued stay
-// valid until they expire. It fails with CodeUserNotFound, or
+// SetPassword sets an account's password. Tokens issued before it are
+// cancelled and the account's connections are closed, so they log in
+// again. It fails with CodeUserNotFound, or
 // CodeBadRequest for a password that is too short or too long.
 func (a *Admin) SetPassword(ctx context.Context, username, password string) (User, error) {
 	return a.user(ctx, setPasswordRequest{Type: "set_password", Username: username, Password: password})
@@ -114,4 +115,52 @@ func (a *Admin) user(ctx context.Context, message any) (User, error) {
 		return User{}, protocolError("the user frame doesn't parse: " + err.Error())
 	}
 	return user, nil
+}
+
+// ListTopics lists every topic that has a log, sorted by name.
+func (a *Admin) ListTopics(ctx context.Context) ([]TopicInfo, error) {
+	frame, err := a.client.request(ctx, bareRequest{Type: "list_topics"})
+	if err != nil {
+		return nil, err
+	}
+	if frame.Type != "topics" {
+		return nil, protocolError("expected topics, got " + frame.Type)
+	}
+	topics := []TopicInfo{}
+	if err := json.Unmarshal(frame.Topics, &topics); err != nil {
+		return nil, protocolError("the topics frame doesn't parse: " + err.Error())
+	}
+	return topics, nil
+}
+
+// GetTopic describes one topic. It fails with CodeTopicNotFound when
+// nothing was ever published to it.
+func (a *Admin) GetTopic(ctx context.Context, topic string) (TopicInfo, error) {
+	return a.topic(ctx, topicRequest{Type: "get_topic", Topic: topic})
+}
+
+// PurgeTopic removes every record a topic holds and returns the topic as
+// it then stands. Its numbering carries on (the next publish gets LastSeq
+// plus one), live subscriptions stay, and a subscriber that had not
+// caught up gets a TruncatedEvent. It fails with CodeTopicNotFound when
+// nothing was ever published to it.
+func (a *Admin) PurgeTopic(ctx context.Context, topic string) (TopicInfo, error) {
+	return a.topic(ctx, topicRequest{Type: "purge_topic", Topic: topic})
+}
+
+// topic sends a request answered by a topic_info frame and returns the
+// topic in it.
+func (a *Admin) topic(ctx context.Context, message any) (TopicInfo, error) {
+	frame, err := a.client.request(ctx, message)
+	if err != nil {
+		return TopicInfo{}, err
+	}
+	if frame.Type != "topic_info" {
+		return TopicInfo{}, protocolError("expected topic_info, got " + frame.Type)
+	}
+	var info TopicInfo
+	if err := json.Unmarshal(frame.Topic.raw, &info); err != nil {
+		return TopicInfo{}, protocolError("the topic_info frame doesn't parse: " + err.Error())
+	}
+	return info, nil
 }

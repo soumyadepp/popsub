@@ -90,13 +90,19 @@ pub enum ClientMessage {
         password: String,
     },
     /// Subscribes to a topic, replaying the history `from` asks for first.
-    /// Answered with `subscribed`, then history, then live records.
+    /// Answered with `subscribed`, then history, then live records. The
+    /// topic may be a wildcard pattern, or the request may name a `group`
+    /// to share the subscription with other connections, but not both.
     Subscribe {
         /// The topic.
         topic: String,
         /// Where replay starts. Omitted means `resume`.
         #[serde(default)]
         from: StartFrom,
+        /// A shared subscription to join. Each message on the topic goes to
+        /// one member of the group, and the group keeps its own position.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// Stops delivery of a topic. Answered with `unsubscribed`.
     Unsubscribe {
@@ -123,6 +129,20 @@ pub enum ClientMessage {
         topic: String,
         /// Its `seq`.
         seq: u64,
+    },
+    /// Admin only. Lists every topic that has a log. Answered with `topics`.
+    ListTopics {},
+    /// Admin only. Describes one topic. Answered with `topic_info`.
+    GetTopic {
+        /// The topic.
+        topic: String,
+    },
+    /// Admin only. Removes every record a topic holds. Its numbering
+    /// carries on, so the next publish gets the next `seq`; subscribers
+    /// that were behind are told with `truncated`. Answered with `topic_info`.
+    PurgeTopic {
+        /// The topic.
+        topic: String,
     },
     /// Asks the server to answer with `pong`, so a client that can't see
     /// WebSocket pings (a browser) can tell the connection is still alive.
@@ -171,7 +191,7 @@ pub enum ClientMessage {
         pattern: String,
     },
     /// Admin only. Sets an account's password. Answered with `user`. Tokens
-    /// already issued stay valid until they expire.
+    /// issued before it are cancelled and the account's connections closed.
     SetPassword {
         /// The account.
         username: String,
@@ -209,6 +229,9 @@ impl ClientMessage {
             ClientMessage::Publish { .. } => "publish",
             ClientMessage::Ack { .. } => "ack",
             ClientMessage::Ping { .. } => "ping",
+            ClientMessage::ListTopics { .. } => "list_topics",
+            ClientMessage::GetTopic { .. } => "get_topic",
+            ClientMessage::PurgeTopic { .. } => "purge_topic",
             ClientMessage::CreateUser { .. } => "create_user",
             ClientMessage::GetUser { .. } => "get_user",
             ClientMessage::ListUsers { .. } => "list_users",

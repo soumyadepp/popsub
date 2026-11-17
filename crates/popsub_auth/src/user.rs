@@ -17,6 +17,11 @@ pub struct User {
     pub enabled: bool,
     /// Unix timestamp (seconds) when the user was created.
     pub created_at: i64,
+    /// Which generation of tokens is valid. A token carries the version it
+    /// was issued under and is refused once this has moved on, which is how
+    /// a password change cancels every token issued before it.
+    #[serde(default)]
+    pub token_version: u64,
 }
 
 impl User {
@@ -39,6 +44,7 @@ impl User {
             role,
             enabled: true,
             created_at: chrono::Utc::now().timestamp(),
+            token_version: 0,
         }
     }
 

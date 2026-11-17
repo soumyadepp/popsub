@@ -6,7 +6,7 @@
 //! fails with `Error::Connect`, and one whose connection drops before the
 //! reply fails the same way, whether or not the server carried it out.
 
-use popsub_protocol::{Access, ClientMessage, RoleSpec, ServerMessage, UserInfo};
+use popsub_protocol::{Access, ClientMessage, RoleSpec, ServerMessage, TopicInfo, UserInfo};
 
 use crate::client::Client;
 use crate::error::Error;
@@ -189,8 +189,8 @@ impl<'a> Admin<'a> {
         .await
     }
 
-    /// Sets an account's password. Its existing tokens stay valid until
-    /// they expire.
+    /// Sets an account's password. Tokens issued before it are cancelled,
+    /// and the account's connections are closed so they log in again.
     ///
     /// Args:
     ///     username: The account.
@@ -266,6 +266,88 @@ impl<'a> Admin<'a> {
             .await?
         {
             ServerMessage::UserDeleted { .. } => Ok(()),
+            other => Err(Error::Protocol(format!("{other:?}"))),
+        }
+    }
+
+    /// Lists every topic that has a log, sorted by name.
+    ///
+    /// Returns:
+    ///     The topics, with their bounds, record counts and live subscribers.
+    ///
+    /// Raises:
+    ///     Error::Server: `forbidden`, or `storage_unavailable`.
+    ///     Error::Connect: When disconnected, or the connection dropped first.
+    ///     Error::Timeout: When no reply arrived in time.
+    ///     Error::Closed: When the client has stopped.
+    ///     Error::Protocol: When the server answers with something else.
+    pub async fn list_topics(&self) -> Result<Vec<TopicInfo>, Error> {
+        match self.client.request(ClientMessage::ListTopics {}).await? {
+            ServerMessage::Topics { topics } => Ok(topics),
+            other => Err(Error::Protocol(format!("{other:?}"))),
+        }
+    }
+
+    /// Describes one topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     Its bounds, record count and live subscribers.
+    ///
+    /// Raises:
+    ///     Error::Server: `topic_not_found`, `forbidden`, or `storage_unavailable`.
+    ///     Error::Connect: When disconnected, or the connection dropped first.
+    ///     Error::Timeout: When no reply arrived in time.
+    ///     Error::Closed: When the client has stopped.
+    ///     Error::Protocol: When the server answers with something else.
+    pub async fn get_topic(&self, topic: impl Into<String>) -> Result<TopicInfo, Error> {
+        self.topic(ClientMessage::GetTopic {
+            topic: topic.into(),
+        })
+        .await
+    }
+
+    /// Removes every record a topic holds. Its numbering carries on, and
+    /// subscribers that hadn't caught up are told their history was truncated.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     The topic afterwards.
+    ///
+    /// Raises:
+    ///     Error::Server: `topic_not_found`, `forbidden`, or `storage_unavailable`.
+    ///     Error::Connect: When disconnected, or the connection dropped first.
+    ///     Error::Timeout: When no reply arrived in time.
+    ///     Error::Closed: When the client has stopped.
+    ///     Error::Protocol: When the server answers with something else.
+    pub async fn purge_topic(&self, topic: impl Into<String>) -> Result<TopicInfo, Error> {
+        self.topic(ClientMessage::PurgeTopic {
+            topic: topic.into(),
+        })
+        .await
+    }
+
+    /// Sends a request answered by a `topic_info` frame.
+    ///
+    /// Args:
+    ///     message: The request.
+    ///
+    /// Returns:
+    ///     The topic in the reply.
+    ///
+    /// Raises:
+    ///     Error::Server: When the server refused it.
+    ///     Error::Connect: When disconnected, or the connection dropped first.
+    ///     Error::Timeout: When no reply arrived in time.
+    ///     Error::Closed: When the client has stopped.
+    ///     Error::Protocol: When the server answers with something else.
+    async fn topic(&self, message: ClientMessage) -> Result<TopicInfo, Error> {
+        match self.client.request(message).await? {
+            ServerMessage::TopicInfo { topic } => Ok(topic),
             other => Err(Error::Protocol(format!("{other:?}"))),
         }
     }

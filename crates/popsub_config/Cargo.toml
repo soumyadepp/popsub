@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+popsub_protocol = { path = "../popsub_protocol" }
 config = "0.15.13"
 serde = { version = "1.0.219", features = ["derive"] }
 popsub_storage = { path = "../popsub_storage" }

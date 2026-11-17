@@ -19,6 +19,22 @@
  * unless its acknowledgement is held back for a full buffer) is
  * acknowledged again, so a lost acknowledgement can't stall the topic.
  *
+ * A wildcard subscription (`orders/#`) is one pattern with one channel.
+ * The server announces each topic it joins for the pattern with a
+ * `subscribed` frame that has no id; the engine then tracks that topic
+ * like any other, with its own next expected `seq` and acknowledgement
+ * memory, owned by the pattern and feeding the pattern's channel. A
+ * `subscribed` or `message` for an untracked topic is matched against the
+ * patterns, and the oldest matching one owns it. After a reconnect the
+ * tracked topics are resubscribed first, then each pattern is sent again
+ * with `from: {"seq": 1}`, which joins only topics created meanwhile.
+ *
+ * A shared subscription (a topic read through a `group`) gets only some of
+ * the topic's messages, out of order, so duplicates are found with a
+ * bounded set of delivered `seq`s instead of a next expected one, nothing
+ * moves on `subscribed.replay_from` or `truncated`, and after a reconnect
+ * it always rejoins the group with `from: "resume"`.
+ *
  * An `unsubscribed` frame with no id means the server ended the
  * subscription; every unsubscribe the engine sends carries an id so its
  * reply is never mistaken for that.
@@ -48,10 +64,11 @@
 
 import { jitteredDelay } from "./backoff.js";
 import type { ResolvedConfig } from "./config.js";
-import { DeliveryTracker } from "./dedup.js";
+import { ACK_MEMORY, DeliveryTracker } from "./dedup.js";
 import { Emitter } from "./events.js";
 import { PopSubError } from "./errors.js";
 import { Aborted, ConnectFailure, Handshake } from "./handshake.js";
+import { isPattern, matchesPattern } from "./pattern.js";
 import {
   closeCode,
   encodeFrame,
@@ -118,6 +135,18 @@ interface Topic {
   tracker: DeliveryTracker;
   /** Whether its buffer overflowed, so deliveries are dropped until it is resubscribed. */
   overflowed: boolean;
+  /** The wildcard pattern it was joined through, or `null` when subscribed by name. */
+  owner: string | null;
+  /** The shared subscription's group, or `null` for an ordinary subscription. */
+  group: string | null;
+}
+
+/** One wildcard subscription. */
+interface Pattern {
+  /** Where the messages of every topic it owns go. */
+  channel: Channel;
+  /** Which subscription this is; the oldest matching pattern owns a new topic. */
+  generation: number;
 }
 
 /** How a served connection ended. */
@@ -171,6 +200,8 @@ export class Engine {
   readonly emitter = new Emitter();
   /** Subscribed topics. */
   readonly #topics = new Map<string, Topic>();
+  /** Wildcard subscriptions, by pattern. */
+  readonly #patterns = new Map<string, Pattern>();
   /** Subscribes waiting for `subscribed`, by topic. */
   readonly #subscribeWaiters = new Map<string, Settle<void>>();
   /** Requests waiting for a reply, by id. */
@@ -238,66 +269,86 @@ export class Engine {
   }
 
   /**
-   * Subscribes to a topic, replacing any earlier subscription to it.
+   * Subscribes to a topic or a wildcard pattern, replacing any earlier
+   * subscription to the same name. With a group it joins a shared
+   * subscription to the topic.
    *
-   * @param topic - The topic.
+   * @param topic - The topic, or a pattern such as `orders/#`.
    * @param from - Where replay starts.
+   * @param group - The shared subscription to join, or `null`.
    * @returns The subscription, and a promise that settles when the server
    *   confirms it.
    * @throws PopSubError of kind `closed` when the client has stopped.
    */
-  subscribe(topic: string, from: WireStartFrom): { subscription: Subscription; done: Promise<void> } {
+  subscribe(
+    topic: string,
+    from: WireStartFrom,
+    group: string | null = null,
+  ): { subscription: Subscription; done: Promise<void> } {
     this.#throwIfStopped();
     const generation = this.#nextGeneration++;
     const channel = new Channel(topic, {
       taken: (message) => {
-        this.#taken(topic, generation, message);
+        this.#taken(message.topic, generation, message);
       },
       leave: () => {
         this.#forget(topic, generation);
       },
     });
-    const previous = this.#topics.get(topic);
-    previous?.channel.end();
+    this.#release(topic, null);
     this.#subscribeWaiters
       .get(topic)
       ?.reject(new PopSubError("protocol", `replaced by a later subscribe to '${topic}'`));
-    this.#topics.set(topic, {
-      channel,
-      from,
-      generation,
-      tracker: new DeliveryTracker(),
-      overflowed: false,
-    });
+    if (group === null && isPattern(topic)) {
+      this.#patterns.set(topic, { channel, generation });
+    } else {
+      this.#topics.set(topic, {
+        channel,
+        from,
+        generation,
+        tracker: new DeliveryTracker(ACK_MEMORY, group !== null),
+        overflowed: false,
+        owner: null,
+        group,
+      });
+    }
     const done = new Promise<void>((resolve, reject) => {
       this.#subscribeWaiters.set(topic, { resolve, reject });
     });
     if (this.#connection !== null) {
-      this.#sendSubscribe(topic, generation, from);
+      this.#sendSubscribe(topic, generation, from, group);
     }
     return { subscription: new Subscription(channel), done };
   }
 
   /**
-   * Unsubscribes from a topic. While disconnected the unsubscribe is queued
-   * and the call succeeds at once.
+   * Unsubscribes from a topic, or from a pattern and every topic joined
+   * through it. While disconnected the unsubscribes are queued and the
+   * call succeeds at once.
    *
-   * @param topic - The topic.
-   * @returns A promise that settles with the server's reply.
+   * @param topic - The topic or pattern.
+   * @returns A promise that settles with the server's reply to the
+   *   unsubscribe for `topic` itself.
    */
   unsubscribe(topic: string): Promise<void> {
     if (this.#stopped !== null) {
       return Promise.reject(PopSubError.closed(this.#stopped.code));
     }
-    this.#dropTopic(topic);
+    const released = this.#release(topic, null);
+    const [first, ...owned] = released.length === 0 ? [topic] : released;
     if (this.#connection === null) {
-      this.#queueOffline({ type: "unsubscribe", topic });
+      for (const name of [first ?? topic, ...owned]) {
+        this.#queueOffline({ type: "unsubscribe", topic: name });
+      }
       return Promise.resolve();
     }
     return new Promise<void>((resolve, reject) => {
       const id = this.#takeId();
       this.#pending.set(id, { kind: "unsubscribe", settle: { resolve, reject } });
-      this.#send({ type: "unsubscribe", topic }, id);
+      this.#send({ type: "unsubscribe", topic: first ?? topic }, id);
+      for (const name of owned) {
+        this.#send({ type: "unsubscribe", topic: name }, this.#takeId());
+      }
     });
   }
 
@@ -690,17 +741,30 @@ export class Engine {
    * Topics the server restored for the session are left to it, except
    * those whose buffer overflowed; every other topic is subscribed again
    * from the next `seq` it expects, so nothing still in the log is missed.
+   * A shared subscription always rejoins its group with `resume`, because
+   * the group's position is on the server. Wildcard patterns are sent
+   * after the topics, in name order, from `{"seq": 1}`: the server skips
+   * topics the connection holds, so that joins only topics created during
+   * the disconnect, from their first message.
    *
    * @param resumed - Topics the server restored.
    */
   #restore(resumed: string[]): void {
     const restored = new Set(resumed);
     for (const [name, topic] of this.#topics) {
-      if (!restored.has(name) || topic.overflowed) {
+      if (topic.group !== null) {
+        this.#sendSubscribe(name, topic.generation, "resume", topic.group);
+      } else if (!restored.has(name) || topic.overflowed) {
         const next = topic.tracker.nextExpected;
-        this.#sendSubscribe(name, topic.generation, next === null ? topic.from : { seq: next });
+        this.#sendSubscribe(name, topic.generation, next === null ? topic.from : { seq: next }, null);
       }
       topic.overflowed = false;
+    }
+    for (const name of [...this.#patterns.keys()].sort()) {
+      const pattern = this.#patterns.get(name);
+      if (pattern !== undefined) {
+        this.#sendSubscribe(name, pattern.generation, { seq: 1 }, null);
+      }
     }
     for (const [id, message] of this.#unconfirmed) {
       this.#send(message, id);
@@ -711,14 +775,18 @@ export class Engine {
   /**
    * Sends a subscribe and records it as pending.
    *
-   * @param topic - The topic.
+   * @param topic - The topic or pattern.
    * @param generation - The subscription it is for.
    * @param from - Where replay starts.
+   * @param group - The shared subscription to join, or `null`.
    */
-  #sendSubscribe(topic: string, generation: number, from: WireStartFrom): void {
+  #sendSubscribe(topic: string, generation: number, from: WireStartFrom, group: string | null): void {
     const id = this.#takeId();
     this.#pending.set(id, { kind: "subscribe", topic, generation });
-    this.#send({ type: "subscribe", topic, from }, id);
+    this.#send(
+      group === null ? { type: "subscribe", topic, from } : { type: "subscribe", topic, from, group },
+      id,
+    );
   }
 
   /**
@@ -772,10 +840,12 @@ export class Engine {
   }
 
   /**
-   * Removes a topic and ends its subscription.
+   * Stops tracking one topic. A topic subscribed by name has its
+   * subscription ended; a topic owned by a pattern only stops, and the
+   * pattern's subscription carries on.
    *
    * @param topic - The topic.
-   * @returns Whether it was subscribed.
+   * @returns Whether it was tracked.
    */
   #dropTopic(topic: string): boolean {
     const entry = this.#topics.get(topic);
@@ -783,28 +853,101 @@ export class Engine {
       return false;
     }
     this.#topics.delete(topic);
-    entry.channel.end();
+    if (entry.owner === null) {
+      entry.channel.end();
+    }
     return true;
   }
 
   /**
-   * Unsubscribes without waiting, when the application closes a
-   * subscription, if the topic still belongs to it.
+   * Starts tracking a topic the server joined for one of this client's
+   * wildcard subscriptions. When several patterns match, the oldest owns it.
    *
-   * @param topic - The topic.
+   * @param name - The topic.
+   * @param start - The first `seq` the server will send, or `null` when unknown.
+   * @returns The tracked topic, or `undefined` when no pattern matches.
+   */
+  #adopt(name: string, start: number | null): Topic | undefined {
+    let owner: string | null = null;
+    let oldest: Pattern | null = null;
+    for (const [pattern, entry] of this.#patterns) {
+      if (matchesPattern(pattern, name) && (oldest === null || entry.generation < oldest.generation)) {
+        owner = pattern;
+        oldest = entry;
+      }
+    }
+    if (owner === null || oldest === null) {
+      return undefined;
+    }
+    const tracker = new DeliveryTracker();
+    tracker.nextExpected = start;
+    const topic: Topic = {
+      channel: oldest.channel,
+      from: { seq: start ?? 1 },
+      generation: oldest.generation,
+      tracker,
+      overflowed: false,
+      owner,
+      group: null,
+    };
+    this.#topics.set(name, topic);
+    return topic;
+  }
+
+  /**
+   * Stops tracking a subscription and ends it: a topic subscribed by name,
+   * or a wildcard pattern together with every topic joined through it.
+   *
+   * @param name - The topic or pattern.
+   * @param generation - Only release it if it is still this subscription;
+   *   `null` releases whatever is there.
+   * @returns What to unsubscribe from on the server: the name first, and
+   *   for a pattern the topics it owned. Empty when nothing was released.
+   */
+  #release(name: string, generation: number | null): string[] {
+    const pattern = this.#patterns.get(name);
+    if (pattern !== undefined && (generation === null || pattern.generation === generation)) {
+      this.#patterns.delete(name);
+      pattern.channel.end();
+      const names = [name];
+      for (const [topic, entry] of this.#topics) {
+        if (entry.owner === name) {
+          this.#topics.delete(topic);
+          names.push(topic);
+        }
+      }
+      return names;
+    }
+    const topic = this.#topics.get(name);
+    if (topic?.owner === null && (generation === null || topic.generation === generation)) {
+      this.#topics.delete(name);
+      topic.channel.end();
+      return [name];
+    }
+    return [];
+  }
+
+  /**
+   * Unsubscribes without waiting, when the application closes a
+   * subscription, if the topic or pattern still belongs to it. A pattern's
+   * owned topics are unsubscribed with it.
+   *
+   * @param topic - The topic or pattern.
    * @param generation - The subscription being closed.
    */
   #forget(topic: string, generation: number): void {
-    if (this.#topics.get(topic)?.generation !== generation) {
+    const released = this.#release(topic, generation);
+    if (released.length === 0) {
       return;
     }
-    this.#dropTopic(topic);
     this.#subscribeWaiters.get(topic)?.reject(PopSubError.closed(null));
     this.#subscribeWaiters.delete(topic);
-    if (this.#connection === null) {
-      this.#queueOffline({ type: "unsubscribe", topic });
-    } else {
-      this.#send({ type: "unsubscribe", topic }, this.#takeId());
+    for (const name of released) {
+      if (this.#connection === null) {
+        this.#queueOffline({ type: "unsubscribe", topic: name });
+      } else {
+        this.#send({ type: "unsubscribe", topic: name }, this.#takeId());
+      }
     }
     this.#wake?.();
   }
@@ -868,7 +1011,14 @@ export class Engine {
         this.#deliver(frame);
         break;
       case "subscribed": {
-        this.#topics.get(frame.topic)?.tracker.moveTo(frame.replay_from);
+        if (!this.#patterns.has(frame.topic)) {
+          const tracked = this.#topics.get(frame.topic);
+          if (tracked === undefined) {
+            this.#adopt(frame.topic, frame.replay_from);
+          } else {
+            tracked.tracker.moveTo(frame.replay_from);
+          }
+        }
         const waiter = this.#subscribeWaiters.get(frame.topic);
         if (waiter !== undefined) {
           this.#subscribeWaiters.delete(frame.topic);
@@ -928,7 +1078,9 @@ export class Engine {
   }
 
   /**
-   * Routes an error frame to the request it answers, or to the events.
+   * Routes an error frame to the request it answers, or to the events. A
+   * refused subscribe ends that subscription; a refused resubscribe of a
+   * topic owned by a pattern only stops tracking that topic.
    *
    * @param pending - The request it answers, if its id matched one.
    * @param id - Its request id, if it had one.
@@ -943,8 +1095,12 @@ export class Engine {
     const error = PopSubError.server(code, frame.message, frame.retry_after ?? null);
     switch (pending?.kind) {
       case "subscribe": {
-        if (this.#topics.get(pending.topic)?.generation === pending.generation) {
-          this.#dropTopic(pending.topic);
+        const released = this.#release(pending.topic, pending.generation).length > 0;
+        const owned = this.#topics.get(pending.topic);
+        if (!released && owned?.owner != null && owned.generation === pending.generation) {
+          this.#topics.delete(pending.topic);
+        }
+        if (released) {
           const waiter = this.#subscribeWaiters.get(pending.topic);
           this.#subscribeWaiters.delete(pending.topic);
           waiter?.reject(error);
@@ -970,14 +1126,16 @@ export class Engine {
 
   /**
    * Hands a delivered message to its subscription, dropping duplicates,
-   * acknowledging as the ack mode says, and holding back when the buffer is full.
+   * acknowledging as the ack mode says, and holding back when the buffer is
+   * full. A message for an untracked topic is adopted by the oldest
+   * matching wildcard pattern; when none matches it is acknowledged and dropped.
    *
    * @param delivery - The delivered message.
    */
   #deliver(delivery: Extract<ServerMessage, { type: "message" }>): void {
     const { topic: name, seq } = delivery;
     const qos: 0 | 1 = delivery.qos === 1 ? 1 : 0;
-    const topic = this.#topics.get(name);
+    const topic = this.#topics.get(name) ?? this.#adopt(name, null);
     if (topic === undefined) {
       if (qos === 1) {
         this.#send({ type: "ack", topic: name, seq });
@@ -1105,6 +1263,10 @@ export class Engine {
       topic.channel.end();
     }
     this.#topics.clear();
+    for (const pattern of this.#patterns.values()) {
+      pattern.channel.end();
+    }
+    this.#patterns.clear();
     this.emitter.clear();
     this.#finish();
   }

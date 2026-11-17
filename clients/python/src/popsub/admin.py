@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from popsub.errors import ProtocolError
-from popsub.protocol import Access, RoleSpec, UserInfo
+from popsub.protocol import Access, RoleSpec, TopicInfo, UserInfo
 
 if TYPE_CHECKING:
     from popsub.client import Client
@@ -146,7 +146,8 @@ class Admin:
     async def set_password(self, username: str, password: str) -> UserInfo:
         """Sets an account's password.
 
-        Tokens already issued stay valid until they expire.
+        Tokens issued before it are cancelled, and the account's connections
+        are closed so they log in again.
 
         Args:
             username: The account.
@@ -194,6 +195,81 @@ class Admin:
         reply = await self._client._request({"type": "delete_user", "username": username})
         if reply.get("type") != "user_deleted":
             raise ProtocolError(f"expected user_deleted, got {reply.get('type')!r}")
+
+    async def list_topics(self) -> list[TopicInfo]:
+        """Lists every topic that has a log, sorted by name.
+
+        Returns:
+            The topics.
+
+        Raises:
+            ServerError: `forbidden`.
+            ProtocolError: When the server answers with something else.
+        """
+        reply = await self._client._request({"type": "list_topics"})
+        topics = reply.get("topics")
+        if reply.get("type") != "topics" or not isinstance(topics, list):
+            raise ProtocolError(f"expected topics, got {reply.get('type')!r}")
+        try:
+            return [TopicInfo.from_json(topic) for topic in topics]
+        except ValueError as error:
+            raise ProtocolError(str(error)) from error
+
+    async def get_topic(self, topic: str) -> TopicInfo:
+        """Reads a topic's log bounds, message count and subscriber count.
+
+        Args:
+            topic: The topic.
+
+        Returns:
+            The topic.
+
+        Raises:
+            ServerError: `topic_not_found` when nothing was ever published
+                to it, or `forbidden`.
+            ProtocolError: When the server answers with something else.
+        """
+        return await self._topic({"type": "get_topic", "topic": topic})
+
+    async def purge_topic(self, topic: str) -> TopicInfo:
+        """Removes every message a topic holds.
+
+        Its numbering carries on (the next publish gets `last_seq + 1`), live
+        subscriptions stay, and a subscriber that hadn't caught up gets
+        `truncated`.
+
+        Args:
+            topic: The topic.
+
+        Returns:
+            The topic after the purge.
+
+        Raises:
+            ServerError: `topic_not_found` or `forbidden`.
+            ProtocolError: When the server answers with something else.
+        """
+        return await self._topic({"type": "purge_topic", "topic": topic})
+
+    async def _topic(self, frame: dict[str, Any]) -> TopicInfo:
+        """Sends a request answered by a `topic_info` frame.
+
+        Args:
+            frame: The request, without an id.
+
+        Returns:
+            The topic in the reply.
+
+        Raises:
+            ServerError: When the server refused it.
+            ProtocolError: When the server answers with something else.
+        """
+        reply = await self._client._request(frame)
+        if reply.get("type") != "topic_info":
+            raise ProtocolError(f"expected topic_info, got {reply.get('type')!r}")
+        try:
+            return TopicInfo.from_json(reply.get("topic"))
+        except ValueError as error:
+            raise ProtocolError(str(error)) from error
 
     async def _user(self, frame: dict[str, Any]) -> UserInfo:
         """Sends a request answered by a `user` frame.

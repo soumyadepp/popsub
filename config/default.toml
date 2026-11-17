@@ -24,6 +24,7 @@ max_connections = 1000
 ack_timeout_ms = 5000
 max_retries = 5
 max_inflight = 100
+dead_letter_topic = ""
 
 [storage]
 backend = "file"

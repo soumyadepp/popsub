@@ -8,6 +8,7 @@ The WebSocket protocol: every frame clients and the server exchange. The server 
 - `src/client.rs`: `ClientFrame` (an optional `id` plus a `ClientMessage`) and `StartFrom`.
 - `src/close.rs`: `CloseCode`, the WebSocket close codes the server sends, with `should_reconnect`.
 - `src/server.rs`: `ServerFrame` (an optional `id` plus a `ServerMessage`), `ErrorCode`, `Limits`, and the structs inside frames (`Delivery`, `Subscribed`, `Truncated`, `Stalled`).
+- `src/topics.rs`: topic patterns (`matches_pattern`, `is_pattern`, `validate_pattern`), shared by the server crates and the Rust client.
 - `src/schema.rs` (feature `schema`): builds `docs/protocol/client.schema.json`, `server.schema.json` and `close-codes.json` from the types with `schemars`.
 - `src/tests.rs`: the exact JSON of every frame, plus (with `schema`) a check that the committed schema files match the types and that sample frames validate against them.
 

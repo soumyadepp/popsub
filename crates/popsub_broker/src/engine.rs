@@ -32,7 +32,9 @@ use tracing::{debug, info, warn};
 use popsub_protocol::{ServerFrame, ServerMessage, Stalled};
 
 use crate::frame::{delivery, to_ws};
-use crate::topic::{CursorUpdate, DeliveryState, InFlight, SubscriberId, Topic};
+use crate::topic::{
+    CursorUpdate, DeliveryState, Group, InFlight, SubscriberId, Topic, group_subscriber_id,
+};
 
 /// The broker: connected clients and topic subscriptions with their delivery state.
 ///
@@ -46,6 +48,43 @@ pub struct Broker {
     pub clients: HashMap<SubscriberId, Client>,
     /// ACK timeout, retry limit and window size.
     settings: BrokerSettings,
+    /// Records given up on since `take_dead_letters` was last called.
+    dead: DeadLetters,
+    /// Each client's wildcard subscriptions.
+    patterns: HashMap<SubscriberId, PatternState>,
+}
+
+/// One client's wildcard subscriptions and the topics they brought in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatternState {
+    /// The patterns the client subscribed to, in order.
+    pub patterns: Vec<String>,
+    /// Topics the client is subscribed to because a pattern matched, as
+    /// opposed to topics it asked for by name.
+    pub joined: std::collections::HashSet<String>,
+}
+
+/// A QoS 1 record one subscription never acknowledged, to be copied to the
+/// dead-letter topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// The record, as it was delivered.
+    pub record: Record,
+    /// The connection that didn't acknowledge it.
+    pub client_id: SubscriberId,
+    /// The user that connection was authenticated as.
+    pub username: Option<String>,
+}
+
+/// What `retry_overdue` gave up on, and the follow-up work it leaves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeadLetters {
+    /// The records to copy to the dead-letter topic.
+    pub letters: Vec<DeadLetter>,
+    /// Cursors that moved past them, to be stored.
+    pub cursors: Vec<CursorUpdate>,
+    /// Subscriptions (topic and client) whose windows now have room, to catch up.
+    pub catch_up: Vec<(String, SubscriberId)>,
 }
 
 /// What an `ack` did.
@@ -60,6 +99,9 @@ pub struct AckOutcome {
     /// Whether the subscription has room again and records waiting in the
     /// log, so the topic's writer should catch it up.
     pub catch_up: bool,
+    /// The subscription the record was in flight to: the client itself, or
+    /// the shared subscription it is a member of.
+    pub subscriber: Option<SubscriberId>,
 }
 
 /// What `Broker::deliver` did, beyond queueing frames.
@@ -95,6 +137,8 @@ pub struct RetryOutcome {
     pub resent: usize,
     /// Subscriptions that ran out of retries and were paused.
     pub stalled: usize,
+    /// Records given up on for one subscription, waiting in `take_dead_letters`.
+    pub dead_lettered: usize,
 }
 
 /// A snapshot of the broker's size, for gauges.
@@ -151,6 +195,8 @@ impl Broker {
             topics: HashMap::new(),
             clients: HashMap::new(),
             settings,
+            dead: DeadLetters::default(),
+            patterns: HashMap::new(),
         }
     }
 
@@ -191,6 +237,14 @@ impl Broker {
     ///     The most unacknowledged QoS 1 records per subscription, at least 1.
     pub fn max_inflight(&self) -> usize {
         self.settings.max_inflight.max(1)
+    }
+
+    /// The dead-letter topic, as configured.
+    ///
+    /// Returns:
+    ///     The topic, or an empty string when dead-lettering is off.
+    pub fn dead_letter_topic(&self) -> &str {
+        &self.settings.dead_letter_topic
     }
 
     /// The connection limit, as configured. The transport enforces it.
@@ -245,7 +299,10 @@ impl Broker {
             .flat_map(|topic| {
                 clients
                     .iter()
-                    .filter(|id| topic.subscribers.contains_key(**id))
+                    .filter(|id| {
+                        topic.subscribers.contains_key(**id)
+                            || topic.groups.values().any(|g| g.members.contains(**id))
+                    })
                     .map(|id| ((*id).clone(), topic.name.clone()))
                     .collect::<Vec<_>>()
             })
@@ -308,8 +365,164 @@ impl Broker {
             .entry(topic.to_string())
             .or_insert_with(|| Topic::new(topic));
         topic.last_seq = topic.last_seq.max(log_last_seq);
+        leave_groups(
+            topic,
+            &subscriber,
+            &self.clients,
+            chrono::Utc::now().timestamp_millis(),
+        );
         topic.subscribe(subscriber, state);
         true
+    }
+
+    /// The next `seq` a subscription on a topic will be sent.
+    ///
+    /// Args:
+    ///     topic: The topic name.
+    ///     subscriber: A client id, or a shared subscription's id.
+    ///
+    /// Returns:
+    ///     The next `seq`, or `None` when there is no such subscription.
+    pub fn subscriber_next_seq(&self, topic: &str, subscriber: &str) -> Option<u64> {
+        Some(
+            self.topics
+                .get(topic)?
+                .subscribers
+                .get(subscriber)?
+                .next_seq,
+        )
+    }
+
+    /// Adds a client to a shared subscription on a topic, creating the
+    /// group's subscription when it is the first member.
+    ///
+    /// A connection holds one subscription per topic, so its own
+    /// subscription to the topic, or its membership of another group there,
+    /// ends. Records in the group's window that were waiting for a member
+    /// are sent to this one.
+    ///
+    /// Args:
+    ///     topic: The topic name.
+    ///     group: The group's name.
+    ///     client_id: The joining client.
+    ///     start_seq: Where the group starts, used only when this creates it.
+    ///     log_last_seq: The newest `seq` in the topic log right now.
+    ///     now_ms: The current time, for records handed to the new member.
+    ///
+    /// Returns:
+    ///     False, without changing anything, when the client isn't registered.
+    pub fn add_group_member(
+        &mut self,
+        topic: &str,
+        group: &str,
+        client_id: &str,
+        start_seq: u64,
+        log_last_seq: u64,
+        now_ms: i64,
+    ) -> bool {
+        let Some(client) = self.clients.get(client_id) else {
+            return false;
+        };
+        let group_id = group_subscriber_id(group);
+        let topic = self
+            .topics
+            .entry(topic.to_string())
+            .or_insert_with(|| Topic::new(topic));
+        topic.last_seq = topic.last_seq.max(log_last_seq);
+        let already = topic
+            .groups
+            .get(&group_id)
+            .is_some_and(|g| g.members.iter().any(|m| m == client_id));
+        if !already {
+            leave_groups(topic, &client_id.to_string(), &self.clients, now_ms);
+        }
+        topic.subscribers.remove(client_id);
+        let state = topic
+            .subscribers
+            .entry(group_id.clone())
+            .or_insert_with(|| DeliveryState::new(start_seq, Some(group_id.clone())));
+        let members = topic.groups.entry(group_id).or_default();
+        if !already {
+            members.members.push(client_id.to_string());
+        }
+        for (seq, pending) in state.inflight.iter_mut() {
+            if members.owners.contains_key(seq) {
+                continue;
+            }
+            if let Some(ws) = to_ws(&delivery(&pending.record)) {
+                let _ = client.sender.send(ws);
+            }
+            pending.sent_at = now_ms;
+            pending.retries = 0;
+            members.owners.insert(*seq, client_id.to_string());
+        }
+        true
+    }
+
+    /// The storage keys of shared subscriptions that have members, so their
+    /// stored cursors are kept alive like connected sessions.
+    ///
+    /// Returns:
+    ///     The group subscriber ids, without repeats.
+    pub fn active_groups(&self) -> Vec<String> {
+        let mut active: Vec<String> = self
+            .topics
+            .values()
+            .flat_map(|topic| topic.groups.iter())
+            .filter(|(_, group)| !group.members.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
+        active.sort();
+        active.dedup();
+        active
+    }
+
+    /// Queues a frame for whoever a subscription on a topic delivers to:
+    /// the client, or every member of a shared subscription.
+    ///
+    /// Args:
+    ///     topic: The topic name.
+    ///     subscriber: A client id, or a shared subscription's id.
+    ///     frame: The frame.
+    ///
+    /// Returns:
+    ///     Whether it was queued for at least one connection.
+    pub fn send_to_subscriber(&self, topic: &str, subscriber: &str, frame: &ServerFrame) -> bool {
+        let Some(group) = self
+            .topics
+            .get(topic)
+            .and_then(|t| t.groups.get(subscriber))
+        else {
+            return self.send_frame(subscriber, frame);
+        };
+        let mut queued = false;
+        for member in &group.members {
+            queued |= self.send_frame(member, frame);
+        }
+        queued
+    }
+
+    /// The outgoing queue to wait on before catching a subscription up.
+    ///
+    /// Args:
+    ///     topic: The topic name.
+    ///     subscriber: A client id, or a shared subscription's id.
+    ///
+    /// Returns:
+    ///     The client's queue, or for a shared subscription its first
+    ///     member's; `None` when there is no one.
+    pub fn subscriber_outbox(&self, topic: &str, subscriber: &str) -> Option<Outbox> {
+        match self
+            .topics
+            .get(topic)
+            .and_then(|t| t.groups.get(subscriber))
+        {
+            Some(group) => group
+                .members
+                .iter()
+                .find_map(|member| self.client_sender(member)),
+            None => self.client_sender(subscriber),
+        }
     }
 
     /// Removes a client's subscription to a topic.
@@ -325,7 +538,129 @@ impl Broker {
     ///     The session whose stored subscription should also be removed, if
     ///     the subscription belonged to a durable session.
     pub fn unsubscribe(&mut self, topic: &str, subscriber: &SubscriberId) -> Option<String> {
-        self.topics.get_mut(topic)?.unsubscribe(subscriber)?.session
+        if let Some(state) = self.patterns.get_mut(subscriber) {
+            state.joined.remove(topic);
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let topic = self.topics.get_mut(topic)?;
+        leave_groups(topic, subscriber, &self.clients, now_ms);
+        topic.unsubscribe(subscriber)?.session
+    }
+
+    /// Records a client's wildcard subscription. Matching topics are joined
+    /// by the caller, with `mark_joined`.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     pattern: The topic pattern.
+    ///
+    /// Returns:
+    ///     False, without changing anything, when the client isn't registered.
+    pub fn add_pattern(&mut self, client_id: &SubscriberId, pattern: &str) -> bool {
+        if !self.clients.contains_key(client_id) {
+            return false;
+        }
+        let state = self.patterns.entry(client_id.clone()).or_default();
+        if !state.patterns.iter().any(|p| p == pattern) {
+            state.patterns.push(pattern.to_string());
+        }
+        true
+    }
+
+    /// Forgets a client's wildcard subscription.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     pattern: The pattern, exactly as subscribed.
+    ///
+    /// Returns:
+    ///     The topics the client joined through it that none of its other
+    ///     patterns match, for the caller to unsubscribe.
+    pub fn remove_pattern(&mut self, client_id: &SubscriberId, pattern: &str) -> Vec<String> {
+        let Some(state) = self.patterns.get_mut(client_id) else {
+            return Vec::new();
+        };
+        state.patterns.retain(|p| p != pattern);
+        let mut orphaned: Vec<String> = state
+            .joined
+            .iter()
+            .filter(|topic| {
+                !state
+                    .patterns
+                    .iter()
+                    .any(|p| popsub_protocol::topics::matches_pattern(p, topic))
+            })
+            .cloned()
+            .collect();
+        orphaned.sort();
+        orphaned
+    }
+
+    /// Notes that a client's subscription to a topic came from a pattern.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     topic: The topic.
+    pub fn mark_joined(&mut self, client_id: &SubscriberId, topic: &str) {
+        if let Some(state) = self.patterns.get_mut(client_id) {
+            state.joined.insert(topic.to_string());
+        }
+    }
+
+    /// Notes that a client asked for a topic by name, so removing a pattern
+    /// leaves that subscription alone.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     topic: The topic.
+    pub fn mark_explicit(&mut self, client_id: &SubscriberId, topic: &str) {
+        if let Some(state) = self.patterns.get_mut(client_id) {
+            state.joined.remove(topic);
+        }
+    }
+
+    /// Whether a client is subscribed to a topic.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     True when it has a subscription, by name or through a pattern.
+    pub fn is_subscribed(&self, client_id: &SubscriberId, topic: &str) -> bool {
+        self.topics.get(topic).is_some_and(|t| {
+            t.subscribers.contains_key(client_id)
+                || t.groups.values().any(|g| g.members.contains(client_id))
+        })
+    }
+
+    /// Finds the clients that should join a topic because one of their
+    /// patterns matches it and they aren't subscribed to it yet.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     Each such client with the user it is authenticated as, sorted by
+    ///     client id. Clients that aren't authenticated are left out.
+    pub fn pattern_holders(&self, topic: &str) -> Vec<(SubscriberId, String)> {
+        let mut holders: Vec<(SubscriberId, String)> = self
+            .patterns
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .patterns
+                    .iter()
+                    .any(|p| popsub_protocol::topics::matches_pattern(p, topic))
+            })
+            .filter(|(client_id, _)| !self.is_subscribed(client_id, topic))
+            .filter_map(|(client_id, _)| {
+                let username = self.clients.get(client_id)?.username.clone()?;
+                Some((client_id.clone(), username))
+            })
+            .collect();
+        holders.sort();
+        holders
     }
 
     /// Sends a newly stored record to every subscription that is up to date.
@@ -349,15 +684,33 @@ impl Broker {
         };
         topic.last_seq = topic.last_seq.max(record.seq);
         let mut outcome = DeliverOutcome::default();
-        for (client_id, state) in topic.subscribers.iter_mut() {
-            let Some(client) = self.clients.get(client_id) else {
+        let Topic {
+            subscribers,
+            groups,
+            name,
+            ..
+        } = topic;
+        for (subscriber, state) in subscribers.iter_mut() {
+            let mut group = groups.get_mut(subscriber);
+            let client = match group.as_deref_mut() {
+                Some(group) => pick_member(group, &self.clients),
+                None => self.clients.get(subscriber),
+            };
+            let Some(client) = client else {
                 continue;
             };
             match send_one(state, &client.sender, record, now_ms, max_inflight) {
-                Offer::Sent => outcome.cursors.extend(state.take_update(&topic.name)),
+                Offer::Sent => {
+                    if let Some(group) = group
+                        && record.qos == 1
+                    {
+                        group.owners.insert(record.seq, client.id.clone());
+                    }
+                    outcome.cursors.extend(state.take_update(name));
+                }
                 Offer::Busy if !state.awaiting_room => {
                     state.awaiting_room = true;
-                    outcome.backed_up.push(client_id.clone());
+                    outcome.backed_up.push(subscriber.clone());
                 }
                 _ => {}
             }
@@ -391,10 +744,17 @@ impl Broker {
     ///     Its `next_seq`, or `None` when it doesn't exist, is stalled, has a
     ///     full window, or its client's outgoing queue is over the soft limit.
     pub fn wants(&self, topic: &str, client_id: &str) -> Option<u64> {
-        let state = self.topics.get(topic)?.subscribers.get(client_id)?;
-        let client = self.clients.get(client_id)?;
-        (state.has_room(self.settings.max_inflight) && client.sender.has_room())
-            .then_some(state.next_seq)
+        let topic = self.topics.get(topic)?;
+        let state = topic.subscribers.get(client_id)?;
+        let sender_has_room = match topic.groups.get(client_id) {
+            Some(group) => group
+                .members
+                .iter()
+                .filter_map(|member| self.clients.get(member))
+                .any(|client| client.sender.has_room()),
+            None => self.clients.get(client_id)?.sender.has_room(),
+        };
+        (state.has_room(self.settings.max_inflight) && sender_has_room).then_some(state.next_seq)
     }
 
     /// Sends records read from the log to one subscription, in order.
@@ -421,18 +781,38 @@ impl Broker {
         now_ms: i64,
     ) -> (usize, Option<CursorUpdate>, bool) {
         let max_inflight = self.settings.max_inflight;
-        let (Some(topic), Some(client)) = (self.topics.get_mut(topic), self.clients.get(client_id))
-        else {
+        let Some(topic) = self.topics.get_mut(topic) else {
             return (0, None, false);
         };
-        let Some(state) = topic.subscribers.get_mut(client_id) else {
+        let Topic {
+            subscribers,
+            groups,
+            name,
+            ..
+        } = topic;
+        let Some(state) = subscribers.get_mut(client_id) else {
             return (0, None, false);
         };
+        let mut group = groups.get_mut(client_id);
         let mut sent = 0;
         let mut backed_up = false;
         for record in records {
+            let client = match group.as_deref_mut() {
+                Some(group) => pick_member(group, &self.clients),
+                None => self.clients.get(client_id),
+            };
+            let Some(client) = client else {
+                break;
+            };
             match send_one(state, &client.sender, record, now_ms, max_inflight) {
-                Offer::Sent => sent += 1,
+                Offer::Sent => {
+                    if let Some(group) = group.as_deref_mut()
+                        && record.qos == 1
+                    {
+                        group.owners.insert(record.seq, client.id.clone());
+                    }
+                    sent += 1;
+                }
                 Offer::Busy => {
                     backed_up = !state.awaiting_room;
                     state.awaiting_room = true;
@@ -441,7 +821,7 @@ impl Broker {
                 _ => break,
             }
         }
-        (sent, state.take_update(&topic.name), backed_up)
+        (sent, state.take_update(name), backed_up)
     }
 
     /// Moves a subscription past records that were trimmed before it got them.
@@ -480,11 +860,30 @@ impl Broker {
         let Some(topic) = self.topics.get_mut(topic) else {
             return AckOutcome::default();
         };
-        let Some(state) = topic.subscribers.get_mut(client_id) else {
+        let own = topic
+            .subscribers
+            .get(client_id)
+            .is_some_and(|state| state.inflight.contains_key(&seq));
+        let subscriber = if own {
+            Some(client_id.to_string())
+        } else {
+            topic
+                .groups
+                .iter()
+                .find(|(_, group)| group.owners.get(&seq).is_some_and(|m| m == client_id))
+                .map(|(id, _)| id.clone())
+        };
+        let Some(subscriber) = subscriber else {
+            debug!(client = %client_id, topic = %topic.name, seq, "ignored ACK for a record not in flight to this client");
+            return AckOutcome::default();
+        };
+        if let Some(group) = topic.groups.get_mut(&subscriber) {
+            group.owners.remove(&seq);
+        }
+        let Some(state) = topic.subscribers.get_mut(&subscriber) else {
             return AckOutcome::default();
         };
         if state.inflight.remove(&seq).is_none() {
-            debug!(client = %client_id, topic = %topic.name, seq, "ignored ACK for a record not in flight to this client");
             return AckOutcome::default();
         }
         metrics().acknowledged.add(1, &[]);
@@ -498,6 +897,7 @@ impl Broker {
             accepted: true,
             cursor: state.take_update(&topic.name),
             catch_up: state.has_room(max_inflight) && state.next_seq <= topic.last_seq,
+            subscriber: Some(subscriber),
         }
     }
 
@@ -513,8 +913,11 @@ impl Broker {
     ///     The durable session the client held, if any.
     pub fn cleanup_client(&mut self, client_id: &SubscriberId) -> Option<String> {
         let session = self.clients.remove(client_id).and_then(|c| c.session);
+        self.patterns.remove(client_id);
+        let now_ms = chrono::Utc::now().timestamp_millis();
         for topic in self.topics.values_mut() {
             topic.unsubscribe(client_id);
+            leave_groups(topic, client_id, &self.clients, now_ms);
         }
         info!(client = %client_id, "cleaned up client");
         session
@@ -527,7 +930,10 @@ impl Broker {
     /// subscription. A record already resent `max_retries` times stalls its
     /// subscription instead: the client is sent a `stalled` frame and
     /// nothing more is sent to that subscription until it acknowledges
-    /// something or subscribes again. `SharedBroker::run_retry_loop` calls
+    /// something or subscribes again. With `dead_letter_topic` set (and on
+    /// any topic but that one), the record is instead dropped from the
+    /// subscription's window and queued for `take_dead_letters`, and the
+    /// subscription carries on. `SharedBroker::run_retry_loop` calls
     /// this on a timer; tests call it directly with a chosen time.
     ///
     /// Args:
@@ -538,28 +944,48 @@ impl Broker {
     pub fn retry_overdue(&mut self, now_ms: i64) -> RetryOutcome {
         let timeout = i64::try_from(self.settings.ack_timeout_ms).unwrap_or(i64::MAX);
         let max_retries = self.settings.max_retries;
+        let max_inflight = self.settings.max_inflight;
+        let dead_letter_topic = self.settings.dead_letter_topic.as_str();
         let mut outcome = RetryOutcome {
             resent: 0,
             stalled: 0,
+            dead_lettered: 0,
         };
         for topic in self.topics.values_mut() {
-            for (client_id, state) in topic.subscribers.iter_mut() {
+            let give_up = !dead_letter_topic.is_empty() && topic.name != dead_letter_topic;
+            let Topic {
+                subscribers,
+                groups,
+                name,
+                last_seq,
+            } = topic;
+            for (client_id, state) in subscribers.iter_mut() {
                 if state.stalled.is_some() {
                     continue;
                 }
-                let Some(client) = self.clients.get(client_id) else {
-                    continue;
-                };
+                let group = groups.get(client_id);
+                let mut expired = Vec::new();
                 for (&seq, pending) in state.inflight.iter_mut() {
                     if now_ms.saturating_sub(pending.sent_at) <= timeout {
                         continue;
                     }
+                    let holder = match group {
+                        Some(group) => group.owners.get(&seq),
+                        None => Some(client_id),
+                    };
+                    let Some(client) = holder.and_then(|id| self.clients.get(id)) else {
+                        continue;
+                    };
                     if pending.retries >= max_retries {
+                        if give_up {
+                            expired.push((seq, client.id.clone(), client.username.clone()));
+                            continue;
+                        }
                         state.stalled = Some(seq);
                         outcome.stalled += 1;
-                        warn!(client = %client_id, topic = %topic.name, seq, "subscription stalled after max retries");
+                        warn!(client = %client_id, topic = %name, seq, "subscription stalled after max retries");
                         let frame = ServerFrame::event(ServerMessage::Stalled(Stalled {
-                            topic: topic.name.clone(),
+                            topic: name.clone(),
                             seq,
                         }));
                         if let Some(ws) = to_ws(&frame) {
@@ -574,11 +1000,132 @@ impl Broker {
                     }
                     outcome.resent += 1;
                 }
+                if expired.is_empty() {
+                    continue;
+                }
+                for (seq, holder, username) in expired {
+                    if let Some(pending) = state.inflight.remove(&seq) {
+                        warn!(client = %holder, topic = %name, seq, "giving up on a record after max retries");
+                        outcome.dead_lettered += 1;
+                        self.dead.letters.push(DeadLetter {
+                            record: pending.record,
+                            client_id: holder,
+                            username,
+                        });
+                    }
+                }
+                self.dead.cursors.extend(state.take_update(name));
+                if state.has_room(max_inflight) && state.next_seq <= *last_seq {
+                    self.dead.catch_up.push((name.clone(), client_id.clone()));
+                }
+            }
+            for (group_id, group) in groups.iter_mut() {
+                if let Some(state) = subscribers.get(group_id) {
+                    group
+                        .owners
+                        .retain(|seq, _| state.inflight.contains_key(seq));
+                }
             }
         }
         metrics().redelivered.add(outcome.resent as u64, &[]);
         metrics().stalled.add(outcome.stalled as u64, &[]);
+        metrics()
+            .dead_lettered
+            .add(outcome.dead_lettered as u64, &[]);
         outcome
+    }
+
+    /// Hands over the records given up on since the last call, with the
+    /// cursors to store and the subscriptions to catch up.
+    ///
+    /// Returns:
+    ///     The dead letters, leaving none behind.
+    pub fn take_dead_letters(&mut self) -> DeadLetters {
+        std::mem::take(&mut self.dead)
+    }
+}
+
+/// Picks the member of a shared subscription to send the next record to:
+/// the next one in turn whose outgoing queue has room, or failing that the
+/// next one in turn at all, whose full queue then holds the group back.
+///
+/// Args:
+///     group: The group.
+///     clients: The registered clients.
+///
+/// Returns:
+///     The member's client, or `None` when the group has no connected member.
+fn pick_member<'a>(
+    group: &mut Group,
+    clients: &'a HashMap<SubscriberId, Client>,
+) -> Option<&'a Client> {
+    let count = group.members.len();
+    let mut fallback = None;
+    for offset in 0..count {
+        let index = (group.next + offset) % count;
+        let Some(client) = clients.get(&group.members[index]) else {
+            continue;
+        };
+        if client.sender.closing().is_none() && client.sender.has_room() {
+            group.next = (index + 1) % count;
+            return Some(client);
+        }
+        fallback = fallback.or(Some(client));
+    }
+    fallback
+}
+
+/// Removes a client from every shared subscription on a topic. Records it
+/// was sent and hadn't acknowledged go to another member at once, or wait
+/// in the group's window for the next member when there is none.
+///
+/// Args:
+///     topic: The topic.
+///     client_id: The leaving client.
+///     clients: The registered clients.
+///     now_ms: The current time, for the records handed over.
+fn leave_groups(
+    topic: &mut Topic,
+    client_id: &SubscriberId,
+    clients: &HashMap<SubscriberId, Client>,
+    now_ms: i64,
+) {
+    let Topic {
+        subscribers,
+        groups,
+        ..
+    } = topic;
+    for (group_id, group) in groups.iter_mut() {
+        let before = group.members.len();
+        group.members.retain(|member| member != client_id);
+        if group.members.len() == before {
+            continue;
+        }
+        group.next = 0;
+        let orphaned: Vec<u64> = group
+            .owners
+            .iter()
+            .filter(|(_, owner)| *owner == client_id)
+            .map(|(seq, _)| *seq)
+            .collect();
+        let Some(state) = subscribers.get_mut(group_id) else {
+            continue;
+        };
+        for seq in orphaned {
+            group.owners.remove(&seq);
+            let Some(pending) = state.inflight.get_mut(&seq) else {
+                continue;
+            };
+            let Some(heir) = pick_member(group, clients) else {
+                continue;
+            };
+            if let Some(ws) = to_ws(&delivery(&pending.record)) {
+                let _ = heir.sender.send(ws);
+            }
+            pending.sent_at = now_ms;
+            pending.retries = 0;
+            group.owners.insert(seq, heir.id.clone());
+        }
     }
 }
 

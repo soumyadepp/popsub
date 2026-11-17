@@ -18,6 +18,18 @@ again so a lost ack can't stall the subscription.
 An `unsubscribed` frame with no id means the server ended the subscription
 (access revoked), so every unsubscribe the engine sends carries an id.
 
+A wildcard subscription (`orders/#`) is one pattern. The server announces
+each topic it joins for it with a `subscribed` frame that has no id; the
+engine then tracks that topic like any other, owned by the pattern, and puts
+its messages on the pattern's subscription. A `subscribed` or `message` for
+an untracked topic is given to the oldest matching pattern. Releasing a
+pattern unsubscribes it and every topic it owned.
+
+A shared subscription (a topic read through a group) gets only some of the
+topic's messages, out of order. It finds duplicates in a bounded set of
+delivered seqs, ignores `replay_from` and `truncated`, and rejoins its group
+with `resume` after a reconnect.
+
 While a subscription's buffer is full the engine waits before reading the
 next frame; the server then paces delivery for this connection.
 """
@@ -37,7 +49,7 @@ from typing import Any, TypeAlias
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidURI, WebSocketException
 
-from popsub._state import Channel, TopicState
+from popsub._state import Channel, TopicState, is_pattern, matches_pattern
 from popsub.config import AckMode, ClientConfig, PasswordCredentials
 from popsub.errors import (
     ClosedError,
@@ -115,11 +127,12 @@ class _Subscribe:
     """Subscribe and report the `subscribed` frame.
 
     Attributes:
-        topic: The topic.
+        topic: The topic, or a wildcard pattern.
         start: Where replay starts.
         generation: Identifies this subscription.
-        channel: Where the topic's messages go.
+        channel: Where the subscription's messages go.
         reply: Gets the `subscribed` frame or the error.
+        group: The shared subscription to join, if any.
     """
 
     topic: str
@@ -127,6 +140,7 @@ class _Subscribe:
     generation: int
     channel: Channel[Message]
     reply: asyncio.Future[dict[str, Any]]
+    group: str | None = None
 
 
 @dataclass
@@ -271,15 +285,33 @@ _FrameHandler: TypeAlias = Callable[["_Connection", dict[str, Any], "_Pending | 
 
 @dataclass
 class _Topic:
-    """One subscribed topic.
+    """One tracked topic: subscribed by name, or joined through a pattern.
 
     Attributes:
         state: Its deduplication and acknowledgement state.
-        channel: Where its messages go.
-        generation: Which subscription this is.
+        channel: Where its messages go; the pattern's channel when owned.
+        generation: Which subscription this is; the pattern's when owned.
+        owner: The wildcard pattern the server joined it for, if any.
+        group: The shared subscription it is read through, if any.
     """
 
     state: TopicState
+    channel: Channel[Message]
+    generation: int
+    owner: str | None = None
+    group: str | None = None
+
+
+@dataclass
+class _Pattern:
+    """One wildcard subscription.
+
+    Attributes:
+        channel: Where the messages of every topic it owns go.
+        generation: Which subscription this is; the oldest matching pattern
+            owns a newly joined topic.
+    """
+
     channel: Channel[Message]
     generation: int
 
@@ -463,6 +495,7 @@ class Engine:
         self._wake = asyncio.Event()
         self._close_requested = asyncio.Event()
         self._topics: dict[str, _Topic] = {}
+        self._patterns: dict[str, _Pattern] = {}
         self._subscribe_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending: dict[int, _Pending] = {}
         self._unconfirmed: dict[int, dict[str, Any]] = {}
@@ -963,10 +996,15 @@ class Engine:
     async def _restore(self, connection: _Connection, resumed: list[str]) -> None:
         """Restores state on a new connection.
 
-        Topics the server restored are left to it; every other topic is
-        subscribed again from the next seq it expects. Then unconfirmed
-        publishes are resent in their original order with their original
-        request ids, and queued frames are sent.
+        Topics the server restored are left to it; every other tracked topic
+        is subscribed again from the next seq it expects. A shared
+        subscription always rejoins its group with `resume`, since it is
+        never restored and its position is on the server. Wildcard patterns
+        are sent after the topics, from seq 1: the server skips topics the
+        connection holds, so that joins only topics created while it was
+        away, from their first message. Then unconfirmed publishes are
+        resent in their original order with their original request ids, and
+        queued frames are sent.
 
         Args:
             connection: The connection.
@@ -975,15 +1013,24 @@ class Engine:
         Raises:
             _ConnectionLostError: When a write fails.
         """
-        again = [(name, topic.state.resubscribe_from()) for name, topic in self._topics.items() if name not in resumed]
-        for name, start in again:
+        again: list[dict[str, Any]] = []
+        for name, topic in self._topics.items():
+            if topic.group is not None:
+                again.append({"type": "subscribe", "topic": name, "from": "resume", "group": topic.group})
+            elif name not in resumed:
+                again.append({"type": "subscribe", "topic": name, "from": topic.state.resubscribe_from().to_json()})
+        again.extend(
+            {"type": "subscribe", "topic": pattern, "from": StartFrom.seq(1).to_json()}
+            for pattern in sorted(self._patterns)
+        )
+        for frame in again:
             request_id = self._take_id()
-            self._pending[request_id] = _PendingSubscribe(name)
-            await self._send(connection, request_id, {"type": "subscribe", "topic": name, "from": start.to_json()})
+            self._pending[request_id] = _PendingSubscribe(str(frame["topic"]))
+            await self._send(connection, request_id, frame)
         for request_id in sorted(self._unconfirmed):
-            frame = self._unconfirmed.get(request_id)
-            if frame is not None:
-                await self._send(connection, request_id, frame)
+            unconfirmed = self._unconfirmed.get(request_id)
+            if unconfirmed is not None:
+                await self._send(connection, request_id, unconfirmed)
         await self._flush_offline(connection)
 
     async def _flush_offline(self, connection: _Connection) -> None:
@@ -1008,12 +1055,12 @@ class Engine:
         if isinstance(command, _Subscribe):
             self._add_topic(command)
         elif isinstance(command, _Unsubscribe):
-            self._remove_topic(command.topic)
-            self._offline.append({"type": "unsubscribe", "topic": command.topic})
+            for name in self._release(command.topic, None) or [command.topic]:
+                self._offline.append({"type": "unsubscribe", "topic": name})
             _settle(command.reply)
         elif isinstance(command, _Forget):
-            if self._forget_topic(command.topic, command.generation):
-                self._offline.append({"type": "unsubscribe", "topic": command.topic})
+            for name in self._release(command.topic, command.generation):
+                self._offline.append({"type": "unsubscribe", "topic": name})
         elif isinstance(command, _Publish):
             self._queue_publish(command)
         elif isinstance(command, _Ack):
@@ -1056,50 +1103,96 @@ class Engine:
         return None
 
     def _add_topic(self, command: _Subscribe) -> None:
-        """Adds or replaces a subscribed topic and registers the subscribe's waiter.
+        """Adds or replaces a subscription and registers the subscribe's waiter.
 
-        A subscription it replaces ends, and an earlier subscribe still
-        waiting on the same topic fails.
+        A wildcard pattern is recorded as a pattern; anything else as a
+        topic subscribed by name. A subscription it replaces ends, and an
+        earlier subscribe still waiting on the same name fails.
 
         Args:
             command: The subscribe.
         """
-        self._remove_topic(command.topic)
-        self._topics[command.topic] = _Topic(TopicState(command.start), command.channel, command.generation)
+        self._release(command.topic, None)
+        if is_pattern(command.topic):
+            self._patterns[command.topic] = _Pattern(command.channel, command.generation)
+        else:
+            self._remove_topic(command.topic)
+            state = TopicState(command.start, shared=command.group is not None)
+            self._topics[command.topic] = _Topic(state, command.channel, command.generation, group=command.group)
         earlier = self._subscribe_waiters.pop(command.topic, None)
         if earlier is not None:
             _settle(earlier, error=ProtocolError("replaced by a later subscribe to the same topic"))
         self._subscribe_waiters[command.topic] = command.reply
 
+    def _adopt(self, name: str, start: int | None) -> bool:
+        """Starts tracking a topic the server joined for a wildcard subscription.
+
+        When several patterns match, the oldest owns it.
+
+        Args:
+            name: The topic.
+            start: The first seq the server will send, when known.
+
+        Returns:
+            Whether a pattern matched.
+        """
+        owners = [(pattern, held) for pattern, held in self._patterns.items() if matches_pattern(pattern, name)]
+        if not owners:
+            return False
+        pattern, held = min(owners, key=lambda owner: owner[1].generation)
+        state = TopicState(StartFrom.seq(start if start is not None else 1), next_expected=start)
+        self._topics[name] = _Topic(state, held.channel, held.generation, owner=pattern)
+        return True
+
+    def _release(self, name: str, generation: int | None) -> list[str]:
+        """Stops tracking a subscription and ends it for the application.
+
+        That is a topic subscribed by name, or a wildcard pattern together
+        with every topic joined through it. A topic owned by a pattern is not
+        released under its own name.
+
+        Args:
+            name: The topic or pattern.
+            generation: Only release it if it is still this subscription;
+                None releases whatever is there.
+
+        Returns:
+            What to unsubscribe from on the server: the name, and for a
+            pattern the topics it owned. Empty when nothing was released.
+        """
+        pattern = self._patterns.get(name)
+        if pattern is not None and generation in (None, pattern.generation):
+            del self._patterns[name]
+            pattern.channel.close_sender()
+            owned = [topic for topic, held in self._topics.items() if held.owner == name]
+            for topic in owned:
+                del self._topics[topic]
+            return [name, *owned]
+        held = self._topics.get(name)
+        if held is not None and held.owner is None and generation in (None, held.generation):
+            del self._topics[name]
+            held.channel.close_sender()
+            return [name]
+        return []
+
     def _remove_topic(self, name: str) -> bool:
-        """Removes a topic, ending its subscription.
+        """Stops tracking one topic.
+
+        A topic subscribed by name ends its subscription. A topic owned by a
+        pattern only stops; the pattern's subscription carries on.
 
         Args:
             name: The topic.
 
         Returns:
-            Whether it was subscribed.
+            Whether it was tracked.
         """
         topic = self._topics.pop(name, None)
         if topic is None:
             return False
-        topic.channel.close_sender()
+        if topic.owner is None:
+            topic.channel.close_sender()
         return True
-
-    def _forget_topic(self, name: str, generation: int) -> bool:
-        """Removes a topic if it still belongs to the given subscription.
-
-        Args:
-            name: The topic.
-            generation: The subscription being closed.
-
-        Returns:
-            Whether it was removed.
-        """
-        topic = self._topics.get(name)
-        if topic is None or topic.generation != generation:
-            return False
-        return self._remove_topic(name)
 
     async def _on_command(self, connection: _Connection, command: _Command) -> None:
         """Acts on a command while connected.
@@ -1114,13 +1207,10 @@ class Engine:
         if isinstance(command, _Subscribe):
             await self._send_subscribe(connection, command)
         elif isinstance(command, _Unsubscribe):
-            self._remove_topic(command.topic)
-            request_id = self._take_id()
-            self._pending[request_id] = _PendingUnsubscribe(command.topic, command.reply)
-            await self._send(connection, request_id, {"type": "unsubscribe", "topic": command.topic})
+            await self._send_unsubscribe(connection, command)
         elif isinstance(command, _Forget):
-            if self._forget_topic(command.topic, command.generation):
-                await self._send(connection, self._take_id(), {"type": "unsubscribe", "topic": command.topic})
+            for name in self._release(command.topic, command.generation):
+                await self._send(connection, self._take_id(), {"type": "unsubscribe", "topic": name})
         elif isinstance(command, _Publish):
             await self._send_publish(connection, command)
         elif isinstance(command, _Ack):
@@ -1144,8 +1234,31 @@ class Engine:
         self._add_topic(command)
         request_id = self._take_id()
         self._pending[request_id] = _PendingSubscribe(command.topic)
-        frame = {"type": "subscribe", "topic": command.topic, "from": command.start.to_json()}
+        frame: dict[str, Any] = {"type": "subscribe", "topic": command.topic, "from": command.start.to_json()}
+        if command.group is not None:
+            frame["group"] = command.group
         await self._send(connection, request_id, frame)
+
+    async def _send_unsubscribe(self, connection: _Connection, command: _Unsubscribe) -> None:
+        """Releases a subscription and unsubscribes on the server.
+
+        A pattern sends one `unsubscribe` for itself and one for each topic
+        it owned; the first reply answers the caller. Every frame carries an
+        id, so no reply is mistaken for the server ending a subscription.
+
+        Args:
+            connection: The connection.
+            command: The unsubscribe.
+
+        Raises:
+            _ConnectionLostError: When a write fails.
+        """
+        names = self._release(command.topic, None) or [command.topic]
+        for index, name in enumerate(names):
+            request_id = self._take_id()
+            if index == 0:
+                self._pending[request_id] = _PendingUnsubscribe(name, command.reply)
+            await self._send(connection, request_id, {"type": "unsubscribe", "topic": name})
 
     async def _send_publish(self, connection: _Connection, command: _Publish) -> None:
         """Registers a publish and sends it, after any QoS 0 publishes queued before it.
@@ -1225,9 +1338,14 @@ class Engine:
         """
         name = str(frame.get("topic", ""))
         replay_from = frame.get("replay_from")
+        start = replay_from if isinstance(replay_from, int) else None
         topic = self._topics.get(name)
-        if topic is not None and isinstance(replay_from, int):
-            topic.state.advance(replay_from)
+        if name in self._patterns:
+            log.debug("wildcard subscription accepted")
+        elif topic is None:
+            self._adopt(name, start)
+        elif start is not None:
+            topic.state.advance(start)
         waiter = self._subscribe_waiters.pop(name, None)
         if waiter is not None:
             _settle(waiter, frame)
@@ -1344,7 +1462,7 @@ class Engine:
         error = _server_error(frame)
         waiter: asyncio.Future[Any] | None = None
         if isinstance(pending, _PendingSubscribe):
-            self._remove_topic(pending.topic)
+            self._release(pending.topic, None)
             waiter = self._subscribe_waiters.pop(pending.topic, None)
         elif isinstance(pending, (_PendingUnsubscribe, _PendingPublish)):
             waiter = pending.reply
@@ -1376,6 +1494,8 @@ class Engine:
         seq = int(frame.get("seq", 0))
         qos = int(frame.get("qos", 0))
         ack = {"type": "ack", "topic": name, "seq": seq}
+        if name not in self._topics:
+            self._adopt(name, None)
         topic = self._topics.get(name)
         if topic is None:
             if qos == 1:
@@ -1397,8 +1517,9 @@ class Engine:
             _engine=self if manual else None,
         )
         delivered = await topic.channel.put(message, self._close_requested)
-        if not delivered and not self._close_requested.is_set() and self._forget_topic(name, topic.generation):
-            await self._send(connection, self._take_id(), {"type": "unsubscribe", "topic": name})
+        if not delivered and not self._close_requested.is_set():
+            for released in self._release(topic.owner or name, topic.generation):
+                await self._send(connection, self._take_id(), {"type": "unsubscribe", "topic": released})
 
     def _stop(self, code: CloseCode | None) -> None:
         """Stops the client for good: records why and fails everything waiting.
@@ -1417,8 +1538,9 @@ class Engine:
                 _settle(pending.reply, error=error)
         self._pending.clear()
         self._unconfirmed.clear()
-        for name in list(self._topics):
-            self._remove_topic(name)
+        for name in [*self._patterns, *self._topics]:
+            self._release(name, None)
+        self._topics.clear()
         while self._commands:
             command = self._commands.popleft()
             reply = getattr(command, "reply", None)

@@ -556,6 +556,7 @@ impl AuthService {
             .ok_or_else(|| AuthError::UserNotFound(username.to_string()))?;
 
         user.password_hash = hash_password(new_password)?;
+        user.token_version = user.token_version.saturating_add(1);
         self.user_store.update_user(user).await?;
         info!(username = %pii(username), "changed a user's password");
         Ok(())
@@ -603,9 +604,9 @@ impl AuthService {
             Role::ReadOnly { .. } => "readonly",
         };
 
-        let token = self
-            .jwt_service
-            .generate_token_with_role(username, role_name)?;
+        let token =
+            self.jwt_service
+                .generate_token_versioned(username, role_name, user.token_version)?;
 
         info!(username = %pii(username), "logged in");
         Ok(token)
@@ -644,11 +645,14 @@ impl AuthService {
     ///     AuthError::TokenExpired: When the token has expired.
     ///     AuthError::JwtError: When the token is malformed or badly signed,
     ///         or the new token can't be signed.
-    ///     AuthError::InvalidToken: When the token's user no longer exists or is disabled.
+    ///     AuthError::InvalidToken: When the token's user no longer exists, is
+    ///         disabled, or changed its password after the token was issued.
     pub async fn refresh_token(&self, token: &str) -> Result<String> {
         let claims = self.jwt_service.validate_token(token)?;
         match self.user_store.get_user(&claims.sub).await? {
-            Some(user) if user.enabled => self.jwt_service.refresh_token(token),
+            Some(user) if user.enabled && user.token_version == claims.ver => {
+                self.jwt_service.refresh_token(token)
+            }
             _ => Err(AuthError::InvalidToken),
         }
     }

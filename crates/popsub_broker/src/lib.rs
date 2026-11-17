@@ -19,11 +19,14 @@ pub mod shared;
 pub mod topic;
 mod writer;
 
-pub use engine::{AckOutcome, Broker, BrokerStats, DeliverOutcome, RetryOutcome};
+pub use engine::{
+    AckOutcome, Broker, BrokerStats, DeadLetter, DeadLetters, DeliverOutcome, PatternState,
+    RetryOutcome,
+};
 pub use frame::close_message;
 pub use health::StorageHealth;
-pub use shared::{LogSettings, SharedBroker, session_key};
-pub use topic::CursorUpdate;
+pub use shared::{Authorizer, LogSettings, SharedBroker, session_key};
+pub use topic::{CursorUpdate, GROUP_PREFIX, Group, group_subscriber_id};
 pub use writer::{Published, SubscribeOutcome};
 
 #[cfg(test)]

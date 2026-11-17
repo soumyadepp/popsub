@@ -54,6 +54,8 @@ pub struct Metrics {
     pub acknowledged: Counter<u64>,
     /// Subscriptions paused after running out of retries.
     pub stalled: Counter<u64>,
+    /// QoS 1 records given up on for one subscription and copied to the dead-letter topic.
+    pub dead_lettered: Counter<u64>,
     /// How long a publish took in the topic writer: append, fan-out and trim, in seconds.
     pub publish_duration: Histogram<f64>,
     /// Storage operations that failed, by `operation`.
@@ -120,6 +122,13 @@ pub fn metrics() -> &'static Metrics {
                 .u64_counter("popsub.subscriptions.stalled")
                 .with_unit("{subscription}")
                 .with_description("Subscriptions paused after running out of retries")
+                .build(),
+            dead_lettered: meter
+                .u64_counter("popsub.messages.dead_lettered")
+                .with_unit("{message}")
+                .with_description(
+                    "QoS 1 records copied to the dead-letter topic after running out of retries",
+                )
                 .build(),
             publish_duration: meter
                 .f64_histogram("popsub.publish.duration")

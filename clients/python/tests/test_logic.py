@@ -14,9 +14,10 @@ from popsub import (
     RoleSpec,
     ServerError,
     StartFrom,
+    TopicInfo,
     UserInfo,
 )
-from popsub._state import AckMemory, TopicState
+from popsub._state import AckMemory, TopicState, is_pattern, matches_pattern
 
 
 def test_backoff_ceiling_doubles_from_initial() -> None:
@@ -160,3 +161,89 @@ def test_server_error_temporariness() -> None:
     assert ServerError("rate_limited", "slow down", 3).is_temporary
     assert ServerError("brand_new_code", "?").is_temporary
     assert not ServerError("invalid_credentials", "no").is_temporary
+
+
+@pytest.mark.parametrize(
+    ("pattern", "topic", "expected"),
+    [
+        ("orders/#", "orders/eu", True),
+        ("orders/#", "orders/eu/berlin", True),
+        ("orders/#", "orders", True),
+        ("orders/#", "ordersx/eu", False),
+        ("#", "anything/at/all", True),
+        ("sensors/+/temp", "sensors/kitchen/temp", True),
+        ("sensors/+/temp", "sensors/kitchen/humidity", False),
+        ("sensors/+/temp", "sensors/temp", False),
+        ("sensors/+/temp", "sensors/a/b/temp", False),
+        ("+", "orders", True),
+        ("+", "orders/eu", False),
+        ("+/#", "orders/eu/berlin", True),
+        ("orders/+", "orders", False),
+        ("orders/eu", "orders/eu", True),
+        ("orders/eu", "orders/us", False),
+        ("orders", "orders/eu", False),
+    ],
+)
+def test_pattern_matching(pattern: str, topic: str, expected: bool) -> None:
+    """A `+` matches one whole level and a trailing `#` matches the rest."""
+    assert matches_pattern(pattern, topic) is expected
+
+
+def test_is_pattern_spots_wildcards() -> None:
+    """Only names with `+` or `#` are patterns."""
+    assert is_pattern("orders/#")
+    assert is_pattern("sensors/+/temp")
+    assert not is_pattern("orders/eu")
+
+
+def test_shared_subscription_deduplicates_by_seen_seqs() -> None:
+    """A shared subscription accepts seqs out of order once each, and re-acknowledges repeats."""
+    state = TopicState(StartFrom.resume(), shared=True)
+    for seq in (7, 3, 9):
+        verdict = state.accept(seq, 1, AckMode.AUTO)
+        assert verdict.deliver
+        assert verdict.ack
+    repeat = state.accept(3, 1, AckMode.AUTO)
+    assert not repeat.deliver
+    assert repeat.ack
+    assert state.accept(4, 1, AckMode.AUTO).deliver
+    assert state.next_expected is None
+
+
+def test_shared_subscription_manual_repeat_is_reacked_only_once_acked() -> None:
+    """In manual mode a shared repeat is acknowledged again only after the application acknowledged it."""
+    state = TopicState(StartFrom.resume(), shared=True)
+    assert state.accept(5, 1, AckMode.MANUAL).deliver
+    assert not state.accept(5, 1, AckMode.MANUAL).ack
+    state.acked.insert(5)
+    repeat = state.accept(5, 1, AckMode.MANUAL)
+    assert not repeat.deliver
+    assert repeat.ack
+
+
+def test_shared_subscription_ignores_replay_from_and_rejoins_with_resume() -> None:
+    """`replay_from` and `truncated` move nothing for a shared subscription, and it rejoins with resume."""
+    state = TopicState(StartFrom.new(), shared=True)
+    state.advance(50)
+    assert state.next_expected is None
+    assert state.accept(2, 0, AckMode.AUTO).deliver
+    assert state.resubscribe_from() == StartFrom.resume()
+
+
+def test_shared_seen_set_is_bounded() -> None:
+    """The seen set forgets the oldest seqs beyond its limit, so an old seq is accepted again."""
+    state = TopicState(StartFrom.resume(), shared=True, seen=AckMemory(limit=2))
+    for seq in (1, 2, 3):
+        state.accept(seq, 0, AckMode.AUTO)
+    assert len(state.seen) == 2
+    assert not state.accept(3, 0, AckMode.AUTO).deliver
+    assert state.accept(1, 0, AckMode.AUTO).deliver
+
+
+def test_topic_info_round_trips() -> None:
+    """A topic object decodes and encodes back to the same JSON."""
+    wire = {"name": "orders", "first_seq": 3, "last_seq": 9, "messages": 7, "subscribers": 2}
+    assert TopicInfo.from_json(wire).to_json() == wire
+    with pytest.raises(ValueError, match="not a topic"):
+        TopicInfo.from_json({"name": "orders"})
+    assert not ServerError("topic_not_found", "no such topic").is_temporary

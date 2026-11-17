@@ -156,6 +156,11 @@
           "const": "user_exists",
           "description": "An account with that username already exists.",
           "type": "string"
+        },
+        {
+          "const": "topic_not_found",
+          "description": "The topic has no log: nothing was ever published to it.",
+          "type": "string"
         }
       ]
     },
@@ -287,6 +292,13 @@
     "Subscribed": {
       "description": "Confirms a subscription and says which records are history.\n\nThe range is empty when `replay_from` is greater than `replay_to`.",
       "properties": {
+        "group": {
+          "description": "The shared subscription that was joined, when the request named one.\n`replay_from` is then the group's position, not this member's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "replay_from": {
           "description": "The first `seq` that will be sent.",
           "format": "uint64",
@@ -326,6 +338,47 @@
       "required": [
         "pattern",
         "access"
+      ],
+      "type": "object"
+    },
+    "TopicInfo": {
+      "description": "A topic, as admins see it.",
+      "properties": {
+        "first_seq": {
+          "description": "The oldest `seq` still kept, or `last_seq + 1` when nothing is kept.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_seq": {
+          "description": "The newest `seq` ever published.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "messages": {
+          "description": "How many records are kept now.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "The topic's name.",
+          "type": "string"
+        },
+        "subscribers": {
+          "description": "How many live subscriptions it has.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "first_seq",
+        "last_seq",
+        "messages",
+        "subscribers"
       ],
       "type": "object"
     },
@@ -638,6 +691,45 @@
       "required": [
         "type",
         "username"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "One topic, in answer to `get_topic` and `purge_topic`.",
+      "properties": {
+        "topic": {
+          "$ref": "#/$defs/TopicInfo",
+          "description": "The topic."
+        },
+        "type": {
+          "const": "topic_info",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topic"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Every topic, sorted by name, in answer to `list_topics`.",
+      "properties": {
+        "topics": {
+          "description": "The topics.",
+          "items": {
+            "$ref": "#/$defs/TopicInfo"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "topics",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "topics"
       ],
       "type": "object"
     },

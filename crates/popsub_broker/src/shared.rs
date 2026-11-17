@@ -17,8 +17,9 @@
 //! which combines the username with the client's session id, so one user
 //! can never attach to another user's session.
 
-use crate::engine::BrokerStats;
+use crate::engine::{BrokerStats, RetryOutcome};
 use crate::health::StorageHealth;
+use popsub_protocol::TopicInfo;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -136,7 +137,20 @@ pub struct SharedBroker {
     writers: Arc<Mutex<Writers>>,
     /// The outcomes of recent appends, for readiness.
     health: Arc<StorageHealth>,
+    /// Retention for particular topics: the first pattern a topic matches
+    /// applies; topics matching none use `log.retention`.
+    topic_retention: Arc<Vec<(String, Retention)>>,
+    /// Decides whether a user may read a topic, when a new topic is about
+    /// to be joined through a wildcard subscription. Unset allows everyone.
+    authorizer: Arc<std::sync::OnceLock<Authorizer>>,
 }
+
+/// Decides whether a user (first argument) may subscribe to a topic (second).
+pub type Authorizer = Arc<
+    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl fmt::Debug for SharedBroker {
     /// Shows the log settings and the storage's capabilities; the broker's
@@ -177,7 +191,104 @@ impl SharedBroker {
             log,
             writers: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(StorageHealth::default()),
+            topic_retention: Arc::new(Vec::new()),
+            authorizer: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+
+    /// Sets who may read which topic, asked before a wildcard subscription
+    /// joins a newly created topic. Only the first call takes effect.
+    ///
+    /// Args:
+    ///     authorizer: The check.
+    pub fn set_authorizer(&self, authorizer: Authorizer) {
+        let _ = self.authorizer.set(authorizer);
+    }
+
+    /// The names of every topic that has a log.
+    ///
+    /// Returns:
+    ///     The topic names, sorted.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the logs can't be listed.
+    pub async fn topic_names(&self) -> StorageResult<Vec<String>> {
+        self.storage.topics().await
+    }
+
+    /// Subscribes a client to a topic because one of its wildcard
+    /// subscriptions matches it. The client gets a `subscribed` frame with
+    /// no id for the topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     client_id: The client.
+    ///     from: Where replay starts.
+    ///
+    /// Returns:
+    ///     What was replayed and whether the subscription was added.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached.
+    ///     StorageError::Corrupt: When a stored record fails its checks.
+    pub async fn join(
+        &self,
+        topic: &str,
+        client_id: &str,
+        from: StartFrom,
+    ) -> StorageResult<SubscribeOutcome> {
+        let outcome = self.subscribe_inner(topic, client_id, from, None).await?;
+        self.with(|broker| broker.mark_joined(&client_id.to_string(), topic));
+        Ok(outcome)
+    }
+
+    /// Joins a topic that just got its first record for every client with a
+    /// matching wildcard subscription that may read it, from that first record.
+    ///
+    /// Args:
+    ///     topic: The new topic.
+    async fn join_pattern_holders(&self, topic: &str) {
+        let holders = self.with(|broker| broker.pattern_holders(topic));
+        for (client_id, username) in holders {
+            let allowed = match self.authorizer.get() {
+                Some(authorizer) => authorizer(username, topic.to_string()).await,
+                None => true,
+            };
+            if !allowed {
+                continue;
+            }
+            if let Err(e) = self.join(topic, &client_id, StartFrom::Seq(1)).await {
+                warn!(topic, client = %client_id, %e, "joining a new topic for a wildcard subscription failed");
+            }
+        }
+    }
+
+    /// Sets retention for particular topics. Call it before the broker is
+    /// used: a topic's writer keeps the policy it started with.
+    ///
+    /// Args:
+    ///     rules: Topic patterns with their policies; the first match applies.
+    ///
+    /// Returns:
+    ///     The broker with the rules.
+    pub fn with_topic_retention(mut self, rules: Vec<(String, Retention)>) -> Self {
+        self.topic_retention = Arc::new(rules);
+        self
+    }
+
+    /// The retention policy for a topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     The policy of the first matching rule, or the default policy.
+    pub fn retention_for(&self, topic: &str) -> Retention {
+        self.topic_retention
+            .iter()
+            .find(|(pattern, _)| popsub_protocol::topics::matches_pattern(pattern, topic))
+            .map_or(self.log.retention, |(_, retention)| *retention)
     }
 
     /// The last `seq` stored on a topic.
@@ -195,6 +306,81 @@ impl SharedBroker {
             .bounds(topic)
             .await
             .map(|bounds| bounds.last_seq)
+    }
+
+    /// Lists every topic that has a log, with its bounds and live subscribers.
+    ///
+    /// Returns:
+    ///     The topics, sorted by name.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the logs can't be read.
+    pub async fn topic_infos(&self) -> StorageResult<Vec<TopicInfo>> {
+        let mut infos = Vec::new();
+        for name in self.storage.topics().await? {
+            if let Some(info) = self.topic_info(&name).await? {
+                infos.push(info);
+            }
+        }
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(infos)
+    }
+
+    /// Describes one topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     Its bounds, record count and live subscribers, or `None` when
+    ///     nothing was ever published to it.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log can't be read.
+    pub async fn topic_info(&self, topic: &str) -> StorageResult<Option<TopicInfo>> {
+        let bounds = self.storage.bounds(topic).await?;
+        if bounds.last_seq == 0 {
+            return Ok(None);
+        }
+        let subscribers = self.with(|broker| {
+            broker
+                .topics
+                .get(topic)
+                .map_or(0, |t| t.subscribers.len() as u64)
+        });
+        Ok(Some(TopicInfo {
+            name: topic.to_string(),
+            first_seq: bounds.first_seq,
+            last_seq: bounds.last_seq,
+            messages: (bounds.last_seq + 1).saturating_sub(bounds.first_seq),
+            subscribers,
+        }))
+    }
+
+    /// Removes every record a topic holds. Its numbering carries on, and
+    /// subscribers that hadn't caught up are told with `truncated` when they
+    /// next read.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     The topic afterwards, or `None` when nothing was ever published to it.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log can't be changed.
+    pub async fn purge_topic(&self, topic: &str) -> StorageResult<Option<TopicInfo>> {
+        if self.topic_info(topic).await?.is_none() {
+            return Ok(None);
+        }
+        let nothing = Retention {
+            max_messages: Some(0),
+            max_age_ms: None,
+            max_bytes: None,
+        };
+        let removed = self.storage.trim(topic, &nothing, now_ms()).await?;
+        info!(topic, removed, "purged a topic");
+        self.topic_info(topic).await
     }
 
     /// A snapshot of the broker's size, for gauges.
@@ -324,11 +510,16 @@ impl SharedBroker {
         if record.message_id.is_empty() {
             record.message_id = Uuid::new_v4().to_string();
         }
-        self.request(topic, |reply| Command::Publish {
-            record: record.clone(),
-            reply,
-        })
-        .await
+        let published = self
+            .request(topic, |reply| Command::Publish {
+                record: record.clone(),
+                reply,
+            })
+            .await?;
+        if published.seq == 1 && !published.duplicate {
+            self.join_pattern_holders(topic).await;
+        }
+        Ok(published)
     }
 
     /// Subscribes a client to a topic and starts replaying the history it asked for.
@@ -358,6 +549,36 @@ impl SharedBroker {
         from: StartFrom,
         request_id: Option<RequestId>,
     ) -> StorageResult<SubscribeOutcome> {
+        let outcome = self
+            .subscribe_inner(topic, client_id, from, request_id)
+            .await?;
+        self.with(|broker| broker.mark_explicit(&client_id.to_string(), topic));
+        Ok(outcome)
+    }
+
+    /// Subscribes a client to a topic through the topic's writer, for both
+    /// `subscribe` (by name) and `join` (through a wildcard subscription).
+    ///
+    /// Args:
+    ///     topic: The topic to subscribe to.
+    ///     client_id: The registered client subscribing.
+    ///     from: Where replay starts.
+    ///     request_id: The subscribe request's id, echoed in `subscribed`.
+    ///
+    /// Returns:
+    ///     What was replayed and whether the subscription was added.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached.
+    ///     StorageError::Corrupt: When a stored record fails its checks.
+    async fn subscribe_inner(
+        &self,
+        topic: &str,
+        client_id: &str,
+        from: StartFrom,
+        request_id: Option<RequestId>,
+    ) -> StorageResult<SubscribeOutcome> {
         let from = match from {
             StartFrom::Resume => self.resume_point(topic, client_id).await?,
             other => other,
@@ -366,9 +587,49 @@ impl SharedBroker {
             client_id: client_id.to_string(),
             from,
             request_id: request_id.clone(),
+            group: None,
             reply,
         })
         .await
+    }
+
+    /// Adds a client to a shared subscription on a topic. Each record on
+    /// the topic goes to one member of the group; see
+    /// `TopicWriter::subscribe_group` for where the group starts.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     group: The group's name.
+    ///     client_id: The registered client joining.
+    ///     from: Where the group starts if this is its first use on the topic.
+    ///     request_id: The subscribe request's id, echoed in `subscribed`.
+    ///
+    /// Returns:
+    ///     The group's position and whether the client was added.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached.
+    ///     StorageError::Corrupt: When a stored record fails its checks.
+    pub async fn subscribe_shared(
+        &self,
+        topic: &str,
+        group: &str,
+        client_id: &str,
+        from: StartFrom,
+        request_id: Option<RequestId>,
+    ) -> StorageResult<SubscribeOutcome> {
+        let outcome = self
+            .request(topic, |reply| Command::Subscribe {
+                client_id: client_id.to_string(),
+                from,
+                request_id: request_id.clone(),
+                group: Some(group.to_string()),
+                reply,
+            })
+            .await?;
+        self.with(|broker| broker.mark_explicit(&client_id.to_string(), topic));
+        Ok(outcome)
     }
 
     /// Works out where `Resume` starts for a client and topic.
@@ -437,7 +698,10 @@ impl SharedBroker {
             self.send(
                 topic,
                 Command::CatchUp {
-                    client_id: client_id.to_string(),
+                    client_id: outcome
+                        .subscriber
+                        .clone()
+                        .unwrap_or_else(|| client_id.to_string()),
                 },
             );
         }
@@ -592,7 +856,10 @@ impl SharedBroker {
                     topic,
                     self.broker.clone(),
                     self.storage.clone(),
-                    self.log,
+                    LogSettings {
+                        retention: self.retention_for(topic),
+                        ..self.log
+                    },
                     self.health.clone(),
                 )
             })
@@ -616,15 +883,77 @@ impl SharedBroker {
         let mut ticker = tokio::time::interval(RETRY_INTERVAL);
         loop {
             ticker.tick().await;
-            let outcome = self.with(|broker| broker.retry_overdue(now_ms()));
-            if outcome.resent > 0 || outcome.stalled > 0 {
+            let outcome = self.retry_pass(now_ms()).await;
+            if outcome.resent > 0 || outcome.stalled > 0 || outcome.dead_lettered > 0 {
                 info!(
                     resent = outcome.resent,
                     stalled = outcome.stalled,
+                    dead_lettered = outcome.dead_lettered,
                     "retried QoS 1 messages"
                 );
             }
         }
+    }
+
+    /// Runs one retry pass: resends overdue records, then copies the ones
+    /// given up on to the dead-letter topic, stores the cursors that moved
+    /// past them and catches the freed subscriptions up.
+    ///
+    /// A dead letter is a new record on `broker.dead_letter_topic`, published
+    /// by `popsub`, whose payload is a JSON object: the original `topic`,
+    /// `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, the
+    /// `subscriber` (username) that didn't acknowledge it, and `reason`
+    /// (`max_retries`). If that publish fails it is logged; the original
+    /// record is still in its own topic's log.
+    ///
+    /// Args:
+    ///     now_ms: The current time in milliseconds since the Unix epoch.
+    ///
+    /// Returns:
+    ///     What the pass did.
+    pub async fn retry_pass(&self, now_ms: i64) -> RetryOutcome {
+        let (outcome, dead, dead_letter_topic) = self.with(|broker| {
+            (
+                broker.retry_overdue(now_ms),
+                broker.take_dead_letters(),
+                broker.dead_letter_topic().to_string(),
+            )
+        });
+        for update in dead.cursors {
+            if let Err(e) = self
+                .storage
+                .ack(&update.session, &update.topic, update.acked_seq)
+                .await
+            {
+                warn!(topic = %update.topic, %e, "storing a cursor failed");
+            }
+        }
+        for letter in dead.letters {
+            let envelope = serde_json::json!({
+                "topic": letter.record.topic,
+                "seq": letter.record.seq,
+                "message_id": letter.record.message_id,
+                "publisher": letter.record.publisher,
+                "payload": letter.record.payload,
+                "published_at_ms": letter.record.published_at_ms,
+                "subscriber": letter.username,
+                "reason": "max_retries",
+            });
+            let record = NewRecord {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                publisher: "popsub".to_string(),
+                payload: envelope.to_string(),
+                qos: 1,
+                published_at_ms: now_ms,
+            };
+            if let Err(e) = self.publish(&dead_letter_topic, record).await {
+                error!(topic = %letter.record.topic, seq = letter.record.seq, %e, "copying a record to the dead-letter topic failed");
+            }
+        }
+        for (topic, client_id) in dead.catch_up {
+            self.send(&topic, Command::CatchUp { client_id });
+        }
+        outcome
     }
 
     /// Trims every topic log to the retention limits every `RETENTION_INTERVAL`, forever.
@@ -663,7 +992,12 @@ impl SharedBroker {
     /// Returns:
     ///     How many sessions were removed.
     pub async fn expire_sessions(&self, now_ms: i64, expiry: Duration) -> u64 {
-        for session in self.with(|broker| broker.connected_sessions()) {
+        let in_use = self.with(|broker| {
+            let mut keys = broker.connected_sessions();
+            keys.extend(broker.active_groups());
+            keys
+        });
+        for session in in_use {
             if let Err(e) = self.storage.touch(&session, now_ms).await {
                 warn!(%e, "touching a connected session failed");
             }
@@ -700,7 +1034,8 @@ impl SharedBroker {
         };
         let mut removed = 0;
         for topic in topics {
-            match self.storage.trim(&topic, &self.log.retention, now_ms).await {
+            let retention = self.retention_for(&topic);
+            match self.storage.trim(&topic, &retention, now_ms).await {
                 Ok(n) => removed += n,
                 Err(e) => warn!(topic, %e, "trimming failed"),
             }

@@ -106,6 +106,7 @@ Metrics, all under the `popsub` instrumentation scope. Counters are cumulative; 
 | `popsub.messages.in_flight` | gauge | QoS 1 records sent and not yet acknowledged |
 | `popsub.subscriptions` | gauge | Live subscriptions |
 | `popsub.subscriptions.stalled` | counter | Subscriptions paused after running out of retries |
+| `popsub.messages.dead_lettered` | counter | QoS 1 records given up on for one subscription and copied to the dead-letter topic |
 | `popsub.topics` | gauge | Topics with a writer or subscribers |
 | `popsub.publish.duration` | histogram, seconds | Append, fan-out and trim in the topic writer |
 | `popsub.storage.errors` | counter | Failed storage operations [`operation`: `append`, `trim`, `cursor`, `read`] |
@@ -117,10 +118,10 @@ Gauges are read from `SharedBroker::stats` at each export (every 60 seconds by d
 All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`). A JSON Schema generated from those types is in `docs/protocol/` for SDKs in other languages; CI fails if it falls out of date.
 
 - **Request ids.** Any client frame may carry an `id`, a number or a string. The reply carries the same `id`. Frames the server sends on its own have none.
-- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
+- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists`, `topic_not_found` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
 - **Evolution.** Within a version, frames, fields and error codes are only added. Clients ignore fields and frame types they don't know, and treat an unknown error code like `internal`. Removing or changing anything needs a new version, named by the client in `auth`.
 
-Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`.
+Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`. `subscribe` and `unsubscribe` also take a pattern, in which a whole level may be `+` (any one level) and the last level may be `#` (the rest); see wildcard subscriptions below. `publish` never does.
 
 ### 4.1 Client to server
 
@@ -145,11 +146,33 @@ The admin requests below need an enabled admin; anyone else gets `forbidden`. A 
 | `set_role` | `username`, `role` | `user`. Replaces the role and its grants. |
 | `grant` | `username`, `pattern`, `access` | `user`. Adds the grant, replacing one for exactly that pattern. Refused for admins, and for publishing on a `readonly` account. |
 | `revoke` | `username`, `pattern` | `user`. Removes the grant for exactly that pattern; `bad_request` if there is none. |
-| `set_password` | `username`, `password` | `user`. Tokens already issued stay valid until they expire. |
+| `set_password` | `username`, `password` | `user`. Tokens issued before it are refused at `auth` from then on, and the account's connections are closed with `token_expired` (4004), so they log in again. |
 | `set_enabled` | `username`, `enabled` | `user` |
 | `delete_user` | `username` | `user_deleted` |
+| `list_topics` | none | `topics`: every topic that has a log, sorted by name |
+| `get_topic` | `topic` | `topic_info`, or `topic_not_found` when nothing was ever published to it |
+| `purge_topic` | `topic` | `topic_info` after removing every record the topic holds. Its numbering carries on (the next publish gets `last_seq + 1`), live subscriptions stay, and a subscriber that hadn't caught up gets `truncated` |
 
 Changes take effect on live connections at once. After `set_role`, `grant` or `revoke`, each of the account's subscriptions its role no longer allows is ended: the connection gets `unsubscribed` with no `id`, and a durable session forgets it. Disabling or deleting an account closes its connections with `account_disabled` (4009), and its tokens are refused at `auth` from then on.
+
+**Wildcard subscriptions.** `subscribe` with a pattern (`orders/#`, `sensors/+/temp`) subscribes the connection to every matching topic the user may read:
+
+- The reply is `subscribed` for the pattern itself, with `replay_from` and `replay_to` 0.
+- Each existing matching topic the connection isn't already subscribed to is then joined with the request's `from`, announced by its own `subscribed` frame with no `id`.
+- A matching topic created later is joined when its first message is stored, from that message, again announced by `subscribed`. The user's permission is checked at that moment.
+- Messages arrive under their own topic and `seq`, and are acknowledged with them. Replay, deduplication, windows and durable cursors all work per topic, as for a subscription by name.
+- `unsubscribe` with the pattern forgets it and ends the topics joined through it (unless another of the connection's patterns still matches them). Topics the connection subscribed to by name are left alone.
+- A pattern is not stored in a durable session; the topics joined through it are. After a reconnect the client subscribes to the pattern again. Sent with `from: {"seq": 1}`, that joins exactly the topics created while it was away, from their first message, because every topic it already holds is skipped.
+- A pattern that matches nothing the user may read is accepted and stays empty. A malformed one gets `invalid_topic`.
+
+**Shared subscriptions.** `subscribe` with a `group` (1 to 64 letters, digits, `_`, `.` or `-`) joins a group on an exact topic; a group with a pattern gets `bad_request`:
+
+- Each record on the topic goes to one member of the group, in turn, skipping members whose outgoing queues are full. Subscribers outside the group, and other groups, still get every record.
+- The group has one position and one window of unacknowledged QoS 1 records (`broker.max_inflight`, for the whole group), and its position is stored under the group's name like a durable session's cursor, so it survives restarts and periods with no members. Records published while a group has no members wait for the next member.
+- `from` only decides where a group starts the first time it is used on a topic (`resume` means `new`). Later members get `subscribed` with the group's current position as `replay_from` and their `from` is ignored. The `subscribed` frame names the `group`.
+- A record is acknowledged by the member it was sent to. When a member disconnects or unsubscribes, its unacknowledged records are sent to another member at once, or wait for one. A record that times out is resent to the same member, and after `max_retries` the group stalls or the record is dead-lettered, as for any subscription.
+- A member sees only its share, not in strict `seq` order, so clients deduplicate a shared subscription by remembering delivered `seq`s rather than by a next expected one, and rejoin with `resume` after a reconnect.
+- A connection holds one subscription per topic: joining a group replaces its own subscription to that topic, and the reverse.
 
 ### 4.2 Server to client
 
@@ -165,6 +188,8 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 | User | `{"type":"user","user":{"username":"...","role":{"kind":"user","topics":[...]},"enabled":true,"created_at_ms":1794800000000}}`, the reply to most admin requests. No password hash. |
 | Users | `{"type":"users","users":[...]}`, the same objects |
 | User deleted | `{"type":"user_deleted","username":"..."}` |
+| Topic info | `{"type":"topic_info","topic":{"name":"orders","first_seq":3,"last_seq":9,"messages":7,"subscribers":2}}` |
+| Topics | `{"type":"topics","topics":[...]}`, the same objects |
 | Published | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
 | Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
 | Truncated | `{"type":"truncated","topic":"...","first_available":1300}`, before records that start later than the subscriber expected |
@@ -244,9 +269,11 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 |---|---|
 | QoS 0 | At most once, to subscribers connected at publish time. Retained history is replayed only when the subscriber asks for it with `from`. |
 | QoS 1, connected subscribers | At least once per subscriber, independently. Each subscriber's ACK clears only its own copy, and retries go only to subscribers that haven't acknowledged. After `max_retries` resends the subscription stalls and is told, rather than the record being dropped silently. |
+| QoS 1, with `broker.dead_letter_topic` set | A record a subscription never acknowledges is, after `max_retries` resends, copied to the dead-letter topic and dropped for that subscription, which then carries on. So for that subscription the record is delivered at least once but never acknowledged, and what remains of it is the copy on the dead-letter topic. If that copy can't be stored it is logged and lost as a dead letter; the original stays in its topic's log until trimmed. |
 | QoS 1, ephemeral subscriber disconnects | Not at least once. Its subscriptions and windows are discarded. |
 | QoS 1, durable session disconnects and reconnects | At least once, provided it reconnects within `session_expiry_secs` and the records are still retained. Everything after its stored cursor is replayed. Records trimmed meanwhile are reported with `truncated`. |
 | QoS 1, broker restarts | With the `file` backend (the default), durable sessions resume from their stored cursors. Records are kept as firmly as `storage.durability` says: `buffered` survives a crash of the server, `synced` also a power loss. A cursor move is lost only to a power loss, which means resending records already acknowledged. With the `memory` backend nothing survives a restart. |
+| Shared subscriptions | At least once to the group as a whole: each record is sent to one member, and one that member never acknowledges goes to another when it disconnects, or is retried to it. Two members never hold the same record at once, but a record can be delivered to a second member after the first disconnects, so workers must tolerate a repeat. Order across members is not kept. The group's stored position gives the same restart behaviour as a durable session. |
 | Ordering | Per topic, every subscriber receives new records in `seq` order, and a replay followed by live delivery has no gap or repeat. Retries are resent out of order. |
 | Duplicates | Possible (retries, and replays of records acknowledged after the cursor was last stored) and detectable: every delivery carries the record's `seq`, so consumers deduplicate by `(topic, seq)`. A publisher retrying with the same `message_id` doesn't create a second record. |
 | Retention | History beyond `storage.retention` is trimmed. A subscriber that asks for trimmed history is told with a `truncated` frame. With the `memory` backend, all history is lost on restart. |
@@ -262,6 +289,7 @@ The design is in `docs/STORAGE.md`; rollout steps 1 to 4 and 6 are done, and ste
 - The `file` backend keeps each topic in `storage.path/topics/t<topic in hex>/` as segment files of CRC-checked records, plus a session log. It takes an exclusive lock on the directory, so a second server pointed at it refuses to start. On startup it scans every segment, cuts off a half-written record at the end of a topic, and refuses to start if a record anywhere else is damaged. Details in `docs/STORAGE.md` section 7.2.
 - `storage.durability` is checked against the backend at startup and refused if the backend can't provide it.
 - `storage.retention` limits each topic by record count, age and bytes. Logs are trimmed after each publish and by the retention loop every minute.
+- `[[storage.topic_retention]]` entries give particular topics their own limits: each has a `pattern` (`+` for one level, a trailing `#` for the rest) and any of `max_messages`, `max_age_secs` and `max_bytes`; a limit left out comes from `storage.retention`. The first entry a topic matches applies, so put specific patterns before general ones. A malformed pattern stops startup. A topic's writer keeps the policy it started with, so changing the rules takes a restart.
 - The old `sled` store is gone. Data in an old `pubsub_db` directory was replay history only and is not migrated; delete it with `make reset-data`.
 
 ## 8. Concurrency
@@ -301,6 +329,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
+| `broker.dead_letter_topic` | empty | Retry loop. Where a QoS 1 record is copied when a subscription runs out of retries for it; empty stalls the subscription instead |
 | `broker.max_inflight` | `100` | Window of unacknowledged QoS 1 records per subscription |
 | `storage.backend` | `file` | The binary. `file` or `memory` |
 | `storage.path` | `pubsub_data` | The `file` backend's directory |
@@ -309,6 +338,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `storage.retention.max_messages` | `1000` | Trimming |
 | `storage.retention.max_age_secs` | `3600` | Trimming |
 | `storage.retention.max_bytes` | `67108864` | Trimming. Counts message ids, publishers and payloads |
+| `storage.topic_retention` | none | Trimming. A list of `{pattern, max_messages, max_age_secs, max_bytes}` entries giving matching topics their own limits; see section 7. Set in the config file, not the environment |
 
 | `limits.login_attempts`, `limits.login_lockout_secs` | `5`, `300` | Failed logins per address and username before a lockout, and its first length |
 | `limits.address_login_attempts`, `limits.address_lockout_secs` | `20`, `900` | Failed logins per address across usernames before a lockout, and its first length |
@@ -342,7 +372,7 @@ Every `limits` value below 1 is treated as 1, so a limit can't be switched off b
 - Topic names are logged and exported as they are. Don't put personal data in topic names, or keep telemetry off.
 - Metric attributes are fixed values (reasons, outcomes, codes) and never carry identities. Span attributes are the request type, a random per-connection id and an error code.
 - Expiry is enforced on each connection: it is warned a minute before and closed at `exp` unless it sends a fresh `auth` (section 4.4).
-- Changing a password doesn't revoke tokens already issued; they stay valid until they expire. Disable the account to cut it off at once.
+- Each account has a token version, carried in its tokens (`ver`). A password change moves it on, so every token issued before is refused at `auth` and on refresh, and the account's live connections are closed with `token_expired`. Tokens issued before versions existed count as version 0.
 
 **Limits**
 
@@ -379,6 +409,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | The server is stopped with Ctrl+C or `SIGTERM` | `/readyz` turns to 503, every client is sent `going_away`, and the process exits half a second later. |
 | Subscriber reads slowly | Once its queue passes the soft limit, deliveries wait in the topic log and are sent as it catches up, in order. Server memory for it stays near the soft limit. If it falls behind retention, it gets `truncated`. |
 | Publisher sends to a topic nobody subscribes to | Stored in the topic log until retention trims it. |
+| A subscriber never acknowledges one record, with `broker.dead_letter_topic` set | After `max_retries` resends the record is copied to the dead-letter topic as a JSON envelope (the original `topic`, `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, the `subscriber` username and `reason: "max_retries"`), dropped from that subscription's window, and the subscription carries on; a durable session's cursor moves past it. Other subscribers are unaffected. The dead-letter topic is an ordinary topic: subscribe to it to handle failures, and give it its own retention. Its own subscribers stall as usual, so a dead letter is never dead-lettered again. |
 | A subscriber stops acknowledging | Its window fills and delivery to it pauses; after `max_retries` it gets `stalled`. Other subscribers are unaffected, and nothing is queued in memory for it. |
 | A client acknowledges a record it wasn't sent | Ignored. |
 | A publisher retries a message after a dropped connection | Same user and `message_id`: stored and delivered once, while the original is retained. |
@@ -408,8 +439,7 @@ The defaults below are set in the `[limits]` section (section 9).
 
 ## 12. Known gaps, in priority order
 
-1. No release artefacts, and only a Rust client library.
-2. Changing a password doesn't revoke the account's outstanding tokens.
+1. No release artefacts, and nothing published to package registries.
 
 ## 13. Proposed direction
 

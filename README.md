@@ -11,6 +11,8 @@ cargo run -p popsub -- server
 ## What you get
 
 - **Topic logs with sequence numbers.** Replay the last N messages, everything since a time, or everything from a `seq`. Replay and live delivery join with no gap and no repeat.
+- **Wildcard subscriptions.** Subscribe to `orders/#` or `sensors/+/temp` and get every matching topic you may read, including ones created later, each message under its own topic and number.
+- **Shared subscriptions.** Subscribe with a group name and each message goes to one member of the group, so workers can split a queue. The group remembers its position, and a worker that dies hands its unfinished messages to the others.
 - **Durable sessions.** Name a session when you connect, and your subscriptions and acknowledgement positions survive disconnects and server restarts.
 - **QoS 0 and QoS 1.** QoS 1 is at-least-once per subscriber. A publisher that retries with the same `message_id` doesn't create a duplicate, and gets the original `seq` back.
 - **Storage you choose.** A file backend (the default), an in-memory one, or your own through the `Storage` trait, held to a shared conformance suite.
@@ -135,7 +137,7 @@ Where to find the full protocol:
 | | Guarantee |
 |---|---|
 | QoS 0 | At most once, to subscribers connected when it is published. |
-| QoS 1 | At least once to every connected subscriber, independently. Each subscriber's acknowledgement clears only its own copy. A message that runs out of retries pauses that subscription and tells the client, instead of disappearing. |
+| QoS 1 | At least once to every connected subscriber, independently. Each subscriber's acknowledgement clears only its own copy. A message that runs out of retries pauses that subscription and tells the client, instead of disappearing; or, with `broker.dead_letter_topic` set, is copied to that topic and the subscription carries on. |
 | Durable sessions | At least once across disconnects and server restarts, as long as the session reconnects within `session_expiry_secs` and the messages are still retained. |
 | Ordering | Per topic, in `seq` order. A retry of an unacknowledged message can arrive after later ones. |
 | Duplicates | Possible, and always detectable by `(topic, seq)`. The Rust client drops them for you. |
@@ -156,7 +158,9 @@ The settings you are most likely to change:
 | `server.allow_registration` | `false` | Let clients create accounts; `server.registration_role` decides what they may use |
 | `storage.backend` | `file` | `file` keeps history, sessions and user accounts in `storage.path` (`pubsub_data`); `memory` loses them on restart |
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
+| `broker.dead_letter_topic` | none | Copy messages that run out of retries here and keep the subscription going, instead of pausing it |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
+| `[[storage.topic_retention]]` | none | Different limits for topics matching a pattern, such as `audit/#` for 30 days; first match wins |
 | `server.max_payload_bytes` | 1 MiB | Largest publish |
 | `server.proxy_protocol` | `false` | Read PROXY protocol headers from trusted TCP load balancers |
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
@@ -167,6 +171,18 @@ The settings you are most likely to change:
 | `server.health_address` | none | Serve `/healthz` and `/readyz` here, such as `0.0.0.0:9091` |
 | `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
 | `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
+
+Topics can keep different amounts of history:
+
+```toml
+[[storage.topic_retention]]
+pattern = "audit/#"
+max_age_secs = 2592000   # 30 days; other limits come from [storage.retention]
+
+[[storage.topic_retention]]
+pattern = "presence/+"
+max_messages = 1
+```
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
 
@@ -267,6 +283,14 @@ From the source tree, run these as `cargo run -p popsub -- users ...`. New passw
 
 A grant is a topic pattern (`+` matches one level, a trailing `#` the rest) with `subscribe`, `publish` or `both`. A `user` account may use what its grants allow, a `readonly` one may only subscribe, and an `admin` may use every topic and manage accounts. The last enabled admin can't be disabled, deleted or demoted.
 
+Admins can also look at and empty topics:
+
+```bash
+popsub topics list            # name, first and last seq, messages kept, live subscribers
+popsub topics show orders
+popsub topics purge orders    # removes its messages; numbering carries on
+```
+
 From Rust, the same requests are on `client.admin()`:
 
 ```rust
@@ -281,7 +305,7 @@ admin.revoke("alice", "orders/#").await?;
 
 | Crate | What it is |
 |---|---|
-| `popsub` | The binary: `server`, a demo `client`, and `users` for managing accounts |
+| `popsub` | The binary: `server`, a demo `client`, and `users` and `topics` for managing a running server |
 | `popsub_sdk` | The Rust client library |
 | `popsub_scenarios` | The scenario suite every client library must pass, and the Rust client's driver for it |
 | `popsub_protocol` | Every frame type, shared by the server and clients |

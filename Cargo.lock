@@ -1751,6 +1751,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "jsonwebtoken",
+ "popsub_protocol",
  "popsub_utils",
  "rand 0.8.5",
  "serde",
@@ -1785,6 +1786,7 @@ name = "popsub_config"
 version = "0.1.0"
 dependencies = [
  "config",
+ "popsub_protocol",
  "popsub_storage",
  "serde",
  "tempfile",

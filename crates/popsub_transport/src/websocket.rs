@@ -259,7 +259,8 @@ pub struct Server {
 
 impl Server {
     /// Creates a server with the default rate limits, the broker's
-    /// connection limit and no trusted proxies.
+    /// connection limit and no trusted proxies. It also tells the broker to
+    /// ask this auth service before a wildcard subscription joins a new topic.
     ///
     /// Args:
     ///     broker: The broker every connection shares.
@@ -269,6 +270,11 @@ impl Server {
     /// Returns:
     ///     A server ready to `listen` or `serve`.
     pub fn new(broker: SharedBroker, auth: Arc<AuthService>) -> Self {
+        let readers = auth.clone();
+        broker.set_authorizer(Arc::new(move |username: String, topic: String| {
+            let readers = readers.clone();
+            Box::pin(async move { readers.can_subscribe(&username, &topic).await })
+        }));
         Self {
             auth,
             limiters: RateLimiters::default(),
@@ -1234,7 +1240,9 @@ impl Session {
                 self.authenticate(id, &token, protocol, session_id.as_deref(), clean_start)
                     .await
             }
-            ClientMessage::Subscribe { topic, from } => self.subscribe(id, &topic, from).await,
+            ClientMessage::Subscribe { topic, from, group } => {
+                self.subscribe(id, &topic, from, group.as_deref()).await
+            }
             ClientMessage::Unsubscribe { topic } => self.unsubscribe(id, &topic).await,
             ClientMessage::Publish {
                 topic,
@@ -1255,7 +1263,10 @@ impl Session {
             | ClientMessage::Revoke { .. }
             | ClientMessage::SetPassword { .. }
             | ClientMessage::SetEnabled { .. }
-            | ClientMessage::DeleteUser { .. }) => self.admin(id, admin).await,
+            | ClientMessage::DeleteUser { .. }
+            | ClientMessage::ListTopics {}
+            | ClientMessage::GetTopic { .. }
+            | ClientMessage::PurgeTopic { .. }) => self.admin(id, admin).await,
         }
     }
 
@@ -1485,7 +1496,8 @@ impl Session {
     /// The reply is `authenticated` with the protocol version and the
     /// server's limits. These get an error and close the connection with the
     /// matching `CloseCode`: an unsupported `protocol` (`unsupported_protocol`),
-    /// an invalid or expired token (`auth_failed`), a token whose account is
+    /// an invalid or expired token (`auth_failed`), a token issued before the
+    /// account's last password change (`auth_failed`), a token whose account is
     /// disabled or deleted (`auth_failed`, closed as `AccountDisabled`), a
     /// user store that can't be read (`internal`, closed as `AuthFailed`), an
     /// invalid `session_id`
@@ -1546,7 +1558,17 @@ impl Session {
             }
         };
         match self.server.auth.get_user(&claims.sub).await {
-            Ok(Some(user)) if user.enabled => {}
+            Ok(Some(user)) if user.enabled && user.token_version == claims.ver => {}
+            Ok(Some(user)) if user.enabled => {
+                warn!(client_id = %self.client_id, username = %pii(&claims.sub), "token issued before a password change");
+                self.fail(
+                    id,
+                    ErrorCode::AuthFailed,
+                    "this token was cancelled by a password change; log in again",
+                    None,
+                )?;
+                return Ok(Flow::Close(CloseCode::AuthFailed));
+            }
             Ok(_) => {
                 warn!(client_id = %self.client_id, username = %pii(&claims.sub), "token for a disabled or deleted account");
                 self.fail(
@@ -1758,6 +1780,9 @@ impl Session {
     ///     id: The request id.
     ///     topic: The topic to subscribe to.
     ///     from: Where replay starts.
+    ///     group: The shared subscription to join, if any. Each record then
+    ///         goes to one member of the group. A malformed name, or a group
+    ///         together with a pattern, gets `bad_request`.
     ///
     /// Returns:
     ///     A closing flow when the client isn't authenticated, otherwise
@@ -1771,11 +1796,30 @@ impl Session {
         id: Option<&RequestId>,
         topic: &str,
         from: StartFrom,
+        group: Option<&str>,
     ) -> Result<Flow> {
         let username = match self.require_user(id, "subscribe")? {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
         };
+        if let Some(group) = group {
+            let problem = if !valid_group(group) {
+                Some(format!(
+                    "a group name is 1 to {MAX_GROUP_CHARS} letters, digits, '_', '.' or '-'"
+                ))
+            } else if popsub_protocol::topics::is_pattern(topic) {
+                Some("a shared subscription needs an exact topic, not a pattern".to_string())
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                self.fail(id, ErrorCode::BadRequest, problem, None)?;
+                return Ok(Flow::Continue);
+            }
+        }
+        if popsub_protocol::topics::is_pattern(topic) {
+            return self.subscribe_pattern(id, &username, topic, from).await;
+        }
         if !valid_topic(topic) {
             self.fail(id, ErrorCode::InvalidTopic, invalid_topic_message(), None)?;
             return Ok(Flow::Continue);
@@ -1790,12 +1834,21 @@ impl Session {
             )?;
             return Ok(Flow::Continue);
         }
-        match self
-            .server
-            .broker
-            .subscribe(topic, &self.client_id, from, id.cloned())
-            .await
-        {
+        let subscribed = match group {
+            Some(group) => {
+                self.server
+                    .broker
+                    .subscribe_shared(topic, group, &self.client_id, from, id.cloned())
+                    .await
+            }
+            None => {
+                self.server
+                    .broker
+                    .subscribe(topic, &self.client_id, from, id.cloned())
+                    .await
+            }
+        };
+        match subscribed {
             Ok(outcome) => {
                 info!(
                     client_id = %self.client_id,
@@ -1818,6 +1871,92 @@ impl Session {
                 )?;
             }
         }
+        Ok(Flow::Continue)
+    }
+
+    /// Subscribes the connection to every topic matching a pattern.
+    ///
+    /// The pattern is recorded first, so a topic created from now on is
+    /// joined from its first record (`SharedBroker::publish` does that, asking
+    /// the server's authorizer). The reply is `subscribed` for the pattern
+    /// itself, with `replay_from` and `replay_to` 0. Then every existing
+    /// topic that matches, that the user may read and that the connection
+    /// isn't already subscribed to is joined with `from`, each announced by a
+    /// `subscribed` frame with no id. Messages arrive under their own topic
+    /// and `seq`. A malformed pattern gets `invalid_topic`. A pattern that
+    /// matches nothing the user may read is accepted and stays empty.
+    ///
+    /// Args:
+    ///     id: The request id.
+    ///     username: The authenticated user.
+    ///     pattern: The topic pattern.
+    ///     from: Where replay starts on each topic joined now.
+    ///
+    /// Returns:
+    ///     `Flow::Continue`.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a reply can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    async fn subscribe_pattern(
+        &self,
+        id: Option<&RequestId>,
+        username: &str,
+        pattern: &str,
+        from: StartFrom,
+    ) -> Result<Flow> {
+        if let Err(why) = popsub_protocol::topics::validate_pattern(pattern) {
+            self.fail(
+                id,
+                ErrorCode::InvalidTopic,
+                format!("invalid topic pattern: {why}"),
+                None,
+            )?;
+            return Ok(Flow::Continue);
+        }
+        let broker = &self.server.broker;
+        if !broker.with(|b| b.add_pattern(&self.client_id, pattern)) {
+            return Ok(Flow::Stop);
+        }
+        let topics = match broker.topic_names().await {
+            Ok(topics) => topics,
+            Err(e) => {
+                error!(client_id = %self.client_id, pattern, %e, "listing topics for a pattern failed");
+                broker.with(|b| b.remove_pattern(&self.client_id, pattern));
+                self.fail(
+                    id,
+                    ErrorCode::StorageUnavailable,
+                    "can't list topics, not subscribed",
+                    None,
+                )?;
+                return Ok(Flow::Continue);
+            }
+        };
+        self.reply(
+            id,
+            ServerMessage::Subscribed(popsub_protocol::Subscribed {
+                topic: pattern.to_string(),
+                replay_from: 0,
+                replay_to: 0,
+                group: None,
+            }),
+        )?;
+        let mut joined = 0usize;
+        for topic in topics {
+            if !popsub_protocol::topics::matches_pattern(pattern, &topic)
+                || broker.with(|b| b.is_subscribed(&self.client_id, &topic))
+                || !self.server.auth.can_subscribe(username, &topic).await
+            {
+                continue;
+            }
+            match broker.join(&topic, &self.client_id, from).await {
+                Ok(_) => joined += 1,
+                Err(e) => {
+                    error!(client_id = %self.client_id, topic, %e, "joining a topic for a pattern failed");
+                }
+            }
+        }
+        info!(client_id = %self.client_id, username = %pii(username), pattern, joined, "subscribed to a pattern");
         Ok(Flow::Continue)
     }
 
@@ -1845,6 +1984,30 @@ impl Session {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
         };
+        if popsub_protocol::topics::is_pattern(topic) {
+            let joined = self
+                .server
+                .broker
+                .with(|broker| broker.remove_pattern(&self.client_id, topic));
+            for concrete in joined {
+                if let Err(e) = self
+                    .server
+                    .broker
+                    .unsubscribe(&concrete, &self.client_id)
+                    .await
+                {
+                    warn!(client_id = %self.client_id, topic = %concrete, %e, "removing a stored subscription failed");
+                }
+            }
+            info!(client_id = %self.client_id, username = %pii(&username), pattern = topic, "unsubscribed from a pattern");
+            self.reply(
+                id,
+                ServerMessage::Unsubscribed {
+                    topic: topic.to_string(),
+                },
+            )?;
+            return Ok(Flow::Continue);
+        }
         if let Err(e) = self.server.broker.unsubscribe(topic, &self.client_id).await {
             error!(client_id = %self.client_id, username = %pii(&username), topic, %e, "removing a stored subscription failed");
             self.fail(
@@ -2037,6 +2200,23 @@ impl Session {
 fn salvage_request_id(text: &str) -> Option<RequestId> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     serde_json::from_value(value.get("id")?.clone()).ok()
+}
+
+/// The longest shared subscription group name, in characters.
+const MAX_GROUP_CHARS: usize = 64;
+
+/// Checks a shared subscription's group name.
+///
+/// Args:
+///     group: The name.
+///
+/// Returns:
+///     True for 1 to `MAX_GROUP_CHARS` ASCII letters, digits, `_`, `.` or `-`.
+fn valid_group(group: &str) -> bool {
+    (1..=MAX_GROUP_CHARS).contains(&group.len())
+        && group
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 /// Checks a topic name a client wants to subscribe or publish to.

@@ -6,6 +6,7 @@ The CLI. Loads config, refuses to start on a non-loopback host while published d
 
 - `src/main.rs`: `Command` enum (`server`, `client`, `users`), `run_server`, `open_storage`, `open_users`, `run_client`.
 - `src/telemetry.rs`: `Telemetry`. `init` sets up console logging and, with `[telemetry] enabled`, the OTLP trace, metric and log exporters, and installs the meter provider globally; `register_gauges` adds the gauges read from `SharedBroker::stats`; `shutdown` flushes.
+- `src/topics.rs`: the `topics` subcommands (`list`, `show`, `purge`), which reuse `users::Connection` and `users::connect`.
 - `src/users.rs`: the `users` subcommands (`list`, `show`, `add`, `grant`, `revoke`, `role`, `passwd`, `disable`, `enable`, `delete`), parsing `--topic PATTERN[:ACCESS]`, and printing accounts.
 
 ## Rules

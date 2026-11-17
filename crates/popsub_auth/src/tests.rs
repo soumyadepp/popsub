@@ -3,7 +3,7 @@
 use crate::error::AuthError;
 use crate::permission::TopicPermission;
 use crate::service::{AuthConfig, AuthService, UserBuilder};
-use crate::user::Role;
+use crate::user::{Role, User};
 
 /// Checks that the configured admin can log in, gets a token with the admin role, and can use any topic.
 #[tokio::test]
@@ -581,4 +581,41 @@ async fn disabling_an_account_refuses_it() {
         auth.set_user_enabled("nobody", true).await,
         Err(AuthError::UserNotFound(_))
     ));
+}
+
+/// Checks that a password change makes earlier tokens fail to refresh while
+/// a token from a fresh login refreshes, and that old user records without a
+/// token version read as version 0.
+#[tokio::test]
+async fn a_password_change_moves_the_token_version() {
+    let service = AuthService::new(AuthConfig::new("a-secret-for-this-test")).await;
+    service
+        .add_user("vera", "first-password", Role::admin())
+        .await
+        .expect("add");
+    let old = service
+        .login("vera", "first-password")
+        .await
+        .expect("login");
+    assert_eq!(service.validate_token(&old).expect("claims").ver, 0);
+    service
+        .update_user_password("vera", "second-password")
+        .await
+        .expect("change");
+    assert!(matches!(
+        service.refresh_token(&old).await,
+        Err(AuthError::InvalidToken)
+    ));
+    let new = service
+        .login("vera", "second-password")
+        .await
+        .expect("login again");
+    assert_eq!(service.validate_token(&new).expect("claims").ver, 1);
+    service.refresh_token(&new).await.expect("refresh");
+
+    let stored: User = serde_json::from_str(
+        r#"{"username":"old","password_hash":"x","role":{"type":"admin"},"enabled":true,"created_at":1}"#,
+    )
+    .expect("an old record");
+    assert_eq!(stored.token_version, 0);
 }

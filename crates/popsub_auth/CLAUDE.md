@@ -27,6 +27,7 @@ Users, roles, password hashing, JWTs and topic permission patterns. The transpor
 - There is one way to build it: `with_store(config, store)` (or `new(config)`, which uses an in-memory store). Both create the configured admin if it's missing.
 - `AuthConfig`'s `Debug` redacts the secret and admin password. Keep it that way if fields are added.
 - Log usernames only through `popsub_utils::pii::pii`, as a field (`username = %pii(username)`), never inside the message text. `AuthError`'s messages carry usernames, so log `e.kind()` rather than `%e` wherever the error could be about a person.
+- `User::token_version` is carried in tokens as `ver`. `update_user_password` bumps it; `refresh_token` and the transport's `auth` refuse a token whose `ver` differs. Any new way to change a password must bump it too.
 - `refresh_token` checks the user still exists and is enabled; `validate_token` doesn't, because permission checks look the user up anyway.
 - The Postgres store compiles in CI (`--all-features`) but is never run against a database.
 

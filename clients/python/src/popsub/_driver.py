@@ -243,6 +243,45 @@ async def _delete_user(admin: Admin, params: dict[str, Any]) -> Any:
     return None
 
 
+async def _list_topics(admin: Admin, params: dict[str, Any]) -> Any:
+    """Calls `list_topics`.
+
+    Args:
+        admin: The admin handle.
+        params: Unused.
+
+    Returns:
+        The topic objects.
+    """
+    return [topic.to_json() for topic in await admin.list_topics()]
+
+
+async def _get_topic(admin: Admin, params: dict[str, Any]) -> Any:
+    """Calls `get_topic`.
+
+    Args:
+        admin: The admin handle.
+        params: The command's params.
+
+    Returns:
+        The topic object.
+    """
+    return (await admin.get_topic(str(params.get("topic", "")))).to_json()
+
+
+async def _purge_topic(admin: Admin, params: dict[str, Any]) -> Any:
+    """Calls `purge_topic`.
+
+    Args:
+        admin: The admin handle.
+        params: The command's params.
+
+    Returns:
+        The topic object after the purge.
+    """
+    return (await admin.purge_topic(str(params.get("topic", "")))).to_json()
+
+
 ADMIN_CALLS: dict[str, _AdminCall] = {
     "create_user": _create_user,
     "get_user": _get_user,
@@ -253,6 +292,9 @@ ADMIN_CALLS: dict[str, _AdminCall] = {
     "set_password": _set_password,
     "set_enabled": _set_enabled,
     "delete_user": _delete_user,
+    "list_topics": _list_topics,
+    "get_topic": _get_topic,
+    "purge_topic": _purge_topic,
 }
 """The admin methods the driver can call, by protocol name."""
 
@@ -395,7 +437,11 @@ class Driver:
         topic = str(command.get("topic", ""))
         start = StartFrom.from_json(command.get("from"))
         self.leaving.discard(topic)
-        subscription = await client.subscribe(topic, start)
+        group = command.get("group")
+        if isinstance(group, str):
+            subscription = await client.subscribe_shared(topic, group, start)
+        else:
+            subscription = await client.subscribe(topic, start)
         self.spawn(self._forward(subscription))
         return {}
 

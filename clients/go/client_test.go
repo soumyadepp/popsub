@@ -320,3 +320,63 @@ func TestNoRetriesStopsTheClientWhenTheConnectionDrops(t *testing.T) {
 		}
 	}
 }
+
+// TestWildcardSubscriptionCarriesEveryMatchingTopic checks a pattern end
+// to end: topics the server announces are tracked separately, their
+// messages arrive on the one subscription under their own names, the
+// server ending one topic stops only that topic, and a topic matching no
+// pattern is dropped.
+func TestWildcardSubscriptionCarriesEveryMatchingTopic(t *testing.T) {
+	f := newFakeServer(t)
+	client := connectTest(t, f, testConfig(f))
+	sub, err := client.Subscribe(context.Background(), "orders/#", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	message := func(topic, seq string) string {
+		return `{"type":"message","topic":"` + topic + `","seq":` + seq + `,"message_id":"m","payload":"p","qos":0,"published_at_ms":0}`
+	}
+	f.inject(t, `{"type":"subscribed","topic":"orders/a","replay_from":3,"replay_to":2}`)
+	f.inject(t, message("orders/a", "2"))
+	f.inject(t, message("orders/a", "3"))
+	f.inject(t, message("elsewhere", "1"))
+	f.inject(t, message("orders/b", "1"))
+	f.inject(t, message("orders/b", "1"))
+	f.inject(t, `{"type":"unsubscribed","topic":"orders/a"}`)
+	f.inject(t, message("orders/b", "2"))
+	want := []Message{{Topic: "orders/a", Seq: 3}, {Topic: "orders/b", Seq: 1}, {Topic: "orders/b", Seq: 2}}
+	for _, expected := range want {
+		got := next(t, sub)
+		if got.Topic != expected.Topic || got.Seq != expected.Seq {
+			t.Fatalf("expected %s #%d, got %s #%d", expected.Topic, expected.Seq, got.Topic, got.Seq)
+		}
+	}
+	if err := client.Unsubscribe(context.Background(), "orders/#"); err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+	if _, ok := <-sub.Messages(); ok {
+		t.Fatal("the pattern's channel should be closed after unsubscribing")
+	}
+}
+
+// TestSharedSubscriptionAcceptsOutOfOrderSeqs checks a shared subscription
+// end to end: seqs arrive in any order and a repeat is dropped.
+func TestSharedSubscriptionAcceptsOutOfOrderSeqs(t *testing.T) {
+	f := newFakeServer(t)
+	client := connectTest(t, f, testConfig(f))
+	sub, err := client.SubscribeShared(context.Background(), "jobs", "workers", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	for _, seq := range []string{"4", "2", "4", "6"} {
+		f.inject(t, `{"type":"message","topic":"jobs","seq":`+seq+`,"message_id":"m","payload":"p","qos":1,"published_at_ms":0}`)
+	}
+	for _, want := range []uint64{4, 2, 6} {
+		if got := next(t, sub).Seq; got != want {
+			t.Fatalf("expected seq %d, got %d", want, got)
+		}
+	}
+	if _, err := client.SubscribeShared(context.Background(), "jobs", "", FromNew); !errors.Is(err, ErrConfig) {
+		t.Fatalf("an empty group should be a config error, got %v", err)
+	}
+}

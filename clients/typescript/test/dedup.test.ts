@@ -67,3 +67,42 @@ test("the acknowledgement memory forgets the oldest seq beyond its capacity", ()
     [true, true, true],
   );
 });
+
+test("a shared subscription finds duplicates by delivered seq, in any order", () => {
+  const tracker = new DeliveryTracker(4096, true);
+  for (const seq of [7, 3, 12]) {
+    assert.equal(tracker.isDuplicate(seq), false);
+    tracker.accept(seq);
+  }
+  assert.equal(tracker.nextExpected, null);
+  assert.deepEqual(
+    [3, 7, 12, 1, 5, 13].map((seq) => tracker.isDuplicate(seq)),
+    [true, true, true, false, false, false],
+  );
+});
+
+test("replay_from and truncated move nothing on a shared subscription", () => {
+  const tracker = new DeliveryTracker(4096, true);
+  tracker.moveTo(50);
+  assert.equal(tracker.nextExpected, null);
+  assert.equal(tracker.isDuplicate(2), false);
+});
+
+test("a shared subscription's delivered set is bounded and forgets the oldest", () => {
+  const tracker = new DeliveryTracker(3, true);
+  for (const seq of [1, 2, 3, 4]) {
+    tracker.accept(seq);
+  }
+  assert.equal(tracker.seen.size, 3);
+  assert.equal(tracker.isDuplicate(1), false);
+  assert.equal(tracker.isDuplicate(4), true);
+});
+
+test("a shared duplicate follows the usual re-acknowledge rule", () => {
+  const tracker = new DeliveryTracker(4096, true);
+  tracker.accept(9);
+  assert.equal(tracker.reacksDuplicate(9, false), false);
+  tracker.acked.insert(9);
+  assert.equal(tracker.reacksDuplicate(9, false), true);
+  assert.equal(tracker.reacksDuplicate(9, true), true);
+});

@@ -274,6 +274,7 @@ async fn test_action_before_auth_fails() {
     let subscribe_msg = ClientMessage::Subscribe {
         topic: "test".to_string(),
         from: StartFrom::New,
+        group: None,
     };
     ws_stream
         .send(WsMessage::Text(
@@ -1394,8 +1395,8 @@ async fn invalid_topics_and_message_ids_are_refused() {
     let mut ws = admin_connection(addr, &settings).await;
     let long_topic = "t".repeat(121);
     for frame in [
-        serde_json::json!({"type": "subscribe", "id": 1, "topic": "metrics/#"}),
-        serde_json::json!({"type": "subscribe", "id": 2, "topic": "a/+/b"}),
+        serde_json::json!({"type": "subscribe", "id": 1, "topic": "metrics/#/x"}),
+        serde_json::json!({"type": "publish", "id": 2, "topic": "a/+/b", "payload": "x"}),
         serde_json::json!({"type": "publish", "id": 3, "topic": "", "payload": "x"}),
         serde_json::json!({"type": "publish", "id": 4, "topic": long_topic, "payload": "x"}),
     ] {
@@ -2334,4 +2335,278 @@ async fn pings_are_answered_before_and_after_auth() {
     let mut admin = admin_connection(addr, &settings).await;
     let late = send_raw(&mut admin, r#"{"type": "ping", "id": 2}"#).await;
     assert_eq!(late, serde_json::json!({"type": "pong", "id": 2}));
+}
+
+/// Checks that changing a password cancels the account's tokens: its live
+/// connection is closed with `token_expired`, the old token is refused at
+/// `auth`, the old password no longer logs in, and the new one does.
+#[tokio::test]
+async fn a_password_change_cancels_tokens_and_connections() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "pat", "password": "pat-password-1", "role": {"kind": "user"}}),
+    )
+    .await;
+    let (mut pat, old_token) = user_connection(addr, "pat", "pat-password-1").await;
+    let changed = request(
+        &mut admin,
+        serde_json::json!({"type": "set_password", "id": 2, "username": "pat", "password": "pat-password-2"}),
+    )
+    .await;
+    assert_eq!(changed["type"], "user", "{changed}");
+    assert_eq!(
+        next_close(&mut pat, Duration::from_secs(2)).await.0,
+        CloseCode::TokenExpired.code()
+    );
+
+    let mut stale = raw_connection(addr).await;
+    let refused = send_raw(
+        &mut stale,
+        &serde_json::json!({"type": "auth", "token": old_token}).to_string(),
+    )
+    .await;
+    assert_eq!(refused["code"], "auth_failed", "{refused}");
+    assert_eq!(
+        next_close(&mut stale, Duration::from_secs(2)).await.0,
+        CloseCode::AuthFailed.code()
+    );
+
+    let mut retry = raw_connection(addr).await;
+    let old_login = send_raw(
+        &mut retry,
+        r#"{"type": "login", "username": "pat", "password": "pat-password-1"}"#,
+    )
+    .await;
+    assert_eq!(old_login["code"], "invalid_credentials", "{old_login}");
+    user_connection(addr, "pat", "pat-password-2").await;
+}
+
+/// Checks the topic admin requests: listing and describing topics, purging
+/// one (its numbering carries on and a subscriber that was behind is told
+/// with `truncated`), `topic_not_found`, and `forbidden` for non-admins.
+#[tokio::test]
+async fn admins_list_describe_and_purge_topics() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    for (topic, count) in [("orders", 3), ("audit", 1)] {
+        for n in 0..count {
+            let published = request(
+                &mut admin,
+                serde_json::json!({"type": "publish", "id": n, "topic": topic, "payload": "x", "qos": 1}),
+            )
+            .await;
+            assert_eq!(published["type"], "published", "{published}");
+        }
+    }
+    let listed = request(
+        &mut admin,
+        serde_json::json!({"type": "list_topics", "id": 10}),
+    )
+    .await;
+    assert_eq!(
+        listed["topics"],
+        serde_json::json!([
+            {"name": "audit", "first_seq": 1, "last_seq": 1, "messages": 1, "subscribers": 0},
+            {"name": "orders", "first_seq": 1, "last_seq": 3, "messages": 3, "subscribers": 0},
+        ])
+    );
+    let purged = request(
+        &mut admin,
+        serde_json::json!({"type": "purge_topic", "id": 11, "topic": "orders"}),
+    )
+    .await;
+    assert_eq!(
+        purged["topic"],
+        serde_json::json!({"name": "orders", "first_seq": 4, "last_seq": 3, "messages": 0, "subscribers": 0})
+    );
+    let next = request(
+        &mut admin,
+        serde_json::json!({"type": "publish", "id": 12, "topic": "orders", "payload": "y", "qos": 1}),
+    )
+    .await;
+    assert_eq!(next["seq"], 4, "{next}");
+    send_json(
+        &mut admin,
+        serde_json::json!({"type": "subscribe", "topic": "orders", "from": {"seq": 1}}),
+    )
+    .await;
+    let mut kinds = Vec::new();
+    while kinds.len() < 3 {
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_text(&mut admin).await).expect("JSON");
+        kinds.push((
+            frame["type"].clone(),
+            frame["first_available"].clone(),
+            frame["seq"].clone(),
+        ));
+    }
+    assert_eq!(kinds[1].0, "truncated");
+    assert_eq!(kinds[1].1, 4);
+    assert_eq!(
+        (kinds[2].0.clone(), kinds[2].2.clone()),
+        (serde_json::json!("message"), serde_json::json!(4))
+    );
+    let described = request(
+        &mut admin,
+        serde_json::json!({"type": "get_topic", "id": 13, "topic": "orders"}),
+    )
+    .await;
+    assert_eq!(described["topic"]["subscribers"], 1, "{described}");
+    let missing = request(
+        &mut admin,
+        serde_json::json!({"type": "get_topic", "id": 14, "topic": "nothing-here"}),
+    )
+    .await;
+    assert_eq!(missing["code"], "topic_not_found", "{missing}");
+
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 15, "username": "tess", "password": "tess-password-1", "role": {"kind": "user"}}),
+    )
+    .await;
+    let (mut tess, _) = user_connection(addr, "tess", "tess-password-1").await;
+    let refused = request(
+        &mut tess,
+        serde_json::json!({"type": "purge_topic", "id": 1, "topic": "orders"}),
+    )
+    .await;
+    assert_eq!(refused["code"], "forbidden", "{refused}");
+}
+
+/// Reads frames until a number of them have arrived, failing after two seconds each.
+///
+/// Args:
+///     ws: The connection.
+///     count: How many frames to read.
+///
+/// Returns:
+///     The frames as JSON, in order.
+async fn frames_json(ws: &mut TestSocket, count: usize) -> Vec<serde_json::Value> {
+    let mut frames = Vec::new();
+    while frames.len() < count {
+        frames.push(serde_json::from_str(&next_text(ws).await).expect("JSON"));
+    }
+    frames
+}
+
+/// Checks that nothing arrives on a connection for a while.
+///
+/// Args:
+///     ws: The connection.
+///
+/// Returns:
+///     The first text frame that did arrive, if any.
+async fn nothing_arrives(ws: &mut TestSocket) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => return Some(text.to_string()),
+            Ok(Some(Ok(_))) => continue,
+            _ => return None,
+        }
+    }
+}
+
+/// Checks wildcard subscriptions: matching topics the user may read are
+/// joined with the requested replay, a topic created later is joined from
+/// its first message, topics the user may not read are never joined, and
+/// unsubscribing the pattern ends the topics it brought in.
+#[tokio::test]
+async fn pattern_subscriptions_join_matching_topics() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    let publish = async |admin: &mut TestSocket, topic: &str, payload: &str| {
+        let published = request(
+            admin,
+            serde_json::json!({"type": "publish", "id": 1, "topic": topic, "payload": payload, "qos": 1}),
+        )
+        .await;
+        assert_eq!(published["type"], "published", "{published}");
+    };
+    publish(&mut admin, "orders/a", "a1").await;
+    publish(&mut admin, "orders/b", "b1").await;
+    publish(&mut admin, "other/x", "x1").await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 2, "username": "wren", "password": "wren-password-1", "role": {"kind": "readonly", "topics": [{"pattern": "orders/#", "access": "subscribe"}]}}),
+    )
+    .await;
+    let (mut wren, _) = user_connection(addr, "wren", "wren-password-1").await;
+
+    let bad = request(
+        &mut wren,
+        serde_json::json!({"type": "subscribe", "id": 1, "topic": "orders/#/x"}),
+    )
+    .await;
+    assert_eq!(bad["code"], "invalid_topic", "{bad}");
+
+    send_json(
+        &mut wren,
+        serde_json::json!({"type": "subscribe", "id": 2, "topic": "#", "from": {"last": 5}}),
+    )
+    .await;
+    let frames = frames_json(&mut wren, 5).await;
+    assert_eq!(
+        frames[0],
+        serde_json::json!({"type": "subscribed", "id": 2, "topic": "#", "replay_from": 0, "replay_to": 0})
+    );
+    let summary: Vec<(String, String)> = frames[1..]
+        .iter()
+        .map(|f| {
+            (
+                f["type"].as_str().unwrap_or_default().to_string(),
+                f["topic"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("subscribed".to_string(), "orders/a".to_string()),
+            ("message".to_string(), "orders/a".to_string()),
+            ("subscribed".to_string(), "orders/b".to_string()),
+            ("message".to_string(), "orders/b".to_string()),
+        ]
+    );
+    assert!(frames[1].get("id").is_none(), "{}", frames[1]);
+
+    publish(&mut admin, "orders/c", "c1").await;
+    let joined = frames_json(&mut wren, 2).await;
+    assert_eq!(
+        joined[0],
+        serde_json::json!({"type": "subscribed", "topic": "orders/c", "replay_from": 1, "replay_to": 1})
+    );
+    assert_eq!(
+        (
+            joined[1]["topic"].clone(),
+            joined[1]["seq"].clone(),
+            joined[1]["payload"].clone()
+        ),
+        (
+            serde_json::json!("orders/c"),
+            serde_json::json!(1),
+            serde_json::json!("c1")
+        )
+    );
+    publish(&mut admin, "secret/z", "z1").await;
+    publish(&mut admin, "other/x", "x2").await;
+    assert_eq!(nothing_arrives(&mut wren).await, None);
+
+    let left = request(
+        &mut wren,
+        serde_json::json!({"type": "unsubscribe", "id": 3, "topic": "#"}),
+    )
+    .await;
+    assert_eq!(
+        left,
+        serde_json::json!({"type": "unsubscribed", "id": 3, "topic": "#"})
+    );
+    publish(&mut admin, "orders/a", "a2").await;
+    publish(&mut admin, "orders/d", "d1").await;
+    assert_eq!(nothing_arrives(&mut wren).await, None);
 }

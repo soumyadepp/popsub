@@ -34,6 +34,7 @@ ERROR_CODES = frozenset(
         "forbidden",
         "user_not_found",
         "user_exists",
+        "topic_not_found",
     }
 )
 """Every error code protocol version 1 defines. Newer servers may add more."""
@@ -376,3 +377,62 @@ class UserInfo:
             )
         except (KeyError, TypeError) as error:
             raise ValueError(f"not a user: {value!r}") from error
+
+
+@dataclass(frozen=True)
+class TopicInfo:
+    """A topic's log, as the topic admin requests return it.
+
+    Attributes:
+        name: The topic.
+        first_seq: The oldest seq still stored.
+        last_seq: The newest seq ever stored; the next publish gets one more.
+        messages: How many messages are stored.
+        subscribers: How many subscriptions the topic has now.
+    """
+
+    name: str
+    first_seq: int
+    last_seq: int
+    messages: int
+    subscribers: int
+
+    def to_json(self) -> dict[str, Any]:
+        """Encodes the topic as on the wire.
+
+        Returns:
+            The `topic` object of a `topic_info` frame.
+        """
+        return {
+            "name": self.name,
+            "first_seq": self.first_seq,
+            "last_seq": self.last_seq,
+            "messages": self.messages,
+            "subscribers": self.subscribers,
+        }
+
+    @classmethod
+    def from_json(cls, value: Any) -> TopicInfo:
+        """Decodes a topic.
+
+        Args:
+            value: The `topic` object of a `topic_info` frame.
+
+        Returns:
+            The topic.
+
+        Raises:
+            ValueError: When the value isn't a valid topic object.
+        """
+        if not isinstance(value, dict):
+            raise ValueError(f"not a topic: {value!r}")
+        try:
+            return cls(
+                name=str(value["name"]),
+                first_seq=int(value["first_seq"]),
+                last_seq=int(value["last_seq"]),
+                messages=int(value["messages"]),
+                subscribers=int(value["subscribers"]),
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"not a topic: {value!r}") from error

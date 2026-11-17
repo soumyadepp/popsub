@@ -43,11 +43,26 @@ A client library hides the protocol's bookkeeping, so an application only sees c
 - A full application buffer pauses reading the socket, so the server's backpressure paces the connection. Never buffer without bound.
 - An `unsubscribed` frame with no `id` means the server ended the subscription (access revoked): end that subscription for the application and report it. Because of this, every `unsubscribe` the client sends carries an `id`.
 
+**Wildcard subscriptions**
+
+- `subscribe` accepts a pattern (`orders/#`, `sensors/+/temp`). The application gets one subscription for it, which yields the messages of every matching topic, each under its own topic name and `seq`.
+- The server announces each topic it joins for the pattern with a `subscribed` frame that has no `id`. The client then tracks that topic like any other (its own next expected `seq`, its own acknowledgements), owned by the pattern. A `subscribed` or `message` for a topic the client isn't tracking is matched against its patterns (the oldest matching one owns it); if none matches, a message is acknowledged and dropped as before.
+- After reconnecting: resubscribe every tracked topic that wasn't resumed from `{"seq": next_expected}` first, as usual, and then send each pattern again with `from: {"seq": 1}`. The server skips topics the connection holds, so this joins only topics created during the disconnect, from their first message.
+- Unsubscribing a pattern (or dropping its subscription) sends `unsubscribe` for the pattern and for each topic it owned, and stops tracking them.
+- When the server ends one owned topic (`unsubscribed` with no `id`), only that topic stops; the pattern's subscription carries on.
+
+**Shared subscriptions**
+
+- Subscribing with a `group` joins a shared subscription: the client receives only some of the topic's messages (other members get the rest), not in strict `seq` order.
+- So a shared subscription doesn't use a next expected `seq`. The client remembers the `seq`s it has handed to the application (a bounded set is enough) and treats a repeat as a duplicate, with the usual re-acknowledge rule. `subscribed.replay_from` and `truncated` don't move anything.
+- After reconnecting, rejoin with the same `group` and `from: "resume"`; the group's position is on the server. A shared subscription is never in `authenticated.resumed`.
+- Acknowledgements, manual or automatic, work as for any subscription.
+
 **Requests**
 
 - Every request that expects a reply carries an `id`; replies and errors are matched by it. Errors surface with their `code` (and `retry_after` for limits).
 - `publish_confirmed` generates a `message_id` (a UUID) and resolves with `seq` and `message_id` once `published` arrives.
-- Admin requests (`create_user`, `get_user`, `list_users`, `set_role`, `grant`, `revoke`, `set_password`, `set_enabled`, `delete_user`) are never queued while disconnected and never resent: a disconnect fails them, because the server may or may not have carried them out.
+- Admin requests (`create_user`, `get_user`, `list_users`, `set_role`, `grant`, `revoke`, `set_password`, `set_enabled`, `delete_user`, `list_topics`, `get_topic`, `purge_topic`) are never queued while disconnected and never resent: a disconnect fails them, because the server may or may not have carried them out.
 - Requests time out after a configurable limit.
 
 **Reporting**

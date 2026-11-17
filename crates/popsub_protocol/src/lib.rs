@@ -23,6 +23,7 @@ mod close;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod server;
+pub mod topics;
 
 #[cfg(test)]
 mod tests;
@@ -30,8 +31,8 @@ mod tests;
 pub use client::{Access, ClientFrame, ClientMessage, RoleKind, RoleSpec, StartFrom, TopicGrant};
 pub use close::CloseCode;
 pub use server::{
-    Delivery, ErrorCode, Limits, ServerFrame, ServerMessage, Stalled, Subscribed, Truncated,
-    UserInfo,
+    Delivery, ErrorCode, Limits, ServerFrame, ServerMessage, Stalled, Subscribed, TopicInfo,
+    Truncated, UserInfo,
 };
 
 /// The protocol version this crate describes. A client names the version it

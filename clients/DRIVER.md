@@ -50,7 +50,7 @@ From here on the driver forwards the client's events (below) until it exits.
 {"id": 2, "op": "subscribe", "topic": "orders", "from": "new"}
 ```
 
-`from` is the protocol's `StartFrom`: `"resume"`, `"new"`, `{"last": 10}`, `{"since_ms": 1794800000000}` or `{"seq": 42}`. Responds `{"ok": true}` once `subscribed` arrives. From then on every message the application receives on the topic is reported as a `message` event, and the end of the subscription as `subscription_ended`.
+An optional `"group": "workers"` joins a shared subscription through the library's call for that. `topic` may be a pattern (`orders/#`); the `message` events then carry each message's own topic, and `subscription_ended` and `unsubscribe` use the pattern. `from` is the protocol's `StartFrom`: `"resume"`, `"new"`, `{"last": 10}`, `{"since_ms": 1794800000000}` or `{"seq": 42}`. Responds `{"ok": true}` once `subscribed` arrives. From then on every message the application receives on the topic is reported as a `message` event, and the end of the subscription as `subscription_ended`.
 
 ### `unsubscribe`
 
@@ -74,7 +74,7 @@ From here on the driver forwards the client's events (below) until it exits.
 {"id": 8, "op": "admin", "method": "grant", "params": {"username": "rita", "pattern": "news/#", "access": "subscribe"}}
 ```
 
-Calls the library's admin method. `method` and the names in `params` are the protocol's own (`create_user` takes `username`, `password` and `role`; `role` is `{"kind": "user", "topics": [...]}` as on the wire). Responds `{"ok": true, "result": ...}` with the user object for most methods, a list of them for `list_users`, and `null` for `delete_user`.
+Calls the library's admin method. `method` and the names in `params` are the protocol's own (`create_user` takes `username`, `password` and `role`; `role` is `{"kind": "user", "topics": [...]}` as on the wire). Responds `{"ok": true, "result": ...}` with the user object for most methods, a list of them for `list_users`, and `null` for `delete_user`. The topic methods are `list_topics` (no params; a list of topic objects), and `get_topic` and `purge_topic` (`topic`; one topic object, `{"name", "first_seq", "last_seq", "messages", "subscribers"}`).
 
 ### `close` and `exit`
 

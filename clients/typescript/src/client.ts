@@ -137,19 +137,64 @@ export class Client {
   }
 
   /**
-   * Subscribes to a topic. Subscribing again to the same topic replaces
-   * the earlier subscription, which ends.
+   * Subscribes to a topic, or to every topic matching a wildcard pattern.
+   * Subscribing again to the same topic or pattern replaces the earlier
+   * subscription, which ends.
    *
-   * @param topic - The topic.
-   * @param from - Where replay starts; `"resume"` by default.
-   * @returns The subscription, which yields messages in `seq` order.
+   * In a pattern a whole level may be `+` (any one level) and the last
+   * level may be `#` (the rest), as in `sensors/+/temp` or `orders/#`. The
+   * one subscription then yields the messages of every matching topic the
+   * user may read, including topics created later, each under its own
+   * `topic` and `seq`. Order is kept within each topic, not across topics.
+   * When the server ends one of those topics (an `unsubscribed` event),
+   * only that topic stops.
+   *
+   * @param topic - The topic or pattern.
+   * @param from - Where replay starts; `"resume"` by default. For a
+   *   pattern it applies to each topic that exists when subscribing.
+   * @returns The subscription, which yields each topic's messages in `seq` order.
    * @throws PopSubError of kind `server` when the server refused it (for
    *   example `not_authorized` or `invalid_topic`), `timeout` when it
    *   didn't complete in time, `closed` when the client has stopped, or
    *   `config` for an invalid `from`.
    */
-  async subscribe(topic: string, from: StartFrom = "resume"): Promise<Subscription> {
-    const { subscription, done } = this.#engine.subscribe(topic, startFromToWire(from));
+  subscribe(topic: string, from: StartFrom = "resume"): Promise<Subscription> {
+    return this.#subscribe(topic, from, null);
+  }
+
+  /**
+   * Joins a shared subscription: each message on the topic goes to one
+   * member of the group, so several clients split the work. This client
+   * gets only its share, not in strict `seq` order, and a message can
+   * reach a second member after the first disconnects without
+   * acknowledging it. Duplicates are dropped by remembering the last 4096
+   * `seq`s delivered. After a reconnect the client rejoins the group with
+   * `resume`; the group's position is kept by the server.
+   *
+   * @param topic - The topic; a pattern is refused with `bad_request`.
+   * @param group - The group: 1 to 64 letters, digits, `_`, `.` or `-`.
+   * @param from - Where the group starts the first time it is used on the
+   *   topic; `"resume"` (which then means `"new"`) by default. Ignored
+   *   when the group already has a position.
+   * @returns The subscription.
+   * @throws PopSubError of kind `server` when the server refused it,
+   *   `timeout`, `closed`, or `config` for an invalid `from`.
+   */
+  subscribeShared(topic: string, group: string, from: StartFrom = "resume"): Promise<Subscription> {
+    return this.#subscribe(topic, from, group);
+  }
+
+  /**
+   * Subscribes and waits for the server to confirm it, closing the
+   * subscription if it is refused or takes too long.
+   *
+   * @param topic - The topic or pattern.
+   * @param from - Where replay starts.
+   * @param group - The shared subscription to join, or `null`.
+   * @returns The subscription.
+   */
+  async #subscribe(topic: string, from: StartFrom, group: string | null): Promise<Subscription> {
+    const { subscription, done } = this.#engine.subscribe(topic, startFromToWire(from), group);
     try {
       await withTimeout(done, this.#config.requestTimeoutMs);
     } catch (error) {
@@ -160,11 +205,12 @@ export class Client {
   }
 
   /**
-   * Unsubscribes from a topic. Its subscription ends, and a durable session
-   * forgets the stored subscription too. While disconnected the unsubscribe
+   * Unsubscribes from a topic, or from a pattern and every topic joined
+   * through it. Its subscription ends, and a durable session forgets the
+   * stored subscription too. While disconnected the unsubscribe
    * is queued and the call succeeds at once.
    *
-   * @param topic - The topic.
+   * @param topic - The topic or pattern, as it was subscribed.
    * @throws PopSubError of kind `server` when the session store couldn't
    *   be updated, `timeout`, or `closed`.
    */

@@ -371,7 +371,8 @@ fn retries_go_only_to_the_subscriber_that_has_not_acked() {
         outcome,
         RetryOutcome {
             resent: 1,
-            stalled: 0
+            stalled: 0,
+            dead_lettered: 0
         }
     );
     assert!(frames(&mut rx_a).is_empty());
@@ -401,7 +402,8 @@ fn running_out_of_retries_stalls_the_subscription() {
         broker.retry_overdue(last),
         RetryOutcome {
             resent: 0,
-            stalled: 1
+            stalled: 1,
+            dead_lettered: 0,
         }
     );
     let stalled = frames(&mut rx);
@@ -1255,4 +1257,190 @@ async fn stats_count_the_brokers_state() {
     );
     assert!(broker.ack(&client_id, "orders", 1).await);
     assert_eq!(broker.stats().in_flight, 0);
+}
+
+/// Checks that a topic gets the retention of the first rule it matches, on
+/// publish and in `trim_all`, and that other topics keep the default.
+#[tokio::test]
+async fn topics_get_the_retention_of_the_first_matching_rule() {
+    let keep = |n: u64| Retention {
+        max_messages: Some(n),
+        max_age_ms: None,
+        max_bytes: None,
+    };
+    let broker = shared(keep(2)).with_topic_retention(vec![
+        ("audit/special".to_string(), keep(1)),
+        ("audit/#".to_string(), keep(4)),
+    ]);
+    for topic in ["chat", "audit/logins", "audit/special"] {
+        for n in 0..6 {
+            broker
+                .publish(topic, new_record(&format!("{topic}-{n}"), 0))
+                .await
+                .expect("publish");
+        }
+    }
+    let first_seq = |topic: &'static str| {
+        let broker = broker.clone();
+        async move {
+            let (id, mut rx) = broker.with(connect);
+            broker
+                .subscribe(topic, &id, StartFrom::Seq(1), None)
+                .await
+                .expect("subscribe");
+            seqs(&frames(&mut rx))
+        }
+    };
+    assert_eq!(first_seq("chat").await, vec![5, 6]);
+    assert_eq!(first_seq("audit/logins").await, vec![3, 4, 5, 6]);
+    assert_eq!(first_seq("audit/special").await, vec![6]);
+    assert_eq!(broker.retention_for("audit/x/y"), keep(4));
+    assert_eq!(broker.retention_for("other"), keep(2));
+    assert_eq!(
+        broker.trim_all(chrono::Utc::now().timestamp_millis()).await,
+        0
+    );
+}
+
+/// Checks that with a dead-letter topic set, a record that runs out of
+/// retries is copied there with its origin, the subscription carries on
+/// with later records instead of stalling, and the dead-letter topic's own
+/// subscribers still stall.
+#[tokio::test]
+async fn records_out_of_retries_go_to_the_dead_letter_topic() {
+    let mut settings = Settings::default().broker;
+    settings.dead_letter_topic = "dead".to_string();
+    settings.max_inflight = 1;
+    let step = settings.ack_timeout_ms as i64 + 1;
+    let retries = i64::from(settings.max_retries);
+    let broker = shared_on(
+        settings,
+        Arc::new(MemoryStorage::new()),
+        Retention::default(),
+    );
+    let (worker, mut worker_rx) = broker.with(connect);
+    let (watcher, mut watcher_rx) = broker.with(connect);
+    broker
+        .subscribe("jobs", &worker, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    broker
+        .subscribe("dead", &watcher, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    broker
+        .publish("jobs", new_record("one", 1))
+        .await
+        .expect("publish");
+    broker
+        .publish("jobs", new_record("two", 1))
+        .await
+        .expect("publish");
+    assert_eq!(seqs(&frames(&mut worker_rx)), vec![1]);
+
+    let now = chrono::Utc::now().timestamp_millis();
+    for attempt in 1..=retries {
+        assert_eq!(broker.retry_pass(now + step * attempt).await.resent, 1);
+    }
+    frames(&mut worker_rx);
+    let gave_up = broker.retry_pass(now + step * (retries + 1)).await;
+    assert_eq!((gave_up.dead_lettered, gave_up.stalled), (1, 0));
+
+    let letters = wait_for_messages(&mut watcher_rx, 1).await;
+    let delivered = letters
+        .iter()
+        .find(|frame| frame["type"] == "message")
+        .expect("a dead letter");
+    let letter: Value =
+        serde_json::from_str(delivered["payload"].as_str().expect("a payload")).expect("JSON");
+    assert_eq!(letter["topic"], "jobs");
+    assert_eq!(letter["seq"], 1);
+    assert_eq!(letter["message_id"], "one");
+    assert_eq!(letter["reason"], "max_retries");
+    let next = wait_for_messages(&mut worker_rx, 1).await;
+    assert_eq!(seqs(&next), vec![2]);
+    assert!(next.iter().all(|frame| frame["type"] != "stalled"));
+
+    let later = chrono::Utc::now().timestamp_millis();
+    for attempt in 1..=retries {
+        broker.retry_pass(later + step * attempt).await;
+    }
+    let stalled = broker.retry_pass(later + step * (retries + 1)).await;
+    assert!(stalled.stalled >= 1, "{stalled:?}");
+    assert!(
+        frames(&mut watcher_rx)
+            .iter()
+            .any(|frame| frame["type"] == "stalled")
+    );
+}
+
+/// Checks a shared subscription: each record goes to one member in turn,
+/// a member that leaves hands its unacknowledged records to the others, the
+/// group keeps its position while it has no members, a later member picks
+/// up there whatever `from` it asks for, and an ordinary subscriber on the
+/// same topic still gets everything.
+#[tokio::test]
+async fn a_shared_subscription_gives_each_record_to_one_member() {
+    let broker = shared(Retention::default());
+    let (a, mut a_rx) = broker.with(connect);
+    let (b, mut b_rx) = broker.with(connect);
+    let (watcher, mut watcher_rx) = broker.with(connect);
+    for member in [&a, &b] {
+        let joined = broker
+            .subscribe_shared("jobs", "workers", member, StartFrom::New, None)
+            .await
+            .expect("join");
+        assert!(joined.added);
+    }
+    broker
+        .subscribe("jobs", &watcher, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    for n in 1..=4 {
+        broker
+            .publish("jobs", new_record(&format!("job-{n}"), 1))
+            .await
+            .expect("publish");
+    }
+    let a_first = seqs(&frames(&mut a_rx));
+    let b_first = seqs(&frames(&mut b_rx));
+    assert_eq!(
+        (a_first.len(), b_first.len()),
+        (2, 2),
+        "{a_first:?} {b_first:?}"
+    );
+    let mut all = [a_first.clone(), b_first.clone()].concat();
+    all.sort();
+    assert_eq!(all, vec![1, 2, 3, 4]);
+    assert_eq!(seqs(&frames(&mut watcher_rx)), vec![1, 2, 3, 4]);
+    assert_eq!(broker.stats().in_flight, 8);
+
+    for seq in &a_first {
+        assert!(broker.ack(&a, "jobs", *seq).await);
+    }
+    assert!(!broker.ack(&a, "jobs", b_first[0]).await);
+    broker.with(|inner| inner.cleanup_client(&b));
+    let mut handed_over = seqs(&frames(&mut a_rx));
+    handed_over.sort();
+    assert_eq!(handed_over, b_first);
+    for seq in &b_first {
+        assert!(broker.ack(&a, "jobs", *seq).await);
+    }
+
+    broker.with(|inner| inner.cleanup_client(&a));
+    for n in 5..=6 {
+        broker
+            .publish("jobs", new_record(&format!("job-{n}"), 1))
+            .await
+            .expect("publish");
+    }
+    let (c, mut c_rx) = broker.with(connect);
+    let joined = broker
+        .subscribe_shared("jobs", "workers", &c, StartFrom::Seq(1), None)
+        .await
+        .expect("join");
+    assert_eq!(joined.replay_from, 5);
+    let received = wait_for_messages(&mut c_rx, 2).await;
+    assert_eq!(received[0]["group"], "workers");
+    assert_eq!(seqs(&received), vec![5, 6]);
 }

@@ -138,6 +138,39 @@ pub struct Topic {
     /// The highest `seq` delivered or known at subscribe time, used to tell
     /// whether a subscription has fallen behind and needs catching up.
     pub last_seq: u64,
+    /// Shared subscriptions on this topic, by their subscriber id (see
+    /// `group_subscriber_id`). Each also has an entry in `subscribers`
+    /// holding the group's one delivery state.
+    pub groups: HashMap<SubscriberId, Group>,
+}
+
+/// The prefix of a shared subscription's subscriber id and storage key.
+/// Client ids are UUIDs, so the two can't collide.
+pub const GROUP_PREFIX: &str = "$share/";
+
+/// The subscriber id, and the key its cursor is stored under, of a shared
+/// subscription.
+///
+/// Args:
+///     group: The group's name.
+///
+/// Returns:
+///     `$share/<group>`.
+pub fn group_subscriber_id(group: &str) -> SubscriberId {
+    format!("{GROUP_PREFIX}{group}")
+}
+
+/// The connections sharing one subscription. Each record goes to one of
+/// them, in turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Group {
+    /// The member connections, in the order they joined.
+    pub members: Vec<SubscriberId>,
+    /// Where the next round-robin pick starts.
+    pub next: usize,
+    /// Which member each unacknowledged QoS 1 record was last sent to. A
+    /// record in the group's window with no entry here is waiting for a member.
+    pub owners: HashMap<u64, SubscriberId>,
 }
 
 impl Topic {
@@ -153,6 +186,7 @@ impl Topic {
             name: name.to_string(),
             subscribers: HashMap::new(),
             last_seq: 0,
+            groups: HashMap::new(),
         }
     }
 

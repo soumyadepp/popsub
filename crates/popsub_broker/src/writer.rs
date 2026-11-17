@@ -24,6 +24,7 @@
 //! until it finishes. Other topics are unaffected.
 
 use crate::health::StorageHealth;
+use crate::topic::group_subscriber_id;
 use popsub_utils::metrics::{attr, metrics};
 use std::sync::Arc;
 
@@ -86,6 +87,8 @@ pub(crate) enum Command {
         from: StartFrom,
         /// The subscribe request's id, echoed in the `subscribed` frame.
         request_id: Option<RequestId>,
+        /// The shared subscription to join, instead of subscribing alone.
+        group: Option<String>,
         /// Where the outcome is sent.
         reply: oneshot::Sender<StorageResult<SubscribeOutcome>>,
     },
@@ -169,9 +172,17 @@ impl TopicWriter {
                     client_id,
                     from,
                     request_id,
+                    group,
                     reply,
                 } => {
-                    let _ = reply.send(self.subscribe(&client_id, from, request_id).await);
+                    let outcome = match group {
+                        Some(group) => {
+                            self.subscribe_group(&client_id, &group, from, request_id)
+                                .await
+                        }
+                        None => self.subscribe(&client_id, from, request_id).await,
+                    };
+                    let _ = reply.send(outcome);
                 }
                 Command::CatchUp { client_id } => {
                     if let Err(e) = self.catch_up(&client_id).await {
@@ -352,6 +363,7 @@ impl TopicWriter {
                     topic: topic.clone(),
                     replay_from: plan.start,
                     replay_to: bounds.last_seq,
+                    group: None,
                 }),
             )),
             plan.truncated.then(|| {
@@ -374,6 +386,105 @@ impl TopicWriter {
         Ok(outcome)
     }
 
+    /// Adds a client to a shared subscription, creating the group on this
+    /// topic when it is the first member, and tells the client.
+    ///
+    /// A group has one position per topic, stored under the group's own key
+    /// like a durable session's cursor. While the group is live, or when it
+    /// has a stored position from before a restart, a joining member picks
+    /// up there and `from` is ignored. `from` only decides where a group
+    /// starts the first time it is used on a topic (`Resume` means `New`).
+    /// The client gets `subscribed` naming the group, with the group's
+    /// position as `replay_from`, and the group is then caught up.
+    ///
+    /// Args:
+    ///     client_id: The joining client.
+    ///     group: The group's name.
+    ///     from: Where a new group starts.
+    ///     request_id: The subscribe request's id, echoed in `subscribed`.
+    ///
+    /// Returns:
+    ///     The group's position, how much was sent straight away, and
+    ///     whether the client was added.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the log or the subscription store
+    ///         can't be reached. The client is not added and may try again.
+    ///     StorageError::Corrupt: When a stored record fails its checks.
+    async fn subscribe_group(
+        &mut self,
+        client_id: &str,
+        group: &str,
+        from: StartFrom,
+        request_id: Option<RequestId>,
+    ) -> StorageResult<SubscribeOutcome> {
+        let bounds = self.storage.bounds(&self.topic).await?;
+        self.last_seq = Some(bounds.last_seq);
+        let group_id = group_subscriber_id(group);
+        let live = self
+            .broker
+            .with(|broker| broker.subscriber_next_seq(&self.topic, &group_id));
+        let (start, truncated) = match live {
+            Some(next) => (next, false),
+            None => {
+                let stored = self.storage.load(&group_id).await?;
+                let from = match stored.iter().find(|s| s.topic == self.topic) {
+                    Some(cursor) => StartFrom::Seq(cursor.acked_seq + 1),
+                    None if from == StartFrom::Resume => StartFrom::New,
+                    None => from,
+                };
+                let seq_at = match from {
+                    StartFrom::SinceMs(time_ms) => {
+                        self.storage.seq_at(&self.topic, time_ms).await?
+                    }
+                    _ => None,
+                };
+                let plan = replay::plan(from, bounds, seq_at);
+                self.storage
+                    .subscribe(&group_id, &self.topic, plan.start - 1)
+                    .await?;
+                (plan.start, plan.truncated)
+            }
+        };
+        let mut outcome = SubscribeOutcome {
+            replay_from: start,
+            replay_to: bounds.last_seq,
+            replayed: 0,
+            truncated,
+            added: false,
+        };
+        let topic = self.topic.clone();
+        let frames = [
+            Some(ServerFrame::reply(
+                request_id,
+                ServerMessage::Subscribed(Subscribed {
+                    topic: topic.clone(),
+                    replay_from: start,
+                    replay_to: bounds.last_seq,
+                    group: Some(group.to_string()),
+                }),
+            )),
+            truncated.then(|| {
+                ServerFrame::event(ServerMessage::Truncated(Truncated {
+                    topic: topic.clone(),
+                    first_available: bounds.first_seq,
+                }))
+            }),
+        ];
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        outcome.added = self.broker.with(|broker| {
+            frames
+                .iter()
+                .flatten()
+                .all(|frame| broker.send_frame(client_id, frame))
+                && broker.add_group_member(&topic, group, client_id, start, bounds.last_seq, now_ms)
+        });
+        if outcome.added {
+            outcome.replayed = self.catch_up(&group_id).await?;
+        }
+        Ok(outcome)
+    }
+
     /// Arranges a catch-up for a client once its outgoing queue drains below
     /// the soft limit.
     ///
@@ -384,7 +495,10 @@ impl TopicWriter {
     /// Args:
     ///     client_id: The client whose queue was too full.
     fn catch_up_when_ready(&self, client_id: String) {
-        let Some(outbox) = self.broker.with(|broker| broker.client_sender(&client_id)) else {
+        let Some(outbox) = self
+            .broker
+            .with(|broker| broker.subscriber_outbox(&self.topic, &client_id))
+        else {
             return;
         };
         let queue = self.queue.clone();
@@ -430,7 +544,8 @@ impl TopicWriter {
             let first_available = page.first().map_or(last_seq + 1, |r| r.seq);
             if first_available > next {
                 let update = self.broker.with(|broker| {
-                    broker.send_frame(
+                    broker.send_to_subscriber(
+                        &self.topic,
                         client_id,
                         &ServerFrame::event(ServerMessage::Truncated(Truncated {
                             topic: self.topic.clone(),

@@ -67,6 +67,7 @@ from popsub.protocol import (
     RoleSpec,
     StartFrom,
     TopicGrant,
+    TopicInfo,
     UserInfo,
 )
 
@@ -104,6 +105,7 @@ __all__ = [
     "Subscription",
     "TokenCredentials",
     "TopicGrant",
+    "TopicInfo",
     "Truncated",
     "Unsubscribed",
     "UserInfo",
