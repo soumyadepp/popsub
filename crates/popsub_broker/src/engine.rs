@@ -46,6 +46,31 @@ pub struct Broker {
     pub clients: HashMap<SubscriberId, Client>,
     /// ACK timeout, retry limit and window size.
     settings: BrokerSettings,
+    /// Records given up on since `take_dead_letters` was last called.
+    dead: DeadLetters,
+}
+
+/// A QoS 1 record one subscription never acknowledged, to be copied to the
+/// dead-letter topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// The record, as it was delivered.
+    pub record: Record,
+    /// The connection that didn't acknowledge it.
+    pub client_id: SubscriberId,
+    /// The user that connection was authenticated as.
+    pub username: Option<String>,
+}
+
+/// What `retry_overdue` gave up on, and the follow-up work it leaves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeadLetters {
+    /// The records to copy to the dead-letter topic.
+    pub letters: Vec<DeadLetter>,
+    /// Cursors that moved past them, to be stored.
+    pub cursors: Vec<CursorUpdate>,
+    /// Subscriptions (topic and client) whose windows now have room, to catch up.
+    pub catch_up: Vec<(String, SubscriberId)>,
 }
 
 /// What an `ack` did.
@@ -95,6 +120,8 @@ pub struct RetryOutcome {
     pub resent: usize,
     /// Subscriptions that ran out of retries and were paused.
     pub stalled: usize,
+    /// Records given up on for one subscription, waiting in `take_dead_letters`.
+    pub dead_lettered: usize,
 }
 
 /// A snapshot of the broker's size, for gauges.
@@ -151,6 +178,7 @@ impl Broker {
             topics: HashMap::new(),
             clients: HashMap::new(),
             settings,
+            dead: DeadLetters::default(),
         }
     }
 
@@ -191,6 +219,14 @@ impl Broker {
     ///     The most unacknowledged QoS 1 records per subscription, at least 1.
     pub fn max_inflight(&self) -> usize {
         self.settings.max_inflight.max(1)
+    }
+
+    /// The dead-letter topic, as configured.
+    ///
+    /// Returns:
+    ///     The topic, or an empty string when dead-lettering is off.
+    pub fn dead_letter_topic(&self) -> &str {
+        &self.settings.dead_letter_topic
     }
 
     /// The connection limit, as configured. The transport enforces it.
@@ -527,7 +563,10 @@ impl Broker {
     /// subscription. A record already resent `max_retries` times stalls its
     /// subscription instead: the client is sent a `stalled` frame and
     /// nothing more is sent to that subscription until it acknowledges
-    /// something or subscribes again. `SharedBroker::run_retry_loop` calls
+    /// something or subscribes again. With `dead_letter_topic` set (and on
+    /// any topic but that one), the record is instead dropped from the
+    /// subscription's window and queued for `take_dead_letters`, and the
+    /// subscription carries on. `SharedBroker::run_retry_loop` calls
     /// this on a timer; tests call it directly with a chosen time.
     ///
     /// Args:
@@ -538,11 +577,15 @@ impl Broker {
     pub fn retry_overdue(&mut self, now_ms: i64) -> RetryOutcome {
         let timeout = i64::try_from(self.settings.ack_timeout_ms).unwrap_or(i64::MAX);
         let max_retries = self.settings.max_retries;
+        let max_inflight = self.settings.max_inflight;
+        let dead_letter_topic = self.settings.dead_letter_topic.as_str();
         let mut outcome = RetryOutcome {
             resent: 0,
             stalled: 0,
+            dead_lettered: 0,
         };
         for topic in self.topics.values_mut() {
+            let give_up = !dead_letter_topic.is_empty() && topic.name != dead_letter_topic;
             for (client_id, state) in topic.subscribers.iter_mut() {
                 if state.stalled.is_some() {
                     continue;
@@ -550,11 +593,16 @@ impl Broker {
                 let Some(client) = self.clients.get(client_id) else {
                     continue;
                 };
+                let mut expired = Vec::new();
                 for (&seq, pending) in state.inflight.iter_mut() {
                     if now_ms.saturating_sub(pending.sent_at) <= timeout {
                         continue;
                     }
                     if pending.retries >= max_retries {
+                        if give_up {
+                            expired.push(seq);
+                            continue;
+                        }
                         state.stalled = Some(seq);
                         outcome.stalled += 1;
                         warn!(client = %client_id, topic = %topic.name, seq, "subscription stalled after max retries");
@@ -574,11 +622,43 @@ impl Broker {
                     }
                     outcome.resent += 1;
                 }
+                if expired.is_empty() {
+                    continue;
+                }
+                for seq in expired {
+                    if let Some(pending) = state.inflight.remove(&seq) {
+                        warn!(client = %client_id, topic = %topic.name, seq, "giving up on a record after max retries");
+                        outcome.dead_lettered += 1;
+                        self.dead.letters.push(DeadLetter {
+                            record: pending.record,
+                            client_id: client_id.clone(),
+                            username: client.username.clone(),
+                        });
+                    }
+                }
+                self.dead.cursors.extend(state.take_update(&topic.name));
+                if state.has_room(max_inflight) && state.next_seq <= topic.last_seq {
+                    self.dead
+                        .catch_up
+                        .push((topic.name.clone(), client_id.clone()));
+                }
             }
         }
         metrics().redelivered.add(outcome.resent as u64, &[]);
         metrics().stalled.add(outcome.stalled as u64, &[]);
+        metrics()
+            .dead_lettered
+            .add(outcome.dead_lettered as u64, &[]);
         outcome
+    }
+
+    /// Hands over the records given up on since the last call, with the
+    /// cursors to store and the subscriptions to catch up.
+    ///
+    /// Returns:
+    ///     The dead letters, leaving none behind.
+    pub fn take_dead_letters(&mut self) -> DeadLetters {
+        std::mem::take(&mut self.dead)
     }
 }
 

@@ -371,7 +371,8 @@ fn retries_go_only_to_the_subscriber_that_has_not_acked() {
         outcome,
         RetryOutcome {
             resent: 1,
-            stalled: 0
+            stalled: 0,
+            dead_lettered: 0
         }
     );
     assert!(frames(&mut rx_a).is_empty());
@@ -401,7 +402,8 @@ fn running_out_of_retries_stalls_the_subscription() {
         broker.retry_overdue(last),
         RetryOutcome {
             resent: 0,
-            stalled: 1
+            stalled: 1,
+            dead_lettered: 0,
         }
     );
     let stalled = frames(&mut rx);
@@ -1297,5 +1299,77 @@ async fn topics_get_the_retention_of_the_first_matching_rule() {
     assert_eq!(
         broker.trim_all(chrono::Utc::now().timestamp_millis()).await,
         0
+    );
+}
+
+/// Checks that with a dead-letter topic set, a record that runs out of
+/// retries is copied there with its origin, the subscription carries on
+/// with later records instead of stalling, and the dead-letter topic's own
+/// subscribers still stall.
+#[tokio::test]
+async fn records_out_of_retries_go_to_the_dead_letter_topic() {
+    let mut settings = Settings::default().broker;
+    settings.dead_letter_topic = "dead".to_string();
+    settings.max_inflight = 1;
+    let step = settings.ack_timeout_ms as i64 + 1;
+    let retries = i64::from(settings.max_retries);
+    let broker = shared_on(
+        settings,
+        Arc::new(MemoryStorage::new()),
+        Retention::default(),
+    );
+    let (worker, mut worker_rx) = broker.with(connect);
+    let (watcher, mut watcher_rx) = broker.with(connect);
+    broker
+        .subscribe("jobs", &worker, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    broker
+        .subscribe("dead", &watcher, StartFrom::New, None)
+        .await
+        .expect("subscribe");
+    broker
+        .publish("jobs", new_record("one", 1))
+        .await
+        .expect("publish");
+    broker
+        .publish("jobs", new_record("two", 1))
+        .await
+        .expect("publish");
+    assert_eq!(seqs(&frames(&mut worker_rx)), vec![1]);
+
+    let now = chrono::Utc::now().timestamp_millis();
+    for attempt in 1..=retries {
+        assert_eq!(broker.retry_pass(now + step * attempt).await.resent, 1);
+    }
+    frames(&mut worker_rx);
+    let gave_up = broker.retry_pass(now + step * (retries + 1)).await;
+    assert_eq!((gave_up.dead_lettered, gave_up.stalled), (1, 0));
+
+    let letters = wait_for_messages(&mut watcher_rx, 1).await;
+    let delivered = letters
+        .iter()
+        .find(|frame| frame["type"] == "message")
+        .expect("a dead letter");
+    let letter: Value =
+        serde_json::from_str(delivered["payload"].as_str().expect("a payload")).expect("JSON");
+    assert_eq!(letter["topic"], "jobs");
+    assert_eq!(letter["seq"], 1);
+    assert_eq!(letter["message_id"], "one");
+    assert_eq!(letter["reason"], "max_retries");
+    let next = wait_for_messages(&mut worker_rx, 1).await;
+    assert_eq!(seqs(&next), vec![2]);
+    assert!(next.iter().all(|frame| frame["type"] != "stalled"));
+
+    let later = chrono::Utc::now().timestamp_millis();
+    for attempt in 1..=retries {
+        broker.retry_pass(later + step * attempt).await;
+    }
+    let stalled = broker.retry_pass(later + step * (retries + 1)).await;
+    assert!(stalled.stalled >= 1, "{stalled:?}");
+    assert!(
+        frames(&mut watcher_rx)
+            .iter()
+            .any(|frame| frame["type"] == "stalled")
     );
 }

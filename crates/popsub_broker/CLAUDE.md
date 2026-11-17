@@ -28,6 +28,7 @@ Topic writers, the broker engine, replay, per-subscriber acknowledgement and dur
 
 - `Resume` (the default `from`) becomes one past the stored cursor for a durable session with a stored subscription to the topic, and `New` otherwise.
 - QoS 0 records count as done once sent and move the cursor. While a window is full, QoS 0 waits too.
+- With `broker.dead_letter_topic` set, `retry_overdue` drops a record that is out of retries from the subscription's window and queues it in `take_dead_letters` instead of stalling; `SharedBroker::retry_pass` then publishes the envelope to that topic, stores moved cursors and catches the subscription up. Subscriptions on the dead-letter topic itself still stall.
 - A stalled subscription gets nothing, not even retries, until it ACKs something (which resets the remaining records' retries) or resubscribes.
 - Resubscribing replaces the subscription and drops its window; for a session, `resume` replays from the stored cursor.
 - Attaching a session held by another connection sends that connection a close frame and removes it.

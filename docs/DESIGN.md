@@ -106,6 +106,7 @@ Metrics, all under the `popsub` instrumentation scope. Counters are cumulative; 
 | `popsub.messages.in_flight` | gauge | QoS 1 records sent and not yet acknowledged |
 | `popsub.subscriptions` | gauge | Live subscriptions |
 | `popsub.subscriptions.stalled` | counter | Subscriptions paused after running out of retries |
+| `popsub.messages.dead_lettered` | counter | QoS 1 records given up on for one subscription and copied to the dead-letter topic |
 | `popsub.topics` | gauge | Topics with a writer or subscribers |
 | `popsub.publish.duration` | histogram, seconds | Append, fan-out and trim in the topic writer |
 | `popsub.storage.errors` | counter | Failed storage operations [`operation`: `append`, `trim`, `cursor`, `read`] |
@@ -249,6 +250,7 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 |---|---|
 | QoS 0 | At most once, to subscribers connected at publish time. Retained history is replayed only when the subscriber asks for it with `from`. |
 | QoS 1, connected subscribers | At least once per subscriber, independently. Each subscriber's ACK clears only its own copy, and retries go only to subscribers that haven't acknowledged. After `max_retries` resends the subscription stalls and is told, rather than the record being dropped silently. |
+| QoS 1, with `broker.dead_letter_topic` set | A record a subscription never acknowledges is, after `max_retries` resends, copied to the dead-letter topic and dropped for that subscription, which then carries on. So for that subscription the record is delivered at least once but never acknowledged, and what remains of it is the copy on the dead-letter topic. If that copy can't be stored it is logged and lost as a dead letter; the original stays in its topic's log until trimmed. |
 | QoS 1, ephemeral subscriber disconnects | Not at least once. Its subscriptions and windows are discarded. |
 | QoS 1, durable session disconnects and reconnects | At least once, provided it reconnects within `session_expiry_secs` and the records are still retained. Everything after its stored cursor is replayed. Records trimmed meanwhile are reported with `truncated`. |
 | QoS 1, broker restarts | With the `file` backend (the default), durable sessions resume from their stored cursors. Records are kept as firmly as `storage.durability` says: `buffered` survives a crash of the server, `synced` also a power loss. A cursor move is lost only to a power loss, which means resending records already acknowledged. With the `memory` backend nothing survives a restart. |
@@ -307,6 +309,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `broker.max_connections` | `1000` | Transport. The most connections at once, counted from `accept`; more are closed with `try_again_later` (1013). `0` means no limit |
 | `broker.ack_timeout_ms` | `5000` | Retry loop |
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
+| `broker.dead_letter_topic` | empty | Retry loop. Where a QoS 1 record is copied when a subscription runs out of retries for it; empty stalls the subscription instead |
 | `broker.max_inflight` | `100` | Window of unacknowledged QoS 1 records per subscription |
 | `storage.backend` | `file` | The binary. `file` or `memory` |
 | `storage.path` | `pubsub_data` | The `file` backend's directory |
@@ -386,6 +389,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | The server is stopped with Ctrl+C or `SIGTERM` | `/readyz` turns to 503, every client is sent `going_away`, and the process exits half a second later. |
 | Subscriber reads slowly | Once its queue passes the soft limit, deliveries wait in the topic log and are sent as it catches up, in order. Server memory for it stays near the soft limit. If it falls behind retention, it gets `truncated`. |
 | Publisher sends to a topic nobody subscribes to | Stored in the topic log until retention trims it. |
+| A subscriber never acknowledges one record, with `broker.dead_letter_topic` set | After `max_retries` resends the record is copied to the dead-letter topic as a JSON envelope (the original `topic`, `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, the `subscriber` username and `reason: "max_retries"`), dropped from that subscription's window, and the subscription carries on; a durable session's cursor moves past it. Other subscribers are unaffected. The dead-letter topic is an ordinary topic: subscribe to it to handle failures, and give it its own retention. Its own subscribers stall as usual, so a dead letter is never dead-lettered again. |
 | A subscriber stops acknowledging | Its window fills and delivery to it pauses; after `max_retries` it gets `stalled`. Other subscribers are unaffected, and nothing is queued in memory for it. |
 | A client acknowledges a record it wasn't sent | Ignored. |
 | A publisher retries a message after a dropped connection | Same user and `message_id`: stored and delivered once, while the original is retained. |

@@ -17,7 +17,7 @@
 //! which combines the username with the client's session id, so one user
 //! can never attach to another user's session.
 
-use crate::engine::BrokerStats;
+use crate::engine::{BrokerStats, RetryOutcome};
 use crate::health::StorageHealth;
 use popsub_protocol::TopicInfo;
 use std::collections::HashMap;
@@ -726,15 +726,77 @@ impl SharedBroker {
         let mut ticker = tokio::time::interval(RETRY_INTERVAL);
         loop {
             ticker.tick().await;
-            let outcome = self.with(|broker| broker.retry_overdue(now_ms()));
-            if outcome.resent > 0 || outcome.stalled > 0 {
+            let outcome = self.retry_pass(now_ms()).await;
+            if outcome.resent > 0 || outcome.stalled > 0 || outcome.dead_lettered > 0 {
                 info!(
                     resent = outcome.resent,
                     stalled = outcome.stalled,
+                    dead_lettered = outcome.dead_lettered,
                     "retried QoS 1 messages"
                 );
             }
         }
+    }
+
+    /// Runs one retry pass: resends overdue records, then copies the ones
+    /// given up on to the dead-letter topic, stores the cursors that moved
+    /// past them and catches the freed subscriptions up.
+    ///
+    /// A dead letter is a new record on `broker.dead_letter_topic`, published
+    /// by `popsub`, whose payload is a JSON object: the original `topic`,
+    /// `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, the
+    /// `subscriber` (username) that didn't acknowledge it, and `reason`
+    /// (`max_retries`). If that publish fails it is logged; the original
+    /// record is still in its own topic's log.
+    ///
+    /// Args:
+    ///     now_ms: The current time in milliseconds since the Unix epoch.
+    ///
+    /// Returns:
+    ///     What the pass did.
+    pub async fn retry_pass(&self, now_ms: i64) -> RetryOutcome {
+        let (outcome, dead, dead_letter_topic) = self.with(|broker| {
+            (
+                broker.retry_overdue(now_ms),
+                broker.take_dead_letters(),
+                broker.dead_letter_topic().to_string(),
+            )
+        });
+        for update in dead.cursors {
+            if let Err(e) = self
+                .storage
+                .ack(&update.session, &update.topic, update.acked_seq)
+                .await
+            {
+                warn!(topic = %update.topic, %e, "storing a cursor failed");
+            }
+        }
+        for letter in dead.letters {
+            let envelope = serde_json::json!({
+                "topic": letter.record.topic,
+                "seq": letter.record.seq,
+                "message_id": letter.record.message_id,
+                "publisher": letter.record.publisher,
+                "payload": letter.record.payload,
+                "published_at_ms": letter.record.published_at_ms,
+                "subscriber": letter.username,
+                "reason": "max_retries",
+            });
+            let record = NewRecord {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                publisher: "popsub".to_string(),
+                payload: envelope.to_string(),
+                qos: 1,
+                published_at_ms: now_ms,
+            };
+            if let Err(e) = self.publish(&dead_letter_topic, record).await {
+                error!(topic = %letter.record.topic, seq = letter.record.seq, %e, "copying a record to the dead-letter topic failed");
+            }
+        }
+        for (topic, client_id) in dead.catch_up {
+            self.send(&topic, Command::CatchUp { client_id });
+        }
+        outcome
     }
 
     /// Trims every topic log to the retention limits every `RETENTION_INTERVAL`, forever.

@@ -134,6 +134,10 @@ pub struct BrokerSettings {
     /// When full, delivery to that subscription waits for acks. Values below
     /// 1 are treated as 1.
     pub max_inflight: usize,
+    /// The topic a QoS 1 record is copied to when a subscription runs out
+    /// of retries for it, after which that subscription carries on. Empty
+    /// (the default) stalls the subscription instead.
+    pub dead_letter_topic: String,
 }
 
 impl Default for BrokerSettings {
@@ -148,6 +152,7 @@ impl Default for BrokerSettings {
             ack_timeout_ms: 5000,
             max_retries: 5,
             max_inflight: 100,
+            dead_letter_topic: String::new(),
         }
     }
 }
