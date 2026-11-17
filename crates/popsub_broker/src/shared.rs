@@ -136,6 +136,9 @@ pub struct SharedBroker {
     writers: Arc<Mutex<Writers>>,
     /// The outcomes of recent appends, for readiness.
     health: Arc<StorageHealth>,
+    /// Retention for particular topics: the first pattern a topic matches
+    /// applies; topics matching none use `log.retention`.
+    topic_retention: Arc<Vec<(String, Retention)>>,
 }
 
 impl fmt::Debug for SharedBroker {
@@ -177,7 +180,35 @@ impl SharedBroker {
             log,
             writers: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(StorageHealth::default()),
+            topic_retention: Arc::new(Vec::new()),
         })
+    }
+
+    /// Sets retention for particular topics. Call it before the broker is
+    /// used: a topic's writer keeps the policy it started with.
+    ///
+    /// Args:
+    ///     rules: Topic patterns with their policies; the first match applies.
+    ///
+    /// Returns:
+    ///     The broker with the rules.
+    pub fn with_topic_retention(mut self, rules: Vec<(String, Retention)>) -> Self {
+        self.topic_retention = Arc::new(rules);
+        self
+    }
+
+    /// The retention policy for a topic.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     The policy of the first matching rule, or the default policy.
+    pub fn retention_for(&self, topic: &str) -> Retention {
+        self.topic_retention
+            .iter()
+            .find(|(pattern, _)| popsub_utils::topics::matches_pattern(pattern, topic))
+            .map_or(self.log.retention, |(_, retention)| *retention)
     }
 
     /// The last `seq` stored on a topic.
@@ -592,7 +623,10 @@ impl SharedBroker {
                     topic,
                     self.broker.clone(),
                     self.storage.clone(),
-                    self.log,
+                    LogSettings {
+                        retention: self.retention_for(topic),
+                        ..self.log
+                    },
                     self.health.clone(),
                 )
             })
@@ -700,7 +734,8 @@ impl SharedBroker {
         };
         let mut removed = 0;
         for topic in topics {
-            match self.storage.trim(&topic, &self.log.retention, now_ms).await {
+            let retention = self.retention_for(&topic);
+            match self.storage.trim(&topic, &retention, now_ms).await {
                 Ok(n) => removed += n,
                 Err(e) => warn!(topic, %e, "trimming failed"),
             }

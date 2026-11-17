@@ -189,6 +189,7 @@ async fn start_server() -> ExitCode {
 ///     String: When `users.json` in the storage directory exists but can't be
 ///         read or parsed.
 ///     String: When `storage.durability` is stronger than the backend provides.
+///     String: When a `storage.topic_retention` pattern is malformed.
 ///     String: When `host:port` or `server.health_address` can't be bound,
 ///         with the underlying I/O error.
 async fn run_server(
@@ -217,13 +218,15 @@ async fn run_server(
         retention: config.storage.retention.to_retention(),
         session_expiry: Duration::from_secs(config.storage.session_expiry_secs),
     };
-    let broker =
-        SharedBroker::new(Broker::new(config.broker.clone()), storage, log).map_err(|e| {
+    let topic_retention = config.storage.topic_retention_rules()?;
+    let broker = SharedBroker::new(Broker::new(config.broker.clone()), storage, log)
+        .map_err(|e| {
             format!(
                 "can't use the {:?} storage backend: {e}",
                 config.storage.backend
             )
-        })?;
+        })?
+        .with_topic_retention(topic_retention);
     info!(backend = ?config.storage.backend, durability = ?log.durability, "storage opened");
     telemetry.register_gauges(&broker);
     tokio::spawn(broker.clone().run_retry_loop());

@@ -1256,3 +1256,46 @@ async fn stats_count_the_brokers_state() {
     assert!(broker.ack(&client_id, "orders", 1).await);
     assert_eq!(broker.stats().in_flight, 0);
 }
+
+/// Checks that a topic gets the retention of the first rule it matches, on
+/// publish and in `trim_all`, and that other topics keep the default.
+#[tokio::test]
+async fn topics_get_the_retention_of_the_first_matching_rule() {
+    let keep = |n: u64| Retention {
+        max_messages: Some(n),
+        max_age_ms: None,
+        max_bytes: None,
+    };
+    let broker = shared(keep(2)).with_topic_retention(vec![
+        ("audit/special".to_string(), keep(1)),
+        ("audit/#".to_string(), keep(4)),
+    ]);
+    for topic in ["chat", "audit/logins", "audit/special"] {
+        for n in 0..6 {
+            broker
+                .publish(topic, new_record(&format!("{topic}-{n}"), 0))
+                .await
+                .expect("publish");
+        }
+    }
+    let first_seq = |topic: &'static str| {
+        let broker = broker.clone();
+        async move {
+            let (id, mut rx) = broker.with(connect);
+            broker
+                .subscribe(topic, &id, StartFrom::Seq(1), None)
+                .await
+                .expect("subscribe");
+            seqs(&frames(&mut rx))
+        }
+    };
+    assert_eq!(first_seq("chat").await, vec![5, 6]);
+    assert_eq!(first_seq("audit/logins").await, vec![3, 4, 5, 6]);
+    assert_eq!(first_seq("audit/special").await, vec![6]);
+    assert_eq!(broker.retention_for("audit/x/y"), keep(4));
+    assert_eq!(broker.retention_for("other"), keep(2));
+    assert_eq!(
+        broker.trim_all(chrono::Utc::now().timestamp_millis()).await,
+        0
+    );
+}

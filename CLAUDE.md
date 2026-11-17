@@ -43,7 +43,7 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_storage` | Topic logs, subscription cursors, the `Storage` traits, the `file` and `memory` backends and the conformance suite |
 | `crates/popsub_connection` | `Client` and `Outbox`: the server's record of one connected socket and its outgoing queue |
 | `crates/popsub_config` | Settings from `config/default.toml` and env vars |
-| `crates/popsub_utils` | `PopSubError`, `Result`, logging, and every OpenTelemetry metric instrument (`metrics`) |
+| `crates/popsub_utils` | `PopSubError`, `Result`, logging, every OpenTelemetry metric instrument (`metrics`), PII masking (`pii`) and topic patterns (`topics`) |
 
 Each crate has its own `CLAUDE.md` with its invariants and gotchas.
 

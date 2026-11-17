@@ -262,6 +262,7 @@ The design is in `docs/STORAGE.md`; rollout steps 1 to 4 and 6 are done, and ste
 - The `file` backend keeps each topic in `storage.path/topics/t<topic in hex>/` as segment files of CRC-checked records, plus a session log. It takes an exclusive lock on the directory, so a second server pointed at it refuses to start. On startup it scans every segment, cuts off a half-written record at the end of a topic, and refuses to start if a record anywhere else is damaged. Details in `docs/STORAGE.md` section 7.2.
 - `storage.durability` is checked against the backend at startup and refused if the backend can't provide it.
 - `storage.retention` limits each topic by record count, age and bytes. Logs are trimmed after each publish and by the retention loop every minute.
+- `[[storage.topic_retention]]` entries give particular topics their own limits: each has a `pattern` (`+` for one level, a trailing `#` for the rest) and any of `max_messages`, `max_age_secs` and `max_bytes`; a limit left out comes from `storage.retention`. The first entry a topic matches applies, so put specific patterns before general ones. A malformed pattern stops startup. A topic's writer keeps the policy it started with, so changing the rules takes a restart.
 - The old `sled` store is gone. Data in an old `pubsub_db` directory was replay history only and is not migrated; delete it with `make reset-data`.
 
 ## 8. Concurrency
@@ -309,6 +310,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `storage.retention.max_messages` | `1000` | Trimming |
 | `storage.retention.max_age_secs` | `3600` | Trimming |
 | `storage.retention.max_bytes` | `67108864` | Trimming. Counts message ids, publishers and payloads |
+| `storage.topic_retention` | none | Trimming. A list of `{pattern, max_messages, max_age_secs, max_bytes}` entries giving matching topics their own limits; see section 7. Set in the config file, not the environment |
 
 | `limits.login_attempts`, `limits.login_lockout_secs` | `5`, `300` | Failed logins per address and username before a lockout, and its first length |
 | `limits.address_login_attempts`, `limits.address_lockout_secs` | `20`, `900` | Failed logins per address across usernames before a lockout, and its first length |

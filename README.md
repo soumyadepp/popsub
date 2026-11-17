@@ -157,6 +157,7 @@ The settings you are most likely to change:
 | `storage.backend` | `file` | `file` keeps history, sessions and user accounts in `storage.path` (`pubsub_data`); `memory` loses them on restart |
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
+| `[[storage.topic_retention]]` | none | Different limits for topics matching a pattern, such as `audit/#` for 30 days; first match wins |
 | `server.max_payload_bytes` | 1 MiB | Largest publish |
 | `server.proxy_protocol` | `false` | Read PROXY protocol headers from trusted TCP load balancers |
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
@@ -167,6 +168,18 @@ The settings you are most likely to change:
 | `server.health_address` | none | Serve `/healthz` and `/readyz` here, such as `0.0.0.0:9091` |
 | `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
 | `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
+
+Topics can keep different amounts of history:
+
+```toml
+[[storage.topic_retention]]
+pattern = "audit/#"
+max_age_secs = 2592000   # 30 days; other limits come from [storage.retention]
+
+[[storage.topic_retention]]
+pattern = "presence/+"
+max_messages = 1
+```
 
 Every setting, with what it does, is in [`docs/DESIGN.md`](docs/DESIGN.md) section 9.
 

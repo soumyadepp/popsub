@@ -112,56 +112,12 @@ impl TopicPermission {
 /// assert!(!topic_matches_pattern("chat/room1", "chat/room2"));
 /// ```
 pub fn topic_matches_pattern(pattern: &str, topic: &str) -> bool {
-    if pattern == topic {
-        return true;
-    }
-
-    if pattern == "#" {
-        return true;
-    }
-
-    let pattern_parts: Vec<&str> = pattern.split('/').collect();
-    let topic_parts: Vec<&str> = topic.split('/').collect();
-
-    let mut pattern_idx = 0;
-    let mut topic_idx = 0;
-
-    while pattern_idx < pattern_parts.len() && topic_idx < topic_parts.len() {
-        let pattern_part = pattern_parts[pattern_idx];
-
-        match pattern_part {
-            "#" => return true,
-            "+" => {
-                pattern_idx += 1;
-                topic_idx += 1;
-            }
-            _ => {
-                if pattern_part != topic_parts[topic_idx] {
-                    return false;
-                }
-                pattern_idx += 1;
-                topic_idx += 1;
-            }
-        }
-    }
-
-    if pattern_idx == pattern_parts.len() && topic_idx == topic_parts.len() {
-        return true;
-    }
-
-    if pattern_idx < pattern_parts.len() {
-        let remaining = &pattern_parts[pattern_idx..];
-        if remaining.len() == 1 && remaining[0] == "#" {
-            return true;
-        }
-    }
-
-    false
+    popsub_utils::topics::matches_pattern(pattern, topic)
 }
 
 /// The longest topic pattern a grant may hold, in bytes. Matches the longest
 /// topic name the server accepts.
-pub const MAX_PATTERN_BYTES: usize = 120;
+pub const MAX_PATTERN_BYTES: usize = popsub_utils::topics::MAX_PATTERN_BYTES;
 
 /// Checks that a topic pattern is well formed before it is granted.
 ///
@@ -186,31 +142,11 @@ pub const MAX_PATTERN_BYTES: usize = 120;
 /// assert!(validate_pattern("a+b").is_err());
 /// ```
 pub fn validate_pattern(pattern: &str) -> crate::error::Result<()> {
-    let refuse = |why: &str| {
-        Err(crate::error::AuthError::PermissionDenied(format!(
+    popsub_utils::topics::validate_pattern(pattern).map_err(|why| {
+        crate::error::AuthError::PermissionDenied(format!(
             "topic pattern '{pattern}' is invalid: {why}"
-        )))
-    };
-    if pattern.is_empty() || pattern.len() > MAX_PATTERN_BYTES {
-        return refuse(&format!("it must be 1 to {MAX_PATTERN_BYTES} bytes"));
-    }
-    if pattern.chars().any(char::is_control) {
-        return refuse("it has control characters");
-    }
-    let levels: Vec<&str> = pattern.split('/').collect();
-    for (index, level) in levels.iter().enumerate() {
-        let last = index + 1 == levels.len();
-        if level.is_empty() {
-            return refuse("a level is empty");
-        }
-        if level.contains('#') && (*level != "#" || !last) {
-            return refuse("'#' may only be the whole last level");
-        }
-        if level.contains('+') && *level != "+" {
-            return refuse("'+' must be a whole level");
-        }
-    }
-    Ok(())
+        ))
+    })
 }
 
 /// Stateless helpers that decide subscribe and publish access from a permission list.
