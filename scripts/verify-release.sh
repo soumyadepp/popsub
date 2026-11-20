@@ -25,7 +25,7 @@ found() {
 }
 
 http_ok() {
-  [[ "$(curl -s -o /dev/null -w '%{http_code}' -A "$agent" "$1")" == "200" ]]
+  [[ "$(curl -sL -o /dev/null -w '%{http_code}' -A "$agent" "$1")" == "200" ]]
 }
 
 found "crates.io popsub_protocol $version" http_ok "https://crates.io/api/v1/crates/popsub_protocol/$version"

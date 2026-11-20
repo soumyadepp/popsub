@@ -190,22 +190,35 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-      - name: Publish the crates that aren't published yet
+      - name: Find the crates that aren't published yet
+        id: pending
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
+          pending=""
           for crate in popsub_protocol popsub_sdk; do
             code=$(curl -s -o /dev/null -w "%{http_code}" -A "popsub-release (github.com/${{ github.repository }})" \
               "https://crates.io/api/v1/crates/$crate/$VERSION")
             if [ "$code" = "200" ]; then
               echo "$crate $VERSION is already on crates.io"
             else
-              cargo publish --locked -p "$crate"
+              pending="$pending $crate"
             fi
+          done
+          echo "crates=${pending# }" >> "$GITHUB_OUTPUT"
+      - if: steps.pending.outputs.crates != ''
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.pending.outputs.crates != ''
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - if: steps.pending.outputs.crates != ''
+        name: Publish them
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CRATES: ${{ steps.pending.outputs.crates }}
+        run: |
+          for crate in $CRATES; do
+            cargo publish --locked -p "$crate"
           done
 
   npm:
