@@ -289,6 +289,7 @@ async fn reconnects_and_resubscribes_without_gaps() {
         message_id: String::new(),
         publisher: "admin".to_string(),
         payload: payload.to_string(),
+        encoding: None,
         qos: 0,
         published_at_ms: 0,
     };

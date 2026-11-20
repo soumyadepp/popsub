@@ -60,6 +60,8 @@ An optional `"group": "workers"` joins a shared subscription through the library
 
 `{"id": 4, "op": "publish", "topic": "orders", "payload": "text"}`. A QoS 0 publish. Responds `{"ok": true}` once the client has accepted it.
 
+In place of `payload`, `"bytes": "AP8="` gives the body as base64: the driver decodes it and publishes those bytes through the library's call for publishing bytes. The same goes for `publish_confirmed`. A `bytes` that isn't base64 is a `config` error.
+
 ### `publish_confirmed`
 
 `{"id": 5, "op": "publish_confirmed", "topic": "orders", "payload": "text"}`. A QoS 1 publish. Responds `{"ok": true, "seq": 12, "message_id": "..."}` once the server confirms it.
@@ -86,7 +88,7 @@ Events have no `id`: `{"event": "<name>", ...}`.
 
 | Event | Fields | When |
 |---|---|---|
-| `message` | `topic`, `seq`, `payload`, `message_id`, `qos` | The library handed a message to the application |
+| `message` | `topic`, `seq`, `payload`, `bytes`, `message_id`, `qos` | The library handed a message to the application. `payload` is the payload string as it arrived; `bytes` is the message's bytes as the library's own accessor returns them, in base64 (for a text message, its UTF-8) |
 | `subscription_ended` | `topic` | The application's subscription to the topic ended without the application asking (revoked access, or the client stopped) |
 | `connected` | `resumed`: topic list | A connection came up |
 | `disconnected` | `code`: close code or `null`, `reconnecting`: boolean | A connection went down |

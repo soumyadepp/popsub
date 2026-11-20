@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::RequestId;
-use crate::client::RoleSpec;
+use crate::client::{Encoding, RoleSpec};
 
 /// A server frame: the `id` of the request it answers, if any, and the frame.
 ///
@@ -290,6 +290,10 @@ pub struct Delivery {
     pub message_id: String,
     /// The message body.
     pub payload: String,
+    /// How `payload` encodes the message's bytes, as the publisher said.
+    /// Absent means the payload is the text itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<Encoding>,
     /// The delivery level the publisher asked for: 0 or 1.
     pub qos: u8,
     /// When the message was published, in milliseconds since the Unix epoch.

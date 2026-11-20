@@ -3,7 +3,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use popsub_protocol::{ClientMessage, CloseCode, ServerMessage, StartFrom, Subscribed};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use popsub_protocol::{ClientMessage, CloseCode, Encoding, ServerMessage, StartFrom, Subscribed};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::admin::Admin;
@@ -219,6 +221,28 @@ impl Client {
         self.command(Command::Publish {
             topic: topic.into(),
             payload: payload.into(),
+            encoding: None,
+            confirm: None,
+        })
+    }
+
+    /// Publishes bytes at QoS 0, for a body that isn't text. They travel as
+    /// base64, so they take about a third more room against the server's
+    /// payload limit; subscribers read them back with `Message::bytes`.
+    ///
+    /// Otherwise it behaves like `publish`.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     bytes: The body.
+    ///
+    /// Raises:
+    ///     Error::Closed: When the client has stopped.
+    pub fn publish_bytes(&self, topic: impl Into<String>, bytes: &[u8]) -> Result<(), Error> {
+        self.command(Command::Publish {
+            topic: topic.into(),
+            payload: STANDARD.encode(bytes),
+            encoding: Some(Encoding::Base64),
             confirm: None,
         })
     }
@@ -250,6 +274,42 @@ impl Client {
         self.command(Command::Publish {
             topic: topic.into(),
             payload: payload.into(),
+            encoding: None,
+            confirm: Some((uuid::Uuid::new_v4().to_string(), reply)),
+        })?;
+        self.wait(outcome).await
+    }
+
+    /// Publishes bytes at QoS 1 and waits until the server has stored them,
+    /// for a body that isn't text. They travel as base64, so they take about
+    /// a third more room against the server's payload limit; subscribers
+    /// read them back with `Message::bytes`.
+    ///
+    /// Otherwise it behaves like `publish_confirmed`.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     bytes: The body.
+    ///
+    /// Returns:
+    ///     Its `seq` and id.
+    ///
+    /// Raises:
+    ///     Error::Server: When the server refused it, for example
+    ///         `not_authorized`, `rate_limited` or `payload_too_large`.
+    ///     Error::Timeout: When it wasn't confirmed in time. It may still
+    ///         have been stored.
+    ///     Error::Closed: When the client has stopped.
+    pub async fn publish_bytes_confirmed(
+        &self,
+        topic: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<Published, Error> {
+        let (reply, outcome) = oneshot::channel();
+        self.command(Command::Publish {
+            topic: topic.into(),
+            payload: STANDARD.encode(bytes),
+            encoding: Some(Encoding::Base64),
             confirm: Some((uuid::Uuid::new_v4().to_string(), reply)),
         })?;
         self.wait(outcome).await

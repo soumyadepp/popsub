@@ -78,6 +78,7 @@ A server that doesn't know `hold_resumed` ignores it, answers without `held`, an
 **Requests**
 
 - Every request that expects a reply carries an `id`; replies and errors are matched by it. Errors surface with their `code` (and `retry_after` for limits).
+- Payloads are strings. For a body that isn't text, each library has a call for publishing bytes, at QoS 0 and confirmed: it sends the bytes as standard padded base64 in `payload` with `encoding: "base64"`. A received message exposes its payload string as it arrived, its `encoding`, and its bytes: the decoded payload when the encoding is `base64`, otherwise the payload's UTF-8. A payload that claims base64 and doesn't decode is an error from the bytes accessor, never a dropped message.
 - `publish_confirmed` generates a `message_id` (a UUID) and resolves with `seq` and `message_id` once `published` arrives.
 - Admin requests (`create_user`, `get_user`, `list_users`, `set_role`, `grant`, `revoke`, `set_password`, `set_enabled`, `delete_user`, `list_topics`, `get_topic`, `purge_topic`) are never queued while disconnected and never resent: a disconnect fails them, because the server may or may not have carried them out.
 - Requests time out after a configurable limit.

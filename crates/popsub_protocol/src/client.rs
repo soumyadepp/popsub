@@ -124,6 +124,11 @@ pub enum ClientMessage {
         topic: String,
         /// The message body.
         payload: String,
+        /// How `payload` encodes the message's bytes. Absent means the
+        /// payload is the text itself. With `base64` the payload must be
+        /// valid base64 or the publish is refused with `bad_request`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoding: Option<Encoding>,
         /// The publisher's idempotency key; generated when omitted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
@@ -388,6 +393,45 @@ pub enum StartFrom {
     SinceMs(i64),
     /// This `seq`, or the oldest retained one if it was trimmed.
     Seq(u64),
+}
+
+/// How a payload string encodes a message's bytes. A payload with no
+/// encoding is the message's text. The server stores and delivers the
+/// payload string unchanged, with its encoding beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    /// Standard base64 (RFC 4648 section 4) with padding, for payloads that
+    /// aren't text.
+    Base64,
+}
+
+impl Encoding {
+    /// Checks that a payload is well formed in this encoding, without
+    /// decoding it.
+    ///
+    /// Args:
+    ///     payload: The payload string.
+    ///
+    /// Returns:
+    ///     Whether it is valid: for `Base64`, a multiple of four characters
+    ///     from the standard alphabet, with at most two `=` and only at the end.
+    pub fn accepts(self, payload: &str) -> bool {
+        match self {
+            Encoding::Base64 => {
+                let bytes = payload.as_bytes();
+                if !bytes.len().is_multiple_of(4) {
+                    return false;
+                }
+                let padding = bytes.iter().rev().take_while(|b| **b == b'=').count();
+                padding <= 2
+                    && bytes[..bytes.len() - padding]
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
+            }
+        }
+    }
 }
 
 /// Tells serde to leave a `false` flag out of a frame.

@@ -145,7 +145,7 @@ Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend'
 | `auth` | `token`, optional `protocol`, optional `session_id`, optional `clean_start`, optional `hold_resumed` | `authenticated`. With `hold_resumed` the session's stored subscriptions are listed in `resumed` but left unattached (`held: true` in the reply): nothing is sent on one until the client subscribes to it. Must succeed before anything below is accepted. A bad token, an unsupported `protocol` or a bad `session_id` closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
 | `subscribe` | `topic`, optional `from` | `subscribed`, then history, then live records. Requires subscribe permission. `from` is `"resume"` (the default: one past a durable session's stored cursor, otherwise no replay), `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`. `storage_unavailable` if the log or session store can't be read, in which case the client is not subscribed. |
 | `unsubscribe` | `topic` | `unsubscribed`, even if the client wasn't subscribed. |
-| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
+| `publish` | `topic`, `payload`, optional `encoding`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. `payload` is always a string: the text itself, or with `encoding: "base64"` the base64 of a body that isn't text. The server checks an encoded payload is valid base64 (`bad_request` otherwise), stores the string and its encoding unchanged, and never decodes it. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
 | `ack` | `topic`, `seq` | None. Confirms one QoS 1 record delivered to this connection. Anything not in flight to this connection is ignored. |
 | `ping` | none | `pong`. Accepted before `auth`. For clients that can't see WebSocket pings (browsers) to check the connection is alive; it also counts as activity for the idle timeout. |
 
@@ -204,7 +204,7 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 | Topic info | `{"type":"topic_info","topic":{"name":"orders","first_seq":3,"last_seq":9,"messages":7,"subscribers":2}}` |
 | Topics | `{"type":"topics","topics":[...]}`, the same objects |
 | Published | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
-| Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
+| Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}`, plus `"encoding":"base64"` when the publisher sent one |
 | Truncated | `{"type":"truncated","topic":"...","first_available":1300}`, before records that start later than the subscriber expected |
 | Stalled | `{"type":"stalled","topic":"...","seq":42}`, when a record runs out of retries |
 | Error | `{"type":"error","code":"not_authorized","message":"..."}`, plus `retry_after` for limits |
@@ -351,7 +351,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.heartbeat_secs` | `30` | Transport. How often each connection is pinged |
 | `server.idle_timeout_secs` | `90` | Transport. How long a connection may send nothing before it is closed |
 | `server.outbound_queue_bytes` | `16777216` | Transport. The hard byte limit of each connection's outgoing queue; the soft limit is a sixteenth of it, at least 64 KiB |
-| `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
+| `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload, counted on the payload string as sent, so a base64 body of N bytes counts as about 4N/3; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
 | `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
 | `server.proxy_protocol` | `false` | Transport. Connections from `server.trusted_proxies` must start with a PROXY protocol header (version 1 or 2), whose address is the client's. Needs `server.trusted_proxies`, or startup stops |
 | `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
@@ -443,7 +443,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | The server is stopped with Ctrl+C or `SIGTERM` | `/readyz` turns to 503, every client is sent `going_away`, and the process exits half a second later. |
 | Subscriber reads slowly | Once its queue passes the soft limit, deliveries wait in the topic log and are sent as it catches up, in order. Server memory for it stays near the soft limit. If it falls behind retention, it gets `truncated`. |
 | Publisher sends to a topic nobody subscribes to | Stored in the topic log until retention trims it. |
-| A subscriber never acknowledges one record, with `broker.dead_letter_topic` set | After `max_retries` resends the record is copied to the dead-letter topic as a JSON envelope (the original `topic`, `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, the `subscriber` username and `reason: "max_retries"`), dropped from that subscription's window, and the subscription carries on; a durable session's cursor moves past it. Other subscribers are unaffected. The dead-letter topic is an ordinary topic: subscribe to it to handle failures, and give it its own retention. Its own subscribers stall as usual, so a dead letter is never dead-lettered again. |
+| A subscriber never acknowledges one record, with `broker.dead_letter_topic` set | After `max_retries` resends the record is copied to the dead-letter topic as a JSON envelope (the original `topic`, `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, its `encoding` when it had one, the `subscriber` username and `reason: "max_retries"`), dropped from that subscription's window, and the subscription carries on; a durable session's cursor moves past it. Other subscribers are unaffected. The dead-letter topic is an ordinary topic: subscribe to it to handle failures, and give it its own retention. Its own subscribers stall as usual, so a dead letter is never dead-lettered again. |
 | A subscriber stops acknowledging | Its window fills and delivery to it pauses; after `max_retries` it gets `stalled`. Other subscribers are unaffected, and nothing is queued in memory for it. |
 | A client acknowledges a record it wasn't sent | Ignored. |
 | A publisher retries a message after a dropped connection | Same user and `message_id`: stored and delivered once, while the original is retained. |
@@ -534,4 +534,4 @@ Replicate topic logs across three nodes with Raft (for example `openraft`). Only
 ## 16. Open questions
 
 - Is a per-topic task model enough, or do hot topics need sharding by subscriber?
-- Should payloads become bytes, with JSON as just one encoding?
+- Payloads stay JSON strings, with `encoding: "base64"` for bodies that aren't text. That costs a third more room for binary data on the wire and in the log. Binary WebSocket frames would avoid it, at the price of a second frame format in every client; is the saving ever worth that?

@@ -4,8 +4,8 @@
 //! transport and client SDKs. The broker writes deliveries, `subscribed`,
 //! `truncated` and `stalled` frames straight to subscribers' channels.
 
-use popsub_protocol::{CloseCode, Delivery, ServerFrame, ServerMessage};
-use popsub_storage::Record;
+use popsub_protocol::{CloseCode, Delivery, Encoding, ServerFrame, ServerMessage};
+use popsub_storage::{PayloadEncoding, Record};
 use tracing::error;
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::Message as WsMessage;
@@ -24,6 +24,9 @@ pub(crate) fn delivery(record: &Record) -> ServerFrame {
         seq: record.seq,
         message_id: record.message_id.clone(),
         payload: record.payload.clone(),
+        encoding: record.encoding.map(|encoding| match encoding {
+            PayloadEncoding::Base64 => Encoding::Base64,
+        }),
         qos: record.qos,
         published_at_ms: record.published_at_ms,
     }))

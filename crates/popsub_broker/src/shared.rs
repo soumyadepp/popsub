@@ -943,7 +943,7 @@ impl SharedBroker {
             }
         }
         for letter in dead.letters {
-            let envelope = serde_json::json!({
+            let mut envelope = serde_json::json!({
                 "topic": letter.record.topic,
                 "seq": letter.record.seq,
                 "message_id": letter.record.message_id,
@@ -953,10 +953,14 @@ impl SharedBroker {
                 "subscriber": letter.username,
                 "reason": "max_retries",
             });
+            if let Some(encoding) = letter.record.encoding {
+                envelope["encoding"] = serde_json::json!(encoding);
+            }
             let record = NewRecord {
                 message_id: uuid::Uuid::new_v4().to_string(),
                 publisher: "popsub".to_string(),
                 payload: envelope.to_string(),
+                encoding: None,
                 qos: 1,
                 published_at_ms: now_ms,
             };

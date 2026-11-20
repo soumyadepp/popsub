@@ -23,6 +23,17 @@
     "Delivery": {
       "description": "A record delivered to a subscriber, live or replayed.",
       "properties": {
+        "encoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Encoding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How `payload` encodes the message's bytes, as the publisher said.\nAbsent means the payload is the text itself."
+        },
         "message_id": {
           "description": "The publisher's id for the message.",
           "type": "string"
@@ -63,6 +74,16 @@
         "published_at_ms"
       ],
       "type": "object"
+    },
+    "Encoding": {
+      "description": "How a payload string encodes a message's bytes. A payload with no\nencoding is the message's text. The server stores and delivers the\npayload string unchanged, with its encoding beside it.",
+      "oneOf": [
+        {
+          "const": "base64",
+          "description": "Standard base64 (RFC 4648 section 4) with padding, for payloads that\naren't text.",
+          "type": "string"
+        }
+      ]
     },
     "ErrorCode": {
       "description": "Why a request failed. New codes may be added within a protocol version;\nclients should treat an unknown code like `internal`.",

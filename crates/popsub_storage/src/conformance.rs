@@ -82,6 +82,7 @@ fn record(id: &str, published_at_ms: i64) -> NewRecord {
         message_id: id.to_string(),
         publisher: "alice".to_string(),
         payload: id.to_string(),
+        encoding: None,
         qos: 1,
         published_at_ms,
     }

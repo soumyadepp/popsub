@@ -20,6 +20,16 @@
         }
       ]
     },
+    "Encoding": {
+      "description": "How a payload string encodes a message's bytes. A payload with no\nencoding is the message's text. The server stores and delivers the\npayload string unchanged, with its encoding beside it.",
+      "oneOf": [
+        {
+          "const": "base64",
+          "description": "Standard base64 (RFC 4648 section 4) with padding, for payloads that\naren't text.",
+          "type": "string"
+        }
+      ]
+    },
     "RequestId": {
       "anyOf": [
         {
@@ -297,6 +307,17 @@
     {
       "description": "Publishes a payload. A QoS 1 publish is answered with `published`\nonce stored; QoS 0 gets no reply unless it fails.",
       "properties": {
+        "encoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Encoding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How `payload` encodes the message's bytes. Absent means the\npayload is the text itself. With `base64` the payload must be\nvalid base64 or the publish is refused with `bad_request`."
+        },
         "message_id": {
           "description": "The publisher's idempotency key; generated when omitted.",
           "type": [

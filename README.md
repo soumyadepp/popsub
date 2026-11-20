@@ -161,7 +161,7 @@ The settings you are most likely to change:
 | `broker.dead_letter_topic` | none | Copy messages that run out of retries here and keep the subscription going, instead of pausing it |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
 | `[[storage.topic_retention]]` | none | Different limits for topics matching a pattern, such as `audit/#` for 30 days; first match wins |
-| `server.max_payload_bytes` | 1 MiB | Largest publish |
+| `server.max_payload_bytes` | 1 MiB | Largest publish payload. A binary body travels as base64, so it counts as about a third more |
 | `server.proxy_protocol` | `false` | Read PROXY protocol headers from trusted TCP load balancers |
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
 | `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |

@@ -28,7 +28,9 @@ pub mod topics;
 #[cfg(test)]
 mod tests;
 
-pub use client::{Access, ClientFrame, ClientMessage, RoleKind, RoleSpec, StartFrom, TopicGrant};
+pub use client::{
+    Access, ClientFrame, ClientMessage, Encoding, RoleKind, RoleSpec, StartFrom, TopicGrant,
+};
 pub use close::CloseCode;
 pub use server::{
     Delivery, ErrorCode, Limits, ServerFrame, ServerMessage, Stalled, Subscribed, TopicInfo,

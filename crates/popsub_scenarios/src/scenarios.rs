@@ -78,6 +78,9 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
     ("shared_subscription_rejoins_after_reconnect", |d| {
         Box::pin(shared_subscription_rejoins_after_reconnect(d))
     }),
+    ("bytes_survive_publish_and_replay", |d| {
+        Box::pin(bytes_survive_publish_and_replay(d))
+    }),
 ];
 
 /// Fails the scenario unless a condition holds.
@@ -1119,5 +1122,61 @@ async fn held_session_topics_wait_for_the_application(command: String) -> Outcom
     })?;
     new.ok("ack", json!({"topic": "jobs", "seq": 1})).await?;
     new.ok("ack", json!({"topic": "jobs", "seq": 2})).await?;
+    nothing_in_flight(&server).await
+}
+
+/// Checks byte payloads: bytes that aren't UTF-8 published through the
+/// library's byte call arrive unchanged on a live subscription and again on
+/// a replay from the log, and a text message beside them still arrives as
+/// text, with its bytes being its UTF-8.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn bytes_survive_publish_and_replay(command: String) -> Outcome {
+    let server = ScenarioServer::start(Backend::Memory).await?;
+    let publisher = admin(&command, &server, "publisher").await?;
+    let live = admin(&command, &server, "live").await?;
+    live.ok("subscribe", json!({"topic": "blobs", "from": "new"}))
+        .await?;
+    let blob = "AP/+gBB/";
+    let text = "h\u{e9}llo";
+    let text_bytes = "aMOpbGxv";
+    publisher
+        .ok(
+            "publish_confirmed",
+            json!({"topic": "blobs", "bytes": blob}),
+        )
+        .await?;
+    publisher
+        .ok(
+            "publish_confirmed",
+            json!({"topic": "blobs", "payload": text}),
+        )
+        .await?;
+    let late = admin(&command, &server, "late").await?;
+    late.ok("subscribe", json!({"topic": "blobs", "from": {"seq": 1}}))
+        .await?;
+    for (name, client) in [("live", &live), ("replayed", &late)] {
+        let first = client
+            .event(WAIT, "the byte message", |e| {
+                e["event"] == "message" && e["seq"] == 1
+            })
+            .await?;
+        check(first["bytes"] == blob, || {
+            format!("{name}: expected bytes {blob}, got {first}")
+        })?;
+        let second = client
+            .event(WAIT, "the text message", |e| {
+                e["event"] == "message" && e["seq"] == 2
+            })
+            .await?;
+        check(
+            second["payload"] == text && second["bytes"] == text_bytes,
+            || format!("{name}: expected the text {text:?} with bytes {text_bytes}, got {second}"),
+        )?;
+    }
     nothing_in_flight(&server).await
 }

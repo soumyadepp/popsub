@@ -8,7 +8,7 @@ use crate::websocket::{Heartbeat, RateLimiters, Server};
 use futures_util::{SinkExt, StreamExt};
 use popsub_broker::{Broker, LogSettings, SharedBroker};
 use popsub_config::Settings;
-use popsub_protocol::{ClientMessage, CloseCode, ErrorCode, ServerMessage, StartFrom};
+use popsub_protocol::{ClientMessage, CloseCode, Encoding, ErrorCode, ServerMessage, StartFrom};
 use popsub_storage::{Durability, FileStorage, MemoryStorage, Storage};
 use std::sync::Arc;
 use std::time::Duration;
@@ -527,6 +527,7 @@ async fn denied_publishes_do_not_spend_the_rate_limit() {
             &ClientMessage::Publish {
                 topic: "private".to_string(),
                 payload: "hello".to_string(),
+                encoding: None,
                 message_id: None,
                 qos: None,
             },
@@ -935,6 +936,84 @@ async fn a_held_session_sends_nothing_until_the_client_subscribes() {
         matches!(&reply, ServerMessage::Authenticated { resumed, .. } if resumed.is_empty()),
         "{reply:?}"
     );
+}
+
+/// Checks that a publish with `encoding: "base64"` is delivered with the
+/// same payload and encoding, live and on replay, and that a payload that
+/// isn't valid base64 is refused with `bad_request` and stores nothing.
+#[tokio::test]
+async fn base64_payloads_are_carried_and_checked() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = admin_connection(addr, &settings).await;
+    send_json(
+        &mut ws,
+        serde_json::json!({"type": "subscribe", "topic": "blobs"}),
+    )
+    .await;
+    assert!(matches!(
+        next_frame(&mut ws).await,
+        ServerMessage::Subscribed(_)
+    ));
+
+    send_json(
+        &mut ws,
+        serde_json::json!({"type": "publish", "id": 1, "topic": "blobs", "payload": "not base64!", "encoding": "base64", "qos": 1}),
+    )
+    .await;
+    assert!(
+        matches!(
+            next_frame(&mut ws).await,
+            ServerMessage::Error {
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ),
+        "an invalid base64 payload should be refused"
+    );
+
+    send_json(
+        &mut ws,
+        serde_json::json!({"type": "publish", "id": 2, "topic": "blobs", "payload": "AP/+gA==", "encoding": "base64", "qos": 1}),
+    )
+    .await;
+    let mut delivered = None;
+    let mut published = None;
+    while delivered.is_none() || published.is_none() {
+        match next_frame(&mut ws).await {
+            ServerMessage::Message(d) => delivered = Some(d),
+            ServerMessage::Published { seq, .. } => published = Some(seq),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    let delivered = delivered.expect("a delivery");
+    assert_eq!(published, Some(1), "the refused publish stored nothing");
+    assert_eq!(
+        (
+            delivered.seq,
+            delivered.payload.as_str(),
+            delivered.encoding
+        ),
+        (1, "AP/+gA==", Some(Encoding::Base64))
+    );
+
+    let mut late = admin_connection(addr, &settings).await;
+    send_json(
+        &mut late,
+        serde_json::json!({"type": "subscribe", "topic": "blobs", "from": {"seq": 1}}),
+    )
+    .await;
+    assert!(matches!(
+        next_frame(&mut late).await,
+        ServerMessage::Subscribed(_)
+    ));
+    match next_frame(&mut late).await {
+        ServerMessage::Message(d) => assert_eq!(
+            (d.payload.as_str(), d.encoding),
+            ("AP/+gA==", Some(Encoding::Base64))
+        ),
+        other => panic!("expected the replayed record, got {other:?}"),
+    }
 }
 
 /// Waits up to two seconds for no connection to hold a durable session.

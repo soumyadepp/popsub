@@ -40,7 +40,7 @@ use popsub_broker::{SharedBroker, close_message, session_key};
 use popsub_config::{LimitSettings, ServerSettings};
 use popsub_connection::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
-use popsub_storage::{MAX_TOPIC_BYTES, NewRecord};
+use popsub_storage::{MAX_TOPIC_BYTES, NewRecord, PayloadEncoding};
 use popsub_utils::error::{PopSubError, Result};
 use popsub_utils::metrics::{attr, metrics};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -57,8 +57,8 @@ use crate::proxy::{TrustedProxies, read_proxy_header};
 use crate::tls::ServerTls;
 
 use popsub_protocol::{
-    ClientFrame, ClientMessage, CloseCode, ErrorCode, Limits, PROTOCOL_VERSION, RequestId,
-    ServerFrame, ServerMessage, StartFrom,
+    ClientFrame, ClientMessage, CloseCode, Encoding, ErrorCode, Limits, PROTOCOL_VERSION,
+    RequestId, ServerFrame, ServerMessage, StartFrom,
 };
 
 /// The longest `session_id` a client may choose, in characters.
@@ -1255,9 +1255,13 @@ impl Session {
             ClientMessage::Publish {
                 topic,
                 payload,
+                encoding,
                 message_id,
                 qos,
-            } => self.publish(id, &topic, payload, message_id, qos).await,
+            } => {
+                self.publish(id, &topic, payload, encoding, message_id, qos)
+                    .await
+            }
             ClientMessage::Ack { topic, seq } => self.ack(&topic, seq).await,
             ClientMessage::Ping {} => {
                 self.reply(id, ServerMessage::Pong {})?;
@@ -2065,6 +2069,9 @@ impl Session {
     ///     id: The request id.
     ///     topic: The topic to publish to.
     ///     payload: The message body.
+    ///     encoding: How the payload encodes the message's bytes, if it
+    ///         isn't the text itself. A payload that isn't valid in it is
+    ///         refused with `bad_request`.
     ///     message_id: The publisher's idempotency key.
     ///     qos: The delivery level, 0 or 1. Defaults to 0.
     ///
@@ -2080,6 +2087,7 @@ impl Session {
         id: Option<&RequestId>,
         topic: &str,
         payload: String,
+        encoding: Option<Encoding>,
         message_id: Option<String>,
         qos: Option<u8>,
     ) -> Result<Flow> {
@@ -2100,6 +2108,15 @@ impl Session {
                     payload.len(),
                     self.server.max_payload_bytes
                 ),
+                None,
+            )?;
+            return Ok(Flow::Continue);
+        }
+        if encoding.is_some_and(|encoding| !encoding.accepts(&payload)) {
+            self.fail(
+                id,
+                ErrorCode::BadRequest,
+                "the payload isn't valid base64",
                 None,
             )?;
             return Ok(Flow::Continue);
@@ -2143,6 +2160,9 @@ impl Session {
             message_id: message_id.unwrap_or_default(),
             publisher: username.clone(),
             payload,
+            encoding: encoding.map(|encoding| match encoding {
+                Encoding::Base64 => PayloadEncoding::Base64,
+            }),
             qos,
             published_at_ms: 0,
         };

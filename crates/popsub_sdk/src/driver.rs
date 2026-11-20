@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use popsub_protocol::{
-    ClientFrame, ClientMessage, CloseCode, Delivery, ErrorCode, Limits, PROTOCOL_VERSION,
+    ClientFrame, ClientMessage, CloseCode, Delivery, Encoding, ErrorCode, Limits, PROTOCOL_VERSION,
     RequestId, ServerFrame, ServerMessage, StartFrom, Subscribed,
 };
 use tokio::net::TcpStream;
@@ -121,6 +121,8 @@ pub(crate) enum Command {
         topic: String,
         /// The body.
         payload: String,
+        /// How the body encodes the message's bytes; `None` means it is text.
+        encoding: Option<Encoding>,
         /// For a confirmed (QoS 1) publish, the idempotency key and where the
         /// outcome goes. `None` is a QoS 0 publish.
         confirm: Option<(String, oneshot::Sender<Result<Published, Error>>)>,
@@ -804,9 +806,10 @@ impl Driver {
             Command::Publish {
                 topic,
                 payload,
+                encoding,
                 confirm,
             } => {
-                self.queue_publish(topic, payload, confirm);
+                self.queue_publish(topic, payload, encoding, confirm);
             }
             Command::Ack { topic, seq } => {
                 if let Some(entry) = self.topics.get_mut(&topic) {
@@ -828,6 +831,7 @@ impl Driver {
     /// Args:
     ///     topic: The topic.
     ///     payload: The body.
+    ///     encoding: How the body encodes the message's bytes, if it isn't text.
     ///     confirm: The idempotency key and reply for a confirmed publish.
     ///
     /// Returns:
@@ -836,6 +840,7 @@ impl Driver {
         &mut self,
         topic: String,
         payload: String,
+        encoding: Option<Encoding>,
         confirm: Option<(String, oneshot::Sender<Result<Published, Error>>)>,
     ) -> Option<u64> {
         match confirm {
@@ -847,6 +852,7 @@ impl Driver {
                     ClientMessage::Publish {
                         topic,
                         payload,
+                        encoding,
                         message_id: Some(message_id),
                         qos: Some(1),
                     },
@@ -861,6 +867,7 @@ impl Driver {
                 self.offline.push_back(ClientMessage::Publish {
                     topic,
                     payload,
+                    encoding,
                     message_id: None,
                     qos: None,
                 });
@@ -1098,8 +1105,9 @@ impl Driver {
             Command::Publish {
                 topic,
                 payload,
+                encoding,
                 confirm,
-            } => match self.queue_publish(topic, payload, confirm) {
+            } => match self.queue_publish(topic, payload, encoding, confirm) {
                 Some(id) => {
                     let message = self.unconfirmed[&id].clone();
                     send(socket, Some(id), message).await
@@ -1378,6 +1386,7 @@ impl Driver {
             seq: delivery.seq,
             message_id: delivery.message_id,
             payload: delivery.payload,
+            encoding: delivery.encoding,
             qos: delivery.qos,
             published_at_ms: delivery.published_at_ms,
             acker,

@@ -6,9 +6,9 @@
 use serde_json::{Value, json};
 
 use crate::{
-    Access, ClientFrame, ClientMessage, CloseCode, Delivery, ErrorCode, Limits, RequestId,
-    RoleKind, RoleSpec, ServerFrame, ServerMessage, Stalled, StartFrom, Subscribed, TopicGrant,
-    TopicInfo, Truncated, UserInfo,
+    Access, ClientFrame, ClientMessage, CloseCode, Delivery, Encoding, ErrorCode, Limits,
+    RequestId, RoleKind, RoleSpec, ServerFrame, ServerMessage, Stalled, StartFrom, Subscribed,
+    TopicGrant, TopicInfo, Truncated, UserInfo,
 };
 
 /// Parses a client frame, failing the test if it doesn't parse.
@@ -97,8 +97,19 @@ fn client_requests_parse() {
             ClientMessage::Publish {
                 topic: "chat".to_string(),
                 payload: "hi".to_string(),
+                encoding: None,
                 message_id: None,
                 qos: None,
+            },
+        ),
+        (
+            json!({"type": "publish", "topic": "chat", "payload": "AP8=", "encoding": "base64", "qos": 1}),
+            ClientMessage::Publish {
+                topic: "chat".to_string(),
+                payload: "AP8=".to_string(),
+                encoding: Some(Encoding::Base64),
+                message_id: None,
+                qos: Some(1),
             },
         ),
         (
@@ -318,10 +329,23 @@ fn events_serialise_without_an_id() {
                 seq: 42,
                 message_id: "m-1".to_string(),
                 payload: "hi".to_string(),
+                encoding: None,
                 qos: 1,
                 published_at_ms: 1_794_800_000_000,
             }),
             json!({"type": "message", "topic": "chat", "seq": 42, "message_id": "m-1", "payload": "hi", "qos": 1, "published_at_ms": 1794800000000_i64}),
+        ),
+        (
+            ServerMessage::Message(Delivery {
+                topic: "chat".to_string(),
+                seq: 43,
+                message_id: "m-2".to_string(),
+                payload: "AP8=".to_string(),
+                encoding: Some(Encoding::Base64),
+                qos: 1,
+                published_at_ms: 1_794_800_000_000,
+            }),
+            json!({"type": "message", "topic": "chat", "seq": 43, "message_id": "m-2", "payload": "AP8=", "encoding": "base64", "qos": 1, "published_at_ms": 1794800000000_i64}),
         ),
         (
             ServerMessage::Truncated(Truncated {
@@ -700,4 +724,17 @@ fn shared_subscription_frames_have_the_documented_shape() {
         )),
         json!({"type": "subscribed", "id": 1, "topic": "jobs", "replay_from": 4, "replay_to": 9, "group": "workers"})
     );
+}
+
+/// Checks which payloads `Encoding::Base64` accepts: padded standard
+/// base64 and the empty string, and nothing with a wrong length, a
+/// character outside the alphabet, or padding in the middle.
+#[test]
+fn base64_payloads_are_checked_without_decoding() {
+    for valid in ["", "AP8=", "aGk=", "aGVsbG8=", "AAAA", "+/+/", "QQ=="] {
+        assert!(Encoding::Base64.accepts(valid), "{valid:?}");
+    }
+    for invalid in ["A", "AP8", "AP8=AAAA", "a-_=", "aG k", "====", "QQ==="] {
+        assert!(!Encoding::Base64.accepts(invalid), "{invalid:?}");
+    }
 }

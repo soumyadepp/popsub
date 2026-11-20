@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use popsub_protocol::{Access, RoleSpec, StartFrom};
 use popsub_sdk::{
     AckMode, Client, ClientConfig, Credentials, Error, Event, Message, ReconnectPolicy,
@@ -116,6 +118,7 @@ async fn handle(state: &Arc<State>, out: &Out, command: &Value) -> Result<Value,
                         "topic": message.topic,
                         "seq": message.seq,
                         "payload": message.payload,
+                        "bytes": message.bytes().ok().map(|bytes| STANDARD.encode(bytes)),
                         "message_id": message.message_id,
                         "qos": message.qos,
                     }));
@@ -140,16 +143,23 @@ async fn handle(state: &Arc<State>, out: &Out, command: &Value) -> Result<Value,
             Ok(json!({}))
         }
         "publish" => {
-            client
-                .publish(text("topic"), text("payload"))
-                .map_err(error)?;
+            match bytes(command)? {
+                Some(bytes) => client.publish_bytes(text("topic"), &bytes),
+                None => client.publish(text("topic"), text("payload")),
+            }
+            .map_err(error)?;
             Ok(json!({}))
         }
         "publish_confirmed" => {
-            let published = client
-                .publish_confirmed(text("topic"), text("payload"))
-                .await
-                .map_err(error)?;
+            let published = match bytes(command)? {
+                Some(bytes) => client.publish_bytes_confirmed(text("topic"), &bytes).await,
+                None => {
+                    client
+                        .publish_confirmed(text("topic"), text("payload"))
+                        .await
+                }
+            }
+            .map_err(error)?;
             Ok(json!({"seq": published.seq, "message_id": published.message_id}))
         }
         "ack" => {
@@ -350,6 +360,26 @@ fn event_json(event: Event) -> Value {
         Event::ServerError { code, message } => {
             json!({"event": "server_error", "code": code.as_str(), "message": message})
         }
+    }
+}
+
+/// Reads a publish command's `bytes`: the body to publish as bytes, in base64.
+///
+/// Args:
+///     command: The command.
+///
+/// Returns:
+///     The bytes, or `None` when the command carries a text `payload` instead.
+///
+/// Raises:
+///     Value: A `config` error when `bytes` isn't base64.
+fn bytes(command: &Value) -> Result<Option<Vec<u8>>, Value> {
+    match command["bytes"].as_str() {
+        Some(encoded) => STANDARD
+            .decode(encoded)
+            .map(Some)
+            .map_err(|e| failure("config", &e.to_string())),
+        None => Ok(None),
     }
 }
 
