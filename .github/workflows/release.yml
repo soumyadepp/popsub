@@ -260,3 +260,12 @@ jobs:
         with:
           packages-dir: clients/python/dist
           skip-existing: true
+
+  verify:
+    name: Verify everything is published
+    needs: [check, github-release, crates, npm, pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every registry for the new version
+        run: scripts/verify-release.sh "${{ needs.check.outputs.version }}"

@@ -13,6 +13,8 @@ A release is one version number shared by the server, the Rust crates and every 
 | PyPI | `popsub` (the Python client) | `pypi` |
 | Go modules | the tag `clients/go/vX.Y.Z`, which is how Go finds a module in a subdirectory | `github-release` |
 
+The last job, `verify`, asks each registry for the new version (the two crates, npm, PyPI, the Go module proxy, the image, and the three release downloads) and fails the run if any is still missing after 15 minutes. `scripts/verify-release.sh X.Y.Z` runs the same check from your machine.
+
 The other workspace crates have `publish = false`: they are the server's internals, shipped inside the binary and the image.
 
 Every publish step skips a version that is already there, so a job that failed can be rerun after fixing what broke it.
