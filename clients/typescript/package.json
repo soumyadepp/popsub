@@ -1,5 +1,5 @@
 {
-  "name": "@popsub/client",
+  "name": "popsub",
   "version": "0.1.0",
   "description": "PopSub client for browsers and Node.js 22+: reconnects, resubscribes without gaps, deduplicates and acknowledges, on the global WebSocket.",
   "keywords": [

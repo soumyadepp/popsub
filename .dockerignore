@@ -1,0 +1,12 @@
+target
+**/target
+.git
+.github
+clients
+docs
+pubsub_data
+pubsub_db
+*.profraw
+cobertura.xml
+.env
+**/node_modules

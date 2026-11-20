@@ -2,7 +2,7 @@
  * The PopSub client for browsers and Node.js 22 or later.
  *
  * ```ts
- * import { Client } from "@popsub/client";
+ * import { Client } from "popsub";
  *
  * const client = await Client.connect({
  *   url: "ws://127.0.0.1:8080",

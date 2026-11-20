@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "The scenario suite every PopSub client library must pass, and the Rust client's driver"
 license = "Apache-2.0"
+publish = false
 
 [[bin]]
 name = "popsub-scenarios"

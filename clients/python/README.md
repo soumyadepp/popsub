@@ -23,13 +23,11 @@ Delivery is what the server provides: QoS 1 is at-least-once per subscriber whil
 
 Python 3.10 or newer. The only runtime dependency is [`websockets`](https://websockets.readthedocs.io/).
 
-The package isn't on PyPI yet. Install it from a checkout of the repository:
-
 ```bash
-uv add path/to/popsub/clients/python
+pip install popsub
 ```
 
-or `pip install path/to/popsub/clients/python`.
+or `uv add popsub`. To use a version that isn't released yet, install it from a checkout: `uv add path/to/popsub/clients/python`.
 
 ## Usage
 

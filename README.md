@@ -20,9 +20,24 @@ cargo run -p popsub -- server
 - **Safe defaults.** Users with per-topic permissions, Argon2id passwords, JWTs, rate limits on logins, registration and publishing, size limits, heartbeats, and backpressure for slow readers.
 - **A Rust client** (`popsub_sdk`) that handles reconnection, resubscription and deduplication for you, and a JSON Schema for building clients in other languages.
 
+## Install
+
+| What | How |
+|---|---|
+| Server, prebuilt | Download a `.tar.gz` for Linux (x86_64, aarch64) or macOS (Apple silicon) from [Releases](https://github.com/soumyadepp/popsub/releases), check it against its `.sha256`, and run `./popsub server` |
+| Server, container | `docker run -p 8080:8080 -v popsub-data:/data -e SERVER__JWT_SECRET=... -e SERVER_PASSWORD=... ghcr.io/soumyadepp/popsub:0.1` |
+| Rust client | `cargo add popsub_sdk` |
+| TypeScript client | `npm install popsub` |
+| Python client | `pip install popsub` |
+| Go client | `go get github.com/soumyadepp/popsub/clients/go@v0.1.0` |
+
+The container listens on all interfaces, so the server refuses to start until you set your own JWT secret and admin password; the defaults are published. It keeps its data in the `/data` volume, serves the health endpoints on port 9090, and runs as an unprivileged user. Any setting can be passed as an environment variable (see [Configuration](#configuration)).
+
+Version 0.x: the protocol and the client APIs may still change between minor versions. [`CHANGELOG.md`](CHANGELOG.md) lists what changed in each release.
+
 ## Quick start
 
-You need Rust 1.89 or newer.
+To build from source you need Rust 1.89 or newer.
 
 ```bash
 git clone https://github.com/soumyadepp/popsub.git
@@ -86,6 +101,10 @@ Where to start reading the code:
 The full design, with the reasons behind it, is in [`docs/DESIGN.md`](docs/DESIGN.md) and [`docs/STORAGE.md`](docs/STORAGE.md).
 
 ## Use it from Rust
+
+```bash
+cargo add popsub_sdk
+```
 
 ```rust
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
@@ -329,6 +348,8 @@ make schema     # regenerate docs/protocol/ after changing a protocol type
 ```
 
 Add `JOBS=2` to any target if a full build runs out of memory.
+
+Releases are cut by pushing a version tag; [`docs/RELEASING.md`](docs/RELEASING.md) has the steps.
 
 ## Contributing
 
