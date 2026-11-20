@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust client for PopSub: reconnection, durable sessions, acknowledgements and deduplication"
 license = "Apache-2.0"
+repository = "https://github.com/soumyadepp/popsub"
+readme = "README.md"
+exclude = ["CLAUDE.md"]
+documentation = "https://docs.rs/popsub_sdk"
+keywords = ["pubsub", "websocket", "messaging", "client"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 base64 = "0.22"
 futures-util = "0.3.31"
-popsub_protocol = { path = "../popsub_protocol" }
+popsub_protocol = { path = "../popsub_protocol", version = "0.1.0" }
 rand = "0.8"
 serde_json = "1"
 thiserror = "2"

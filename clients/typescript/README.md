@@ -6,7 +6,11 @@ It does what every PopSub client does (see [`clients/README.md`](../README.md)):
 
 ## Install
 
-The package isn't published to a registry yet. Build it and install it from this folder:
+```bash
+npm install popsub
+```
+
+To use a version that isn't released yet, build it from a checkout and install it from this folder:
 
 ```bash
 cd clients/typescript
@@ -19,7 +23,7 @@ npm install /path/to/popsub/clients/typescript
 ## Usage
 
 ```ts
-import { Client, PopSubError } from "@popsub/client";
+import { Client, PopSubError } from "popsub";
 
 const client = await Client.connect(
   {

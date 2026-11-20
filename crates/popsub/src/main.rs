@@ -38,7 +38,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 /// Runs the PopSub WebSocket broker or a demo client against it.
 #[derive(Parser)]
-#[command(name = "popsub")]
+#[command(name = "popsub", version)]
 enum Command {
     /// Start the WebSocket server
     Server,
