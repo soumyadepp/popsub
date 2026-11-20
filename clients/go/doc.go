@@ -10,12 +10,19 @@
 // messages, and handing each (topic, seq) to the application at most once.
 //
 // A durable session outlives the process. When a new process connects with
-// the same SessionID, the server starts sending what it kept for the
-// session's topics before the application has subscribed. The client
-// leaves those messages unacknowledged, so the server keeps them, and they
-// are replayed once the application subscribes to the topic by name or
-// through a pattern that matches it. Messages on a session topic the
-// application never subscribes to stay on the server.
+// the same SessionID, the session's topics exist on the server before the
+// application has subscribed to anything. The client asks the server to
+// hold them (hold_resumed in auth): a server that does sends nothing on a
+// session topic until the application subscribes to it, by name or through
+// a pattern that matches it, and then continues one past the session's
+// cursor. After a reconnect the client subscribes again to the session
+// topics it tracks, since the server no longer attaches them.
+//
+// A server that does not know the request starts sending on the session's
+// topics straight away. The client then leaves those messages
+// unacknowledged, so the server keeps them, and they are replayed once the
+// application subscribes. Messages on a session topic the application
+// never subscribes to stay on the server.
 //
 // Example:
 //

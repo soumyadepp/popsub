@@ -220,10 +220,15 @@ impl SharedBroker {
     /// subscriptions matches it. The client gets a `subscribed` frame with
     /// no id for the topic.
     ///
+    /// When the client's durable session has a stored cursor for the topic
+    /// that isn't attached (the client authenticated with `hold_resumed`),
+    /// the subscription starts one past that cursor whatever `from` says, so
+    /// a pattern never skips what the session was keeping.
+    ///
     /// Args:
     ///     topic: The topic.
     ///     client_id: The client.
-    ///     from: Where replay starts.
+    ///     from: Where replay starts when the session has no cursor for it.
     ///
     /// Returns:
     ///     What was replayed and whether the subscription was added.
@@ -238,6 +243,10 @@ impl SharedBroker {
         client_id: &str,
         from: StartFrom,
     ) -> StorageResult<SubscribeOutcome> {
+        let from = match self.resume_point(topic, client_id).await? {
+            StartFrom::Seq(kept) => StartFrom::Seq(kept),
+            _ => from,
+        };
         let outcome = self.subscribe_inner(topic, client_id, from, None).await?;
         self.with(|broker| broker.mark_joined(&client_id.to_string(), topic));
         Ok(outcome)
@@ -655,7 +664,8 @@ impl SharedBroker {
     }
 
     /// Unsubscribes a client from a topic, and forgets the stored
-    /// subscription if the client holds a durable session.
+    /// subscription if the client holds a durable session, including one
+    /// that was never attached to this connection (`hold_resumed`).
     ///
     /// Args:
     ///     topic: The topic to leave.
@@ -664,7 +674,11 @@ impl SharedBroker {
     /// Raises:
     ///     StorageError::Unavailable: When the stored subscription can't be removed.
     pub async fn unsubscribe(&self, topic: &str, client_id: &str) -> StorageResult<()> {
-        let session = self.with(|broker| broker.unsubscribe(topic, &client_id.to_string()));
+        let session = self.with(|broker| {
+            broker
+                .unsubscribe(topic, &client_id.to_string())
+                .or_else(|| broker.client_session(client_id))
+        });
         match session {
             Some(session) => self.storage.unsubscribe(&session, topic).await,
             None => Ok(()),

@@ -5,7 +5,8 @@
  * and `ping` (unless told to stop answering pings), sends one QoS 1
  * message after each subscribe, records every request it receives, and
  * can drop connections and refuse new ones. A test can script it: name
- * the topics `authenticated` lists as resumed, give frames to send right
+ * the topics `authenticated` lists as resumed, have it answer `held: true`
+ * as a server that holds a session's topics does, give frames to send right
  * after `authenticated` (what a durable session kept), replace the replies
  * to chosen requests, and send frames to every open connection. It never
  * sends WebSocket pings, so a client hears nothing from it unless it asks.
@@ -32,6 +33,8 @@ export interface FakeServerOptions {
   idleTimeoutSecs?: number;
   /** The topics `authenticated.resumed` lists; none by default. */
   resumed?: string[];
+  /** Whether `authenticated` carries `held: true`; left out by default. */
+  held?: boolean;
   /** Frames sent right after every `authenticated`; none by default. */
   kept?: Frame[];
   /**
@@ -144,12 +147,14 @@ function decode(buffer: Buffer): { frames: { opcode: number; payload: Buffer }[]
  * @param request - The parsed request.
  * @param limits - The `heartbeat_secs` and `idle_timeout_secs` to announce.
  * @param resumed - The topics to list in `authenticated.resumed`.
+ * @param held - Whether `authenticated` carries `held: true`.
  * @returns The frames to send back, in order.
  */
 function reply(
   request: Frame,
   limits: { heartbeatSecs: number; idleTimeoutSecs: number },
   resumed: string[],
+  held: boolean,
 ): Frame[] {
   const id = request.id;
   const topic = request.topic;
@@ -163,6 +168,7 @@ function reply(
           id,
           protocol: 1,
           resumed,
+          ...(held ? { held: true } : {}),
           limits: {
             max_inflight: 100,
             session_expiry_secs: 60,
@@ -257,7 +263,7 @@ export async function startFakeServer(options: FakeServerOptions = {}): Promise<
         if (type === "ping" && !answeringPings) {
           continue;
         }
-        const answers = options.respond?.(request) ?? reply(request, limits, resumed);
+        const answers = options.respond?.(request) ?? reply(request, limits, resumed, options.held === true);
         for (const answer of type === "auth" ? [...answers, ...kept] : answers) {
           socket.write(encode(1, Buffer.from(JSON.stringify(answer))));
         }

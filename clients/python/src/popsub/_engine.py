@@ -6,7 +6,8 @@ happens: reconnect with jittered backoff, or stop for good
 (`session_taken_over`, `unsupported_protocol`, `auth_failed`,
 `account_disabled`, `token_expired` with a bare token, or a rejected login).
 After reconnecting it subscribes every topic again from the next seq it
-expects (topics a durable session restored are left to the server, unless
+expects (topics a durable session restored are subscribed again from
+`resume` when the server holds them, and otherwise left to the server unless
 one is still being claimed), resends
 confirmed publishes still waiting for `published` under the same request id
 and `message_id`, and sends QoS 0 publishes held while disconnected.
@@ -28,8 +29,18 @@ pattern unsubscribes it and every topic it owned. Subscribing again to a
 pattern the engine holds replaces the subscription: the topics it owned move
 to the new one with the next seq they expect, and the earlier one ends.
 
-A durable session can be held by a new process. The topics the server lists
-as resumed that the engine isn't tracking are unclaimed: their messages are
+A durable session can be held by a new process, before the application has
+subscribed to anything. With a session id the `auth` frame carries
+`hold_resumed`, asking the server to send nothing on the session's topics
+until the engine subscribes to them. A server that does so answers
+`authenticated` with `held`: nothing is unclaimed then, a subscribe to a
+resumed topic is an ordinary subscribe, and after a reconnect the engine
+subscribes again from `resume` to each tracked topic the server lists as
+resumed.
+
+A server that answers without `held` sends on the resumed topics straight
+away. The topics it lists
+as resumed that the engine isn't tracking are then unclaimed: their messages are
 dropped without an acknowledgement, so the server keeps them. Subscribing to
 one by name, or to a pattern that matches it, claims it. A claimed topic's
 messages are still dropped unacknowledged until the `subscribed` that
@@ -514,6 +525,7 @@ class Engine:
         self._topics: dict[str, _Topic] = {}
         self._patterns: dict[str, _Pattern] = {}
         self._unclaimed: set[str] = set()
+        self._held = False
         self._subscribe_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending: dict[int, _Pending] = {}
         self._unconfirmed: dict[int, dict[str, Any]] = {}
@@ -780,6 +792,10 @@ class Engine:
     async def _connect(self) -> tuple[_Connection, list[str]]:
         """Opens a connection, logs in if needed, and authenticates.
 
+        With a session id the `auth` frame carries `hold_resumed`. Whether
+        the server answered with `held` is recorded for this connection;
+        an absent `held` means it didn't.
+
         Returns:
             The connection and the topics the server restored for the session.
 
@@ -819,6 +835,7 @@ class Engine:
             auth: dict[str, Any] = {"type": "auth", "token": token, "protocol": PROTOCOL_VERSION}
             if config.session_id is not None:
                 auth["session_id"] = config.session_id
+                auth["hold_resumed"] = True
             if config.clean_start and not self._connected_once:
                 auth["clean_start"] = True
             reply = await self._exchange(connection, auth)
@@ -829,7 +846,8 @@ class Engine:
             raise
         self._silence = _silence_limit(reply.get("limits"))
         resumed = [topic for topic in reply.get("resumed") or [] if isinstance(topic, str)]
-        log.info("connected, %d topics resumed", len(resumed))
+        self._held = reply.get("held") is True
+        log.info("connected, %d topics resumed, held %s", len(resumed), self._held)
         return connection, resumed
 
     async def _exchange(self, connection: _Connection, frame: dict[str, Any]) -> dict[str, Any]:
@@ -1021,15 +1039,22 @@ class Engine:
         this process. Their messages are dropped without an acknowledgement
         until the application claims them, so the server keeps them.
 
+        When the server holds the session's topics (`held`) it sends nothing
+        on them until the engine subscribes, so none is unclaimed.
+
         Args:
             resumed: Topics the server restored.
         """
-        self._unclaimed = {name for name in resumed if name not in self._topics}
+        self._unclaimed = set() if self._held else {name for name in resumed if name not in self._topics}
 
     async def _restore(self, connection: _Connection, resumed: list[str]) -> None:
         """Restores state on a new connection.
 
-        Topics the server restored are left to it, except one still waiting
+        When the server holds the session's topics (`held`), each tracked
+        topic it lists as resumed is subscribed again from `resume`, which
+        is one past the session's cursor, since the server no longer
+        attaches it. Otherwise
+        topics the server restored are left to it, except one still waiting
         for the `subscribed` that claims it, which is subscribed again: from
         the application's start, or from `resume` when a pattern owns it.
         Every other tracked topic is subscribed again from the next seq it
@@ -1058,6 +1083,8 @@ class Engine:
                 again.append({"type": "subscribe", "topic": name, "from": start.to_json()})
             elif name not in resumed:
                 again.append({"type": "subscribe", "topic": name, "from": topic.state.resubscribe_from().to_json()})
+            elif self._held:
+                again.append({"type": "subscribe", "topic": name, "from": StartFrom.resume().to_json()})
         again.extend(
             {"type": "subscribe", "topic": pattern, "from": StartFrom.seq(1).to_json()}
             for pattern in sorted(self._patterns)

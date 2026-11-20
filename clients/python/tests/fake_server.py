@@ -25,12 +25,15 @@ class FakeServer:
         received: Every frame received, in order.
         duplicate_deliveries: Send every message twice, as a server resending
             an unacknowledged message would.
+        honours_hold: Answer an `auth` that carries `hold_resumed` with
+            `held`, as a server that holds a session's topics does.
     """
 
     def __init__(self) -> None:
         """Builds a server that hasn't started."""
         self.received: list[dict[str, Any]] = []
         self.duplicate_deliveries = False
+        self.honours_hold = False
         self._logs: dict[str, list[dict[str, Any]]] = {}
         self._connections: list[ServerConnection] = []
         self._lock = threading.Lock()
@@ -154,11 +157,12 @@ class FakeServer:
         """Answers an auth.
 
         Args:
-            frame: Unused.
+            frame: The auth.
             subscribed: Unused.
 
         Returns:
-            `authenticated` with limits and nothing resumed.
+            `authenticated` with limits and nothing resumed, and with `held`
+            when the auth asked for the hold and the server honours it.
         """
         limits = {
             "max_inflight": 100,
@@ -168,7 +172,10 @@ class FakeServer:
             "max_payload_bytes": 1024,
             "max_topic_bytes": 120,
         }
-        return [{"type": "authenticated", "protocol": 1, "limits": limits, "resumed": []}]
+        reply: dict[str, Any] = {"type": "authenticated", "protocol": 1, "limits": limits, "resumed": []}
+        if self.honours_hold and frame.get("hold_resumed") is True:
+            reply["held"] = True
+        return [reply]
 
     def _subscribe(self, frame: dict[str, Any], subscribed: set[str]) -> list[dict[str, Any]]:
         """Answers a subscribe; only new messages are delivered.

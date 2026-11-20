@@ -483,6 +483,10 @@
     {
       "description": "An `auth` was accepted. On an already authenticated connection,\n`auth` with a new token for the same user only refreshes the token,\nand the reply's `resumed` is empty.",
       "properties": {
+        "held": {
+          "description": "Whether the `auth` asked for `hold_resumed` and the server\nhonoured it: the topics in `resumed` are stored but not attached,\nand nothing is sent on one until the client subscribes to it.",
+          "type": "boolean"
+        },
         "limits": {
           "$ref": "#/$defs/Limits",
           "description": "Limits the client should respect."
@@ -494,7 +498,7 @@
           "type": "integer"
         },
         "resumed": {
-          "description": "Topics whose stored subscriptions are being restored. Each is\nfollowed by its own `subscribed` frame.",
+          "description": "Topics the session has stored subscriptions for. Each is being\nrestored and is followed by its own `subscribed` frame, unless\n`held` is set.",
           "items": {
             "type": "string"
           },

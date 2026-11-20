@@ -494,6 +494,119 @@ func TestPatternClaimsTheSessionsTopics(t *testing.T) {
 	}
 }
 
+// sessionConfig is testConfig with a durable session id.
+func sessionConfig(f *fakeServer) Config {
+	cfg := testConfig(f)
+	cfg.SessionID = "alice-laptop"
+	return cfg
+}
+
+// TestAuthAsksForTheHoldOnlyWithASession checks that auth carries
+// hold_resumed: true with a session id and leaves it out without one, and
+// that the auth which installs a refreshed token carries neither.
+func TestAuthAsksForTheHoldOnlyWithASession(t *testing.T) {
+	plain := newFakeServer(t)
+	connectTest(t, plain, testConfig(plain))
+	if auth := plain.awaitAuths(t, 1)[0]; auth["hold_resumed"] != nil || auth["session_id"] != nil {
+		t.Fatalf("an ephemeral auth should not ask for the hold, got %v", auth)
+	}
+	f := newFakeServer(t)
+	f.hold()
+	connectTest(t, f, sessionConfig(f))
+	if auth := f.awaitAuths(t, 1)[0]; auth["hold_resumed"] != true || auth["session_id"] != "alice-laptop" {
+		t.Fatalf("an auth with a session should ask for the hold, got %v", auth)
+	}
+	f.inject(t, `{"type":"auth_expiring","expires_at_ms":1}`)
+	if refresh := f.awaitAuths(t, 2)[1]; refresh["hold_resumed"] != nil || refresh["session_id"] != nil {
+		t.Fatalf("the token refresh auth should carry no session and no hold, got %v", refresh)
+	}
+}
+
+// TestHeldResumedTopicIsSubscribedAgainFromResume checks that when the
+// server holds the session's topics, after a reconnect a tracked topic it
+// lists as resumed is subscribed again with resume, while a tracked topic
+// it does not list is subscribed again from the next seq it expects.
+func TestHeldResumedTopicIsSubscribedAgainFromResume(t *testing.T) {
+	f := newFakeServer(t)
+	f.hold()
+	client := connectTest(t, f, sessionConfig(f))
+	<-f.authenticated
+	if _, err := client.Subscribe(context.Background(), "jobs", FromNew); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	feed, err := client.Subscribe(context.Background(), "feed", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if _, err := client.PublishConfirmed(context.Background(), "feed", "one"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	next(t, feed)
+	f.resume("jobs")
+	f.dropConnection(websocket.StatusGoingAway)
+	<-f.authenticated
+	if again := f.awaitReceived(t, "subscribe", "jobs", 2)[1]; again["from"] != "resume" {
+		t.Fatalf("expected the held topic to be subscribed again from resume, got %v", again["from"])
+	}
+	again := f.awaitReceived(t, "subscribe", "feed", 2)[1]
+	if from, _ := again["from"].(map[string]any); from["seq"] != float64(2) {
+		t.Fatalf("expected feed to be subscribed again from seq 2, got %v", again["from"])
+	}
+}
+
+// TestUnheldResumedTopicIsLeftToTheServer checks the fallback beside the
+// test above: when the server answers without held, a tracked topic it
+// lists as resumed is not subscribed again after a reconnect.
+func TestUnheldResumedTopicIsLeftToTheServer(t *testing.T) {
+	f := newFakeServer(t)
+	client := connectTest(t, f, sessionConfig(f))
+	<-f.authenticated
+	if _, err := client.Subscribe(context.Background(), "jobs", FromNew); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	f.resume("jobs")
+	f.dropConnection(websocket.StatusGoingAway)
+	<-f.authenticated
+	settle(t, client)
+	if subscribes := f.received("subscribe", "jobs"); len(subscribes) != 1 {
+		t.Fatalf("expected the resumed topic to be left to the server, got %v", subscribes)
+	}
+}
+
+// TestHeldSessionTopicsAreNotUnclaimed checks a new process on a session
+// the server holds: a subscribe by name to a session topic is ordinary, so
+// a message that follows its subscribed is handed over and acknowledged,
+// and a pattern sends no extra subscribe by name for the session topics it
+// matches.
+func TestHeldSessionTopicsAreNotUnclaimed(t *testing.T) {
+	f := newFakeServer(t)
+	f.hold()
+	f.resume("jobs", "tasks/a")
+	client := connectTest(t, f, sessionConfig(f))
+	jobs, err := client.Subscribe(context.Background(), "jobs", FromResume)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	f.inject(t, qos1("jobs", "1"))
+	if got := next(t, jobs).Seq; got != 1 {
+		t.Fatalf("expected seq 1 on the held topic, got %d", got)
+	}
+	f.awaitReceived(t, "ack", "jobs", 1)
+	tasks, err := client.Subscribe(context.Background(), "tasks/#", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	settle(t, client)
+	if claims := f.received("subscribe", "tasks/a"); len(claims) != 0 {
+		t.Fatalf("a pattern should claim nothing by name while held, got %v", claims)
+	}
+	f.inject(t, `{"type":"subscribed","topic":"tasks/a","replay_from":3,"replay_to":3}`)
+	f.inject(t, qos1("tasks/a", "3"))
+	if got := next(t, tasks); got.Topic != "tasks/a" || got.Seq != 3 {
+		t.Fatalf("expected tasks/a #3 through the pattern, got %s #%d", got.Topic, got.Seq)
+	}
+}
+
 // TestRepeatedPatternSubscribeReplacesTheSubscription checks that
 // subscribing again to a held pattern closes the earlier subscription
 // without losing anything: a topic already joined keeps its next expected

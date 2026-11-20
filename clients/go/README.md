@@ -78,13 +78,15 @@ Subscribing again to a pattern the client holds replaces the subscription: the e
 
 ### Durable sessions in a new process
 
-A durable session (`SessionID`) outlives the application. When a new process connects with the same `SessionID`, the server starts sending what it kept for the session's topics straight away, before the application has subscribed. The client does not hand those messages over and does not acknowledge them, so the server keeps them.
+A durable session (`SessionID`) outlives the application. When a new process connects with the same `SessionID`, the session's topics exist on the server before the application has subscribed to anything. With a `SessionID` the client's `auth` carries `hold_resumed: true`, which asks the server to hold those topics. A server that honours it answers `held: true` and sends nothing on a session topic until the client subscribes to it.
 
 ```go
 jobs, err := client.Subscribe(ctx, "jobs", popsub.FromResume)
 ```
 
-Subscribing to such a topic by name claims it: the server replays what it kept, in order, to the new `Subscription`. Subscribing to a pattern claims every session topic it matches, each from where the session left it, whatever `from` the pattern was given. A session topic the application never subscribes to stays on the server, where its messages wait, and after the server's `max_retries` the subscription stalls or the messages are dead-lettered.
+When held, subscribing to a session topic is an ordinary subscribe: `FromResume` starts one past the session's cursor. A pattern joins every session topic it matches from that topic's cursor, whatever `from` the pattern was given. Nothing is in flight for a topic the application never subscribes to, so it neither stalls nor is dead-lettered. After a reconnect the client subscribes again, with `resume`, to each topic it tracks that the server lists as resumed, because the server no longer attaches them.
+
+A server that does not know `hold_resumed` answers without `held` and starts sending on the session's topics straight away. The client then does not hand those messages over and does not acknowledge them, so the server keeps them. Subscribing to such a topic by name claims it: the server replays what it kept, in order, to the new `Subscription`. Subscribing to a pattern claims every session topic it matches, each from where the session left it. A session topic the application never subscribes to stays on the server, where its messages wait, and after the server's `max_retries` the subscription stalls or the messages are dead-lettered.
 
 ### Shared subscriptions
 

@@ -69,10 +69,16 @@ pub enum ServerMessage {
         /// The durable session held, echoed from `auth`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
-        /// Topics whose stored subscriptions are being restored. Each is
-        /// followed by its own `subscribed` frame.
+        /// Topics the session has stored subscriptions for. Each is being
+        /// restored and is followed by its own `subscribed` frame, unless
+        /// `held` is set.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         resumed: Vec<String>,
+        /// Whether the `auth` asked for `hold_resumed` and the server
+        /// honoured it: the topics in `resumed` are stored but not attached,
+        /// and nothing is sent on one until the client subscribes to it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        held: bool,
         /// Limits the client should respect.
         limits: Limits,
     },
@@ -326,4 +332,16 @@ pub struct Stalled {
     pub topic: String,
     /// The record that was never acknowledged.
     pub seq: u64,
+}
+
+/// Tells serde to leave a `false` flag out of a frame.
+///
+/// Args:
+///     flag: The flag.
+///
+/// Returns:
+///     True when the flag is false.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }

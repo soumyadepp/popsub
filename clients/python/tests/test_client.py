@@ -1,7 +1,8 @@
 """End-to-end tests of `Client` against the in-process fake server.
 
 They check what the scenario suite can't see from outside: that closing the
-client leaves no task running, and that nothing logs a destroyed pending task.
+client leaves no task running, that nothing logs a destroyed pending task,
+and what the `auth` frame carries with and without a session id.
 """
 
 from __future__ import annotations
@@ -65,12 +66,13 @@ async def acks_seen(server: FakeServer, count: int, within: float = 2.0) -> list
         await asyncio.sleep(0.01)
 
 
-def make_config(server: FakeServer, password: str = PASSWORD) -> ClientConfig:
+def make_config(server: FakeServer, password: str = PASSWORD, session_id: str | None = None) -> ClientConfig:
     """Builds a configuration with fast reconnects for the fake server.
 
     Args:
         server: The server.
         password: The password to log in with.
+        session_id: The durable session to hold; None is ephemeral.
 
     Returns:
         The configuration.
@@ -80,6 +82,7 @@ def make_config(server: FakeServer, password: str = PASSWORD) -> ClientConfig:
         PasswordCredentials("alice", password),
         reconnect=ReconnectPolicy(initial=0.02, max=0.2),
         request_timeout=5.0,
+        session_id=session_id,
     )
 
 
@@ -167,6 +170,32 @@ async def test_reconnect_resubscribes_from_next_expected(server: FakeServer) -> 
     froms = [frame["from"] for frame in server.frames("subscribe")]
     assert froms == [{"last": 5}, {"seq": 2}]
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_asks_for_the_hold_only_with_a_session(server: FakeServer) -> None:
+    """The `auth` frame carries `hold_resumed` with a session id and omits it without one."""
+    ephemeral = await Client.connect(make_config(server))
+    await ephemeral.close()
+    durable = await Client.connect(make_config(server, session_id="alice-laptop"))
+    await durable.close()
+    without, with_session = server.frames("auth")
+    assert "hold_resumed" not in without
+    assert "session_id" not in without
+    assert with_session["session_id"] == "alice-laptop"
+    assert with_session["hold_resumed"] is True
+
+
+@pytest.mark.asyncio
+async def test_held_is_read_from_authenticated_and_absent_means_false(server: FakeServer) -> None:
+    """The engine records `held` when the server answers with it and false when the reply has none."""
+    unheld = await Client.connect(make_config(server, session_id="alice-laptop"))
+    assert unheld._engine._held is False
+    await unheld.close()
+    server.honours_hold = True
+    held = await Client.connect(make_config(server, session_id="alice-laptop"))
+    assert held._engine._held is True
+    await held.close()
 
 
 @pytest.mark.asyncio

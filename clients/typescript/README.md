@@ -84,7 +84,7 @@ Subscribing again to a pattern the client already holds replaces the subscriptio
 
 ### A durable session in a new process
 
-A durable session (`sessionId`) outlives the process. When a new process connects with the same `sessionId`, the server starts sending what it kept for the session's topics straight away, before the application has subscribed to anything; the `connected` event lists those topics in `resumed`.
+A durable session (`sessionId`) outlives the process. When a new process connects with the same `sessionId`, the `connected` event lists the session's topics in `resumed` before the application has subscribed to anything. With a `sessionId` the client asks the server to hold those topics (`hold_resumed: true` in `auth`), and a server that honours it (it answers `held: true`) sends nothing on them until the client subscribes.
 
 ```ts
 const client = await Client.connect({ url, credentials, sessionId: "alice-laptop", ackMode: "manual" });
@@ -92,7 +92,9 @@ const jobs = await client.subscribe("jobs", "resume");
 const tasks = await client.subscribe("tasks/#");
 ```
 
-Until the application subscribes to one of those topics, the client drops its messages without acknowledging them, so the server keeps them. Subscribing to the topic by name, or to a pattern that matches it, claims it: the subscribe replays the kept messages in order, and they are handed over from the `subscribed` reply on. For a pattern the client sends one more `subscribe` per claimed topic, by name with `from: "resume"`, because the server skips topics the connection already holds when it handles the pattern. A topic the application never subscribes to stays unclaimed: its messages wait on the server, where after `max_retries` the subscription stalls or the messages are dead-lettered, as for any subscriber that doesn't acknowledge. To drop a topic from the session, `unsubscribe` it.
+When the topics are held, subscribing to one by name, or to a pattern that matches it, is an ordinary subscribe: `"resume"` starts one past the session's cursor, and the server joins a pattern's topic from that cursor whatever the pattern's `from`. Nothing is in flight for a topic the application never subscribes to, so it neither stalls nor is dead-lettered. After a reconnect the client subscribes again, from `"resume"`, to every topic it tracks that the server lists in `resumed`.
+
+A server that doesn't know `hold_resumed` answers without `held` and starts sending what it kept straight away. Then, until the application subscribes to one of those topics, the client drops its messages without acknowledging them, so the server keeps them. Subscribing to the topic by name, or to a pattern that matches it, claims it: the subscribe replays the kept messages in order, and they are handed over from the `subscribed` reply on. For a pattern the client sends one more `subscribe` per claimed topic, by name with `from: "resume"`, because the server skips topics the connection already holds when it handles the pattern. A topic the application never subscribes to stays unclaimed: its messages wait on the server, where after `max_retries` the subscription stalls or the messages are dead-lettered, as for any subscriber that doesn't acknowledge. To drop a topic from the session, `unsubscribe` it.
 
 ### Shared subscriptions
 

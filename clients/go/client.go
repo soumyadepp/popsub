@@ -72,9 +72,12 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 // on from where each was on the new Subscription: nothing is replayed and
 // nothing is skipped.
 //
-// On a durable session that an earlier process left subscriptions on,
-// messages the server sends for those topics before this call are not
-// acknowledged, so they are replayed to the Subscription returned here. A
+// On a durable session that an earlier process left subscriptions on, the
+// server holds those topics until this call when it honours the client's
+// request to, and FromResume then starts one past the session's cursor.
+// When it does not, messages it sends for those topics before this call
+// are not acknowledged, so they are replayed to the Subscription returned
+// here. A
 // pattern picks up every such topic it matches, each from where the
 // session left it, whatever from says.
 //

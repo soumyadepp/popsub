@@ -142,7 +142,7 @@ Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend'
 |---|---|---|
 | `register` | `username`, `password` | `registered`. Only when `server.allow_registration` is on. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`; passwords at least 8 characters. Allowed before `auth`. |
 | `login` | `username`, `password` | `logged_in` with a JWT. Checked against the user store (Argon2id). Rate limited, see section 10. |
-| `auth` | `token`, optional `protocol`, optional `session_id`, optional `clean_start` | `authenticated`. Must succeed before anything below is accepted. A bad token, an unsupported `protocol` or a bad `session_id` closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
+| `auth` | `token`, optional `protocol`, optional `session_id`, optional `clean_start`, optional `hold_resumed` | `authenticated`. With `hold_resumed` the session's stored subscriptions are listed in `resumed` but left unattached (`held: true` in the reply): nothing is sent on one until the client subscribes to it. Must succeed before anything below is accepted. A bad token, an unsupported `protocol` or a bad `session_id` closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
 | `subscribe` | `topic`, optional `from` | `subscribed`, then history, then live records. Requires subscribe permission. `from` is `"resume"` (the default: one past a durable session's stored cursor, otherwise no replay), `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`. `storage_unavailable` if the log or session store can't be read, in which case the client is not subscribed. |
 | `unsubscribe` | `topic` | `unsubscribed`, even if the client wasn't subscribed. |
 | `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
@@ -194,7 +194,7 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 | Registered | `{"type":"registered"}` |
 | Pong | `{"type":"pong"}`, the answer to `ping` |
 | Logged in | `{"type":"logged_in","token":"..."}` |
-| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90,"max_payload_bytes":1048576,"max_topic_bytes":120}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
+| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90,"max_payload_bytes":1048576,"max_topic_bytes":120}}`, plus `session_id` and `resumed` (the session's topics) for a durable session, and `held: true` when `hold_resumed` was asked for |
 | Auth expiring | `{"type":"auth_expiring","expires_at_ms":1794800000000}`, a minute before the token expires |
 | Subscribed | `{"type":"subscribed","topic":"...","replay_from":41,"replay_to":90}`. Records `replay_from` to `replay_to` are history; later ones are live. Also sent, without an `id`, for each subscription a session restores. |
 | Unsubscribed | `{"type":"unsubscribed","topic":"..."}`. Also sent, without an `id`, when an admin change ends a subscription the user may no longer read. |
@@ -274,17 +274,16 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 - `auth` with a `session_id` binds the connection to a durable session keyed by the token's username and that id, so two users with the same id get different sessions.
 - Any other connection holding the same session is sent a close frame and removed. This is how a client reconnecting before the server noticed its old connection drop takes the session back.
 - `clean_start` discards the stored subscriptions. Otherwise each stored subscription is checked against the user's current permissions (forgotten if no longer allowed), listed in `authenticated.resumed`, and subscribed again with `resume`, so everything after the stored cursor (sent but unacknowledged, or published while away) is replayed.
-- A session can outlive the application that opened it. When a new process authenticates with the same `session_id`, the server resumes the stored subscriptions at once, before that process has subscribed to anything. The client libraries hold back until the application subscribes:
+- A session can outlive the application that opened it, so a new process can authenticate with the same `session_id` before it has subscribed to anything. With `hold_resumed` in `auth`, the server lists the stored subscriptions in `resumed`, answers `held: true`, and leaves them unattached: nothing is sent or put in flight until the client subscribes.
 
 ```mermaid
 sequenceDiagram
     participant App as Application
     participant Client as Client library
     participant Server
-    Client->>Server: auth with session_id
-    Server-->>Client: authenticated, resumed jobs
-    Server-->>Client: jobs 2
-    Note over Client: not subscribed yet, so dropped without an ack
+    Client->>Server: auth with session_id, hold_resumed
+    Server-->>Client: authenticated, resumed jobs, held
+    Note over Server: jobs stays stored, nothing is sent
     App->>Client: subscribe jobs
     Client->>Server: subscribe jobs from resume
     Server-->>Client: subscribed, replay from 2
@@ -293,7 +292,8 @@ sequenceDiagram
     Client->>Server: ack jobs 2
 ```
 
-  The cursor doesn't move while nothing is acknowledged, so the application's subscribe replays everything in order. Anything the server sends between the subscribe and its `subscribed` is dropped the same way. A pattern subscribe claims each matching resumed topic with a `subscribe` by name from `resume`. `clients/README.md` has the full rule.
+  `subscribe` with `from: "resume"` starts one past the stored cursor. A pattern that matches a held topic joins it from that cursor too, whatever the pattern's `from`, and `unsubscribe` forgets a held topic. After a reconnect the client subscribes to its resumed topics again itself. The client libraries always ask for the hold.
+- Without `hold_resumed` the stored subscriptions are attached as soon as `auth` succeeds and their records start arriving at once. A client that isn't ready for them must not acknowledge them: the cursor then stays put and a later `subscribe` from `resume` replays them. The client libraries do this when a server doesn't answer `held` (`clients/README.md`); a topic left that way stalls or is dead-lettered after `max_retries`.
 - Sessions are touched on connect, on disconnect, and every minute while connected. A session not touched for `storage.session_expiry_secs` is removed with its subscriptions.
 
 ## 6. Delivery semantics
@@ -305,7 +305,7 @@ sequenceDiagram
 | QoS 1, with `broker.dead_letter_topic` set | A record a subscription never acknowledges is, after `max_retries` resends, copied to the dead-letter topic and dropped for that subscription, which then carries on. So for that subscription the record is delivered at least once but never acknowledged, and what remains of it is the copy on the dead-letter topic. If that copy can't be stored it is logged and lost as a dead letter; the original stays in its topic's log until trimmed. |
 | QoS 1, ephemeral subscriber disconnects | Not at least once. Its subscriptions and windows are discarded. |
 | QoS 1, durable session disconnects and reconnects | At least once, provided it reconnects within `session_expiry_secs` and the records are still retained. Everything after its stored cursor is replayed. Records trimmed meanwhile are reported with `truncated`. |
-| QoS 1, durable session, the application restarts | At least once, on the same terms as a reconnect. The server starts sending the session's records as soon as the new process authenticates, before it has subscribed. The client libraries don't acknowledge records on a topic the application hasn't subscribed to in this process, so the cursor stays put and the application's subscribe replays them. A topic the new process never subscribes to keeps its records on the server until the subscription stalls or they are dead-lettered. A client written against the raw protocol must do the same, or it loses them. |
+| QoS 1, durable session, the application restarts | At least once, on the same terms as a reconnect. With `hold_resumed` in `auth` (the client libraries always send it) the server sends nothing on the session's topics until the new process subscribes, and its subscribe replays from the stored cursor. Without it the server starts sending as soon as the process authenticates, and a client that acknowledges a record its application hasn't subscribed for loses it. |
 | QoS 1, broker restarts | With the `file` backend (the default), durable sessions resume from their stored cursors. Records are kept as firmly as `storage.durability` says: `buffered` survives a crash of the server, `synced` also a power loss. A cursor move is lost only to a power loss, which means resending records already acknowledged. With the `memory` backend nothing survives a restart. |
 | Shared subscriptions | At least once to the group as a whole: each record is sent to one member, and one that member never acknowledges goes to another when it disconnects, or is retried to it. Two members never hold the same record at once, but a record can be delivered to a second member after the first disconnects, so workers must tolerate a repeat. Order across members is not kept. The group's stored position gives the same restart behaviour as a durable session. |
 | Ordering | Per topic, every subscriber receives new records in `seq` order, and a replay followed by live delivery has no gap or repeat. Retries are resent out of order. |

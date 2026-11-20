@@ -288,6 +288,11 @@ pub(crate) struct Driver {
     /// hasn't subscribed to in this process. Their messages are dropped
     /// without an acknowledgement, so the server keeps them for the session.
     unclaimed: HashSet<String>,
+    /// Whether the server left the session's topics unattached on this
+    /// connection (`authenticated.held`). Then nothing arrives on a topic
+    /// until this client subscribes to it, so nothing is unclaimed, and
+    /// `restore` subscribes to the resumed topics itself.
+    held: bool,
     /// Subscribes waiting for `subscribed`, by topic.
     subscribe_waiters: HashMap<String, oneshot::Sender<Result<Subscribed, Error>>>,
     /// Requests waiting for a reply, by id.
@@ -334,6 +339,7 @@ impl Driver {
             topics: HashMap::new(),
             patterns: HashMap::new(),
             unclaimed: HashSet::new(),
+            held: false,
             subscribe_waiters: HashMap::new(),
             pending: HashMap::new(),
             unconfirmed: HashMap::new(),
@@ -535,13 +541,18 @@ impl Driver {
             protocol: Some(PROTOCOL_VERSION),
             session_id: self.config.session_id.clone(),
             clean_start: self.config.clean_start && !self.connected_once,
+            hold_resumed: self.config.session_id.is_some(),
         };
         match self.exchange(&mut socket, id, auth).await? {
             ServerMessage::Authenticated {
-                resumed, limits, ..
+                resumed,
+                limits,
+                held,
+                ..
             } => {
                 self.silence = silence_limit(&limits);
-                info!(url = %self.config.url, resumed = resumed.len(), "connected");
+                self.held = held;
+                info!(url = %self.config.url, resumed = resumed.len(), held, "connected");
                 Ok((socket, resumed))
             }
             other => Err(refusal(other)),
@@ -613,7 +624,7 @@ impl Driver {
     async fn serve(&mut self, mut socket: Socket, resumed: Vec<String>) -> Ending {
         self.unclaimed = resumed
             .iter()
-            .filter(|name| !self.topics.contains_key(*name))
+            .filter(|name| !self.held && !self.topics.contains_key(*name))
             .cloned()
             .collect();
         if self.restore(&mut socket, &resumed).await.is_err() {
@@ -668,7 +679,10 @@ impl Driver {
     /// Restores state on a new connection: resubscribes, resends
     /// unconfirmed publishes, sends queued frames.
     ///
-    /// Topics the server restored for the session are left alone, except
+    /// When the server holds the session's topics (`held`), each one this
+    /// client tracks is subscribed again from `Resume`, which is one past
+    /// the session's cursor. Otherwise topics the server restored for the
+    /// session are left alone, except
     /// one still waiting for the `subscribed` that claims it, which is
     /// subscribed again the way the application asked; every other topic is subscribed again from the next `seq` it expects, so
     /// nothing still in the log is missed. Wildcard subscriptions are sent
@@ -696,6 +710,8 @@ impl Driver {
             } else if !resumed.contains(name) {
                 let from = topic.next_expected.map_or(topic.from, StartFrom::Seq);
                 resubscribe.push((name.clone(), from, None));
+            } else if self.held {
+                resubscribe.push((name.clone(), StartFrom::Resume, None));
             }
         }
         for (name, from, group) in resubscribe {
@@ -1222,6 +1238,7 @@ impl Driver {
                         protocol: Some(PROTOCOL_VERSION),
                         session_id: None,
                         clean_start: false,
+                        hold_resumed: false,
                     };
                     send(socket, Some(id), auth).await?;
                 }

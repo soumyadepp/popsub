@@ -124,7 +124,9 @@ class Client:
         On a durable session held by an earlier process, messages the server
         kept for a topic are neither delivered nor acknowledged until this
         is called for the topic or for a pattern matching it; they are then
-        replayed in order.
+        replayed in order. The client asks the server to hold them back
+        until then, and drops them unacknowledged itself when the server
+        sends them anyway.
 
         Args:
             topic: The topic or pattern.

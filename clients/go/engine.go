@@ -185,11 +185,14 @@ type readResult struct {
 // reconnects with jittered backoff when the close code allows. After a
 // reconnect it resubscribes every topic the server did not restore from the
 // next seq it expects, and resends unconfirmed publishes under the same
-// request id and message_id. Topics the server restored for a durable
-// session that the application has not subscribed to in this process are
-// kept in unclaimed, and their messages are left unacknowledged on the
-// server. Every field below except lastHeard is touched only by that
-// goroutine, until done is closed.
+// request id and message_id. With a session id it asks the server to hold
+// the session's topics; when the server does (held), nothing arrives on one
+// until the engine subscribes to it, and after a reconnect the engine
+// subscribes again to the resumed topics it tracks. When the server does
+// not, topics it restored for the session that the application has not
+// subscribed to in this process are kept in unclaimed, and their messages
+// are left unacknowledged on the server. Every field below except lastHeard
+// is touched only by that goroutine, until done is closed.
 type engine struct {
 	// cfg is the configuration, with defaults applied.
 	cfg Config
@@ -215,8 +218,14 @@ type engine struct {
 	patterns map[string]*patternState
 	// unclaimed are the topics the server restored for the session that the
 	// application has not subscribed to in this process. Their messages are
-	// dropped without an acknowledgement, so the server keeps them.
+	// dropped without an acknowledgement, so the server keeps them. Empty
+	// while held is true.
 	unclaimed map[string]bool
+	// held says whether the server left the session's topics unattached on
+	// this connection (authenticated.held). Then nothing arrives on a topic
+	// until the engine subscribes to it, so nothing is unclaimed, and
+	// restore subscribes to the resumed topics itself.
+	held bool
 	// nextOrder numbers wildcard subscriptions by age.
 	nextOrder uint64
 	// waiters are subscribes waiting for subscribed, by topic.
@@ -394,9 +403,11 @@ func (e *engine) heard() {
 }
 
 // connect opens a connection, logs in when the credentials hold a
-// password, and authenticates. It returns the connection and the topics
-// the server restored for the session, or why it failed: not retryable for
-// rejected credentials, an unsupported protocol or a bad session id.
+// password, and authenticates, asking the server to hold the session's
+// topics when there is a session id and recording in held whether it did.
+// It returns the connection and the topics the server restored for the
+// session, or why it failed: not retryable for rejected credentials, an
+// unsupported protocol or a bad session id.
 func (e *engine) connect() (*websocket.Conn, []string, *connectFailure) {
 	ctx, cancel := context.WithTimeout(e.ctx, e.cfg.RequestTimeout)
 	defer cancel()
@@ -426,11 +437,12 @@ func (e *engine) connect() (*websocket.Conn, []string, *connectFailure) {
 		token = reply.Token
 	}
 	auth := authRequest{
-		Type:       "auth",
-		Token:      token,
-		Protocol:   protocolVersion,
-		SessionID:  e.cfg.SessionID,
-		CleanStart: e.cfg.CleanStart && !e.connectedOnce,
+		Type:        "auth",
+		Token:       token,
+		Protocol:    protocolVersion,
+		SessionID:   e.cfg.SessionID,
+		CleanStart:  e.cfg.CleanStart && !e.connectedOnce,
+		HoldResumed: e.cfg.SessionID != "",
 	}
 	reply, failure := e.exchange(ctx, conn, e.takeID(), auth)
 	if failure != nil {
@@ -445,6 +457,7 @@ func (e *engine) connect() (*websocket.Conn, []string, *connectFailure) {
 	if reply.Limits != nil {
 		e.silence = reply.Limits.silence()
 	}
+	e.held = reply.Held
 	resumed := reply.Resumed
 	if resumed == nil {
 		resumed = []string{}
@@ -622,8 +635,13 @@ func (e *engine) send(conn *websocket.Conn, id uint64, message any) error {
 // markUnclaimed records, for a new connection, which topics the server
 // restored for the session without the application having subscribed to
 // them in this process: the resumed topics the engine is not tracking.
+// When the server holds the session's topics it sends nothing on them, so
+// none is unclaimed.
 func (e *engine) markUnclaimed(resumed []string) {
 	e.unclaimed = make(map[string]bool, len(resumed))
+	if e.held {
+		return
+	}
 	for _, name := range resumed {
 		if e.topics[name] == nil {
 			e.unclaimed[name] = true
@@ -634,7 +652,11 @@ func (e *engine) markUnclaimed(resumed []string) {
 // restore prepares a new connection. It resubscribes every tracked topic
 // the server did not restore for the session from the next seq it expects
 // (so nothing still in the log is missed); a shared subscription always
-// rejoins its group with resume, since it is never restored. A topic still
+// rejoins its group with resume, since it is never restored. A tracked
+// topic the server did restore is left to the server, unless the server
+// holds the session's topics (held): then it is subscribed again with
+// resume, one past the session's cursor, because the server no longer
+// attaches it. A topic still
 // waiting for the subscribed that claims it is subscribed again even when
 // the server restored it, the way the application asked, or with resume
 // when a pattern owns it. Then it sends
@@ -648,12 +670,16 @@ func (e *engine) restore(conn *websocket.Conn, resumed []string) error {
 		restored[topic] = true
 	}
 	for name, topic := range e.topics {
+		from := topic.restoreFrom()
 		if topic.group == "" && !topic.claiming && restored[name] {
-			continue
+			if !e.held {
+				continue
+			}
+			from = FromResume
 		}
 		id := e.takeID()
 		e.pending[id] = pendingSubscribe{topic: name}
-		again := subscribeRequest{Type: "subscribe", Topic: name, From: topic.restoreFrom(), Group: topic.group}
+		again := subscribeRequest{Type: "subscribe", Topic: name, From: from, Group: topic.group}
 		if err := e.send(conn, id, again); err != nil {
 			return err
 		}

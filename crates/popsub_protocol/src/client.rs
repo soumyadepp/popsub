@@ -61,7 +61,8 @@ pub enum ClientMessage {
     /// `protocol` is the version the client speaks; omitted means 1. With a
     /// `session_id`, the connection holds that durable session of the user:
     /// its subscriptions and cursors are restored and kept after the
-    /// connection ends. `clean_start` discards them first.
+    /// connection ends. `clean_start` discards them first; `hold_resumed`
+    /// keeps them stored but sends nothing until the client subscribes.
     Auth {
         /// The JWT.
         token: String,
@@ -74,6 +75,13 @@ pub enum ClientMessage {
         /// Whether to discard the session's stored subscriptions.
         #[serde(default)]
         clean_start: bool,
+        /// Whether to leave the session's stored subscriptions unattached.
+        /// They are still listed in `authenticated.resumed`, but nothing is
+        /// sent on one until the client subscribes to it, and `subscribe`
+        /// with `from: "resume"` then starts one past its stored cursor. So a
+        /// client is never sent a record before it is ready for it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        hold_resumed: bool,
     },
     /// Exchanges a username and password for a JWT. Answered with `logged_in`.
     Login {
@@ -380,4 +388,16 @@ pub enum StartFrom {
     SinceMs(i64),
     /// This `seq`, or the oldest retained one if it was trimmed.
     Seq(u64),
+}
+
+/// Tells serde to leave a `false` flag out of a frame.
+///
+/// Args:
+///     flag: The flag.
+///
+/// Returns:
+///     True when the flag is false.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }

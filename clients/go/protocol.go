@@ -206,6 +206,10 @@ type authRequest struct {
 	SessionID string `json:"session_id,omitempty"`
 	// CleanStart discards the session's stored subscriptions first.
 	CleanStart bool `json:"clean_start,omitempty"`
+	// HoldResumed asks the server to list the session's stored
+	// subscriptions without attaching them, so it sends nothing on them
+	// until the client subscribes. Set whenever SessionID is.
+	HoldResumed bool `json:"hold_resumed,omitempty"`
 }
 
 // subscribeRequest is the subscribe frame.
@@ -406,6 +410,9 @@ type serverFrame struct {
 	Limits *limits `json:"limits"`
 	// Resumed are the topics a durable session restored, in authenticated.
 	Resumed []string `json:"resumed"`
+	// Held says the server left the resumed topics unattached, in
+	// authenticated; absent means it did not.
+	Held bool `json:"held"`
 	// ExpiresAtMs is when the token expires, in auth_expiring.
 	ExpiresAtMs int64 `json:"expires_at_ms"`
 	// Topic is the topic's name, in message, subscribed, unsubscribed,

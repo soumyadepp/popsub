@@ -423,6 +423,33 @@ func TestUnclaimedTopicsAreClaimedBySubscribing(t *testing.T) {
 	}
 }
 
+// TestHeldLeavesNothingUnclaimed checks that when the server holds the
+// session's topics no resumed topic is unclaimed, so a subscribe by name
+// is not a claim and a pattern claims nothing by name, and that a later
+// connection the server does not hold goes back to marking them.
+func TestHeldLeavesNothingUnclaimed(t *testing.T) {
+	e := newEngine(Config{})
+	defer e.cancel()
+	e.markUnclaimed([]string{"stale"})
+	e.held = true
+	e.markUnclaimed([]string{"jobs", "tasks/a"})
+	if len(e.unclaimed) != 0 {
+		t.Fatalf("expected nothing unclaimed while held, got %v", e.unclaimed)
+	}
+	e.addTopic("jobs", FromResume, "", newSubscription("jobs", 1))
+	if e.topics["jobs"].claiming {
+		t.Fatal("a subscribe to a held topic is not a claim")
+	}
+	if claimed := e.addTopic("tasks/#", FromNew, "", newSubscription("tasks/#", 1)); claimed != nil {
+		t.Fatalf("a pattern claims nothing by name while held, got %v", claimed)
+	}
+	e.held = false
+	e.markUnclaimed([]string{"jobs", "tasks/a"})
+	if len(e.unclaimed) != 1 || !e.unclaimed["tasks/a"] {
+		t.Fatalf("expected tasks/a unclaimed once the server stops holding, got %v", e.unclaimed)
+	}
+}
+
 // TestReplacingAPatternMovesItsTopics checks that subscribing again to a
 // held pattern closes the earlier subscription and moves the topics it
 // owned to the new one with their next expected seq, leaving topics owned

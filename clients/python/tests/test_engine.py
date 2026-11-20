@@ -3,7 +3,8 @@
 They feed the engine commands and server frames directly and record what it
 writes, to check the two things the fake server can't show: what a new
 process does with a durable session's topics before and while the
-application claims them, and what subscribing again to a held wildcard
+application claims them, what it does instead when the server holds those
+topics (`authenticated.held`), and what subscribing again to a held wildcard
 pattern does to the topics it owned.
 """
 
@@ -229,6 +230,76 @@ async def test_reconnect_resubscribes_topics_still_being_claimed() -> None:
     assert engine._unclaimed == set()
     await receive(engine, again, delivery("jobs", 1))
     assert again.of_type("ack") == []
+
+
+@pytest.mark.asyncio
+async def test_held_session_has_no_unclaimed_topics() -> None:
+    """With `held` no resumed topic is unclaimed, so a subscribe is not a claim and its messages are delivered."""
+    engine, wire = make_engine(), Wire()
+    engine._held = True
+    engine._note_resumed(["jobs", "tasks/a"])
+    assert engine._unclaimed == set()
+    jobs = await subscribe(engine, wire, "jobs", StartFrom.resume(), 1)
+    assert wire.of_type("subscribe") == [{"type": "subscribe", "topic": "jobs", "from": "resume"}]
+    assert engine._topics["jobs"].claiming is False
+    await receive(engine, wire, delivery("jobs", 2))
+    assert buffered(jobs) == [("jobs", 2)]
+    assert wire.of_type("ack") == [{"type": "ack", "topic": "jobs", "seq": 2}]
+
+
+@pytest.mark.asyncio
+async def test_held_pattern_subscribe_sends_no_claims_by_name() -> None:
+    """With `held` a pattern subscribe sends only the pattern, leaving the resumed topics it matches to the server."""
+    engine, wire = make_engine(), Wire()
+    engine._held = True
+    engine._note_resumed(["tasks/a", "tasks/b", "jobs"])
+    await subscribe(engine, wire, "tasks/#", StartFrom.new(), 1)
+    assert wire.of_type("subscribe") == [{"type": "subscribe", "topic": "tasks/#", "from": "new"}]
+    assert set(engine._topics) == set()
+
+
+@pytest.mark.asyncio
+async def test_held_reconnect_resubscribes_resumed_topics_from_resume() -> None:
+    """With `held` a reconnect subscribes again from `resume` to each tracked topic the server lists as resumed."""
+    engine, wire = make_engine(), Wire()
+    engine._held = True
+    await subscribe(engine, wire, "jobs", StartFrom.last(3), 1)
+    await receive(engine, wire, {"type": "subscribed", "id": wire.sent[-1]["id"], "topic": "jobs", "replay_from": 1})
+    await receive(engine, wire, delivery("jobs", 1))
+    await subscribe(engine, wire, "fresh", StartFrom.new(), 2)
+    await receive(engine, wire, {"type": "subscribed", "id": wire.sent[-1]["id"], "topic": "fresh", "replay_from": 5})
+    channel: Channel[Message] = Channel(16)
+    reply: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    command = _Subscribe("work", StartFrom.resume(), 3, channel, reply, "pool")
+    await engine._send_subscribe(wire.connection(), command)
+    await subscribe(engine, wire, "tasks/#", StartFrom.new(), 4)
+    await receive(engine, wire, {"type": "subscribed", "topic": "tasks/a", "replay_from": 1})
+    engine._fail_requests()
+    again = Wire()
+    resumed = ["jobs", "tasks/a", "elsewhere"]
+    engine._note_resumed(resumed)
+    await engine._restore(again.connection(), resumed)
+    assert again.of_type("subscribe") == [
+        {"type": "subscribe", "topic": "jobs", "from": "resume"},
+        {"type": "subscribe", "topic": "fresh", "from": {"seq": 5}},
+        {"type": "subscribe", "topic": "work", "from": "resume", "group": "pool"},
+        {"type": "subscribe", "topic": "tasks/a", "from": "resume"},
+        {"type": "subscribe", "topic": "tasks/#", "from": {"seq": 1}},
+    ]
+    assert engine._unclaimed == set()
+
+
+@pytest.mark.asyncio
+async def test_unheld_reconnect_leaves_resumed_topics_to_the_server() -> None:
+    """Without `held` a reconnect sends no subscribe for a tracked topic the server lists as resumed."""
+    engine, wire = make_engine(), Wire()
+    await subscribe(engine, wire, "jobs", StartFrom.new(), 1)
+    await receive(engine, wire, {"type": "subscribed", "id": wire.sent[-1]["id"], "topic": "jobs", "replay_from": 1})
+    engine._fail_requests()
+    again = Wire()
+    engine._note_resumed(["jobs"])
+    await engine._restore(again.connection(), ["jobs"])
+    assert again.of_type("subscribe") == []
 
 
 @pytest.mark.asyncio

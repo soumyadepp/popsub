@@ -8,8 +8,10 @@
  * `unsupported_protocol`, `auth_failed`, `account_disabled`, rejected
  * credentials, and `token_expired` with token credentials). After
  * reconnecting it resubscribes every topic from the next `seq` it expects
- * (topics a durable session restored on its own are left to the server,
- * unless a claim on them is still unanswered; see below), resends confirmed publishes that never got their `published` under the
+ * (a topic the server lists as resumed for a durable session is instead
+ * subscribed again from `resume` when the server holds the session's
+ * topics, and otherwise left to the server unless a claim on it is still
+ * unanswered; see below), resends confirmed publishes that never got their `published` under the
  * same request id and `message_id`, and sends QoS 0 publishes and
  * unsubscribes queued while disconnected.
  *
@@ -21,8 +23,18 @@
  *
  * A durable session outlives the process. When a new process connects
  * with the same session id, the server lists the session's topics in
- * `authenticated.resumed` and sends what it kept for them at once, before
- * the application has subscribed to anything. A resumed topic the engine
+ * `authenticated.resumed` before the application has subscribed to
+ * anything. The engine must never acknowledge a message the application
+ * couldn't have received, so with a session id its `auth` carries
+ * `hold_resumed: true`. A server that honours it answers `held: true` and
+ * sends nothing on a resumed topic until the engine subscribes to it. Then
+ * nothing is unclaimed, a subscribe to a resumed topic is an ordinary
+ * subscribe, a pattern needs no subscribes by name, and after a reconnect
+ * the engine subscribes again to every tracked topic the server lists as
+ * resumed, with `from: "resume"`, because the server no longer does it.
+ *
+ * A server that doesn't know `hold_resumed` answers without `held` and
+ * sends what it kept for the resumed topics at once. A resumed topic the engine
  * isn't tracking is unclaimed: its messages are dropped without an
  * acknowledgement, so the server keeps them for the session. Subscribing
  * to an unclaimed topic by name, or to a pattern that matches it, claims
@@ -236,6 +248,13 @@ export class Engine {
    * acknowledgement, so the server keeps them for the session.
    */
   #unclaimed = new Set<string>();
+  /**
+   * Whether the server left the session's topics unattached on this
+   * connection (`authenticated.held`). Then nothing arrives on a topic
+   * until the engine subscribes to it, so nothing is unclaimed, and
+   * `#restore` subscribes to the resumed topics itself.
+   */
+  #held = false;
   /** Subscribes waiting for `subscribed`, by topic. */
   readonly #subscribeWaiters = new Map<string, Settle<void>>();
   /** Requests waiting for a reply, by id. */
@@ -644,7 +663,9 @@ export class Engine {
   }
 
   /**
-   * Opens a connection, logs in if needed, and authenticates.
+   * Opens a connection, logs in if needed, and authenticates. With a
+   * session id the `auth` asks the server to hold the session's topics
+   * (`hold_resumed`), and `#held` records whether it did.
    *
    * @returns The authenticated connection with the topics the server
    *   restored, a failure saying whether retrying could help, or `stopped`
@@ -684,6 +705,7 @@ export class Engine {
       const auth: ClientMessage = { type: "auth", token, protocol: PROTOCOL_VERSION };
       if (this.#config.sessionId !== null) {
         auth.session_id = this.#config.sessionId;
+        auth.hold_resumed = true;
       }
       if (this.#config.cleanStart && !this.#connectedOnce) {
         auth.clean_start = true;
@@ -693,6 +715,7 @@ export class Engine {
         throw refusal(reply);
       }
       this.#applyLimits(reply.limits);
+      this.#held = reply.held === true;
       return { kind: "connected", handshake, resumed: reply.resumed ?? [] };
     } catch (reason) {
       handshake.close();
@@ -730,7 +753,8 @@ export class Engine {
 
   /**
    * Serves one connection until it ends. Works out which restored topics
-   * are unclaimed (those the engine isn't tracking), restores subscriptions
+   * are unclaimed (those the engine isn't tracking, or none when the server
+   * holds the session's topics), restores subscriptions
    * and resends, then handles frames as they arrive. A timer sends `ping` while
    * the connection is silent and ends it as lost once the silence passes
    * `idle_timeout_secs + heartbeat_secs`.
@@ -784,7 +808,7 @@ export class Engine {
           finish({ kind: "lost", code: closeCode(code) });
         },
       });
-      this.#unclaimed = new Set(resumed.filter((name) => !this.#topics.has(name)));
+      this.#unclaimed = new Set(resumed.filter((name) => !this.#held && !this.#topics.has(name)));
       this.#restore(resumed);
       for (const text of early) {
         if (!live()) {
@@ -799,7 +823,10 @@ export class Engine {
    * Restores state on a new connection: resubscribes, resends unconfirmed
    * publishes, and sends queued frames.
    *
-   * Topics the server restored for the session are left to it, except
+   * When the server holds the session's topics (`#held`), each topic it
+   * lists as resumed that the engine tracks is subscribed again from
+   * `resume`, which is one past the session's cursor. Otherwise
+   * topics the server restored for the session are left to it, except
    * those whose buffer overflowed and those still waiting for the
    * `subscribed` that claims them, which are subscribed again the way the
    * application asked (`resume` for one owned by a pattern); every other
@@ -823,6 +850,8 @@ export class Engine {
       } else if (!restored.has(name) || topic.overflowed) {
         const next = topic.tracker.nextExpected;
         this.#sendSubscribe(name, topic.generation, next === null ? topic.from : { seq: next }, null);
+      } else if (this.#held) {
+        this.#sendSubscribe(name, topic.generation, "resume", null);
       }
       topic.overflowed = false;
     }

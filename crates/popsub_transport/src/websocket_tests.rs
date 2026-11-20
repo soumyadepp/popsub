@@ -158,6 +158,7 @@ async fn test_login_success() {
         protocol: None,
         session_id: None,
         clean_start: false,
+        hold_resumed: false,
     };
     ws_stream
         .send(WsMessage::Text(
@@ -235,6 +236,7 @@ async fn test_auth_failure_invalid_token() {
         protocol: None,
         session_id: None,
         clean_start: false,
+        hold_resumed: false,
     };
     ws_stream
         .send(WsMessage::Text(
@@ -514,6 +516,7 @@ async fn denied_publishes_do_not_spend_the_rate_limit() {
             protocol: None,
             session_id: None,
             clean_start: false,
+            hold_resumed: false,
         },
     )
     .await;
@@ -572,6 +575,26 @@ async fn admin_session(
     settings: &Settings,
     session_id: Option<&str>,
 ) -> (TestSocket, ServerMessage) {
+    admin_session_with(addr, settings, session_id, false).await
+}
+
+/// Connects to a server and authenticates as the admin, optionally holding
+/// a durable session and asking the server to hold its stored subscriptions.
+///
+/// Args:
+///     addr: The server's address.
+///     settings: The settings the server uses, for the admin credentials.
+///     session_id: The session to hold, if any.
+///     hold_resumed: Whether to send `hold_resumed`.
+///
+/// Returns:
+///     An authenticated connection and the `authenticated` reply.
+async fn admin_session_with(
+    addr: std::net::SocketAddr,
+    settings: &Settings,
+    session_id: Option<&str>,
+    hold_resumed: bool,
+) -> (TestSocket, ServerMessage) {
     let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
         .await
@@ -594,6 +617,7 @@ async fn admin_session(
             protocol: None,
             session_id: session_id.map(str::to_string),
             clean_start: false,
+            hold_resumed,
         },
     )
     .await;
@@ -833,6 +857,83 @@ async fn a_session_resumes_after_reconnecting() {
     assert_eq!(
         received,
         vec![(2, "two".to_string()), (3, "three".to_string())]
+    );
+}
+
+/// Checks `hold_resumed`: the session's topic is listed but nothing is sent
+/// or put in flight until the client subscribes, which then replays from the
+/// stored cursor; and unsubscribing a topic that was never attached forgets it.
+#[tokio::test]
+async fn a_held_session_sends_nothing_until_the_client_subscribes() {
+    let settings = Settings::default();
+    let (addr, broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut publisher = admin_connection(addr, &settings).await;
+    let publish = |payload: &str| serde_json::json!({"type": "publish", "topic": "chat", "payload": payload, "qos": 1});
+
+    let (mut phone, _) = admin_session(addr, &settings, Some("phone")).await;
+    send_json(
+        &mut phone,
+        serde_json::json!({"type": "subscribe", "topic": "chat"}),
+    )
+    .await;
+    assert!(matches!(
+        next_frame(&mut phone).await,
+        ServerMessage::Subscribed(_)
+    ));
+    for payload in ["one", "two"] {
+        send_json(&mut publisher, publish(payload)).await;
+        next_frame(&mut publisher).await;
+    }
+    assert_eq!(next_delivery(&mut phone).await, (1, "one".to_string()));
+    assert_eq!(next_delivery(&mut phone).await, (2, "two".to_string()));
+    phone.close(None).await.expect("close");
+    drop(phone);
+    assert!(wait_for_no_session(&broker).await);
+
+    let (mut phone, reply) = admin_session_with(addr, &settings, Some("phone"), true).await;
+    assert!(
+        matches!(&reply, ServerMessage::Authenticated { resumed, held: true, .. } if resumed == &["chat".to_string()]),
+        "{reply:?}"
+    );
+    send_json(&mut phone, serde_json::json!({"type": "ping", "id": 1})).await;
+    assert!(
+        matches!(next_frame(&mut phone).await, ServerMessage::Pong {}),
+        "nothing should arrive before the client subscribes"
+    );
+    assert_eq!(broker.stats().in_flight, 0);
+
+    send_json(
+        &mut phone,
+        serde_json::json!({"type": "subscribe", "topic": "chat"}),
+    )
+    .await;
+    match next_frame(&mut phone).await {
+        ServerMessage::Subscribed(s) => assert_eq!(s.replay_from, 1),
+        other => panic!("expected subscribed, got {other:?}"),
+    }
+    assert_eq!(next_delivery(&mut phone).await, (1, "one".to_string()));
+    assert_eq!(next_delivery(&mut phone).await, (2, "two".to_string()));
+    phone.close(None).await.expect("close");
+    drop(phone);
+    assert!(wait_for_no_session(&broker).await);
+
+    let (mut phone, _) = admin_session_with(addr, &settings, Some("phone"), true).await;
+    send_json(
+        &mut phone,
+        serde_json::json!({"type": "unsubscribe", "topic": "chat", "id": 2}),
+    )
+    .await;
+    assert!(matches!(
+        next_frame(&mut phone).await,
+        ServerMessage::Unsubscribed { .. }
+    ));
+    phone.close(None).await.expect("close");
+    drop(phone);
+    assert!(wait_for_no_session(&broker).await);
+    let (_phone, reply) = admin_session_with(addr, &settings, Some("phone"), true).await;
+    assert!(
+        matches!(&reply, ServerMessage::Authenticated { resumed, .. } if resumed.is_empty()),
+        "{reply:?}"
     );
 }
 

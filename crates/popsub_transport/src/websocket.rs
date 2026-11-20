@@ -1236,9 +1236,17 @@ impl Session {
                 protocol,
                 session_id,
                 clean_start,
+                hold_resumed,
             } => {
-                self.authenticate(id, &token, protocol, session_id.as_deref(), clean_start)
-                    .await
+                self.authenticate(
+                    id,
+                    &token,
+                    protocol,
+                    session_id.as_deref(),
+                    clean_start,
+                    hold_resumed,
+                )
+                .await
             }
             ClientMessage::Subscribe { topic, from, group } => {
                 self.subscribe(id, &topic, from, group.as_deref()).await
@@ -1522,6 +1530,9 @@ impl Session {
     ///     protocol: The protocol version the client speaks; `None` means 1.
     ///     session_id: The durable session to hold, if any.
     ///     clean_start: Whether to discard the session's stored subscriptions.
+    ///     hold_resumed: Whether to leave the stored subscriptions unattached
+    ///         until the client subscribes to them, so nothing is sent on a
+    ///         topic before the client asks for it.
     ///
     /// Returns:
     ///     `Flow::Continue` when authentication succeeded, otherwise `Flow::Close`.
@@ -1536,6 +1547,7 @@ impl Session {
         protocol: Option<u32>,
         session_id: Option<&str>,
         clean_start: bool,
+        hold_resumed: bool,
     ) -> Result<Flow> {
         if let Some(version) = protocol
             && version != PROTOCOL_VERSION
@@ -1638,6 +1650,7 @@ impl Session {
                     protocol: PROTOCOL_VERSION,
                     session_id: None,
                     resumed: Vec::new(),
+                    held: false,
                     limits,
                 },
             )?;
@@ -1684,16 +1697,20 @@ impl Session {
                 }
             }
         }
-        info!(client_id = %self.client_id, username = %pii(&username), session_id = %pii(session_id), clean_start, resumed = resumed.len(), "authenticated with a session");
+        info!(client_id = %self.client_id, username = %pii(&username), session_id = %pii(session_id), clean_start, hold_resumed, resumed = resumed.len(), "authenticated with a session");
         self.reply(
             id,
             ServerMessage::Authenticated {
                 protocol: PROTOCOL_VERSION,
                 session_id: Some(session_id.to_string()),
                 resumed: resumed.clone(),
+                held: hold_resumed,
                 limits,
             },
         )?;
+        if hold_resumed {
+            return Ok(Flow::Continue);
+        }
         for topic in resumed {
             if let Err(e) = self
                 .server
@@ -1759,6 +1776,7 @@ impl Session {
                 protocol: PROTOCOL_VERSION,
                 session_id,
                 resumed: Vec::new(),
+                held: false,
                 limits: self.server.limits(),
             },
         )?;

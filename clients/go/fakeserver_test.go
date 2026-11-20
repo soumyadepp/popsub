@@ -19,11 +19,12 @@ import (
 // confirms subscribes (except to topics named "hang", which it never
 // answers), confirms publishes and delivers them to the same connection,
 // answers unsubscribe and list_users, and lets a test write raw frames,
-// choose the topics it reports as resumed, and read the frames it received.
+// choose the topics it reports as resumed and whether it holds them when
+// asked, and read the frames it received.
 type fakeServer struct {
 	// server is the HTTP server.
 	server *httptest.Server
-	// mu guards conn, seqs, resumed and frames.
+	// mu guards conn, seqs, resumed, holds and frames.
 	mu sync.Mutex
 	// conn is the latest authenticated connection.
 	conn *websocket.Conn
@@ -31,6 +32,10 @@ type fakeServer struct {
 	seqs map[string]uint64
 	// resumed is what authenticated lists as the session's restored topics.
 	resumed []string
+	// holds makes authenticated answer held: true to an auth that carries
+	// hold_resumed: true; when false the server answers without held, as
+	// one that does not know the request.
+	holds bool
 	// frames is every frame received, on any connection, oldest first.
 	frames []map[string]any
 	// authenticated gets a token each time a connection authenticates.
@@ -97,9 +102,14 @@ func (f *fakeServer) answer(ctx context.Context, conn *websocket.Conn, frame map
 		f.mu.Lock()
 		f.conn = conn
 		resumed := append([]string{}, f.resumed...)
+		held := f.holds && frame["hold_resumed"] == true
 		f.mu.Unlock()
-		reply(map[string]any{"type": "authenticated", "protocol": 1, "resumed": resumed,
-			"limits": map[string]any{"heartbeat_secs": 30, "idle_timeout_secs": 90}})
+		authenticated := map[string]any{"type": "authenticated", "protocol": 1, "resumed": resumed,
+			"limits": map[string]any{"heartbeat_secs": 30, "idle_timeout_secs": 90}}
+		if held {
+			authenticated["held"] = true
+		}
+		reply(authenticated)
 		f.authenticated <- struct{}{}
 	case "subscribe":
 		if topic == "hang" {
@@ -166,6 +176,38 @@ func (f *fakeServer) resume(topics ...string) {
 	f.mu.Lock()
 	f.resumed = topics
 	f.mu.Unlock()
+}
+
+// hold makes the server hold the session's topics for later connections
+// that ask it to, answering held: true.
+func (f *fakeServer) hold() {
+	f.mu.Lock()
+	f.holds = true
+	f.mu.Unlock()
+}
+
+// awaitAuths waits until at least count auth frames have been received,
+// and returns them oldest first.
+func (f *fakeServer) awaitAuths(t *testing.T, count int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		var found []map[string]any
+		for _, frame := range f.frames {
+			if frame["type"] == "auth" {
+				found = append(found, frame)
+			}
+		}
+		f.mu.Unlock()
+		if len(found) >= count {
+			return found
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d auth frames, got %d", count, len(found))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // received returns the frames of one type received for one topic so far,

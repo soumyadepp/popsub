@@ -90,6 +90,7 @@ export type ClientMessage =
       protocol?: number;
       session_id?: string;
       clean_start?: boolean;
+      hold_resumed?: boolean;
     }
   | { type: "subscribe"; topic: string; from?: WireStartFrom; group?: string }
   | { type: "unsubscribe"; topic: string }
@@ -130,6 +131,7 @@ export type ServerMessage =
       limits: Limits;
       session_id?: string | null;
       resumed?: string[];
+      held?: boolean;
     }
   | { type: "subscribed"; topic: string; replay_from: number; replay_to: number }
   | { type: "unsubscribed"; topic: string }

@@ -8,7 +8,16 @@
  * hands over nor acknowledges those messages until the application
  * subscribes, that the subscribe (by name, or by a pattern that matches)
  * then delivers them from `subscribed.replay_from`, and that a claim left
- * unanswered by a dropped connection is sent again.
+ * unanswered by a dropped connection is sent again. That is the fallback
+ * for a server that answers `auth` without `held`.
+ *
+ * The held tests have the server answer `held: true`. They check that
+ * `auth` carries `hold_resumed` exactly when the client has a session id
+ * (so not on the `auth` that refreshes a token), that nothing is treated as
+ * unclaimed (a pattern sends no subscribes by name, and a topic the server
+ * announces for it is handed over at once), and that after a reconnect a
+ * tracked topic the server lists as resumed is subscribed again from
+ * `resume`, where the fallback leaves it to the server.
  *
  * The replacement tests subscribe to the same pattern twice and check that
  * the topics it had joined keep their next expected `seq` and feed the new
@@ -210,6 +219,155 @@ test("a claim left unanswered is sent again after a reconnect although the topic
     await settle(client);
     assert.deepEqual(subscribes(server), ['jobs {"seq":5}', 'jobs {"seq":5}']);
     assert.deepEqual(acks(server), ["jobs:5"]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+/**
+ * Waits for the client's next `connected` event.
+ *
+ * @param client - The client.
+ * @returns A promise that resolves when the event arrives.
+ */
+function nextConnected(client: Client): Promise<void> {
+  return new Promise((resolve) => {
+    const off = client.on((event) => {
+      if (event.type === "connected") {
+        off();
+        resolve();
+      }
+    });
+  });
+}
+
+/**
+ * Lists what the `auth` frames the server received say about a session.
+ *
+ * @param server - The server.
+ * @returns The `session_id` and `hold_resumed` of each, in order, with
+ *   `undefined` for a field the frame doesn't have.
+ */
+function auths(server: FakeServer): { session: unknown; hold: unknown }[] {
+  return server
+    .requests()
+    .filter((request) => request.type === "auth")
+    .map((request) => ({ session: request.session_id, hold: request.hold_resumed }));
+}
+
+test("auth asks the server to hold the session's topics only when there is a session", async () => {
+  const server = await startFakeServer({ held: true });
+  const withSession = await connect(server);
+  const without = await Client.connect({ url: server.url, credentials: { token: "t" } });
+  try {
+    assert.deepEqual(auths(server), [
+      { session: "s", hold: true },
+      { session: undefined, hold: undefined },
+    ]);
+  } finally {
+    await withSession.close();
+    await without.close();
+    await server.close();
+  }
+});
+
+test("the auth that refreshes a token doesn't ask for the hold", async () => {
+  const server = await startFakeServer({ held: true });
+  const client = await Client.connect({
+    url: server.url,
+    credentials: { username: "u", password: "p" },
+    sessionId: "s",
+  });
+  try {
+    const refreshed = new Promise<void>((resolve) => {
+      client.on((event) => {
+        if (event.type === "authRefreshed") {
+          resolve();
+        }
+      });
+    });
+    server.send({ type: "auth_expiring", expires_at_ms: Date.now() + 1000 });
+    await refreshed;
+    assert.deepEqual(auths(server), [
+      { session: "s", hold: true },
+      { session: undefined, hold: undefined },
+    ]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("with held topics nothing is unclaimed and a pattern sends no subscribes by name", async () => {
+  const server = await startFakeServer({
+    held: true,
+    resumed: ["jobs", "tasks/a"],
+    respond: (request) =>
+      request.type === "subscribe" ? [subscribed(request, String(request.topic), 1)] : undefined,
+  });
+  const client = await connect(server);
+  try {
+    const tasks = await client.subscribe("tasks/#", "new");
+    server.send(subscribed(null, "tasks/a", 1));
+    server.send(message("tasks/a", 1));
+    server.send(message("jobs", 1));
+    const first = await tasks.next();
+    assert.deepEqual([first?.topic, first?.seq], ["tasks/a", 1]);
+    await settle(client);
+    assert.deepEqual(subscribes(server), ['tasks/# "new"']);
+    assert.deepEqual(acks(server), ["tasks/a:1", "jobs:1"]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("with held topics a resumed tracked topic is subscribed again from resume after a reconnect", async () => {
+  const server = await startFakeServer({
+    held: true,
+    resumed: ["jobs"],
+    respond: (request) =>
+      request.type === "subscribe" ? [subscribed(request, String(request.topic), 1)] : undefined,
+  });
+  const client = await connect(server);
+  try {
+    await client.subscribe("jobs", "new");
+    await client.subscribe("other", "new");
+    await client.subscribe("orders/#", "new");
+    const reconnected = nextConnected(client);
+    server.drop();
+    await reconnected;
+    await settle(client);
+    assert.deepEqual(subscribes(server), [
+      'jobs "new"',
+      'other "new"',
+      'orders/# "new"',
+      'jobs "resume"',
+      'other {"seq":1}',
+      'orders/# {"seq":1}',
+    ]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("without held topics a resumed tracked topic is left to the server after a reconnect", async () => {
+  const server = await startFakeServer({
+    resumed: ["jobs"],
+    respond: (request) =>
+      request.type === "subscribe" ? [subscribed(request, String(request.topic), 1)] : undefined,
+  });
+  const client = await connect(server);
+  try {
+    await client.subscribe("jobs", "new");
+    await client.subscribe("other", "new");
+    const reconnected = nextConnected(client);
+    server.drop();
+    await reconnected;
+    await settle(client);
+    assert.deepEqual(subscribes(server), ['jobs "new"', 'other "new"', 'other {"seq":1}']);
   } finally {
     await client.close();
     await server.close();

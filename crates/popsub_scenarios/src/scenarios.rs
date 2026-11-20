@@ -50,6 +50,9 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
     ("durable_session_keeps_messages_for_a_new_process", |d| {
         Box::pin(durable_session_keeps_messages_for_a_new_process(d))
     }),
+    ("held_session_topics_wait_for_the_application", |d| {
+        Box::pin(held_session_topics_wait_for_the_application(d))
+    }),
     ("taken_over_session_stops_the_old_client", |d| {
         Box::pin(taken_over_session_stops_the_old_client(d))
     }),
@@ -1071,5 +1074,50 @@ async fn shared_subscription_rejoins_after_reconnect(command: String) -> Outcome
     })?;
     client.ok("ack", json!({"topic": "jobs", "seq": 2})).await?;
     client.ok("ack", json!({"topic": "jobs", "seq": 3})).await?;
+    nothing_in_flight(&server).await
+}
+
+/// Checks that a client asks the server to hold a durable session's topics:
+/// a new process that hasn't subscribed yet is sent nothing, so nothing is
+/// in flight or retried on the server however long it waits, and its
+/// subscribe then gets everything the old process left unacknowledged.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn held_session_topics_wait_for_the_application(command: String) -> Outcome {
+    let server = ScenarioServer::start(Backend::Memory).await?;
+    let mut args = connect_args(&server.url(), "admin", "password");
+    args["session_id"] = json!("phone");
+    args["ack_mode"] = json!("manual");
+    let old = connected(&command, "old", args.clone()).await?;
+    old.ok("subscribe", json!({"topic": "jobs", "from": "resume"}))
+        .await?;
+    server.publish("jobs", "one", 1).await?;
+    server.publish("jobs", "two", 1).await?;
+    let before = old.messages("jobs", 2, WAIT).await;
+    check(before == [1, 2], || {
+        format!("expected [1, 2], got {before:?}")
+    })?;
+    old.ok("close", json!({})).await?;
+    drop(old);
+    let new = connected(&command, "new", args).await?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let in_flight = server.broker().stats().in_flight;
+    check(in_flight == 0, || {
+        format!(
+            "the server should hold the session's topics, but {in_flight} records are in flight"
+        )
+    })?;
+    new.ok("subscribe", json!({"topic": "jobs", "from": "resume"}))
+        .await?;
+    let kept = new.messages("jobs", 2, WAIT).await;
+    check(kept == [1, 2], || {
+        format!("expected the kept [1, 2], got {kept:?}")
+    })?;
+    new.ok("ack", json!({"topic": "jobs", "seq": 1})).await?;
+    new.ok("ack", json!({"topic": "jobs", "seq": 2})).await?;
     nothing_in_flight(&server).await
 }

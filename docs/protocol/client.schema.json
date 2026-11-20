@@ -158,11 +158,15 @@
   "description": "Every frame a PopSub client sends.",
   "oneOf": [
     {
-      "description": "Authenticates the connection with a JWT from `login`. Answered with\n`authenticated`.\n\n`protocol` is the version the client speaks; omitted means 1. With a\n`session_id`, the connection holds that durable session of the user:\nits subscriptions and cursors are restored and kept after the\nconnection ends. `clean_start` discards them first.",
+      "description": "Authenticates the connection with a JWT from `login`. Answered with\n`authenticated`.\n\n`protocol` is the version the client speaks; omitted means 1. With a\n`session_id`, the connection holds that durable session of the user:\nits subscriptions and cursors are restored and kept after the\nconnection ends. `clean_start` discards them first; `hold_resumed`\nkeeps them stored but sends nothing until the client subscribes.",
       "properties": {
         "clean_start": {
           "default": false,
           "description": "Whether to discard the session's stored subscriptions.",
+          "type": "boolean"
+        },
+        "hold_resumed": {
+          "description": "Whether to leave the session's stored subscriptions unattached.\nThey are still listed in `authenticated.resumed`, but nothing is\nsent on one until the client subscribes to it, and `subscribe`\nwith `from: \"resume\"` then starts one past its stored cursor. So a\nclient is never sent a record before it is ready for it.",
           "type": "boolean"
         },
         "protocol": {
