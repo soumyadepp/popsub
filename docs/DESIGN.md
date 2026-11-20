@@ -32,20 +32,27 @@ This document describes how the system works today, where its guarantees hold an
 
 ### 3.1 Crates
 
-```
-                 popsub (CLI: server, client)
-                   |
- popsub_transport (WebSocket, protocol, auth and limit enforcement)
-        |                 |                    |
- popsub_broker      popsub_auth          popsub_ratelimit
- (topics, QoS 1)    (users, JWT, RBAC)   (token bucket, sliding window, lockouts)
-        |
- popsub_connection (per-connection record)   popsub_config (settings loader)
-        |                                        |
- popsub_utils (errors, logging)          popsub_storage (topic logs, Storage traits, backends)
+```mermaid
+flowchart TD
+    cli["popsub<br/>the binary"]
+    transport["popsub_transport<br/>WebSocket server"]
+    sdk["popsub_sdk<br/>Rust client"]
+    broker["popsub_broker<br/>topics and delivery"]
+    auth["popsub_auth<br/>users and permissions"]
+    ratelimit["popsub_ratelimit<br/>rate limits"]
+    connection["popsub_connection<br/>one connected socket"]
+    storage["popsub_storage<br/>topic logs"]
 
- popsub_protocol (every frame type; used by transport, broker, binary and client SDKs)
+    cli --> transport
+    cli --> sdk
+    transport --> broker
+    transport --> auth
+    transport --> ratelimit
+    broker --> connection
+    broker --> storage
 ```
+
+An arrow means "depends on". Three crates are left out because nearly everything uses them: `popsub_protocol` (the frame types), `popsub_config` (settings) and `popsub_utils` (errors, logging, metrics). `popsub_scenarios`, the client scenario suite, sits beside the binary.
 
 | Crate | Responsibility |
 |---|---|
@@ -65,14 +72,20 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 
 ### 3.2 Runtime
 
+```mermaid
+flowchart LR
+    in(["socket in"]) --> session["Session"]
+    session -- "publish, subscribe" --> writer["Topic writer"]
+    session -- "ack, unsubscribe" --> broker["Broker"]
+    writer -- "append, read" --> storage[("Storage")]
+    writer -- "fan out" --> broker
+    broker -- "deliveries" --> send["Send loop"]
+    send --> out(["socket out"])
+    storage -.- retention["Retention loop"]
+    broker -.- retry["Retry loop"]
 ```
- socket --> Session (connection task) --publish/subscribe--> topic writer (one task per topic) --append/read--> Storage
-            |                                                      |
-            |                                                      +--SharedBroker::with--> Broker --> client channel --> send loop --> socket
-            |--SharedBroker::with (unsubscribe, ack, auth state)-->                          ^
-            |  replies go straight to the session's own channel          retry loop (1s) ---+
-            +--> AuthService                                              retention loop (60s) --> Storage
-```
+
+Solid arrows are the path of a message; dotted lines attach the background loops to what they work on. Replies to a request skip the broker and go from the session straight to the send loop, and the session calls `AuthService` for register, login and auth.
 
 - **Server.** Holds what every connection shares (broker, auth service, rate limiters) and runs the accept loop. A failed `accept` is logged and retried after 100 ms instead of stopping the server.
 - **Session.** One per socket, in its own task. Reads frames, parses JSON, and calls the method for the message type. Replies are queued on the session's own outgoing channel, so replying never takes the broker lock.
@@ -261,6 +274,26 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 - `auth` with a `session_id` binds the connection to a durable session keyed by the token's username and that id, so two users with the same id get different sessions.
 - Any other connection holding the same session is sent a close frame and removed. This is how a client reconnecting before the server noticed its old connection drop takes the session back.
 - `clean_start` discards the stored subscriptions. Otherwise each stored subscription is checked against the user's current permissions (forgotten if no longer allowed), listed in `authenticated.resumed`, and subscribed again with `resume`, so everything after the stored cursor (sent but unacknowledged, or published while away) is replayed.
+- A session can outlive the application that opened it. When a new process authenticates with the same `session_id`, the server resumes the stored subscriptions at once, before that process has subscribed to anything. The client libraries hold back until the application subscribes:
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Client as Client library
+    participant Server
+    Client->>Server: auth with session_id
+    Server-->>Client: authenticated, resumed jobs
+    Server-->>Client: jobs 2
+    Note over Client: not subscribed yet, so dropped without an ack
+    App->>Client: subscribe jobs
+    Client->>Server: subscribe jobs from resume
+    Server-->>Client: subscribed, replay from 2
+    Server-->>Client: jobs 2
+    Client->>App: jobs 2
+    Client->>Server: ack jobs 2
+```
+
+  The cursor doesn't move while nothing is acknowledged, so the application's subscribe replays everything in order. Anything the server sends between the subscribe and its `subscribed` is dropped the same way. A pattern subscribe claims each matching resumed topic with a `subscribe` by name from `resume`. `clients/README.md` has the full rule.
 - Sessions are touched on connect, on disconnect, and every minute while connected. A session not touched for `storage.session_expiry_secs` is removed with its subscriptions.
 
 ## 6. Delivery semantics
@@ -272,6 +305,7 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 | QoS 1, with `broker.dead_letter_topic` set | A record a subscription never acknowledges is, after `max_retries` resends, copied to the dead-letter topic and dropped for that subscription, which then carries on. So for that subscription the record is delivered at least once but never acknowledged, and what remains of it is the copy on the dead-letter topic. If that copy can't be stored it is logged and lost as a dead letter; the original stays in its topic's log until trimmed. |
 | QoS 1, ephemeral subscriber disconnects | Not at least once. Its subscriptions and windows are discarded. |
 | QoS 1, durable session disconnects and reconnects | At least once, provided it reconnects within `session_expiry_secs` and the records are still retained. Everything after its stored cursor is replayed. Records trimmed meanwhile are reported with `truncated`. |
+| QoS 1, durable session, the application restarts | At least once, on the same terms as a reconnect. The server starts sending the session's records as soon as the new process authenticates, before it has subscribed. The client libraries don't acknowledge records on a topic the application hasn't subscribed to in this process, so the cursor stays put and the application's subscribe replays them. A topic the new process never subscribes to keeps its records on the server until the subscription stalls or they are dead-lettered. A client written against the raw protocol must do the same, or it loses them. |
 | QoS 1, broker restarts | With the `file` backend (the default), durable sessions resume from their stored cursors. Records are kept as firmly as `storage.durability` says: `buffered` survives a crash of the server, `synced` also a power loss. A cursor move is lost only to a power loss, which means resending records already acknowledged. With the `memory` backend nothing survives a restart. |
 | Shared subscriptions | At least once to the group as a whole: each record is sent to one member, and one that member never acknowledges goes to another when it disconnects, or is retried to it. Two members never hold the same record at once, but a record can be delivered to a second member after the first disconnects, so workers must tolerate a repeat. Order across members is not kept. The group's stored position gives the same restart behaviour as a durable session. |
 | Ordering | Per topic, every subscriber receives new records in `seq` order, and a replay followed by live delivery has no gap or repeat. Retries are resent out of order. |

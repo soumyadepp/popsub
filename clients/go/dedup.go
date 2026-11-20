@@ -62,6 +62,12 @@ type topicState struct {
 	group string
 	// seen is the seqs handed to the application, for a shared subscription.
 	seen *ackMemory
+	// claiming says the server held the topic for the session before the
+	// application subscribed, and the subscribed that answers the
+	// application's subscribe has not arrived. Until it does, messages on
+	// the topic are the server's own resume: they are dropped without an
+	// acknowledgement, because the subscribe replays them.
+	claiming bool
 }
 
 // newTopicState builds the record of a new subscription.
@@ -80,6 +86,30 @@ func (t *topicState) advance(seq uint64) {
 		t.next = seq
 		t.hasNext = true
 	}
+}
+
+// claim ends the wait for the subscribed that claims the topic, forgetting
+// the next expected seq so that subscribed's replay_from sets it. It does
+// nothing for a topic that is not claiming.
+func (t *topicState) claim() {
+	if t.claiming {
+		t.claiming = false
+		t.hasNext = false
+	}
+}
+
+// restoreFrom is where the subscribe sent on a new connection starts. A
+// topic still claiming asks again the way the application did, or with
+// resume when a pattern owns it or it is a shared subscription; any other
+// topic uses resumeFrom.
+func (t *topicState) restoreFrom() StartFrom {
+	if t.claiming && t.group == "" {
+		if t.owner != "" {
+			return FromResume
+		}
+		return t.from
+	}
+	return t.resumeFrom()
 }
 
 // resumeFrom is where a resubscription after a reconnect starts: the next

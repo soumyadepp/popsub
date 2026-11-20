@@ -74,6 +74,18 @@ for message := range orders.Messages() {
 
 Each matching topic is tracked on its own (its next expected `seq`, its acknowledgements). After a reconnect the client resubscribes the topics it was reading from where each left off, then sends the pattern again so topics created meanwhile are read from their first message. If the server ends one matching topic (`UnsubscribedEvent`), only that topic stops. `client.Unsubscribe(ctx, "orders/#")` ends them all.
 
+Subscribing again to a pattern the client holds replaces the subscription: the earlier `Subscription`'s channel is closed, and the topics already joined move to the new one and keep their next expected `seq`, so each message still arrives once.
+
+### Durable sessions in a new process
+
+A durable session (`SessionID`) outlives the application. When a new process connects with the same `SessionID`, the server starts sending what it kept for the session's topics straight away, before the application has subscribed. The client does not hand those messages over and does not acknowledge them, so the server keeps them.
+
+```go
+jobs, err := client.Subscribe(ctx, "jobs", popsub.FromResume)
+```
+
+Subscribing to such a topic by name claims it: the server replays what it kept, in order, to the new `Subscription`. Subscribing to a pattern claims every session topic it matches, each from where the session left it, whatever `from` the pattern was given. A session topic the application never subscribes to stays on the server, where its messages wait, and after the server's `max_retries` the subscription stalls or the messages are dead-lettered.
+
 ### Shared subscriptions
 
 Members of a group split a topic's messages: each message goes to one member. A member gets only its share, not in strict `seq` order.

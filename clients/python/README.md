@@ -8,10 +8,11 @@ The client handles the protocol's bookkeeping so an application only connects, s
 - Reconnects with jittered exponential backoff, and reads the close code to decide whether to: never after `auth_failed` (4001), `session_taken_over` (4003), `unsupported_protocol` (4006) or `account_disabled` (4009), and after `token_expired` (4004) only with password credentials. A rejected login on the first connection fails `connect` without retrying.
 - Treats the connection as dead when nothing (pings included) arrives for `idle_timeout_secs + heartbeat_secs` from the server's `limits`.
 - After reconnecting, leaves topics the server resumed for a durable session alone, subscribes every other topic again from `{"seq": next_expected}`, resends unconfirmed `publish_confirmed` calls with the same request id and `message_id`, and sends QoS 0 publishes held while disconnected (up to 10,000; the oldest are dropped first).
+- In a new process on an existing durable session, neither hands over nor acknowledges messages on a resumed topic until the application subscribes to it by name or through a matching pattern, so the server keeps them. The subscribe then replays them: messages that arrive before its `subscribed` are dropped unacknowledged, and a pattern sends a `subscribe` by name from `resume` for each resumed topic it matches. A resumed topic the application never subscribes to stays unacknowledged on the server.
 - Hands each `(topic, seq)` to the application once. A duplicate is acknowledged again when it was acknowledged before, or always in automatic mode.
 - Stops reading the socket while a subscription's buffer is full, so the server paces delivery instead of the client buffering without bound.
 - Ends a subscription and reports `Unsubscribed` when the server ends it (an `unsubscribed` frame with no id). Every unsubscribe the client sends carries an id for that reason.
-- Treats a wildcard subscription (`orders/#`) as one subscription: each topic the server joins for it is tracked on its own (next expected `seq`, acknowledgements), and after a reconnect the tracked topics are resubscribed first and the pattern is sent again from `{"seq": 1}`, which joins only topics created meanwhile.
+- Treats a wildcard subscription (`orders/#`) as one subscription: each topic the server joins for it is tracked on its own (next expected `seq`, acknowledgements), and after a reconnect the tracked topics are resubscribed first and the pattern is sent again from `{"seq": 1}`, which joins only topics created meanwhile. Subscribing again to a held pattern replaces the subscription: its topics move to the new one with their next expected `seq`, and the earlier one ends.
 - Deduplicates a shared subscription (a topic read through a `group`) with a bounded set of the 4,096 most recently delivered `seq`s, since a member gets only some messages and not in order, and rejoins the group with `resume` after a reconnect.
 - Never queues or resends admin requests: a disconnect fails them with `ConnectError`, because the server may or may not have carried them out.
 
@@ -76,6 +77,8 @@ async def follow_orders(client: Client) -> None:
 ```
 
 `client.unsubscribe("orders/#")`, or closing the subscription, leaves the pattern and every topic joined through it. If the server ends one of those topics (access revoked), only that topic stops and `Unsubscribed` names it.
+
+Subscribing again to the same pattern returns a new subscription that takes over the topics already joined, each from the next `seq` it expects, so every message still arrives once. The earlier subscription ends; closing it afterwards changes nothing.
 
 ### Shared subscriptions
 
@@ -167,6 +170,6 @@ uv sync
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest
 ```
 
-That runs the formatter check, the linter, `mypy --strict` over the package and tests, and the tests. The tests cover backoff, deduplication (by next expected seq, and by the seen set for shared subscriptions), the wildcard pattern matcher and the wire types, and run the client against a small in-process fake server to check that resent copies are dropped and acknowledged again, that a reconnect resubscribes from the next expected seq, and that `close()` leaves no task running.
+That runs the formatter check, the linter, `mypy --strict` over the package and tests, and the tests. The tests cover backoff, deduplication (by next expected seq, and by the seen set for shared subscriptions), the wildcard pattern matcher and the wire types, feed the engine frames directly to check how a new process claims a durable session's topics and how a repeated pattern subscribe moves its topics, and run the client against a small in-process fake server to check that resent copies are dropped and acknowledged again, that a reconnect resubscribes from the next expected seq, and that `close()` leaves no task running.
 
 `uv build` writes the wheel and source distribution to `dist/`.

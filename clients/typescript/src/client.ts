@@ -139,7 +139,17 @@ export class Client {
   /**
    * Subscribes to a topic, or to every topic matching a wildcard pattern.
    * Subscribing again to the same topic or pattern replaces the earlier
-   * subscription, which ends.
+   * subscription, which ends. A topic subscribed again starts over from
+   * `from`. A pattern subscribed again keeps the topics it had joined:
+   * their later messages go to the new subscription, each once, and the
+   * earlier subscription can be closed or dropped without losing any.
+   *
+   * With a durable session started in an earlier process, the server sends
+   * what it kept for the session's topics as soon as the client connects.
+   * The client neither hands over nor acknowledges those messages until
+   * the application subscribes to the topic, by name or through a pattern
+   * that matches it; the subscribe then replays them in order. Messages of
+   * a topic the application never subscribes to stay on the server.
    *
    * In a pattern a whole level may be `+` (any one level) and the last
    * level may be `#` (the rest), as in `sensors/+/temp` or `orders/#`. The

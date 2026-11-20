@@ -138,7 +138,7 @@ Where to find the full protocol:
 |---|---|
 | QoS 0 | At most once, to subscribers connected when it is published. |
 | QoS 1 | At least once to every connected subscriber, independently. Each subscriber's acknowledgement clears only its own copy. A message that runs out of retries pauses that subscription and tells the client, instead of disappearing; or, with `broker.dead_letter_topic` set, is copied to that topic and the subscription carries on. |
-| Durable sessions | At least once across disconnects and server restarts, as long as the session reconnects within `session_expiry_secs` and the messages are still retained. |
+| Durable sessions | At least once across disconnects, restarts of the application and server restarts, as long as the session reconnects within `session_expiry_secs` and the messages are still retained. |
 | Ordering | Per topic, in `seq` order. A retry of an unacknowledged message can arrive after later ones. |
 | Duplicates | Possible, and always detectable by `(topic, seq)`. The Rust client drops them for you. |
 | Retention | Each topic keeps `max_messages`, `max_age_secs` and `max_bytes` of history. A subscriber that asks for trimmed history is told with a `truncated` frame. |

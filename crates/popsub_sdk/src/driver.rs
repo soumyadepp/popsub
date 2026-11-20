@@ -203,6 +203,12 @@ struct Topic {
     group: Option<String>,
     /// The `seq`s already handed to the application, for a shared subscription.
     seen: AckMemory,
+    /// Whether the server held this topic for the session before the
+    /// application subscribed, and the `subscribed` that answers the
+    /// application's subscribe hasn't arrived yet. Until it does, messages
+    /// on the topic are from the server's own resume: they are dropped
+    /// without an acknowledgement, because the subscribe replays them.
+    claiming: bool,
 }
 
 /// One wildcard subscription. The topics it brings in are `Topic`s owned by it.
@@ -278,6 +284,10 @@ pub(crate) struct Driver {
     topics: HashMap<String, Topic>,
     /// Wildcard subscriptions, by pattern.
     patterns: HashMap<String, Pattern>,
+    /// Topics the server restored for the session that the application
+    /// hasn't subscribed to in this process. Their messages are dropped
+    /// without an acknowledgement, so the server keeps them for the session.
+    unclaimed: HashSet<String>,
     /// Subscribes waiting for `subscribed`, by topic.
     subscribe_waiters: HashMap<String, oneshot::Sender<Result<Subscribed, Error>>>,
     /// Requests waiting for a reply, by id.
@@ -323,6 +333,7 @@ impl Driver {
             closed,
             topics: HashMap::new(),
             patterns: HashMap::new(),
+            unclaimed: HashSet::new(),
             subscribe_waiters: HashMap::new(),
             pending: HashMap::new(),
             unconfirmed: HashMap::new(),
@@ -600,6 +611,11 @@ impl Driver {
     /// Returns:
     ///     How the connection ended.
     async fn serve(&mut self, mut socket: Socket, resumed: Vec<String>) -> Ending {
+        self.unclaimed = resumed
+            .iter()
+            .filter(|name| !self.topics.contains_key(*name))
+            .cloned()
+            .collect();
         if self.restore(&mut socket, &resumed).await.is_err() {
             return Ending::Lost(None);
         }
@@ -652,8 +668,9 @@ impl Driver {
     /// Restores state on a new connection: resubscribes, resends
     /// unconfirmed publishes, sends queued frames.
     ///
-    /// Topics the server restored for the session are left alone; every
-    /// other topic is subscribed again from the next `seq` it expects, so
+    /// Topics the server restored for the session are left alone, except
+    /// one still waiting for the `subscribed` that claims it, which is
+    /// subscribed again the way the application asked; every other topic is subscribed again from the next `seq` it expects, so
     /// nothing still in the log is missed. Wildcard subscriptions are sent
     /// again after that, from `seq` 1: the server only joins topics the
     /// connection doesn't hold yet, which are exactly the ones created while
@@ -670,6 +687,12 @@ impl Driver {
         for (name, topic) in &self.topics {
             if topic.group.is_some() {
                 resubscribe.push((name.clone(), StartFrom::Resume, topic.group.clone()));
+            } else if topic.claiming {
+                let from = match topic.owner {
+                    Some(_) => StartFrom::Resume,
+                    None => topic.from,
+                };
+                resubscribe.push((name.clone(), from, None));
             } else if !resumed.contains(name) {
                 let from = topic.next_expected.map_or(topic.from, StartFrom::Seq);
                 resubscribe.push((name.clone(), from, None));
@@ -832,12 +855,28 @@ impl Driver {
 
     /// Adds or replaces a subscription: a topic, or a wildcard pattern.
     ///
+    /// Subscribing again to a pattern the client holds replaces the
+    /// subscription: the topics it owned move to the new one and keep the
+    /// next `seq` they expect, because the server sends nothing again for
+    /// topics the connection holds. Subscribing again to a topic by name
+    /// starts over from `from`.
+    ///
+    /// A topic the server held for the session, subscribed by name or
+    /// matched by the pattern, is claimed: it is tracked with `claiming`
+    /// set, so what the server sent on its own is dropped until the
+    /// `subscribed` that answers the claim. A topic subscribed again while
+    /// its claim is unanswered stays `claiming`.
+    ///
     /// Args:
     ///     topic: The topic or pattern.
     ///     from: Where replay starts.
     ///     group: The shared subscription to join, if any.
     ///     generation: Which subscription this is.
     ///     buffer: Where its messages go.
+    ///
+    /// Returns:
+    ///     For a pattern, the session's topics it claimed, which the caller
+    ///     subscribes to by name with `StartFrom::Resume`. Empty for a topic.
     fn add_topic(
         &mut self,
         topic: String,
@@ -845,11 +884,43 @@ impl Driver {
         group: Option<String>,
         generation: u64,
         buffer: mpsc::Sender<Message>,
-    ) {
+    ) -> Vec<String> {
         if popsub_protocol::topics::is_pattern(&topic) {
+            for owned in self.topics.values_mut() {
+                if owned.owner.as_deref() == Some(topic.as_str()) {
+                    owned.buffer = buffer.clone();
+                    owned.generation = generation;
+                }
+            }
+            let mut claimed: Vec<String> = self
+                .unclaimed
+                .iter()
+                .filter(|name| popsub_protocol::topics::matches_pattern(&topic, name))
+                .cloned()
+                .collect();
+            claimed.sort();
+            for name in &claimed {
+                self.unclaimed.remove(name);
+                self.topics.insert(
+                    name.clone(),
+                    Topic {
+                        buffer: buffer.clone(),
+                        from: StartFrom::Resume,
+                        next_expected: None,
+                        generation,
+                        acked: AckMemory::default(),
+                        owner: Some(topic.clone()),
+                        group: None,
+                        seen: AckMemory::default(),
+                        claiming: true,
+                    },
+                );
+            }
             self.patterns.insert(topic, Pattern { buffer, generation });
-            return;
+            return claimed;
         }
+        let claiming = self.unclaimed.remove(&topic)
+            || self.topics.get(&topic).is_some_and(|held| held.claiming);
         self.topics.insert(
             topic,
             Topic {
@@ -861,8 +932,10 @@ impl Driver {
                 owner: None,
                 group,
                 seen: AckMemory::default(),
+                claiming,
             },
         );
+        Vec::new()
     }
 
     /// Starts tracking a topic the server joined for one of this client's
@@ -892,6 +965,7 @@ impl Driver {
             owner: Some(pattern.clone()),
             group: None,
             seen: AckMemory::default(),
+            claiming: false,
         };
         self.topics.insert(name.to_string(), topic);
         true
@@ -954,7 +1028,8 @@ impl Driver {
                 buffer,
                 reply,
             } => {
-                self.add_topic(topic.clone(), from, group.clone(), generation, buffer);
+                let claimed =
+                    self.add_topic(topic.clone(), from, group.clone(), generation, buffer);
                 self.subscribe_waiters.insert(topic.clone(), reply);
                 let id = self.take_id();
                 self.pending.insert(
@@ -964,7 +1039,23 @@ impl Driver {
                     },
                 );
                 let subscribe = ClientMessage::Subscribe { topic, from, group };
-                send(socket, Some(id), subscribe).await
+                send(socket, Some(id), subscribe).await?;
+                for name in claimed {
+                    let id = self.take_id();
+                    self.pending.insert(
+                        id,
+                        Pending::Subscribe {
+                            topic: name.clone(),
+                        },
+                    );
+                    let claim = ClientMessage::Subscribe {
+                        topic: name,
+                        from: StartFrom::Resume,
+                        group: None,
+                    };
+                    send(socket, Some(id), claim).await?;
+                }
+                Ok(())
             }
             Command::Unsubscribe { topic, reply } => {
                 let mut names = self.release(&topic, None);
@@ -1060,6 +1151,10 @@ impl Driver {
                 if self.patterns.contains_key(&subscribed.topic) {
                     debug!(pattern = %subscribed.topic, "wildcard subscription accepted");
                 } else if let Some(topic) = self.topics.get_mut(&subscribed.topic) {
+                    if topic.claiming {
+                        topic.claiming = false;
+                        topic.next_expected = None;
+                    }
                     if topic.group.is_none() {
                         topic.next_expected =
                             Some(topic.next_expected.map_or(start, |n| n.max(start)));
@@ -1197,6 +1292,11 @@ impl Driver {
     /// Hands a delivered message to its subscription, dropping duplicates
     /// and acknowledging as `AckMode` says.
     ///
+    /// A message on a topic the server holds for the session that the
+    /// application hasn't subscribed to here, or whose subscribe is still
+    /// unanswered, is dropped without an acknowledgement: the server keeps
+    /// it and replays it when the application's subscribe is handled.
+    ///
     /// Args:
     ///     socket: The connection, for acknowledgements.
     ///     delivery: The delivered message.
@@ -1208,6 +1308,9 @@ impl Driver {
             topic: delivery.topic.clone(),
             seq: delivery.seq,
         };
+        if self.unclaimed.contains(&delivery.topic) {
+            return Ok(());
+        }
         if !self.topics.contains_key(&delivery.topic) {
             self.adopt(&delivery.topic, None);
         }
@@ -1217,6 +1320,9 @@ impl Driver {
             }
             return Ok(());
         };
+        if topic.claiming {
+            return Ok(());
+        }
         let duplicate = match topic.group {
             Some(_) => topic.seen.contains(delivery.seq),
             None => topic.next_expected.is_some_and(|next| delivery.seq < next),

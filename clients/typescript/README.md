@@ -80,6 +80,20 @@ for await (const message of orders) {
 
 Each topic the server joins for the pattern is tracked on its own (next expected `seq`, acknowledgements), so deduplication and gap-free resubscription work per topic. After a reconnect the client resubscribes those topics from where each left off and sends the pattern again, which picks up topics created while it was away from their first message. If the server ends one of the topics (an `unsubscribed` event naming it), only that topic stops. `client.unsubscribe("orders/#")`, `close()` on the subscription, or breaking out of the loop leaves the pattern and every topic joined through it.
 
+Subscribing again to a pattern the client already holds replaces the subscription. The topics joined through it move to the new subscription and keep their next expected `seq`, so each later message arrives once, on the new subscription. The earlier subscription ends: it yields what it had already buffered and then `undefined`, and closing or dropping it doesn't unsubscribe anything.
+
+### A durable session in a new process
+
+A durable session (`sessionId`) outlives the process. When a new process connects with the same `sessionId`, the server starts sending what it kept for the session's topics straight away, before the application has subscribed to anything; the `connected` event lists those topics in `resumed`.
+
+```ts
+const client = await Client.connect({ url, credentials, sessionId: "alice-laptop", ackMode: "manual" });
+const jobs = await client.subscribe("jobs", "resume");
+const tasks = await client.subscribe("tasks/#");
+```
+
+Until the application subscribes to one of those topics, the client drops its messages without acknowledging them, so the server keeps them. Subscribing to the topic by name, or to a pattern that matches it, claims it: the subscribe replays the kept messages in order, and they are handed over from the `subscribed` reply on. For a pattern the client sends one more `subscribe` per claimed topic, by name with `from: "resume"`, because the server skips topics the connection already holds when it handles the pattern. A topic the application never subscribes to stays unclaimed: its messages wait on the server, where after `max_retries` the subscription stalls or the messages are dead-lettered, as for any subscriber that doesn't acknowledge. To drop a topic from the session, `unsubscribe` it.
+
 ### Shared subscriptions
 
 Members of a group split a topic's messages: each message goes to one member. Subscribers outside the group still get everything.
@@ -155,4 +169,4 @@ npm install
 npm run check
 ```
 
-`npm run check` runs, in order, `typecheck` (`tsc` with `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` and `noImplicitOverride`), `lint` (ESLint with typescript-eslint's strict and stylistic type-checked presets, no warnings allowed), `format:check` (Prettier) and `test` (Node's built-in test runner). The tests cover the backoff ceiling, deduplication (by next expected `seq`, and by delivered `seq`s for shared subscriptions), the topic pattern matcher, close codes and configuration checks, check that a silent connection is pinged and that a `ping` left unanswered leads to a reconnect, and run a client in a child process against a small in-test WebSocket server to check that a closed client leaves nothing that keeps Node running. `npm run format` rewrites files in place, and `npm run build` compiles to `dist/` with declaration files and source maps.
+`npm run check` runs, in order, `typecheck` (`tsc` with `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` and `noImplicitOverride`), `lint` (ESLint with typescript-eslint's strict and stylistic type-checked presets, no warnings allowed), `format:check` (Prettier) and `test` (Node's built-in test runner). The tests cover the backoff ceiling, deduplication (by next expected `seq`, and by delivered `seq`s for shared subscriptions), the topic pattern matcher, close codes and configuration checks, check that a silent connection is pinged and that a `ping` left unanswered leads to a reconnect, and run a client against a small in-test WebSocket server to check how a new process claims a durable session's topics (nothing acknowledged or handed over before the application subscribes, by name or by pattern, and a claim sent again after a reconnect) and that subscribing again to a pattern moves its topics to the new subscription, and run one in a child process to check that a closed client leaves nothing that keeps Node running. `npm run format` rewrites files in place, and `npm run build` compiles to `dist/` with declaration files and source maps.

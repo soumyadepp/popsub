@@ -9,6 +9,14 @@
 // id and message_id so the server stores them once, acknowledging QoS 1
 // messages, and handing each (topic, seq) to the application at most once.
 //
+// A durable session outlives the process. When a new process connects with
+// the same SessionID, the server starts sending what it kept for the
+// session's topics before the application has subscribed. The client
+// leaves those messages unacknowledged, so the server keeps them, and they
+// are replayed once the application subscribes to the topic by name or
+// through a pattern that matches it. Messages on a session topic the
+// application never subscribes to stay on the server.
+//
 // Example:
 //
 //	cfg := popsub.Config{

@@ -116,7 +116,15 @@ class Client:
         and seq, including topics created later.
 
         Subscribing to a topic or pattern already subscribed replaces the
-        earlier subscription, which ends.
+        earlier subscription, which ends. A topic starts over from
+        `start_from`. A pattern's joined topics move to the new subscription
+        and carry on from the next seq each expects, so no message is
+        repeated or lost.
+
+        On a durable session held by an earlier process, messages the server
+        kept for a topic are neither delivered nor acknowledged until this
+        is called for the topic or for a pattern matching it; they are then
+        replayed in order.
 
         Args:
             topic: The topic or pattern.

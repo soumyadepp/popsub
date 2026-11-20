@@ -47,6 +47,9 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
     ("durable_session_resumes_after_restart", |d| {
         Box::pin(durable_session_resumes_after_restart(d))
     }),
+    ("durable_session_keeps_messages_for_a_new_process", |d| {
+        Box::pin(durable_session_keeps_messages_for_a_new_process(d))
+    }),
     ("taken_over_session_stops_the_old_client", |d| {
         Box::pin(taken_over_session_stops_the_old_client(d))
     }),
@@ -65,6 +68,12 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
     }),
     ("shared_subscription_splits_messages", |d| {
         Box::pin(shared_subscription_splits_messages(d))
+    }),
+    ("wildcard_subscription_can_be_replaced", |d| {
+        Box::pin(wildcard_subscription_can_be_replaced(d))
+    }),
+    ("shared_subscription_rejoins_after_reconnect", |d| {
+        Box::pin(shared_subscription_rejoins_after_reconnect(d))
     }),
 ];
 
@@ -914,5 +923,153 @@ async fn shared_subscription_splits_messages(command: String) -> Outcome {
             .ok("ack", json!({"topic": "jobs", "seq": seq}))
             .await?;
     }
+    nothing_in_flight(&server).await
+}
+
+/// Checks that a durable session's messages survive the application
+/// restarting: a new process with the same session gets everything the old
+/// one left unacknowledged and everything published in between, on a topic
+/// subscribed by name and on one joined through a pattern, even though the
+/// server starts sending them before the new process subscribes.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn durable_session_keeps_messages_for_a_new_process(command: String) -> Outcome {
+    let server = ScenarioServer::start(Backend::Memory).await?;
+    let mut args = connect_args(&server.url(), "admin", "password");
+    args["session_id"] = json!("phone");
+    args["ack_mode"] = json!("manual");
+    let old = connected(&command, "old", args.clone()).await?;
+    old.ok("subscribe", json!({"topic": "jobs", "from": "resume"}))
+        .await?;
+    old.ok("subscribe", json!({"topic": "tasks/#", "from": "new"}))
+        .await?;
+    server.publish("jobs", "one", 1).await?;
+    server.publish("jobs", "two", 1).await?;
+    server.publish("tasks/a", "a1", 1).await?;
+    let before = old.messages_on_any(3, WAIT).await;
+    check(before.len() == 3, || {
+        format!("expected three messages before the restart, got {before:?}")
+    })?;
+    old.ok("ack", json!({"topic": "jobs", "seq": 1})).await?;
+    let deadline = Instant::now() + WAIT;
+    while server.broker().stats().in_flight != 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    old.ok("close", json!({})).await?;
+    drop(old);
+    server.publish("jobs", "three", 1).await?;
+    server.publish("tasks/a", "a2", 1).await?;
+    args["ack_mode"] = json!("auto");
+    let new = connected(&command, "new", args).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    new.ok("subscribe", json!({"topic": "jobs", "from": "resume"}))
+        .await?;
+    new.ok("subscribe", json!({"topic": "tasks/#", "from": "new"}))
+        .await?;
+    let mut kept = new.messages_on_any(4, WAIT).await;
+    kept.sort();
+    check(
+        kept == [
+            ("jobs".to_string(), 2),
+            ("jobs".to_string(), 3),
+            ("tasks/a".to_string(), 1),
+            ("tasks/a".to_string(), 2),
+        ],
+        || format!("expected jobs 2, 3 and tasks/a 1, 2 for the new process, got {kept:?}"),
+    )?;
+    server.publish("jobs", "four", 1).await?;
+    server.publish("tasks/a", "a3", 1).await?;
+    let mut live = new.messages_on_any(3, QUIET).await;
+    live.sort();
+    check(
+        live == [("jobs".to_string(), 4), ("tasks/a".to_string(), 3)],
+        || format!("expected jobs 4 and tasks/a 3 once each, got {live:?}"),
+    )?;
+    nothing_in_flight(&server).await
+}
+
+/// Checks that subscribing again to a pattern replaces the subscription:
+/// messages on a topic it already brought in and on a new topic each arrive
+/// exactly once afterwards.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn wildcard_subscription_can_be_replaced(command: String) -> Outcome {
+    let server = ScenarioServer::start(Backend::Memory).await?;
+    let client = admin(&command, &server, "client").await?;
+    let subscribe = json!({"topic": "orders/#", "from": "new"});
+    client.ok("subscribe", subscribe.clone()).await?;
+    server.publish("orders/a", "a1", 1).await?;
+    let first = client.messages_on_any(1, WAIT).await;
+    check(first == [("orders/a".to_string(), 1)], || {
+        format!("expected orders/a 1, got {first:?}")
+    })?;
+    client.ok("subscribe", subscribe).await?;
+    server.publish("orders/a", "a2", 1).await?;
+    server.publish("orders/b", "b1", 1).await?;
+    let mut after = client.messages_on_any(3, QUIET).await;
+    after.sort();
+    check(
+        after == [("orders/a".to_string(), 2), ("orders/b".to_string(), 1)],
+        || format!("expected orders/a 2 and orders/b 1 once each, got {after:?}"),
+    )?;
+    nothing_in_flight(&server).await
+}
+
+/// Checks that a member of a shared subscription rejoins its group after a
+/// reconnect: it gets what was published while it was away, a message it
+/// already had isn't handed over again, and both can be acknowledged.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn shared_subscription_rejoins_after_reconnect(command: String) -> Outcome {
+    let mut server = ScenarioServer::start(Backend::Memory).await?;
+    let mut args = connect_args(&server.url(), "admin", "password");
+    args["ack_mode"] = json!("manual");
+    let client = connected(&command, "client", args).await?;
+    client
+        .ok(
+            "subscribe",
+            json!({"topic": "jobs", "from": "new", "group": "workers"}),
+        )
+        .await?;
+    server.publish("jobs", "one", 1).await?;
+    server.publish("jobs", "two", 1).await?;
+    let before = client.messages("jobs", 2, WAIT).await;
+    check(before == [1, 2], || {
+        format!("expected [1, 2], got {before:?}")
+    })?;
+    client.ok("ack", json!({"topic": "jobs", "seq": 1})).await?;
+    let deadline = Instant::now() + WAIT;
+    while server.broker().stats().in_flight != 1 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    server.pause().await;
+    client
+        .event(WAIT, "a disconnected event", |e| {
+            e["event"] == "disconnected"
+        })
+        .await?;
+    server.publish("jobs", "three", 1).await?;
+    server.resume().await?;
+    client
+        .event(WAIT, "a connected event", |e| e["event"] == "connected")
+        .await?;
+    let after = client.messages("jobs", 2, QUIET).await;
+    check(after == [3], || {
+        format!("expected only the new [3] after rejoining, got {after:?}")
+    })?;
+    client.ok("ack", json!({"topic": "jobs", "seq": 2})).await?;
+    client.ok("ack", json!({"topic": "jobs", "seq": 3})).await?;
     nothing_in_flight(&server).await
 }

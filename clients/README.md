@@ -35,6 +35,16 @@ A client library hides the protocol's bookkeeping, so an application only sees c
 - A failed first connection with a rejected login (`invalid_credentials`) or other non-temporary refusal fails `connect` instead of retrying.
 - After reconnecting: topics listed in `authenticated.resumed` are left to the server. Every other subscribed topic is subscribed again from `{"seq": next_expected}`, never from the original `from`, so nothing still in the log is missed. Confirmed publishes still waiting for `published` are resent with the same request id and `message_id`, so the server stores them once. QoS 0 publishes made while disconnected (up to a bound) are sent.
 
+**A durable session in a new process**
+
+A durable session outlives the application. When a new process connects with the same `session_id`, the server lists the session's topics in `authenticated.resumed` and starts sending what it kept for them straight away, before the application has subscribed to anything.
+
+- A resumed topic the client isn't tracking is unclaimed. A message on an unclaimed topic is not handed over and not acknowledged, so the server keeps it for the session. (Acknowledging it, as for any other untracked topic, would lose it.)
+- When the application subscribes to an unclaimed topic by name, the client claims it: it sends the subscribe as usual and goes on dropping the topic's messages, unacknowledged, until that subscribe's `subscribed` arrives. Those are the server's own resume; the subscribe replays them in order. From `subscribed` on the topic is tracked like any other, with `replay_from` as its next expected `seq`.
+- When the application subscribes to a pattern, the client claims every unclaimed topic the pattern matches: it tracks each as owned by the pattern and sends a `subscribe` for it by name with `from: "resume"`, dropping its messages until that `subscribed` arrives, as above. The server skips topics the connection holds when it handles the pattern itself, so without this nothing would replay them.
+- After a reconnect, a topic still waiting for the `subscribed` that claims it is subscribed again (the application's `from`, or `resume` for one owned by a pattern) even when the server lists it in `resumed`.
+- A topic the application never subscribes to stays unclaimed: its messages wait on the server, and after `max_retries` the subscription stalls there or the messages are dead-lettered, as for any subscriber that doesn't acknowledge.
+
 **Receiving**
 
 - Each subscribed topic remembers the next `seq` it expects. A message below it is a duplicate: never hand it to the application, but acknowledge it again if it was acknowledged before (or always, in automatic mode), so a lost ack can't stall the subscription.
@@ -46,8 +56,9 @@ A client library hides the protocol's bookkeeping, so an application only sees c
 **Wildcard subscriptions**
 
 - `subscribe` accepts a pattern (`orders/#`, `sensors/+/temp`). The application gets one subscription for it, which yields the messages of every matching topic, each under its own topic name and `seq`.
-- The server announces each topic it joins for the pattern with a `subscribed` frame that has no `id`. The client then tracks that topic like any other (its own next expected `seq`, its own acknowledgements), owned by the pattern. A `subscribed` or `message` for a topic the client isn't tracking is matched against its patterns (the oldest matching one owns it); if none matches, a message is acknowledged and dropped as before.
+- The server announces each topic it joins for the pattern with a `subscribed` frame that has no `id`. The client then tracks that topic like any other (its own next expected `seq`, its own acknowledgements), owned by the pattern. A `subscribed` or `message` for a topic the client isn't tracking is matched against its patterns (the oldest matching one owns it); if none matches, a message is acknowledged and dropped as before, unless the topic is an unclaimed one of the session (above).
 - After reconnecting: resubscribe every tracked topic that wasn't resumed from `{"seq": next_expected}` first, as usual, and then send each pattern again with `from: {"seq": 1}`. The server skips topics the connection holds, so this joins only topics created during the disconnect, from their first message.
+- Subscribing again to a pattern the client already holds replaces the subscription: the topics it owned move to the new subscription and keep their next expected `seq` (the server sends nothing again for topics the connection holds), and the earlier subscription receives nothing more. Each message still reaches the application once.
 - Unsubscribing a pattern (or dropping its subscription) sends `unsubscribe` for the pattern and for each topic it owned, and stops tracking them.
 - When the server ends one owned topic (`unsubscribed` with no `id`), only that topic stops; the pattern's subscription carries on.
 

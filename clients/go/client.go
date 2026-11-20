@@ -67,7 +67,16 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 // Subscribe subscribes to a topic and waits for the server to confirm it.
 // FromResume continues a durable session's stored subscription and
 // replays nothing otherwise. Subscribing again to a topic replaces the
-// earlier Subscription, whose channel is then closed.
+// earlier Subscription, whose channel is then closed. Subscribing again to
+// a pattern does the same, and the topics already joined through it carry
+// on from where each was on the new Subscription: nothing is replayed and
+// nothing is skipped.
+//
+// On a durable session that an earlier process left subscriptions on,
+// messages the server sends for those topics before this call are not
+// acknowledged, so they are replayed to the Subscription returned here. A
+// pattern picks up every such topic it matches, each from where the
+// session left it, whatever from says.
 //
 // The topic may be a pattern, in which + is any one whole level and a
 // trailing # is the rest (orders/#, sensors/+/temp). The one Subscription
