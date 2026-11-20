@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,6 +60,9 @@ type command struct {
 	Group string `json:"group"`
 	// Payload is the body, for publish and publish_confirmed.
 	Payload string `json:"payload"`
+	// Bytes is the body as base64, for publish and publish_confirmed in
+	// place of Payload; nil when the command carries a text payload.
+	Bytes *string `json:"bytes"`
 	// Seq is the message to acknowledge, for ack.
 	Seq uint64 `json:"seq"`
 	// Method is the admin method, for admin.
@@ -212,12 +216,32 @@ func (d *driver) handle(c *command) (map[string]any, failure) {
 		}
 		return nil, nil
 	case "publish":
-		if err := client.Publish(c.Topic, c.Payload); err != nil {
+		body, isBytes, fail := c.body()
+		if fail != nil {
+			return nil, fail
+		}
+		var err error
+		if isBytes {
+			err = client.PublishBytes(c.Topic, body)
+		} else {
+			err = client.Publish(c.Topic, c.Payload)
+		}
+		if err != nil {
 			return nil, describe(err)
 		}
 		return nil, nil
 	case "publish_confirmed":
-		published, err := client.PublishConfirmed(ctx, c.Topic, c.Payload)
+		body, isBytes, fail := c.body()
+		if fail != nil {
+			return nil, fail
+		}
+		var published popsub.Published
+		var err error
+		if isBytes {
+			published, err = client.PublishBytesConfirmed(ctx, c.Topic, body)
+		} else {
+			published, err = client.PublishConfirmed(ctx, c.Topic, c.Payload)
+		}
 		if err != nil {
 			return nil, describe(err)
 		}
@@ -241,6 +265,30 @@ func (d *driver) handle(c *command) (map[string]any, failure) {
 	default:
 		return nil, plain("protocol", "unknown op "+c.Op)
 	}
+}
+
+// body reads a publish command's bytes field. It returns the decoded
+// bytes and true when the command carries one, false when it carries a
+// text payload instead, and a config error when bytes isn't base64.
+func (c *command) body() ([]byte, bool, failure) {
+	if c.Bytes == nil {
+		return nil, false, nil
+	}
+	decoded, err := base64.StdEncoding.Strict().DecodeString(*c.Bytes)
+	if err != nil {
+		return nil, false, plain("config", "bytes isn't base64: "+err.Error())
+	}
+	return decoded, true, nil
+}
+
+// encodedBytes describes a message's bytes for a message event: the
+// base64 of what Message.Bytes returns, or nil when it fails.
+func encodedBytes(message popsub.Message) any {
+	body, err := message.Bytes()
+	if err != nil {
+		return nil
+	}
+	return base64.StdEncoding.EncodeToString(body)
 }
 
 // connect creates the client, waits for its first connection, and starts
@@ -310,8 +358,8 @@ func (d *driver) subscribe(ctx context.Context, client *popsub.Client, c *comman
 	return nil, nil
 }
 
-// forwardMessages reports each message of a subscription, holding QoS 1
-// ones for ack, then reports the end of the subscription unless the
+// forwardMessages reports each message of a subscription with its payload
+// string and its bytes, holding QoS 1 ones for ack, then reports the end of the subscription unless the
 // harness unsubscribed from it.
 func (d *driver) forwardMessages(sub *popsub.Subscription) {
 	for message := range sub.Messages() {
@@ -325,6 +373,7 @@ func (d *driver) forwardMessages(sub *popsub.Subscription) {
 			"topic":      message.Topic,
 			"seq":        message.Seq,
 			"payload":    message.Payload,
+			"bytes":      encodedBytes(message),
 			"message_id": message.MessageID,
 			"qos":        message.QoS,
 		})

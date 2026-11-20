@@ -289,6 +289,7 @@ async fn reconnects_and_resubscribes_without_gaps() {
         message_id: String::new(),
         publisher: "admin".to_string(),
         payload: payload.to_string(),
+        encoding: None,
         qos: 0,
         published_at_ms: 0,
     };
@@ -817,5 +818,36 @@ async fn shared_subscriptions_split_messages_between_members() {
             })
         ),
         "{bad_name:?}"
+    );
+}
+
+/// Checks that subscribing again to a pattern moves the topics it already
+/// brought in to the new subscription, so dropping the old one loses nothing.
+#[tokio::test]
+async fn a_replaced_wildcard_subscription_keeps_its_topics() {
+    let server = TestServer::memory(&Settings::default()).await;
+    let client = Client::connect(server.config()).await.expect("connect");
+    let mut old = client
+        .subscribe("orders/#", StartFrom::New)
+        .await
+        .expect("subscribe");
+    client
+        .publish_confirmed("orders/eu", "first")
+        .await
+        .expect("publish");
+    assert_eq!(next(&mut old).await.payload, "first");
+    let mut new = client
+        .subscribe("orders/#", StartFrom::New)
+        .await
+        .expect("subscribe again");
+    drop(old);
+    client
+        .publish_confirmed("orders/eu", "second")
+        .await
+        .expect("publish");
+    let second = next(&mut new).await;
+    assert_eq!(
+        (second.topic.as_str(), second.seq, second.payload.as_str()),
+        ("orders/eu", 2, "second")
     );
 }

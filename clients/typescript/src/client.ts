@@ -5,6 +5,7 @@
  */
 
 import { Admin } from "./admin.js";
+import { encodeBase64 } from "./base64.js";
 import { resolveConfig, type ClientConfig, type ResolvedConfig } from "./config.js";
 import { Engine, type Published } from "./engine.js";
 import { PopSubError } from "./errors.js";
@@ -139,7 +140,17 @@ export class Client {
   /**
    * Subscribes to a topic, or to every topic matching a wildcard pattern.
    * Subscribing again to the same topic or pattern replaces the earlier
-   * subscription, which ends.
+   * subscription, which ends. A topic subscribed again starts over from
+   * `from`. A pattern subscribed again keeps the topics it had joined:
+   * their later messages go to the new subscription, each once, and the
+   * earlier subscription can be closed or dropped without losing any.
+   *
+   * With a durable session started in an earlier process, the server sends
+   * what it kept for the session's topics as soon as the client connects.
+   * The client neither hands over nor acknowledges those messages until
+   * the application subscribes to the topic, by name or through a pattern
+   * that matches it; the subscribe then replays them in order. Messages of
+   * a topic the application never subscribes to stay on the server.
    *
    * In a pattern a whole level may be `+` (any one level) and the last
    * level may be `#` (the rest), as in `sensors/+/temp` or `orders/#`. The
@@ -235,6 +246,22 @@ export class Client {
   }
 
   /**
+   * Publishes bytes at QoS 0, for a body that isn't text. They travel as
+   * standard padded base64 in `payload` with `encoding: "base64"`, so they
+   * take about a third more room against the server's payload limit;
+   * subscribers read them back with `Message.bytes`.
+   *
+   * Otherwise it behaves like `publish`, queue while disconnected included.
+   *
+   * @param topic - The topic.
+   * @param bytes - The body.
+   * @throws PopSubError of kind `closed` when the client has stopped.
+   */
+  publishBytes(topic: string, bytes: Uint8Array): void {
+    this.#engine.publish(topic, encodeBase64(bytes), "base64");
+  }
+
+  /**
    * Publishes a message at QoS 1 and waits until the server has stored it.
    *
    * The message gets a new `message_id` (a UUID) and is resent under it,
@@ -251,6 +278,31 @@ export class Client {
    */
   publishConfirmed(topic: string, payload: string): Promise<Published> {
     return withTimeout(this.#engine.publishConfirmed(topic, payload), this.#config.requestTimeoutMs);
+  }
+
+  /**
+   * Publishes bytes at QoS 1 and waits until the server has stored them,
+   * for a body that isn't text. They travel as standard padded base64 in
+   * `payload` with `encoding: "base64"`, so they take about a third more
+   * room against the server's payload limit; subscribers read them back
+   * with `Message.bytes`.
+   *
+   * Otherwise it behaves like `publishConfirmed`: one `message_id`, resent
+   * with the same request id after every reconnect until confirmed.
+   *
+   * @param topic - The topic.
+   * @param bytes - The body.
+   * @returns Its `seq` and `messageId`.
+   * @throws PopSubError of kind `server` when the server refused it (for
+   *   example `not_authorized`, `rate_limited` or `payload_too_large`),
+   *   `timeout` when it wasn't confirmed in time (it may still be stored,
+   *   and is still resent until confirmed), or `closed`.
+   */
+  publishBytesConfirmed(topic: string, bytes: Uint8Array): Promise<Published> {
+    return withTimeout(
+      this.#engine.publishConfirmed(topic, encodeBase64(bytes), "base64"),
+      this.#config.requestTimeoutMs,
+    );
   }
 
   /**

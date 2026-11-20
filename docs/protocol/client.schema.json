@@ -20,6 +20,16 @@
         }
       ]
     },
+    "Encoding": {
+      "description": "How a payload string encodes a message's bytes. A payload with no\nencoding is the message's text. The server stores and delivers the\npayload string unchanged, with its encoding beside it.",
+      "oneOf": [
+        {
+          "const": "base64",
+          "description": "Standard base64 (RFC 4648 section 4) with padding, for payloads that\naren't text.",
+          "type": "string"
+        }
+      ]
+    },
     "RequestId": {
       "anyOf": [
         {
@@ -158,11 +168,15 @@
   "description": "Every frame a PopSub client sends.",
   "oneOf": [
     {
-      "description": "Authenticates the connection with a JWT from `login`. Answered with\n`authenticated`.\n\n`protocol` is the version the client speaks; omitted means 1. With a\n`session_id`, the connection holds that durable session of the user:\nits subscriptions and cursors are restored and kept after the\nconnection ends. `clean_start` discards them first.",
+      "description": "Authenticates the connection with a JWT from `login`. Answered with\n`authenticated`.\n\n`protocol` is the version the client speaks; omitted means 1. With a\n`session_id`, the connection holds that durable session of the user:\nits subscriptions and cursors are restored and kept after the\nconnection ends. `clean_start` discards them first; `hold_resumed`\nkeeps them stored but sends nothing until the client subscribes.",
       "properties": {
         "clean_start": {
           "default": false,
           "description": "Whether to discard the session's stored subscriptions.",
+          "type": "boolean"
+        },
+        "hold_resumed": {
+          "description": "Whether to leave the session's stored subscriptions unattached.\nThey are still listed in `authenticated.resumed`, but nothing is\nsent on one until the client subscribes to it, and `subscribe`\nwith `from: \"resume\"` then starts one past its stored cursor. So a\nclient is never sent a record before it is ready for it.",
           "type": "boolean"
         },
         "protocol": {
@@ -293,6 +307,17 @@
     {
       "description": "Publishes a payload. A QoS 1 publish is answered with `published`\nonce stored; QoS 0 gets no reply unless it fails.",
       "properties": {
+        "encoding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Encoding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How `payload` encodes the message's bytes. Absent means the\npayload is the text itself. With `base64` the payload must be\nvalid base64 or the publish is refused with `bad_request`."
+        },
         "message_id": {
           "description": "The publisher's idempotency key; generated when omitted.",
           "type": [

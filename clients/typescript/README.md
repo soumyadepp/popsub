@@ -62,6 +62,8 @@ await client.close();
 | `unsubscribe(topic)`                             | Ends the subscription to a topic, or to a pattern and every topic joined through it, and tells the server. While disconnected it is queued and resolves at once.                                                                                                                                                                                                                                                                                                                                                                               |
 | `publish(topic, payload)`                        | QoS 0. Returns at once. Up to 10,000 publishes (and unsubscribes) are held while disconnected, oldest dropped first. Server refusals arrive as `serverError` events.                                                                                                                                                                                                                                                                                                                                                                           |
 | `publishConfirmed(topic, payload)`               | QoS 1. Resolves with `{ seq, messageId }` once stored. Resent after every reconnect until confirmed.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `publishBytes(topic, bytes)`                     | QoS 0 for a `Uint8Array` body that isn't text. Otherwise the same as `publish`. See [Binary payloads](#binary-payloads).                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `publishBytesConfirmed(topic, bytes)`            | QoS 1 for a `Uint8Array` body. Otherwise the same as `publishConfirmed`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `admin()`                                        | An `Admin` with the account calls `createUser`, `getUser`, `listUsers`, `setRole`, `grant`, `revoke`, `setPassword`, `setEnabled` and `deleteUser`, and the topic calls `listTopics`, `getTopic` and `purgeTopic`, which return `TopicInfo` (`name`, `firstSeq`, `lastSeq`, `messages`, `subscribers`). `getTopic` and `purgeTopic` reject with `topic_not_found` for a topic nothing was ever published to. None of these is queued or resent: while disconnected, or when the connection drops before the reply, they reject with `connect`. |
 | `on(listener)` / `off(listener)`                 | Registers or removes an event listener. `on` returns a function that removes it.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `close()`                                        | Stops the client: closes the socket, fails pending requests with `closed`, ends every subscription, clears every timer and listener. Resolves once stopped.                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -79,6 +81,22 @@ for await (const message of orders) {
 ```
 
 Each topic the server joins for the pattern is tracked on its own (next expected `seq`, acknowledgements), so deduplication and gap-free resubscription work per topic. After a reconnect the client resubscribes those topics from where each left off and sends the pattern again, which picks up topics created while it was away from their first message. If the server ends one of the topics (an `unsubscribed` event naming it), only that topic stops. `client.unsubscribe("orders/#")`, `close()` on the subscription, or breaking out of the loop leaves the pattern and every topic joined through it.
+
+Subscribing again to a pattern the client already holds replaces the subscription. The topics joined through it move to the new subscription and keep their next expected `seq`, so each later message arrives once, on the new subscription. The earlier subscription ends: it yields what it had already buffered and then `undefined`, and closing or dropping it doesn't unsubscribe anything.
+
+### A durable session in a new process
+
+A durable session (`sessionId`) outlives the process. When a new process connects with the same `sessionId`, the `connected` event lists the session's topics in `resumed` before the application has subscribed to anything. With a `sessionId` the client asks the server to hold those topics (`hold_resumed: true` in `auth`), and a server that honours it (it answers `held: true`) sends nothing on them until the client subscribes.
+
+```ts
+const client = await Client.connect({ url, credentials, sessionId: "alice-laptop", ackMode: "manual" });
+const jobs = await client.subscribe("jobs", "resume");
+const tasks = await client.subscribe("tasks/#");
+```
+
+When the topics are held, subscribing to one by name, or to a pattern that matches it, is an ordinary subscribe: `"resume"` starts one past the session's cursor, and the server joins a pattern's topic from that cursor whatever the pattern's `from`. Nothing is in flight for a topic the application never subscribes to, so it neither stalls nor is dead-lettered. After a reconnect the client subscribes again, from `"resume"`, to every topic it tracks that the server lists in `resumed`.
+
+A server that doesn't know `hold_resumed` answers without `held` and starts sending what it kept straight away. Then, until the application subscribes to one of those topics, the client drops its messages without acknowledging them, so the server keeps them. Subscribing to the topic by name, or to a pattern that matches it, claims it: the subscribe replays the kept messages in order, and they are handed over from the `subscribed` reply on. For a pattern the client sends one more `subscribe` per claimed topic, by name with `from: "resume"`, because the server skips topics the connection already holds when it handles the pattern. A topic the application never subscribes to stays unclaimed: its messages wait on the server, where after `max_retries` the subscription stalls or the messages are dead-lettered, as for any subscriber that doesn't acknowledge. To drop a topic from the session, `unsubscribe` it.
 
 ### Shared subscriptions
 
@@ -98,7 +116,24 @@ That example assumes `ackMode: "manual"`; in automatic mode `ack()` does nothing
 
 A `Subscription` is an async iterable of `Message`s in `seq` order. `next()` resolves with the next message, or `undefined` once the subscription has ended and is drained. It ends when the server ends it (access revoked), when the application unsubscribes, or when the client stops. `close()`, or breaking out of `for await`, unsubscribes and drops the messages not yet taken. `buffered` is how many messages wait.
 
-A `Message` has `topic`, `seq`, `messageId`, `payload`, `qos` and `publishedAtMs`. In manual mode, `ack()` acknowledges a QoS 1 message; in automatic mode and for QoS 0 it does nothing. Acknowledging twice is harmless.
+A `Message` has `topic`, `seq`, `messageId`, `payload`, `encoding`, `qos` and `publishedAtMs`, and `bytes()` returns its body as a `Uint8Array` (see [Binary payloads](#binary-payloads)). In manual mode, `ack()` acknowledges a QoS 1 message; in automatic mode and for QoS 0 it does nothing. Acknowledging twice is harmless.
+
+### Binary payloads
+
+A payload is always a string. For a body that isn't text, publish a `Uint8Array`:
+
+```ts
+client.publishBytes("frames", new Uint8Array([0x00, 0xff, 0xfe, 0x80]));
+const stored = await client.publishBytesConfirmed("frames", bytes);
+
+for await (const message of frames) {
+  const body = message.bytes();
+}
+```
+
+`publishBytes` and `publishBytesConfirmed` send the bytes as standard padded base64 in `payload` with `encoding: "base64"`, and otherwise behave exactly like `publish` and `publishConfirmed`: the same queue while disconnected, and the same resend under one request id and `message_id`. The server checks that the payload is base64 and carries it without decoding. Base64 adds about a third, and the server's payload limit (`max_payload_bytes`) counts the encoded string, so the largest body that fits is about three quarters of the limit.
+
+On a received message, `payload` is the string as it arrived and `encoding` is `"base64"` for a message published as bytes or `null` for text. `bytes()` returns the decoded payload when the encoding is `base64`, and the payload's UTF-8 bytes otherwise, so it works for either kind. If a payload claims base64 and doesn't decode, the message is still delivered and `bytes()` throws a `PopSubError` of kind `protocol`. Encoding and decoding use a small strict codec in the package (padding required, no whitespace), not `Buffer`, so they work the same in browsers and Node.
 
 ### Events
 
@@ -155,4 +190,4 @@ npm install
 npm run check
 ```
 
-`npm run check` runs, in order, `typecheck` (`tsc` with `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` and `noImplicitOverride`), `lint` (ESLint with typescript-eslint's strict and stylistic type-checked presets, no warnings allowed), `format:check` (Prettier) and `test` (Node's built-in test runner). The tests cover the backoff ceiling, deduplication (by next expected `seq`, and by delivered `seq`s for shared subscriptions), the topic pattern matcher, close codes and configuration checks, check that a silent connection is pinged and that a `ping` left unanswered leads to a reconnect, and run a client in a child process against a small in-test WebSocket server to check that a closed client leaves nothing that keeps Node running. `npm run format` rewrites files in place, and `npm run build` compiles to `dist/` with declaration files and source maps.
+`npm run check` runs, in order, `typecheck` (`tsc` with `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` and `noImplicitOverride`), `lint` (ESLint with typescript-eslint's strict and stylistic type-checked presets, no warnings allowed), `format:check` (Prettier) and `test` (Node's built-in test runner). The tests cover the backoff ceiling, byte payloads (the base64 codec, the frames byte and text publishes send, and `Message.bytes`), deduplication (by next expected `seq`, and by delivered `seq`s for shared subscriptions), the topic pattern matcher, close codes and configuration checks, check that a silent connection is pinged and that a `ping` left unanswered leads to a reconnect, and run a client against a small in-test WebSocket server to check how a new process claims a durable session's topics (nothing acknowledged or handed over before the application subscribes, by name or by pattern, and a claim sent again after a reconnect) and that subscribing again to a pattern moves its topics to the new subscription, and run one in a child process to check that a closed client leaves nothing that keeps Node running. `npm run format` rewrites files in place, and `npm run build` compiles to `dist/` with declaration files and source maps.

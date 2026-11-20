@@ -380,3 +380,276 @@ func TestSharedSubscriptionAcceptsOutOfOrderSeqs(t *testing.T) {
 		t.Fatalf("an empty group should be a config error, got %v", err)
 	}
 }
+
+// qos1 is the text of a QoS 1 message frame for a topic and seq.
+func qos1(topic, seq string) string {
+	return `{"type":"message","topic":"` + topic + `","seq":` + seq + `,"message_id":"m","payload":"p","qos":1,"published_at_ms":0}`
+}
+
+// settle waits until the server has handled every frame the client sent
+// before the call, by publishing to a topic of its own and waiting for the
+// confirmation.
+func settle(t *testing.T, client *Client) {
+	t.Helper()
+	if _, err := client.PublishConfirmed(context.Background(), "settle", "now"); err != nil {
+		t.Fatalf("settling: %v", err)
+	}
+}
+
+// TestUnclaimedTopicIsKeptUntilSubscribed checks a new process on a
+// durable session: a message on a resumed topic that arrives before the
+// application subscribes is neither handed over nor acknowledged, and the
+// replay after the subscribe is handed over and acknowledged once.
+func TestUnclaimedTopicIsKeptUntilSubscribed(t *testing.T) {
+	f := newFakeServer(t)
+	f.resume("jobs")
+	client := connectTest(t, f, testConfig(f))
+	f.inject(t, qos1("jobs", "2"))
+	settle(t, client)
+	if acks := f.received("ack", "jobs"); len(acks) != 0 {
+		t.Fatalf("a message on an unclaimed topic was acknowledged: %v", acks)
+	}
+	sub, err := client.Subscribe(context.Background(), "jobs", FromResume)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	f.inject(t, qos1("jobs", "2"))
+	if got := next(t, sub).Seq; got != 2 {
+		t.Fatalf("expected the replayed seq 2, got %d", got)
+	}
+	if acks := f.awaitReceived(t, "ack", "jobs", 1); acks[0]["seq"] != float64(2) {
+		t.Fatalf("expected an ack for seq 2, got %v", acks)
+	}
+	settle(t, client)
+	if acks := f.received("ack", "jobs"); len(acks) != 1 {
+		t.Fatalf("expected one ack for jobs, got %v", acks)
+	}
+}
+
+// TestClaimingTopicDropsMessagesUntilSubscribed checks that between the
+// application's subscribe to an unclaimed topic and its subscribed, the
+// topic's messages are dropped without an acknowledgement, and that after a
+// reconnect the subscribe is sent again as the application asked although
+// the server lists the topic as resumed.
+func TestClaimingTopicDropsMessagesUntilSubscribed(t *testing.T) {
+	f := newFakeServer(t)
+	f.resume("hang")
+	client := connectTest(t, f, testConfig(f))
+	<-f.authenticated
+	failed := make(chan error, 1)
+	go func() {
+		_, err := client.Subscribe(context.Background(), "hang", FromLast(3))
+		failed <- err
+	}()
+	f.awaitReceived(t, "subscribe", "hang", 1)
+	f.inject(t, qos1("hang", "5"))
+	settle(t, client)
+	if acks := f.received("ack", "hang"); len(acks) != 0 {
+		t.Fatalf("a message on a claiming topic was acknowledged: %v", acks)
+	}
+	f.dropConnection(websocket.StatusGoingAway)
+	<-f.authenticated
+	again := f.awaitReceived(t, "subscribe", "hang", 2)[1]
+	if from, _ := again["from"].(map[string]any); from["last"] != float64(3) {
+		t.Fatalf("expected the claim to be sent again from last 3, got %v", again["from"])
+	}
+	if err := <-failed; !errors.Is(err, ErrTimeout) {
+		t.Fatalf("expected the unanswered subscribe to time out, got %v", err)
+	}
+}
+
+// TestPatternClaimsTheSessionsTopics checks that subscribing to a pattern
+// claims the unclaimed topics it matches: each is subscribed by name with
+// resume, and its replay arrives on the pattern's subscription, while an
+// unclaimed topic the pattern does not match stays unacknowledged.
+func TestPatternClaimsTheSessionsTopics(t *testing.T) {
+	f := newFakeServer(t)
+	f.resume("tasks/a", "tasks/b", "audit")
+	client := connectTest(t, f, testConfig(f))
+	f.inject(t, qos1("tasks/a", "1"))
+	sub, err := client.Subscribe(context.Background(), "tasks/#", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	for _, name := range []string{"tasks/a", "tasks/b"} {
+		if claim := f.awaitReceived(t, "subscribe", name, 1)[0]; claim["from"] != "resume" {
+			t.Fatalf("expected %s to be claimed from resume, got %v", name, claim["from"])
+		}
+	}
+	settle(t, client)
+	f.inject(t, qos1("tasks/a", "1"))
+	f.inject(t, qos1("audit", "1"))
+	f.inject(t, qos1("tasks/b", "1"))
+	for _, want := range []string{"tasks/a", "tasks/b"} {
+		if got := next(t, sub); got.Topic != want || got.Seq != 1 {
+			t.Fatalf("expected %s #1, got %s #%d", want, got.Topic, got.Seq)
+		}
+	}
+	f.awaitReceived(t, "ack", "tasks/b", 1)
+	if acks := f.received("ack", "tasks/a"); len(acks) != 1 {
+		t.Fatalf("expected one ack for tasks/a, got %v", acks)
+	}
+	if acks := f.received("ack", "audit"); len(acks) != 0 {
+		t.Fatalf("an unclaimed topic outside the pattern was acknowledged: %v", acks)
+	}
+}
+
+// sessionConfig is testConfig with a durable session id.
+func sessionConfig(f *fakeServer) Config {
+	cfg := testConfig(f)
+	cfg.SessionID = "alice-laptop"
+	return cfg
+}
+
+// TestAuthAsksForTheHoldOnlyWithASession checks that auth carries
+// hold_resumed: true with a session id and leaves it out without one, and
+// that the auth which installs a refreshed token carries neither.
+func TestAuthAsksForTheHoldOnlyWithASession(t *testing.T) {
+	plain := newFakeServer(t)
+	connectTest(t, plain, testConfig(plain))
+	if auth := plain.awaitAuths(t, 1)[0]; auth["hold_resumed"] != nil || auth["session_id"] != nil {
+		t.Fatalf("an ephemeral auth should not ask for the hold, got %v", auth)
+	}
+	f := newFakeServer(t)
+	f.hold()
+	connectTest(t, f, sessionConfig(f))
+	if auth := f.awaitAuths(t, 1)[0]; auth["hold_resumed"] != true || auth["session_id"] != "alice-laptop" {
+		t.Fatalf("an auth with a session should ask for the hold, got %v", auth)
+	}
+	f.inject(t, `{"type":"auth_expiring","expires_at_ms":1}`)
+	if refresh := f.awaitAuths(t, 2)[1]; refresh["hold_resumed"] != nil || refresh["session_id"] != nil {
+		t.Fatalf("the token refresh auth should carry no session and no hold, got %v", refresh)
+	}
+}
+
+// TestHeldResumedTopicIsSubscribedAgainFromResume checks that when the
+// server holds the session's topics, after a reconnect a tracked topic it
+// lists as resumed is subscribed again with resume, while a tracked topic
+// it does not list is subscribed again from the next seq it expects.
+func TestHeldResumedTopicIsSubscribedAgainFromResume(t *testing.T) {
+	f := newFakeServer(t)
+	f.hold()
+	client := connectTest(t, f, sessionConfig(f))
+	<-f.authenticated
+	if _, err := client.Subscribe(context.Background(), "jobs", FromNew); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	feed, err := client.Subscribe(context.Background(), "feed", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if _, err := client.PublishConfirmed(context.Background(), "feed", "one"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	next(t, feed)
+	f.resume("jobs")
+	f.dropConnection(websocket.StatusGoingAway)
+	<-f.authenticated
+	if again := f.awaitReceived(t, "subscribe", "jobs", 2)[1]; again["from"] != "resume" {
+		t.Fatalf("expected the held topic to be subscribed again from resume, got %v", again["from"])
+	}
+	again := f.awaitReceived(t, "subscribe", "feed", 2)[1]
+	if from, _ := again["from"].(map[string]any); from["seq"] != float64(2) {
+		t.Fatalf("expected feed to be subscribed again from seq 2, got %v", again["from"])
+	}
+}
+
+// TestUnheldResumedTopicIsLeftToTheServer checks the fallback beside the
+// test above: when the server answers without held, a tracked topic it
+// lists as resumed is not subscribed again after a reconnect.
+func TestUnheldResumedTopicIsLeftToTheServer(t *testing.T) {
+	f := newFakeServer(t)
+	client := connectTest(t, f, sessionConfig(f))
+	<-f.authenticated
+	if _, err := client.Subscribe(context.Background(), "jobs", FromNew); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	f.resume("jobs")
+	f.dropConnection(websocket.StatusGoingAway)
+	<-f.authenticated
+	settle(t, client)
+	if subscribes := f.received("subscribe", "jobs"); len(subscribes) != 1 {
+		t.Fatalf("expected the resumed topic to be left to the server, got %v", subscribes)
+	}
+}
+
+// TestHeldSessionTopicsAreNotUnclaimed checks a new process on a session
+// the server holds: a subscribe by name to a session topic is ordinary, so
+// a message that follows its subscribed is handed over and acknowledged,
+// and a pattern sends no extra subscribe by name for the session topics it
+// matches.
+func TestHeldSessionTopicsAreNotUnclaimed(t *testing.T) {
+	f := newFakeServer(t)
+	f.hold()
+	f.resume("jobs", "tasks/a")
+	client := connectTest(t, f, sessionConfig(f))
+	jobs, err := client.Subscribe(context.Background(), "jobs", FromResume)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	f.inject(t, qos1("jobs", "1"))
+	if got := next(t, jobs).Seq; got != 1 {
+		t.Fatalf("expected seq 1 on the held topic, got %d", got)
+	}
+	f.awaitReceived(t, "ack", "jobs", 1)
+	tasks, err := client.Subscribe(context.Background(), "tasks/#", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	settle(t, client)
+	if claims := f.received("subscribe", "tasks/a"); len(claims) != 0 {
+		t.Fatalf("a pattern should claim nothing by name while held, got %v", claims)
+	}
+	f.inject(t, `{"type":"subscribed","topic":"tasks/a","replay_from":3,"replay_to":3}`)
+	f.inject(t, qos1("tasks/a", "3"))
+	if got := next(t, tasks); got.Topic != "tasks/a" || got.Seq != 3 {
+		t.Fatalf("expected tasks/a #3 through the pattern, got %s #%d", got.Topic, got.Seq)
+	}
+}
+
+// TestRepeatedPatternSubscribeReplacesTheSubscription checks that
+// subscribing again to a held pattern closes the earlier subscription
+// without losing anything: a topic already joined keeps its next expected
+// seq, so a repeat is dropped and the next message arrives once, on the new
+// subscription, as does a topic joined afterwards.
+func TestRepeatedPatternSubscribeReplacesTheSubscription(t *testing.T) {
+	f := newFakeServer(t)
+	client := connectTest(t, f, testConfig(f))
+	first, err := client.Subscribe(context.Background(), "orders/#", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	f.inject(t, `{"type":"subscribed","topic":"orders/a","replay_from":1,"replay_to":0}`)
+	f.inject(t, qos1("orders/a", "1"))
+	if got := next(t, first); got.Topic != "orders/a" || got.Seq != 1 {
+		t.Fatalf("expected orders/a #1 on the first subscription, got %s #%d", got.Topic, got.Seq)
+	}
+	second, err := client.Subscribe(context.Background(), "orders/#", FromNew)
+	if err != nil {
+		t.Fatalf("subscribe again: %v", err)
+	}
+	select {
+	case message, ok := <-first.Messages():
+		if ok {
+			t.Fatalf("the replaced subscription got %s #%d", message.Topic, message.Seq)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the replaced subscription's channel was not closed")
+	}
+	f.inject(t, qos1("orders/a", "1"))
+	f.inject(t, qos1("orders/a", "2"))
+	f.inject(t, qos1("orders/b", "1"))
+	want := []Message{{Topic: "orders/a", Seq: 2}, {Topic: "orders/b", Seq: 1}}
+	for _, expected := range want {
+		got := next(t, second)
+		if got.Topic != expected.Topic || got.Seq != expected.Seq {
+			t.Fatalf("expected %s #%d, got %s #%d", expected.Topic, expected.Seq, got.Topic, got.Seq)
+		}
+	}
+	if err := client.Unsubscribe(context.Background(), "orders/#"); err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+	for _, name := range []string{"orders/#", "orders/a", "orders/b"} {
+		f.awaitReceived(t, "unsubscribe", name, 1)
+	}
+}

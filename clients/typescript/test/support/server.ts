@@ -3,9 +3,13 @@
  * of RFC 6455 (unfragmented text and close frames) to talk to the client.
  * It answers `login`, `auth`, `subscribe`, `unsubscribe`, QoS 1 `publish`
  * and `ping` (unless told to stop answering pings), sends one QoS 1
- * message after each subscribe, records every request type it receives,
- * and can drop connections and refuse new ones. It never sends WebSocket
- * pings, so a client hears nothing from it unless it asks.
+ * message after each subscribe, records every request it receives, and
+ * can drop connections and refuse new ones. A test can script it: name
+ * the topics `authenticated` lists as resumed, have it answer `held: true`
+ * as a server that holds a session's topics does, give frames to send right
+ * after `authenticated` (what a durable session kept), replace the replies
+ * to chosen requests, and send frames to every open connection. It never
+ * sends WebSocket pings, so a client hears nothing from it unless it asks.
  *
  * @module
  */
@@ -18,12 +22,28 @@ import type { Duplex } from "node:stream";
 /** The GUID RFC 6455 appends to the key for the accept header. */
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-/** The limits the fake server announces in `authenticated`. */
+/** A JSON frame, as the fake server receives and sends it. */
+export type Frame = Record<string, unknown>;
+
+/** The limits the fake server announces in `authenticated`, and its script. */
 export interface FakeServerOptions {
   /** The announced `heartbeat_secs`; 30 by default. */
   heartbeatSecs?: number;
   /** The announced `idle_timeout_secs`; 90 by default. */
   idleTimeoutSecs?: number;
+  /** The topics `authenticated.resumed` lists; none by default. */
+  resumed?: string[];
+  /** Whether `authenticated` carries `held: true`; left out by default. */
+  held?: boolean;
+  /** Frames sent right after every `authenticated`; none by default. */
+  kept?: Frame[];
+  /**
+   * Replaces the replies to a request.
+   *
+   * @param request - The parsed request.
+   * @returns The frames to send back, or `undefined` for the usual replies.
+   */
+  respond?: (request: Frame) => Frame[] | undefined;
 }
 
 /** A running fake server. */
@@ -34,6 +54,16 @@ export interface FakeServer {
   authenticated(): number;
   /** The `type` of every request received so far, in order. */
   received(): string[];
+  /** Every request received so far, in order. */
+  requests(): Frame[];
+  /**
+   * Sends a frame to every open connection.
+   *
+   * @param frame - The frame.
+   */
+  send(frame: Frame): void;
+  /** Destroys every open connection without a close frame; new ones are still accepted. */
+  drop(): void;
   /**
    * Sets whether `ping` gets a `pong`.
    *
@@ -116,12 +146,16 @@ function decode(buffer: Buffer): { frames: { opcode: number; payload: Buffer }[]
  *
  * @param request - The parsed request.
  * @param limits - The `heartbeat_secs` and `idle_timeout_secs` to announce.
+ * @param resumed - The topics to list in `authenticated.resumed`.
+ * @param held - Whether `authenticated` carries `held: true`.
  * @returns The frames to send back, in order.
  */
 function reply(
-  request: Record<string, unknown>,
+  request: Frame,
   limits: { heartbeatSecs: number; idleTimeoutSecs: number },
-): Record<string, unknown>[] {
+  resumed: string[],
+  held: boolean,
+): Frame[] {
   const id = request.id;
   const topic = request.topic;
   switch (request.type) {
@@ -133,7 +167,8 @@ function reply(
           type: "authenticated",
           id,
           protocol: 1,
-          resumed: [],
+          resumed,
+          ...(held ? { held: true } : {}),
           limits: {
             max_inflight: 100,
             session_expiry_secs: 60,
@@ -171,7 +206,7 @@ function reply(
 /**
  * Starts a fake server on a free loopback port.
  *
- * @param options - The limits to announce.
+ * @param options - The limits to announce and the script to follow.
  * @returns The running server.
  */
 export async function startFakeServer(options: FakeServerOptions = {}): Promise<FakeServer> {
@@ -181,6 +216,9 @@ export async function startFakeServer(options: FakeServerOptions = {}): Promise<
   };
   const sockets = new Set<Duplex>();
   const received: string[] = [];
+  const requests: Frame[] = [];
+  const resumed = options.resumed ?? [];
+  const kept = options.kept ?? [];
   let refusing = false;
   let answeringPings = true;
   let authenticated = 0;
@@ -215,16 +253,18 @@ export async function startFakeServer(options: FakeServerOptions = {}): Promise<
         if (frame.opcode !== 1) {
           continue;
         }
-        const request = JSON.parse(frame.payload.toString("utf8")) as Record<string, unknown>;
+        const request = JSON.parse(frame.payload.toString("utf8")) as Frame;
         const type = typeof request.type === "string" ? request.type : "";
         received.push(type);
+        requests.push(request);
         if (type === "auth") {
           authenticated += 1;
         }
         if (type === "ping" && !answeringPings) {
           continue;
         }
-        for (const answer of reply(request, limits)) {
+        const answers = options.respond?.(request) ?? reply(request, limits, resumed, options.held === true);
+        for (const answer of type === "auth" ? [...answers, ...kept] : answers) {
           socket.write(encode(1, Buffer.from(JSON.stringify(answer))));
         }
       }
@@ -236,6 +276,17 @@ export async function startFakeServer(options: FakeServerOptions = {}): Promise<
     url: `ws://127.0.0.1:${String(port)}`,
     authenticated: () => authenticated,
     received: () => [...received],
+    requests: () => [...requests],
+    send: (frame) => {
+      for (const socket of sockets) {
+        socket.write(encode(1, Buffer.from(JSON.stringify(frame))));
+      }
+    },
+    drop: () => {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+    },
     answerPings: (answer) => {
       answeringPings = answer;
     },

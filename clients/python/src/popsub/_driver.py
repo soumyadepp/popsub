@@ -3,13 +3,18 @@
 Reads commands from standard input and writes responses and events to
 standard output, one JSON object per line, as `clients/DRIVER.md` in the
 PopSub repository describes. `popsub-scenarios` runs it with
-`python -m popsub._driver`. Logs go to standard error; set `POPSUB_LOG` to a
+`python -m popsub._driver`. A publish command may carry `bytes` (base64) in
+place of `payload`, which goes through the client's calls for publishing
+bytes, and every `message` event reports the message's bytes in base64 as
+`Message.data` returns them. Logs go to standard error; set `POPSUB_LOG` to a
 level name such as `DEBUG` to see more.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import logging
@@ -21,7 +26,7 @@ from typing import Any, TypeAlias
 from popsub.admin import Admin
 from popsub.client import Client
 from popsub.config import AckMode, ClientConfig, PasswordCredentials, ReconnectPolicy
-from popsub.errors import ClosedError, PopSubError, ServerError
+from popsub.errors import ClosedError, PopSubError, ProtocolError, ServerError
 from popsub.message import Message, Subscription
 from popsub.protocol import Access, RoleSpec, StartFrom
 
@@ -119,6 +124,45 @@ def config_from_command(command: Command) -> ClientConfig:
         ),
         request_timeout=_seconds(command.get("request_timeout_ms"), 30_000),
     )
+
+
+def _bytes(command: Command) -> bytes | None:
+    """Reads a publish command's `bytes`: the body to publish as bytes, in base64.
+
+    Args:
+        command: The command.
+
+    Returns:
+        The bytes, or None when the command carries a text `payload` instead.
+
+    Raises:
+        _DriverError: A `config` error when `bytes` isn't base64.
+    """
+    encoded = command.get("bytes")
+    if encoded is None:
+        return None
+    if not isinstance(encoded, str):
+        raise _DriverError("config", "bytes must be a base64 string")
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise _DriverError("config", f"bytes isn't valid base64: {error}") from error
+
+
+def _message_bytes(message: Message) -> str | None:
+    """Reads a message's bytes through `Message.data`, for a `message` event.
+
+    Args:
+        message: The message.
+
+    Returns:
+        The bytes in base64, or None when the payload claims base64 and
+        doesn't decode.
+    """
+    try:
+        return base64.b64encode(message.data).decode("ascii")
+    except ProtocolError:
+        return None
 
 
 async def _create_user(admin: Admin, params: dict[str, Any]) -> Any:
@@ -470,7 +514,12 @@ class Driver:
         Returns:
             An empty result.
         """
-        await client.publish(str(command.get("topic", "")), str(command.get("payload", "")))
+        topic = str(command.get("topic", ""))
+        data = _bytes(command)
+        if data is None:
+            await client.publish(topic, str(command.get("payload", "")))
+        else:
+            await client.publish_bytes(topic, data)
         return {}
 
     async def _publish_confirmed(self, client: Client, command: Command) -> dict[str, Any]:
@@ -483,7 +532,12 @@ class Driver:
         Returns:
             The `seq` and `message_id`.
         """
-        published = await client.publish_confirmed(str(command.get("topic", "")), str(command.get("payload", "")))
+        topic = str(command.get("topic", ""))
+        data = _bytes(command)
+        if data is None:
+            published = await client.publish_confirmed(topic, str(command.get("payload", "")))
+        else:
+            published = await client.publish_bytes_confirmed(topic, data)
         return {"seq": published.seq, "message_id": published.message_id}
 
     async def _ack(self, client: Client, command: Command) -> dict[str, Any]:
@@ -552,6 +606,7 @@ class Driver:
                     "topic": message.topic,
                     "seq": message.seq,
                     "payload": message.payload,
+                    "bytes": _message_bytes(message),
                     "message_id": message.message_id,
                     "qos": message.qos,
                 }

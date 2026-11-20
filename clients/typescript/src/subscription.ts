@@ -1,9 +1,15 @@
 /**
  * What the application receives: messages, and subscriptions that yield
- * them in `seq` order.
+ * them in `seq` order. A message carries its payload string as it
+ * travelled and its `encoding`; `Message.bytes` returns the body as bytes
+ * for either kind.
  *
  * @module
  */
+
+import { decodeBase64 } from "./base64.js";
+import { PopSubError } from "./errors.js";
+import type { Encoding } from "./protocol.js";
 
 /** The fields of a delivered message. */
 export interface MessageFields {
@@ -13,8 +19,10 @@ export interface MessageFields {
   seq: number;
   /** The publisher's id for it. */
   messageId: string;
-  /** The body. */
+  /** The body as it travelled: the text itself, or base64 when `encoding` says so. */
   payload: string;
+  /** How `payload` encodes the message's bytes; `null` or left out for text. */
+  encoding?: Encoding | null;
   /** 0 or 1. */
   qos: 0 | 1;
   /** When it was published, in milliseconds since the Unix epoch. */
@@ -25,15 +33,23 @@ export interface MessageFields {
  * A message delivered on a subscription. Each `(topic, seq)` reaches the
  * application at most once per client.
  */
-export class Message implements MessageFields {
+export class Message implements Required<MessageFields> {
   /** The topic it was published to. */
   readonly topic: string;
   /** Its position in the topic. */
   readonly seq: number;
   /** The publisher's id for it. */
   readonly messageId: string;
-  /** The body. */
+  /**
+   * The body as it travelled: the text itself, or base64 when `encoding`
+   * says so. `bytes` decodes it either way.
+   */
   readonly payload: string;
+  /**
+   * How `payload` encodes the message's bytes: `null` for text, `"base64"`
+   * for a message published as bytes.
+   */
+  readonly encoding: Encoding | null;
   /** 0 or 1. */
   readonly qos: 0 | 1;
   /** When it was published, in milliseconds since the Unix epoch. */
@@ -53,9 +69,31 @@ export class Message implements MessageFields {
     this.seq = fields.seq;
     this.messageId = fields.messageId;
     this.payload = fields.payload;
+    this.encoding = fields.encoding ?? null;
     this.qos = fields.qos;
     this.publishedAtMs = fields.publishedAtMs;
     this.#acker = acker;
+  }
+
+  /**
+   * The message's bytes: the payload's UTF-8 bytes for a text message, or
+   * the decoded payload for one published as bytes.
+   *
+   * @returns The bytes the publisher sent, in a new array on every call.
+   * @throws PopSubError of kind `protocol` when the payload says it is
+   *   base64 and isn't. The server checks this on publish, so it means the
+   *   record was stored some other way. The message itself was still
+   *   delivered, and `payload` holds the string as it arrived.
+   */
+  bytes(): Uint8Array {
+    if (this.encoding === null) {
+      return new TextEncoder().encode(this.payload);
+    }
+    const decoded = decodeBase64(this.payload);
+    if (decoded === null) {
+      throw new PopSubError("protocol", "the payload isn't valid base64");
+    }
+    return decoded;
   }
 
   /**

@@ -6,9 +6,13 @@ happens: reconnect with jittered backoff, or stop for good
 (`session_taken_over`, `unsupported_protocol`, `auth_failed`,
 `account_disabled`, `token_expired` with a bare token, or a rejected login).
 After reconnecting it subscribes every topic again from the next seq it
-expects (topics a durable session restored are left to the server), resends
+expects (topics a durable session restored are subscribed again from
+`resume` when the server holds them, and otherwise left to the server unless
+one is still being claimed), resends
 confirmed publishes still waiting for `published` under the same request id
-and `message_id`, and sends QoS 0 publishes held while disconnected.
+and `message_id`, and sends QoS 0 publishes held while disconnected. A
+publish of bytes is the same frame with a base64 payload and `encoding`, so
+it is queued and resent the same way.
 
 Each delivered message is checked against the next seq its topic expects,
 so a resend or replay never reaches the application twice. A duplicate that
@@ -23,7 +27,27 @@ each topic it joins for it with a `subscribed` frame that has no id; the
 engine then tracks that topic like any other, owned by the pattern, and puts
 its messages on the pattern's subscription. A `subscribed` or `message` for
 an untracked topic is given to the oldest matching pattern. Releasing a
-pattern unsubscribes it and every topic it owned.
+pattern unsubscribes it and every topic it owned. Subscribing again to a
+pattern the engine holds replaces the subscription: the topics it owned move
+to the new one with the next seq they expect, and the earlier one ends.
+
+A durable session can be held by a new process, before the application has
+subscribed to anything. With a session id the `auth` frame carries
+`hold_resumed`, asking the server to send nothing on the session's topics
+until the engine subscribes to them. A server that does so answers
+`authenticated` with `held`: nothing is unclaimed then, a subscribe to a
+resumed topic is an ordinary subscribe, and after a reconnect the engine
+subscribes again from `resume` to each tracked topic the server lists as
+resumed.
+
+A server that answers without `held` sends on the resumed topics straight
+away. The topics it lists
+as resumed that the engine isn't tracking are then unclaimed: their messages are
+dropped without an acknowledgement, so the server keeps them. Subscribing to
+one by name, or to a pattern that matches it, claims it. A claimed topic's
+messages are still dropped unacknowledged until the `subscribed` that
+answers the claim, because the subscribe replays them; a pattern claims each
+matching topic with a subscribe by name from `resume`.
 
 A shared subscription (a topic read through a group) gets only some of the
 topic's messages, out of order. It finds duplicates in a bounded set of
@@ -73,7 +97,7 @@ from popsub.message import (
     Truncated,
     Unsubscribed,
 )
-from popsub.protocol import PROTOCOL_VERSION, CloseCode, StartFrom
+from popsub.protocol import PROTOCOL_VERSION, CloseCode, Encoding, StartFrom
 
 log = logging.getLogger("popsub")
 
@@ -178,12 +202,14 @@ class _Publish:
         payload: The body.
         message_id: The idempotency key of a confirmed publish; None for QoS 0.
         reply: Gets the confirmation of a confirmed publish; None for QoS 0.
+        encoding: How the payload encodes bytes; None for text.
     """
 
     topic: str
     payload: str
     message_id: str | None = None
     reply: asyncio.Future[Published] | None = None
+    encoding: Encoding | None = None
 
 
 @dataclass
@@ -293,6 +319,11 @@ class _Topic:
         generation: Which subscription this is; the pattern's when owned.
         owner: The wildcard pattern the server joined it for, if any.
         group: The shared subscription it is read through, if any.
+        claiming: True when the server held the topic for the session before
+            the application subscribed, and the `subscribed` that answers
+            the subscribe hasn't arrived. Until it does, the topic's
+            messages come from the server's own resume and are dropped
+            without an acknowledgement, because the subscribe replays them.
     """
 
     state: TopicState
@@ -300,6 +331,7 @@ class _Topic:
     generation: int
     owner: str | None = None
     group: str | None = None
+    claiming: bool = False
 
 
 @dataclass
@@ -496,6 +528,8 @@ class Engine:
         self._close_requested = asyncio.Event()
         self._topics: dict[str, _Topic] = {}
         self._patterns: dict[str, _Pattern] = {}
+        self._unclaimed: set[str] = set()
+        self._held = False
         self._subscribe_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending: dict[int, _Pending] = {}
         self._unconfirmed: dict[int, dict[str, Any]] = {}
@@ -762,6 +796,10 @@ class Engine:
     async def _connect(self) -> tuple[_Connection, list[str]]:
         """Opens a connection, logs in if needed, and authenticates.
 
+        With a session id the `auth` frame carries `hold_resumed`. Whether
+        the server answered with `held` is recorded for this connection;
+        an absent `held` means it didn't.
+
         Returns:
             The connection and the topics the server restored for the session.
 
@@ -801,6 +839,7 @@ class Engine:
             auth: dict[str, Any] = {"type": "auth", "token": token, "protocol": PROTOCOL_VERSION}
             if config.session_id is not None:
                 auth["session_id"] = config.session_id
+                auth["hold_resumed"] = True
             if config.clean_start and not self._connected_once:
                 auth["clean_start"] = True
             reply = await self._exchange(connection, auth)
@@ -811,7 +850,8 @@ class Engine:
             raise
         self._silence = _silence_limit(reply.get("limits"))
         resumed = [topic for topic in reply.get("resumed") or [] if isinstance(topic, str)]
-        log.info("connected, %d topics resumed", len(resumed))
+        self._held = reply.get("held") is True
+        log.info("connected, %d topics resumed, held %s", len(resumed), self._held)
         return connection, resumed
 
     async def _exchange(self, connection: _Connection, frame: dict[str, Any]) -> dict[str, Any]:
@@ -899,8 +939,9 @@ class Engine:
     async def _serve(self, connection: _Connection, resumed: list[str]) -> _Ending:
         """Serves one connection until it ends.
 
-        Restores subscriptions, resends unconfirmed publishes and sends queued
-        frames first, then handles commands and frames.
+        Works out which resumed topics are unclaimed, restores
+        subscriptions, resends unconfirmed publishes and sends queued frames
+        first, then handles commands and frames.
 
         Args:
             connection: The authenticated connection.
@@ -912,6 +953,7 @@ class Engine:
         receiving: asyncio.Future[Any] | None = None
         waking: asyncio.Future[Any] | None = None
         try:
+            self._note_resumed(resumed)
             await self._restore(connection, resumed)
             while True:
                 if await self._run_commands(connection):
@@ -993,11 +1035,34 @@ class Engine:
             await self._on_frame(connection, frame)
         return None
 
+    def _note_resumed(self, resumed: list[str]) -> None:
+        """Records which of a new connection's resumed topics are unclaimed.
+
+        Those are the topics the server restored for the session that the
+        engine isn't tracking: the application hasn't subscribed to them in
+        this process. Their messages are dropped without an acknowledgement
+        until the application claims them, so the server keeps them.
+
+        When the server holds the session's topics (`held`) it sends nothing
+        on them until the engine subscribes, so none is unclaimed.
+
+        Args:
+            resumed: Topics the server restored.
+        """
+        self._unclaimed = set() if self._held else {name for name in resumed if name not in self._topics}
+
     async def _restore(self, connection: _Connection, resumed: list[str]) -> None:
         """Restores state on a new connection.
 
-        Topics the server restored are left to it; every other tracked topic
-        is subscribed again from the next seq it expects. A shared
+        When the server holds the session's topics (`held`), each tracked
+        topic it lists as resumed is subscribed again from `resume`, which
+        is one past the session's cursor, since the server no longer
+        attaches it. Otherwise
+        topics the server restored are left to it, except one still waiting
+        for the `subscribed` that claims it, which is subscribed again: from
+        the application's start, or from `resume` when a pattern owns it.
+        Every other tracked topic is subscribed again from the next seq it
+        expects. A shared
         subscription always rejoins its group with `resume`, since it is
         never restored and its position is on the server. Wildcard patterns
         are sent after the topics, from seq 1: the server skips topics the
@@ -1017,8 +1082,13 @@ class Engine:
         for name, topic in self._topics.items():
             if topic.group is not None:
                 again.append({"type": "subscribe", "topic": name, "from": "resume", "group": topic.group})
+            elif topic.claiming:
+                start = StartFrom.resume() if topic.owner is not None else topic.state.start
+                again.append({"type": "subscribe", "topic": name, "from": start.to_json()})
             elif name not in resumed:
                 again.append({"type": "subscribe", "topic": name, "from": topic.state.resubscribe_from().to_json()})
+            elif self._held:
+                again.append({"type": "subscribe", "topic": name, "from": StartFrom.resume().to_json()})
         again.extend(
             {"type": "subscribe", "topic": pattern, "from": StartFrom.seq(1).to_json()}
             for pattern in sorted(self._patterns)
@@ -1085,44 +1155,95 @@ class Engine:
         Returns:
             The request id of a confirmed publish, otherwise None.
         """
+        frame: dict[str, Any] = {"type": "publish", "topic": command.topic, "payload": command.payload}
+        if command.encoding is not None:
+            frame["encoding"] = command.encoding.value
         if command.reply is not None and command.message_id is not None:
             request_id = self._take_id()
             self._pending[request_id] = _PendingPublish(command.reply)
-            self._unconfirmed[request_id] = {
-                "type": "publish",
-                "topic": command.topic,
-                "payload": command.payload,
-                "message_id": command.message_id,
-                "qos": 1,
-            }
+            self._unconfirmed[request_id] = {**frame, "message_id": command.message_id, "qos": 1}
             return request_id
         if len(self._offline) >= OFFLINE_PUBLISHES:
             self._offline.popleft()
             log.warning("dropped the oldest publish held while disconnected")
-        self._offline.append({"type": "publish", "topic": command.topic, "payload": command.payload})
+        self._offline.append(frame)
         return None
 
-    def _add_topic(self, command: _Subscribe) -> None:
+    def _add_topic(self, command: _Subscribe) -> list[str]:
         """Adds or replaces a subscription and registers the subscribe's waiter.
 
         A wildcard pattern is recorded as a pattern; anything else as a
         topic subscribed by name. A subscription it replaces ends, and an
-        earlier subscribe still waiting on the same name fails.
+        earlier subscribe still waiting on the same name fails. A topic
+        subscribed again by name starts over from the subscribe's start.
+
+        A topic subscribed by name that is unclaimed is claimed: it is
+        tracked with `claiming` set, so what the server sent on its own is
+        dropped until the `subscribed` that answers this subscribe. A topic
+        subscribed again while its claim is unanswered stays `claiming`.
 
         Args:
             command: The subscribe.
+
+        Returns:
+            For a pattern, the session's topics it claimed, which the caller
+            subscribes to by name from `resume`. Empty for a topic.
         """
-        self._release(command.topic, None)
+        claimed: list[str] = []
         if is_pattern(command.topic):
-            self._patterns[command.topic] = _Pattern(command.channel, command.generation)
+            claimed = self._add_pattern(command)
         else:
+            held = self._topics.get(command.topic)
+            claiming = command.topic in self._unclaimed or (held is not None and held.claiming)
+            self._release(command.topic, None)
             self._remove_topic(command.topic)
+            self._unclaimed.discard(command.topic)
             state = TopicState(command.start, shared=command.group is not None)
-            self._topics[command.topic] = _Topic(state, command.channel, command.generation, group=command.group)
+            self._topics[command.topic] = _Topic(
+                state, command.channel, command.generation, group=command.group, claiming=claiming
+            )
         earlier = self._subscribe_waiters.pop(command.topic, None)
         if earlier is not None:
             _settle(earlier, error=ProtocolError("replaced by a later subscribe to the same topic"))
         self._subscribe_waiters[command.topic] = command.reply
+        return claimed
+
+    def _add_pattern(self, command: _Subscribe) -> list[str]:
+        """Records a wildcard subscription, replacing one the engine holds.
+
+        When the pattern is already held, the topics it owned move to the
+        new subscription and keep their deduplication and acknowledgement
+        state, because the server sends nothing again for topics the
+        connection holds. The earlier subscription ends, and closing it
+        later releases nothing, since its generation no longer matches.
+
+        Every unclaimed topic the pattern matches is claimed: tracked as
+        owned by the pattern with `claiming` set. The server skips topics
+        the connection holds when it handles the pattern, so the caller
+        subscribes to each by name to have its messages replayed.
+
+        Args:
+            command: The subscribe, whose topic is a pattern.
+
+        Returns:
+            The claimed topics, sorted.
+        """
+        pattern = command.topic
+        earlier = self._patterns.get(pattern)
+        if earlier is not None and earlier.channel is not command.channel:
+            earlier.channel.close_sender()
+        for held in self._topics.values():
+            if held.owner == pattern:
+                held.channel = command.channel
+                held.generation = command.generation
+        claimed = sorted(name for name in self._unclaimed if matches_pattern(pattern, name))
+        for name in claimed:
+            self._unclaimed.discard(name)
+            self._topics[name] = _Topic(
+                TopicState(StartFrom.resume()), command.channel, command.generation, owner=pattern, claiming=True
+            )
+        self._patterns[pattern] = _Pattern(command.channel, command.generation)
+        return claimed
 
     def _adopt(self, name: str, start: int | None) -> bool:
         """Starts tracking a topic the server joined for a wildcard subscription.
@@ -1224,20 +1345,28 @@ class Engine:
     async def _send_subscribe(self, connection: _Connection, command: _Subscribe) -> None:
         """Registers a subscribe and sends it.
 
+        A pattern that claimed topics of the session is followed by one
+        `subscribe` by name from `resume` for each of them.
+
         Args:
             connection: The connection.
             command: The subscribe.
 
         Raises:
-            _ConnectionLostError: When the write fails.
+            _ConnectionLostError: When a write fails.
         """
-        self._add_topic(command)
+        claimed = self._add_topic(command)
         request_id = self._take_id()
         self._pending[request_id] = _PendingSubscribe(command.topic)
         frame: dict[str, Any] = {"type": "subscribe", "topic": command.topic, "from": command.start.to_json()}
         if command.group is not None:
             frame["group"] = command.group
         await self._send(connection, request_id, frame)
+        for name in claimed:
+            request_id = self._take_id()
+            self._pending[request_id] = _PendingSubscribe(name)
+            claim = {"type": "subscribe", "topic": name, "from": StartFrom.resume().to_json()}
+            await self._send(connection, request_id, claim)
 
     async def _send_unsubscribe(self, connection: _Connection, command: _Unsubscribe) -> None:
         """Releases a subscription and unsubscribes on the server.
@@ -1330,6 +1459,10 @@ class Engine:
     async def _on_subscribed(self, connection: _Connection, frame: dict[str, Any], pending: _Pending | None) -> None:
         """Records where a subscription starts and answers its subscribe.
 
+        For a topic being claimed, this is the answer to the claim: the
+        topic stops dropping messages and its next expected seq becomes
+        `replay_from`, whatever it was.
+
         Args:
             connection: Unused.
             frame: The `subscribed` frame.
@@ -1344,8 +1477,12 @@ class Engine:
             log.debug("wildcard subscription accepted")
         elif topic is None:
             self._adopt(name, start)
-        elif start is not None:
-            topic.state.advance(start)
+        else:
+            if topic.claiming:
+                topic.claiming = False
+                topic.state.next_expected = None
+            if start is not None:
+                topic.state.advance(start)
         waiter = self._subscribe_waiters.pop(name, None)
         if waiter is not None:
             _settle(waiter, frame)
@@ -1479,6 +1616,10 @@ class Engine:
 
         Drops duplicates and acknowledges as the acknowledgement mode says.
 
+        A message on an unclaimed topic, or on a topic whose claim is still
+        unanswered, is dropped without an acknowledgement: the server keeps
+        it and replays it when the application's subscribe is handled.
+
         Waits while the subscription's buffer is full, which stops the
         engine reading the socket until the application catches up or the
         client is closed.
@@ -1494,12 +1635,16 @@ class Engine:
         seq = int(frame.get("seq", 0))
         qos = int(frame.get("qos", 0))
         ack = {"type": "ack", "topic": name, "seq": seq}
+        if name in self._unclaimed:
+            return
         if name not in self._topics:
             self._adopt(name, None)
         topic = self._topics.get(name)
         if topic is None:
             if qos == 1:
                 await self._send(connection, None, ack)
+            return
+        if topic.claiming:
             return
         verdict = topic.state.accept(seq, qos, self._config.ack_mode)
         if verdict.ack:
@@ -1514,6 +1659,7 @@ class Engine:
             payload=str(frame.get("payload", "")),
             qos=qos,
             published_at_ms=int(frame.get("published_at_ms", 0)),
+            encoding=Encoding.from_json(frame.get("encoding")),
             _engine=self if manual else None,
         )
         delivered = await topic.channel.put(message, self._close_requested)

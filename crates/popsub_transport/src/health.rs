@@ -255,6 +255,7 @@ mod tests {
             message_id: id.to_string(),
             publisher: "alice".to_string(),
             payload: "x".to_string(),
+            encoding: None,
             qos: 1,
             published_at_ms: 1,
         }

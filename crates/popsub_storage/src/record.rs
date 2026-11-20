@@ -3,6 +3,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How a stored payload string encodes a message's bytes. The log keeps it
+/// beside the payload and never decodes anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadEncoding {
+    /// Standard base64 with padding.
+    Base64,
+}
+
 /// A message to append to a topic log, before the log gives it a sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewRecord {
@@ -13,6 +22,10 @@ pub struct NewRecord {
     pub publisher: String,
     /// The message body.
     pub payload: String,
+    /// How `payload` encodes the message's bytes; `None` means it is text.
+    /// Records written before this field existed read back as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<PayloadEncoding>,
     /// Delivery level requested by the publisher: 0 or 1.
     pub qos: u8,
     /// When the message was published, in milliseconds since the Unix epoch.
@@ -33,6 +46,10 @@ pub struct Record {
     pub publisher: String,
     /// The message body.
     pub payload: String,
+    /// How `payload` encodes the message's bytes; `None` means it is text.
+    /// Records written before this field existed read back as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<PayloadEncoding>,
     /// Delivery level requested by the publisher: 0 or 1.
     pub qos: u8,
     /// When the message was published, in milliseconds since the Unix epoch.
@@ -60,6 +77,7 @@ impl Record {
             message_id: new.message_id,
             publisher: new.publisher,
             payload: new.payload,
+            encoding: new.encoding,
             qos: new.qos,
             published_at_ms,
         }

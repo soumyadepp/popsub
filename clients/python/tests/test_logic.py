@@ -1,4 +1,4 @@
-"""Unit tests for the client's pure logic: backoff, deduplication, and wire types."""
+"""Unit tests for the client's pure logic: backoff, deduplication, wire types and a message's bytes."""
 
 from __future__ import annotations
 
@@ -9,7 +9,10 @@ from popsub import (
     ClientConfig,
     CloseCode,
     ConfigError,
+    Encoding,
+    Message,
     PasswordCredentials,
+    ProtocolError,
     ReconnectPolicy,
     RoleSpec,
     ServerError,
@@ -247,3 +250,46 @@ def test_topic_info_round_trips() -> None:
     with pytest.raises(ValueError, match="not a topic"):
         TopicInfo.from_json({"name": "orders"})
     assert not ServerError("topic_not_found", "no such topic").is_temporary
+
+
+def make_message(payload: str, encoding: Encoding | None) -> Message:
+    """Builds a received message with a payload and an encoding.
+
+    Args:
+        payload: The payload string as it arrived.
+        encoding: Its encoding; None for text.
+
+    Returns:
+        The message.
+    """
+    return Message("blobs", 1, "id-1", payload, 1, 1_794_800_000_000, encoding)
+
+
+def test_base64_message_decodes_to_its_bytes() -> None:
+    """A base64 message gives the published bytes, including ones that aren't UTF-8."""
+    message = make_message("AP/+gA==", Encoding.BASE64)
+    assert message.data == b"\x00\xff\xfe\x80"
+    assert message.payload == "AP/+gA=="
+    assert make_message("", Encoding.BASE64).data == b""
+
+
+def test_text_message_bytes_are_its_utf8() -> None:
+    """A text message gives its payload's UTF-8 bytes, even when the text looks like base64."""
+    assert make_message("caf\u00e9", None).data == b"caf\xc3\xa9"
+    assert make_message("AP8=", None).data == b"AP8="
+
+
+@pytest.mark.parametrize("payload", ["not base64!", "AP8", "A P8=", "AP8=\n", "caf\u00e9"])
+def test_invalid_base64_payload_raises_from_the_accessor(payload: str) -> None:
+    """A payload that claims base64 and doesn't decode still builds a message, and its bytes raise."""
+    message = make_message(payload, Encoding.BASE64)
+    assert message.payload == payload
+    with pytest.raises(ProtocolError):
+        _ = message.data
+
+
+def test_encoding_is_read_from_the_frame_field() -> None:
+    """Only `base64` names an encoding; an absent or unknown value reads as text."""
+    assert Encoding.from_json("base64") is Encoding.BASE64
+    assert Encoding.from_json(None) is None
+    assert Encoding.from_json("gzip") is None

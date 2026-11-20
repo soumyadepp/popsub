@@ -72,6 +72,7 @@ fn crash_child() {
                 message_id: id.clone(),
                 publisher: "alice".to_string(),
                 payload: id,
+                encoding: None,
                 qos: 1,
                 published_at_ms: 1,
             };

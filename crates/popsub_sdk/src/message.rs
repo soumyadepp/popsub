@@ -1,9 +1,12 @@
 //! What the application receives: messages, subscriptions and events.
 
-use popsub_protocol::CloseCode;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use popsub_protocol::{CloseCode, Encoding};
 use tokio::sync::mpsc;
 
 use crate::driver::Command;
+use crate::error::Error;
 
 /// A message delivered on a subscription.
 #[derive(Debug)]
@@ -15,8 +18,12 @@ pub struct Message {
     pub seq: u64,
     /// The publisher's id for it.
     pub message_id: String,
-    /// The body.
+    /// The body as it travelled: the text itself, or base64 when
+    /// `encoding` says so. `bytes` decodes it either way.
     pub payload: String,
+    /// How `payload` encodes the message's bytes. `None` means it is text;
+    /// `Some(Encoding::Base64)` means it was published with `publish_bytes`.
+    pub encoding: Option<Encoding>,
     /// 0 or 1.
     pub qos: u8,
     /// When it was published, in milliseconds since the Unix epoch.
@@ -27,6 +34,25 @@ pub struct Message {
 }
 
 impl Message {
+    /// The message's bytes: the payload's UTF-8 bytes for a text message,
+    /// or the decoded payload for one published as bytes.
+    ///
+    /// Returns:
+    ///     The bytes the publisher sent.
+    ///
+    /// Raises:
+    ///     Error::Protocol: When the payload says it is base64 and isn't.
+    ///         The server checks this on publish, so it means the record
+    ///         was stored some other way.
+    pub fn bytes(&self) -> Result<Vec<u8>, Error> {
+        match self.encoding {
+            None => Ok(self.payload.as_bytes().to_vec()),
+            Some(Encoding::Base64) => STANDARD
+                .decode(&self.payload)
+                .map_err(|e| Error::Protocol(format!("the payload isn't valid base64: {e}"))),
+        }
+    }
+
     /// Acknowledges the message, so the server stops resending it and a
     /// durable session's cursor can move past it.
     ///

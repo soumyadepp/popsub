@@ -43,3 +43,19 @@ func Example() {
 		message.Ack()
 	}
 }
+
+// ExampleMessage_Bytes reads the bytes of a message published with
+// PublishBytes and of a text message.
+func ExampleMessage_Bytes() {
+	binary := popsub.Message{Payload: "AP/+gA==", Encoding: popsub.EncodingBase64}
+	body, err := binary.Bytes()
+	fmt.Println(body, err)
+
+	text := popsub.Message{Payload: "hi"}
+	body, err = text.Bytes()
+	fmt.Println(body, err)
+
+	// Output:
+	// [0 255 254 128] <nil>
+	// [104 105] <nil>
+}

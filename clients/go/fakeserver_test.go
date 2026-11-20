@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -16,17 +17,28 @@ import (
 // fakeServer is a small in-process stand-in for a PopSub server, enough
 // for unit tests: it logs in any password except "wrong", authenticates,
 // confirms subscribes (except to topics named "hang", which it never
-// answers), confirms publishes and delivers them to the same connection,
-// answers unsubscribe and list_users, and lets a test write raw frames.
+// answers), confirms publishes and delivers them to the same connection with the
+// encoding they were published with,
+// answers unsubscribe and list_users, and lets a test write raw frames,
+// choose the topics it reports as resumed and whether it holds them when
+// asked, and read the frames it received.
 type fakeServer struct {
 	// server is the HTTP server.
 	server *httptest.Server
-	// mu guards conn and seqs.
+	// mu guards conn, seqs, resumed, holds and frames.
 	mu sync.Mutex
 	// conn is the latest authenticated connection.
 	conn *websocket.Conn
 	// seqs is the last seq per topic.
 	seqs map[string]uint64
+	// resumed is what authenticated lists as the session's restored topics.
+	resumed []string
+	// holds makes authenticated answer held: true to an auth that carries
+	// hold_resumed: true; when false the server answers without held, as
+	// one that does not know the request.
+	holds bool
+	// frames is every frame received, on any connection, oldest first.
+	frames []map[string]any
 	// authenticated gets a token each time a connection authenticates.
 	authenticated chan struct{}
 }
@@ -62,6 +74,9 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		if json.Unmarshal(data, &frame) != nil {
 			continue
 		}
+		f.mu.Lock()
+		f.frames = append(f.frames, frame)
+		f.mu.Unlock()
 		f.answer(ctx, conn, frame)
 	}
 }
@@ -87,9 +102,15 @@ func (f *fakeServer) answer(ctx context.Context, conn *websocket.Conn, frame map
 	case "auth":
 		f.mu.Lock()
 		f.conn = conn
+		resumed := append([]string{}, f.resumed...)
+		held := f.holds && frame["hold_resumed"] == true
 		f.mu.Unlock()
-		reply(map[string]any{"type": "authenticated", "protocol": 1, "resumed": []string{},
-			"limits": map[string]any{"heartbeat_secs": 30, "idle_timeout_secs": 90}})
+		authenticated := map[string]any{"type": "authenticated", "protocol": 1, "resumed": resumed,
+			"limits": map[string]any{"heartbeat_secs": 30, "idle_timeout_secs": 90}}
+		if held {
+			authenticated["held"] = true
+		}
+		reply(authenticated)
 		f.authenticated <- struct{}{}
 	case "subscribe":
 		if topic == "hang" {
@@ -114,8 +135,12 @@ func (f *fakeServer) answer(ctx context.Context, conn *websocket.Conn, frame map
 		if qos == 1 {
 			reply(map[string]any{"type": "published", "message_id": messageID, "seq": seq})
 		}
-		f.send(ctx, conn, map[string]any{"type": "message", "topic": topic, "seq": seq, "message_id": messageID,
-			"payload": frame["payload"], "qos": qos, "published_at_ms": 1794800000000})
+		message := map[string]any{"type": "message", "topic": topic, "seq": seq, "message_id": messageID,
+			"payload": frame["payload"], "qos": qos, "published_at_ms": 1794800000000}
+		if encoding, ok := frame["encoding"]; ok {
+			message["encoding"] = encoding
+		}
+		f.send(ctx, conn, message)
 	case "list_users":
 		reply(map[string]any{"type": "users", "users": []any{}})
 	}
@@ -148,5 +173,75 @@ func (f *fakeServer) dropConnection(code websocket.StatusCode) {
 	f.mu.Unlock()
 	if conn != nil {
 		_ = conn.Close(code, "")
+	}
+}
+
+// resume sets the topics later connections are told the session restored.
+func (f *fakeServer) resume(topics ...string) {
+	f.mu.Lock()
+	f.resumed = topics
+	f.mu.Unlock()
+}
+
+// hold makes the server hold the session's topics for later connections
+// that ask it to, answering held: true.
+func (f *fakeServer) hold() {
+	f.mu.Lock()
+	f.holds = true
+	f.mu.Unlock()
+}
+
+// awaitAuths waits until at least count auth frames have been received,
+// and returns them oldest first.
+func (f *fakeServer) awaitAuths(t *testing.T, count int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		var found []map[string]any
+		for _, frame := range f.frames {
+			if frame["type"] == "auth" {
+				found = append(found, frame)
+			}
+		}
+		f.mu.Unlock()
+		if len(found) >= count {
+			return found
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d auth frames, got %d", count, len(found))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// received returns the frames of one type received for one topic so far,
+// oldest first.
+func (f *fakeServer) received(kind, topic string) []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var found []map[string]any
+	for _, frame := range f.frames {
+		if frame["type"] == kind && frame["topic"] == topic {
+			found = append(found, frame)
+		}
+	}
+	return found
+}
+
+// awaitReceived waits until at least count frames of one type have been
+// received for one topic, and returns them.
+func (f *fakeServer) awaitReceived(t *testing.T, kind, topic string, count int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		found := f.received(kind, topic)
+		if len(found) >= count {
+			return found
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d %s frames for %s, got %d", count, kind, topic, len(found))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

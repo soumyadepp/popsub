@@ -67,8 +67,11 @@ type forgetCommand struct {
 type publishCommand struct {
 	// topic is the topic.
 	topic string
-	// payload is the body.
+	// payload is the body: text, or base64 when encoding says so.
 	payload string
+	// encoding is EncodingBase64 for a body published as bytes, and empty
+	// for text.
+	encoding Encoding
 	// messageID is the idempotency key of a confirmed publish.
 	messageID string
 	// reply gets the outcome of a confirmed publish; nil for QoS 0.
@@ -185,8 +188,14 @@ type readResult struct {
 // reconnects with jittered backoff when the close code allows. After a
 // reconnect it resubscribes every topic the server did not restore from the
 // next seq it expects, and resends unconfirmed publishes under the same
-// request id and message_id. Every field below except lastHeard is touched
-// only by that goroutine, until done is closed.
+// request id and message_id. With a session id it asks the server to hold
+// the session's topics; when the server does (held), nothing arrives on one
+// until the engine subscribes to it, and after a reconnect the engine
+// subscribes again to the resumed topics it tracks. When the server does
+// not, topics it restored for the session that the application has not
+// subscribed to in this process are kept in unclaimed, and their messages
+// are left unacknowledged on the server. Every field below except lastHeard
+// is touched only by that goroutine, until done is closed.
 type engine struct {
 	// cfg is the configuration, with defaults applied.
 	cfg Config
@@ -210,6 +219,16 @@ type engine struct {
 	topics map[string]*topicState
 	// patterns are the wildcard subscriptions, by pattern.
 	patterns map[string]*patternState
+	// unclaimed are the topics the server restored for the session that the
+	// application has not subscribed to in this process. Their messages are
+	// dropped without an acknowledgement, so the server keeps them. Empty
+	// while held is true.
+	unclaimed map[string]bool
+	// held says whether the server left the session's topics unattached on
+	// this connection (authenticated.held). Then nothing arrives on a topic
+	// until the engine subscribes to it, so nothing is unclaimed, and
+	// restore subscribes to the resumed topics itself.
+	held bool
 	// nextOrder numbers wildcard subscriptions by age.
 	nextOrder uint64
 	// waiters are subscribes waiting for subscribed, by topic.
@@ -244,6 +263,7 @@ func newEngine(cfg Config) *engine {
 		cancel:      cancel,
 		topics:      make(map[string]*topicState),
 		patterns:    make(map[string]*patternState),
+		unclaimed:   make(map[string]bool),
 		waiters:     make(map[string]chan *Error),
 		pending:     make(map[uint64]any),
 		unconfirmed: make(map[uint64]publishRequest),
@@ -386,9 +406,11 @@ func (e *engine) heard() {
 }
 
 // connect opens a connection, logs in when the credentials hold a
-// password, and authenticates. It returns the connection and the topics
-// the server restored for the session, or why it failed: not retryable for
-// rejected credentials, an unsupported protocol or a bad session id.
+// password, and authenticates, asking the server to hold the session's
+// topics when there is a session id and recording in held whether it did.
+// It returns the connection and the topics the server restored for the
+// session, or why it failed: not retryable for rejected credentials, an
+// unsupported protocol or a bad session id.
 func (e *engine) connect() (*websocket.Conn, []string, *connectFailure) {
 	ctx, cancel := context.WithTimeout(e.ctx, e.cfg.RequestTimeout)
 	defer cancel()
@@ -418,11 +440,12 @@ func (e *engine) connect() (*websocket.Conn, []string, *connectFailure) {
 		token = reply.Token
 	}
 	auth := authRequest{
-		Type:       "auth",
-		Token:      token,
-		Protocol:   protocolVersion,
-		SessionID:  e.cfg.SessionID,
-		CleanStart: e.cfg.CleanStart && !e.connectedOnce,
+		Type:        "auth",
+		Token:       token,
+		Protocol:    protocolVersion,
+		SessionID:   e.cfg.SessionID,
+		CleanStart:  e.cfg.CleanStart && !e.connectedOnce,
+		HoldResumed: e.cfg.SessionID != "",
 	}
 	reply, failure := e.exchange(ctx, conn, e.takeID(), auth)
 	if failure != nil {
@@ -437,6 +460,7 @@ func (e *engine) connect() (*websocket.Conn, []string, *connectFailure) {
 	if reply.Limits != nil {
 		e.silence = reply.Limits.silence()
 	}
+	e.held = reply.Held
 	resumed := reply.Resumed
 	if resumed == nil {
 		resumed = []string{}
@@ -507,11 +531,12 @@ func closeCodeOf(err error) CloseCode {
 	return knownCloseCode(int(status))
 }
 
-// serve runs one authenticated connection until it ends: it restores
-// subscriptions and resends first, then handles frames, commands and the
-// silence limit. It returns only after the connection is closed and its
-// reader goroutine has exited.
+// serve runs one authenticated connection until it ends: it works out
+// which resumed topics are unclaimed, restores subscriptions and resends,
+// then handles frames, commands and the silence limit. It returns only
+// after the connection is closed and its reader goroutine has exited.
 func (e *engine) serve(conn *websocket.Conn, resumed []string) ending {
+	e.markUnclaimed(resumed)
 	if e.restore(conn, resumed) != nil {
 		conn.CloseNow()
 		return ending{}
@@ -610,10 +635,34 @@ func (e *engine) send(conn *websocket.Conn, id uint64, message any) error {
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
+// markUnclaimed records, for a new connection, which topics the server
+// restored for the session without the application having subscribed to
+// them in this process: the resumed topics the engine is not tracking.
+// When the server holds the session's topics it sends nothing on them, so
+// none is unclaimed.
+func (e *engine) markUnclaimed(resumed []string) {
+	e.unclaimed = make(map[string]bool, len(resumed))
+	if e.held {
+		return
+	}
+	for _, name := range resumed {
+		if e.topics[name] == nil {
+			e.unclaimed[name] = true
+		}
+	}
+}
+
 // restore prepares a new connection. It resubscribes every tracked topic
 // the server did not restore for the session from the next seq it expects
 // (so nothing still in the log is missed); a shared subscription always
-// rejoins its group with resume, since it is never restored. Then it sends
+// rejoins its group with resume, since it is never restored. A tracked
+// topic the server did restore is left to the server, unless the server
+// holds the session's topics (held): then it is subscribed again with
+// resume, one past the session's cursor, because the server no longer
+// attaches it. A topic still
+// waiting for the subscribed that claims it is subscribed again even when
+// the server restored it, the way the application asked, or with resume
+// when a pattern owns it. Then it sends
 // each wildcard pattern again from seq 1: the server skips topics the
 // connection holds, so that joins only topics created while it was away,
 // from their first message. Last it resends unconfirmed publishes in
@@ -624,12 +673,16 @@ func (e *engine) restore(conn *websocket.Conn, resumed []string) error {
 		restored[topic] = true
 	}
 	for name, topic := range e.topics {
-		if topic.group == "" && restored[name] {
-			continue
+		from := topic.restoreFrom()
+		if topic.group == "" && !topic.claiming && restored[name] {
+			if !e.held {
+				continue
+			}
+			from = FromResume
 		}
 		id := e.takeID()
 		e.pending[id] = pendingSubscribe{topic: name}
-		again := subscribeRequest{Type: "subscribe", Topic: name, From: topic.resumeFrom(), Group: topic.group}
+		again := subscribeRequest{Type: "subscribe", Topic: name, From: from, Group: topic.group}
 		if err := e.send(conn, id, again); err != nil {
 			return err
 		}
@@ -710,14 +763,14 @@ func (e *engine) queuePublish(c publishCommand) uint64 {
 	if c.reply != nil {
 		id := e.takeID()
 		e.pending[id] = pendingPublish{reply: c.reply}
-		e.unconfirmed[id] = publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload, MessageID: c.messageID, QoS: 1}
+		e.unconfirmed[id] = publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload, Encoding: c.encoding, MessageID: c.messageID, QoS: 1}
 		return id
 	}
 	if len(e.offline) >= offlinePublishes {
 		e.offline[0] = nil
 		e.offline = e.offline[1:]
 	}
-	e.offline = append(e.offline, publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload})
+	e.offline = append(e.offline, publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload, Encoding: c.encoding})
 	return 0
 }
 
@@ -734,9 +787,18 @@ func (e *engine) setWaiter(topic string, reply chan *Error) {
 // addTopic adds or replaces a subscription: a topic by name (through a
 // group when group is set), or a wildcard pattern. A replaced
 // subscription's channel is closed. A replaced pattern's topics move to the
-// new subscription; a topic a pattern owned that is now subscribed by name
-// leaves the pattern's subscription open.
-func (e *engine) addTopic(topic string, from StartFrom, group string, sub *Subscription) {
+// new subscription and keep the next seq they expect, because the server
+// sends nothing again for topics the connection holds; a topic a pattern
+// owned that is now subscribed by name leaves the pattern's subscription
+// open and starts over from from.
+//
+// An unclaimed topic, subscribed by name or matched by the pattern, is
+// claimed: it is tracked with claiming set, so what the server sent on its
+// own is dropped until the subscribed that answers the claim. A topic
+// subscribed by name again while its claim is unanswered stays claiming.
+// For a pattern it returns the topics it claimed, in name order, which the
+// caller subscribes to by name with FromResume; nil for a topic.
+func (e *engine) addTopic(topic string, from StartFrom, group string, sub *Subscription) []string {
 	if isPattern(topic) {
 		if old := e.patterns[topic]; old != nil && old.sub != sub {
 			old.sub.end()
@@ -746,16 +808,37 @@ func (e *engine) addTopic(topic string, from StartFrom, group string, sub *Subsc
 				}
 			}
 		}
+		var claimed []string
+		for name := range e.unclaimed {
+			if matchesPattern(topic, name) {
+				claimed = append(claimed, name)
+			}
+		}
+		sort.Strings(claimed)
+		for _, name := range claimed {
+			delete(e.unclaimed, name)
+			state := newTopicState(sub, FromResume)
+			state.owner = topic
+			state.claiming = true
+			e.topics[name] = state
+		}
 		e.nextOrder++
 		e.patterns[topic] = &patternState{sub: sub, order: e.nextOrder}
-		return
+		return claimed
 	}
-	if old := e.topics[topic]; old != nil && old.owner == "" && old.sub != sub {
-		old.sub.end()
+	claiming := e.unclaimed[topic]
+	delete(e.unclaimed, topic)
+	if old := e.topics[topic]; old != nil {
+		claiming = claiming || old.claiming
+		if old.owner == "" && old.sub != sub {
+			old.sub.end()
+		}
 	}
 	state := newTopicState(sub, from)
 	state.group = group
+	state.claiming = claiming
 	e.topics[topic] = state
+	return nil
 }
 
 // adopt starts tracking a topic the server joined for one of the client's
@@ -829,15 +912,28 @@ func (e *engine) endTopic(topic string) bool {
 	return true
 }
 
-// onCommand acts on a command while connected.
+// onCommand acts on a command while connected. A subscribe to a pattern is
+// followed by a subscribe by name with FromResume for each of the session's
+// topics the pattern claimed, since the server skips topics the connection
+// holds when it handles the pattern.
 func (e *engine) onCommand(conn *websocket.Conn, command any) error {
 	switch c := command.(type) {
 	case subscribeCommand:
-		e.addTopic(c.topic, c.from, c.group, c.sub)
+		claimed := e.addTopic(c.topic, c.from, c.group, c.sub)
 		e.setWaiter(c.topic, c.reply)
 		id := e.takeID()
 		e.pending[id] = pendingSubscribe{topic: c.topic}
-		return e.send(conn, id, subscribeRequest{Type: "subscribe", Topic: c.topic, From: c.from, Group: c.group})
+		if err := e.send(conn, id, subscribeRequest{Type: "subscribe", Topic: c.topic, From: c.from, Group: c.group}); err != nil {
+			return err
+		}
+		for _, name := range claimed {
+			id := e.takeID()
+			e.pending[id] = pendingSubscribe{topic: name}
+			if err := e.send(conn, id, subscribeRequest{Type: "subscribe", Topic: name, From: FromResume}); err != nil {
+				return err
+			}
+		}
+		return nil
 	case unsubscribeCommand:
 		names := e.release(c.topic, nil)
 		if len(names) == 0 {
@@ -902,6 +998,7 @@ func (e *engine) onFrame(conn *websocket.Conn, frame *serverFrame) error {
 	case "subscribed":
 		if e.patterns[frame.Topic.name] == nil {
 			if topic := e.topics[frame.Topic.name]; topic != nil {
+				topic.claim()
 				topic.advance(frame.ReplayFrom)
 			} else {
 				e.adopt(frame.Topic.name, frame.ReplayFrom, true)
@@ -974,11 +1071,18 @@ func (e *engine) onError(id uint64, pending any, frame *serverFrame) {
 }
 
 // deliver hands a message to its subscription, dropping duplicates and
-// acknowledging as the AckMode says. A message for an untracked topic that
-// matches a wildcard subscription is adopted by it first; one that matches
-// nothing is acknowledged and dropped. While the subscription's buffer is
-// full it waits, so the engine stops taking frames from the reader.
+// acknowledging as the AckMode says. A message on an unclaimed topic, or
+// on one whose claim is still unanswered, is dropped without an
+// acknowledgement: the server keeps it and replays it when the
+// application's subscribe is handled. A message for any other untracked
+// topic that matches a wildcard subscription is adopted by it first; one
+// that matches nothing is acknowledged and dropped. While the
+// subscription's buffer is full it waits, so the engine stops taking
+// frames from the reader.
 func (e *engine) deliver(conn *websocket.Conn, frame *serverFrame) error {
+	if e.unclaimed[frame.Topic.name] {
+		return nil
+	}
 	ack := ackRequest{Type: "ack", Topic: frame.Topic.name, Seq: frame.Seq}
 	topic := e.topics[frame.Topic.name]
 	if topic == nil && e.adopt(frame.Topic.name, 0, false) {
@@ -988,6 +1092,9 @@ func (e *engine) deliver(conn *websocket.Conn, frame *serverFrame) error {
 		if frame.QoS == 1 {
 			return e.send(conn, 0, ack)
 		}
+		return nil
+	}
+	if topic.claiming {
 		return nil
 	}
 	handOver, acknowledge := topic.receive(frame.Seq, frame.QoS, e.cfg.AckMode)
@@ -1004,6 +1111,7 @@ func (e *engine) deliver(conn *websocket.Conn, frame *serverFrame) error {
 		Seq:           frame.Seq,
 		MessageID:     frame.MessageID,
 		Payload:       frame.Payload,
+		Encoding:      frame.Encoding,
 		QoS:           frame.QoS,
 		PublishedAtMs: frame.PublishedAtMs,
 	}

@@ -196,6 +196,7 @@ impl ScenarioServer {
             message_id: uuid::Uuid::new_v4().to_string(),
             publisher: "scenario".to_string(),
             payload: payload.to_string(),
+            encoding: None,
             qos,
             published_at_ms: now_ms(),
         };

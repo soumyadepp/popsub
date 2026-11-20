@@ -1825,6 +1825,7 @@ dependencies = [
 name = "popsub_scenarios"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "popsub_auth",
  "popsub_broker",
@@ -1843,6 +1844,7 @@ dependencies = [
 name = "popsub_sdk"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
  "popsub_broker",
  "popsub_config",

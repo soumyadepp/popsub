@@ -22,7 +22,7 @@ The WebSocket edge. Accepts connections, speaks the protocol defined in `popsub_
 - `register`, `login` and `auth` are accepted before authentication. Anything else first gets `must authenticate first` and closes the connection, as does a failed `auth` or a client that is no longer registered. Permission denials and rate limits send an error and keep it open.
 - Subscribe, unsubscribe, publish, ack and session attachment are async `SharedBroker` calls. Auth state goes through `SharedBroker::with`. The auth service is a plain `Arc<AuthService>` with no lock of its own.
 - If storage fails, a QoS 1 publisher gets `storage unavailable` and a failed subscribe gets an error and is not subscribed. A QoS 1 publish that succeeds gets `published` with its `seq`.
-- `authenticate` with a `session_id` replies `authenticated` first, then restores each stored subscription the user may still read (forgetting the rest), so the client sees the reply before any restored history.
+- `authenticate` with a `session_id` replies `authenticated` first, then restores each stored subscription the user may still read (forgetting the rest), so the client sees the reply before any restored history. With `hold_resumed` it restores nothing: the stored subscriptions are listed, `held` is set, and each stays unattached until the client subscribes to it.
 - `ack` takes a topic and `seq`; ACKs for records not in flight to the connection are ignored and only logged.
 - Replies go through `Session::reply` or `Session::fail`, never through the broker's client map, and always carry the request's `id`. Every failure has an `ErrorCode`.
 - A frame that doesn't parse gets `bad_request` (with the `id` if `salvage_request_id` can read one) and the connection stays open.

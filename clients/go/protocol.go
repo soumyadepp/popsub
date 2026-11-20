@@ -206,6 +206,10 @@ type authRequest struct {
 	SessionID string `json:"session_id,omitempty"`
 	// CleanStart discards the session's stored subscriptions first.
 	CleanStart bool `json:"clean_start,omitempty"`
+	// HoldResumed asks the server to list the session's stored
+	// subscriptions without attaching them, so it sends nothing on them
+	// until the client subscribes. Set whenever SessionID is.
+	HoldResumed bool `json:"hold_resumed,omitempty"`
 }
 
 // subscribeRequest is the subscribe frame.
@@ -234,8 +238,11 @@ type publishRequest struct {
 	Type string `json:"type"`
 	// Topic is the topic.
 	Topic string `json:"topic"`
-	// Payload is the body.
+	// Payload is the body: text, or base64 when Encoding says so.
 	Payload string `json:"payload"`
+	// Encoding is EncodingBase64 for a body published as bytes, and
+	// omitted for text.
+	Encoding Encoding `json:"encoding,omitempty"`
 	// MessageID is the idempotency key of a confirmed publish.
 	MessageID string `json:"message_id,omitempty"`
 	// QoS is 1 for a confirmed publish, and omitted (0) otherwise.
@@ -406,6 +413,9 @@ type serverFrame struct {
 	Limits *limits `json:"limits"`
 	// Resumed are the topics a durable session restored, in authenticated.
 	Resumed []string `json:"resumed"`
+	// Held says the server left the resumed topics unattached, in
+	// authenticated; absent means it did not.
+	Held bool `json:"held"`
 	// ExpiresAtMs is when the token expires, in auth_expiring.
 	ExpiresAtMs int64 `json:"expires_at_ms"`
 	// Topic is the topic's name, in message, subscribed, unsubscribed,
@@ -421,6 +431,8 @@ type serverFrame struct {
 	MessageID string `json:"message_id"`
 	// Payload is the body, in message.
 	Payload string `json:"payload"`
+	// Encoding is how Payload encodes the body, in message; absent for text.
+	Encoding Encoding `json:"encoding"`
 	// QoS is 0 or 1, in message.
 	QoS uint8 `json:"qos"`
 	// PublishedAtMs is when the record was published, in message.

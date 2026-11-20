@@ -145,6 +145,7 @@ fn record(seq: u64, qos: u8) -> Record {
         message_id: format!("m{seq}"),
         publisher: "alice".to_string(),
         payload: format!("payload {seq}"),
+        encoding: None,
         qos,
         published_at_ms: 1_000,
     }
@@ -163,6 +164,7 @@ fn new_record(message_id: &str, qos: u8) -> NewRecord {
         message_id: message_id.to_string(),
         publisher: "alice".to_string(),
         payload: message_id.to_string(),
+        encoding: None,
         qos,
         published_at_ms: 0,
     }

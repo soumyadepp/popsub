@@ -1,12 +1,15 @@
 """End-to-end tests of `Client` against the in-process fake server.
 
 They check what the scenario suite can't see from outside: that closing the
-client leaves no task running, and that nothing logs a destroyed pending task.
+client leaves no task running, that nothing logs a destroyed pending task,
+what the `auth` frame carries with and without a session id, and what the
+`publish` frame carries for bytes and for text.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
 import logging
 from collections.abc import Iterator
@@ -19,6 +22,7 @@ from popsub import (
     ClosedError,
     ConnectError,
     Disconnected,
+    Encoding,
     PasswordCredentials,
     ReconnectPolicy,
     ServerError,
@@ -65,12 +69,30 @@ async def acks_seen(server: FakeServer, count: int, within: float = 2.0) -> list
         await asyncio.sleep(0.01)
 
 
-def make_config(server: FakeServer, password: str = PASSWORD) -> ClientConfig:
+async def frames_seen(server: FakeServer, kind: str, count: int, within: float = 2.0) -> None:
+    """Waits for the fake server to record a number of frames of one type.
+
+    Args:
+        server: The server.
+        kind: The frame type, such as `publish`.
+        count: How many to wait for.
+        within: The longest to wait, in seconds.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within
+    while True:
+        if len(server.frames(kind)) >= count or loop.time() >= deadline:
+            return
+        await asyncio.sleep(0.01)
+
+
+def make_config(server: FakeServer, password: str = PASSWORD, session_id: str | None = None) -> ClientConfig:
     """Builds a configuration with fast reconnects for the fake server.
 
     Args:
         server: The server.
         password: The password to log in with.
+        session_id: The durable session to hold; None is ephemeral.
 
     Returns:
         The configuration.
@@ -80,6 +102,7 @@ def make_config(server: FakeServer, password: str = PASSWORD) -> ClientConfig:
         PasswordCredentials("alice", password),
         reconnect=ReconnectPolicy(initial=0.02, max=0.2),
         request_timeout=5.0,
+        session_id=session_id,
     )
 
 
@@ -170,6 +193,32 @@ async def test_reconnect_resubscribes_from_next_expected(server: FakeServer) -> 
 
 
 @pytest.mark.asyncio
+async def test_auth_asks_for_the_hold_only_with_a_session(server: FakeServer) -> None:
+    """The `auth` frame carries `hold_resumed` with a session id and omits it without one."""
+    ephemeral = await Client.connect(make_config(server))
+    await ephemeral.close()
+    durable = await Client.connect(make_config(server, session_id="alice-laptop"))
+    await durable.close()
+    without, with_session = server.frames("auth")
+    assert "hold_resumed" not in without
+    assert "session_id" not in without
+    assert with_session["session_id"] == "alice-laptop"
+    assert with_session["hold_resumed"] is True
+
+
+@pytest.mark.asyncio
+async def test_held_is_read_from_authenticated_and_absent_means_false(server: FakeServer) -> None:
+    """The engine records `held` when the server answers with it and false when the reply has none."""
+    unheld = await Client.connect(make_config(server, session_id="alice-laptop"))
+    assert unheld._engine._held is False
+    await unheld.close()
+    server.honours_hold = True
+    held = await Client.connect(make_config(server, session_id="alice-laptop"))
+    assert held._engine._held is True
+    await held.close()
+
+
+@pytest.mark.asyncio
 async def test_rejected_login_fails_connect(server: FakeServer) -> None:
     """A rejected login fails `connect` with `invalid_credentials` and leaves no task."""
     with pytest.raises(ServerError) as caught:
@@ -196,3 +245,62 @@ def test_no_destroyed_pending_task_warnings(server: FakeServer, caplog: pytest.L
         asyncio.run(lifecycle())
         gc.collect()
     assert not [record for record in caplog.records if "destroyed but it is pending" in record.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_bytes_publishes_carry_base64_and_the_encoding(server: FakeServer) -> None:
+    """Both byte calls send padded base64 with the encoding, and the subscriber reads the same bytes back."""
+    body = b"\x00\xff\xfe\x80"
+    client = await Client.connect(make_config(server))
+    subscription = await client.subscribe("blobs", StartFrom.new())
+    stored = await client.publish_bytes_confirmed("blobs", body)
+    await client.publish_bytes("blobs", body)
+    received = [await subscription.next(), await subscription.next()]
+    await client.close()
+    confirmed, plain = server.frames("publish")
+    assert {key: value for key, value in confirmed.items() if key != "id"} == {
+        "type": "publish",
+        "topic": "blobs",
+        "payload": "AP/+gA==",
+        "encoding": "base64",
+        "message_id": stored.message_id,
+        "qos": 1,
+    }
+    assert plain == {"type": "publish", "topic": "blobs", "payload": "AP/+gA==", "encoding": "base64"}
+    assert [(message.payload, message.encoding, message.data) for message in received if message is not None] == [
+        ("AP/+gA==", Encoding.BASE64, body),
+        ("AP/+gA==", Encoding.BASE64, body),
+    ]
+    assert base64.b64decode(plain["payload"], validate=True) == body
+
+
+@pytest.mark.asyncio
+async def test_text_publishes_carry_no_encoding(server: FakeServer) -> None:
+    """Neither text call sends an encoding, and the subscriber gets a text message."""
+    client = await Client.connect(make_config(server))
+    subscription = await client.subscribe("orders", StartFrom.new())
+    await client.publish_confirmed("orders", "one")
+    await client.publish("orders", "two")
+    received = [await subscription.next(), await subscription.next()]
+    await client.close()
+    assert ["encoding" in frame for frame in server.frames("publish")] == [False, False]
+    assert [(message.payload, message.encoding, message.data) for message in received if message is not None] == [
+        ("one", None, b"one"),
+        ("two", None, b"two"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_bytes_are_resent_with_the_same_ids_and_encoding(server: FakeServer) -> None:
+    """A confirmed bytes publish cut off before its confirmation goes out again as the same frame."""
+    server.swallow_publishes = True
+    client = await Client.connect(make_config(server))
+    publishing = asyncio.ensure_future(client.publish_bytes_confirmed("blobs", b"\x00\xff"))
+    await frames_seen(server, "publish", 1)
+    server.swallow_publishes = False
+    await asyncio.to_thread(server.drop_connections)
+    stored = await publishing
+    await client.close()
+    first, second = server.frames("publish")
+    assert first == second
+    assert (first["payload"], first["encoding"], first["message_id"]) == ("AP8=", "base64", stored.message_id)

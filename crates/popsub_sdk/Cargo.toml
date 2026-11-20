@@ -6,6 +6,7 @@ description = "Rust client for PopSub: reconnection, durable sessions, acknowled
 license = "Apache-2.0"
 
 [dependencies]
+base64 = "0.22"
 futures-util = "0.3.31"
 popsub_protocol = { path = "../popsub_protocol" }
 rand = "0.8"

@@ -3,8 +3,8 @@
 
 use crate::conformance::Fixture;
 use crate::{
-    Capabilities, Durability, LogBounds, MemoryStorage, MessageLog, NewRecord, Record, Retention,
-    Storage, StorageError,
+    Capabilities, Durability, LogBounds, MemoryStorage, MessageLog, NewRecord, PayloadEncoding,
+    Record, Retention, Storage, StorageError,
 };
 
 /// Opens a new, empty `MemoryStorage` every time, since it can't be reopened.
@@ -44,6 +44,7 @@ fn stored(id: &str, publisher: &str, payload: &str) -> Record {
         message_id: id.to_string(),
         publisher: publisher.to_string(),
         payload: payload.to_string(),
+        encoding: None,
         qos: 0,
         published_at_ms: 0,
     };
@@ -177,6 +178,7 @@ fn duplicate_after_trim_is_a_new_record() {
             message_id: "m".to_string(),
             publisher: "alice".to_string(),
             payload: "p".to_string(),
+            encoding: None,
             qos: 1,
             published_at_ms: 1,
         };
@@ -201,4 +203,21 @@ fn duplicate_after_trim_is_a_new_record() {
         );
         assert!(!storage.capabilities().persistent);
     });
+}
+
+/// Checks that a record written before payload encodings existed reads back
+/// as text, and that an encoding is stored beside the payload.
+#[test]
+fn records_keep_their_payload_encoding() {
+    let old = r#"{"topic":"t","seq":1,"message_id":"m","publisher":"p","payload":"hi","qos":1,"published_at_ms":5}"#;
+    let record: Record = serde_json::from_str(old).expect("an old record");
+    assert_eq!(record.encoding, None);
+    assert_eq!(serde_json::to_string(&record).expect("serialise"), old);
+
+    let mut encoded = record;
+    encoded.encoding = Some(PayloadEncoding::Base64);
+    let text = serde_json::to_string(&encoded).expect("serialise");
+    assert!(text.contains(r#""encoding":"base64""#), "{text}");
+    let back: Record = serde_json::from_str(&text).expect("parse");
+    assert_eq!(back, encoded);
 }

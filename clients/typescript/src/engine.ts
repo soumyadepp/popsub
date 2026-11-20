@@ -8,8 +8,10 @@
  * `unsupported_protocol`, `auth_failed`, `account_disabled`, rejected
  * credentials, and `token_expired` with token credentials). After
  * reconnecting it resubscribes every topic from the next `seq` it expects
- * (topics a durable session restored on its own are left to the server),
- * resends confirmed publishes that never got their `published` under the
+ * (a topic the server lists as resumed for a durable session is instead
+ * subscribed again from `resume` when the server holds the session's
+ * topics, and otherwise left to the server unless a claim on it is still
+ * unanswered; see below), resends confirmed publishes that never got their `published` under the
  * same request id and `message_id`, and sends QoS 0 publishes and
  * unsubscribes queued while disconnected.
  *
@@ -18,6 +20,32 @@
  * application acknowledged before (or any duplicate in automatic mode,
  * unless its acknowledgement is held back for a full buffer) is
  * acknowledged again, so a lost acknowledgement can't stall the topic.
+ *
+ * A durable session outlives the process. When a new process connects
+ * with the same session id, the server lists the session's topics in
+ * `authenticated.resumed` before the application has subscribed to
+ * anything. The engine must never acknowledge a message the application
+ * couldn't have received, so with a session id its `auth` carries
+ * `hold_resumed: true`. A server that honours it answers `held: true` and
+ * sends nothing on a resumed topic until the engine subscribes to it. Then
+ * nothing is unclaimed, a subscribe to a resumed topic is an ordinary
+ * subscribe, a pattern needs no subscribes by name, and after a reconnect
+ * the engine subscribes again to every tracked topic the server lists as
+ * resumed, with `from: "resume"`, because the server no longer does it.
+ *
+ * A server that doesn't know `hold_resumed` answers without `held` and
+ * sends what it kept for the resumed topics at once. A resumed topic the engine
+ * isn't tracking is unclaimed: its messages are dropped without an
+ * acknowledgement, so the server keeps them for the session. Subscribing
+ * to an unclaimed topic by name, or to a pattern that matches it, claims
+ * it. A claimed topic is tracked, but its messages are still dropped
+ * unacknowledged until the `subscribed` that answers the claim arrives,
+ * because the subscribe replays them in order from `replay_from`. A
+ * pattern claims a topic by sending one more `subscribe` for it by name
+ * with `from: "resume"`, since the server skips topics the connection
+ * holds when it handles the pattern itself. After a reconnect a claim
+ * still unanswered is sent again even when the server lists the topic as
+ * resumed. A topic the application never subscribes to stays unclaimed.
  *
  * A wildcard subscription (`orders/#`) is one pattern with one channel.
  * The server announces each topic it joins for the pattern with a
@@ -28,6 +56,10 @@
  * patterns, and the oldest matching one owns it. After a reconnect the
  * tracked topics are resubscribed first, then each pattern is sent again
  * with `from: {"seq": 1}`, which joins only topics created meanwhile.
+ * Subscribing again to a pattern the engine holds replaces the
+ * subscription: the topics it owned move to the new channel and keep
+ * their next expected `seq`, because the server sends nothing again for
+ * topics the connection holds, and the earlier channel ends.
  *
  * A shared subscription (a topic read through a `group`) gets only some of
  * the topic's messages, out of order, so duplicates are found with a
@@ -75,9 +107,11 @@ import {
   errorCode,
   parseServerFrame,
   PROTOCOL_VERSION,
+  publishFrame,
   shouldReconnect,
   type ClientMessage,
   type CloseCode,
+  type Encoding,
   type Limits,
   type ServerFrame,
   type ServerMessage,
@@ -139,6 +173,14 @@ interface Topic {
   owner: string | null;
   /** The shared subscription's group, or `null` for an ordinary subscription. */
   group: string | null;
+  /**
+   * Whether the server held this topic for the session before the
+   * application subscribed, and the `subscribed` that answers the
+   * application's subscribe hasn't arrived yet. Until it does, messages on
+   * the topic are the server's own resume: they are dropped without an
+   * acknowledgement, because the subscribe replays them.
+   */
+  claiming: boolean;
 }
 
 /** One wildcard subscription. */
@@ -202,6 +244,19 @@ export class Engine {
   readonly #topics = new Map<string, Topic>();
   /** Wildcard subscriptions, by pattern. */
   readonly #patterns = new Map<string, Pattern>();
+  /**
+   * Topics the server restored for the session that the application hasn't
+   * subscribed to in this process. Their messages are dropped without an
+   * acknowledgement, so the server keeps them for the session.
+   */
+  #unclaimed = new Set<string>();
+  /**
+   * Whether the server left the session's topics unattached on this
+   * connection (`authenticated.held`). Then nothing arrives on a topic
+   * until the engine subscribes to it, so nothing is unclaimed, and
+   * `#restore` subscribes to the resumed topics itself.
+   */
+  #held = false;
   /** Subscribes waiting for `subscribed`, by topic. */
   readonly #subscribeWaiters = new Map<string, Settle<void>>();
   /** Requests waiting for a reply, by id. */
@@ -273,6 +328,19 @@ export class Engine {
    * subscription to the same name. With a group it joins a shared
    * subscription to the topic.
    *
+   * Subscribing again to a topic by name starts over from `from`.
+   * Subscribing again to a pattern keeps the topics it owned (see
+   * `#replacePattern`).
+   *
+   * A topic the server held for the session, subscribed by name or matched
+   * by the pattern, is claimed: it is tracked with `claiming` set, so what
+   * the server sent on its own is dropped until the `subscribed` that
+   * answers the claim. A topic subscribed again while its claim is
+   * unanswered stays `claiming`. For a pattern each claimed topic gets its own
+   * subscribe by name with `from: "resume"`, sent after the pattern's.
+   * While disconnected nothing is sent; `#restore` sends the claims on the
+   * next connection.
+   *
    * @param topic - The topic, or a pattern such as `orders/#`.
    * @param from - Where replay starts.
    * @param group - The shared subscription to join, or `null`.
@@ -295,12 +363,20 @@ export class Engine {
         this.#forget(topic, generation);
       },
     });
-    this.#release(topic, null);
+    const wildcard = group === null && isPattern(topic);
+    const stillClaiming = this.#topics.get(topic)?.claiming === true;
+    if (wildcard && this.#patterns.has(topic)) {
+      this.#replacePattern(topic, channel, generation);
+    } else {
+      this.#release(topic, null);
+    }
     this.#subscribeWaiters
       .get(topic)
       ?.reject(new PopSubError("protocol", `replaced by a later subscribe to '${topic}'`));
-    if (group === null && isPattern(topic)) {
+    let claimed: string[] = [];
+    if (wildcard) {
       this.#patterns.set(topic, { channel, generation });
+      claimed = this.#claimMatching(topic, channel, generation);
     } else {
       this.#topics.set(topic, {
         channel,
@@ -310,6 +386,7 @@ export class Engine {
         overflowed: false,
         owner: null,
         group,
+        claiming: this.#unclaimed.delete(topic) || stillClaiming,
       });
     }
     const done = new Promise<void>((resolve, reject) => {
@@ -317,6 +394,9 @@ export class Engine {
     });
     if (this.#connection !== null) {
       this.#sendSubscribe(topic, generation, from, group);
+      for (const name of claimed) {
+        this.#sendSubscribe(name, generation, "resume", null);
+      }
     }
     return { subscription: new Subscription(channel), done };
   }
@@ -356,12 +436,13 @@ export class Engine {
    * Publishes at QoS 0. While disconnected the publish is queued.
    *
    * @param topic - The topic.
-   * @param payload - The body.
+   * @param payload - The body: text, or base64 when `encoding` says so.
+   * @param encoding - How `payload` encodes the body, or `null` for text.
    * @throws PopSubError of kind `closed` when the client has stopped.
    */
-  publish(topic: string, payload: string): void {
+  publish(topic: string, payload: string, encoding: Encoding | null = null): void {
     this.#throwIfStopped();
-    this.#queueOffline({ type: "publish", topic, payload });
+    this.#queueOffline(publishFrame(topic, payload, encoding));
     this.#flushOffline();
   }
 
@@ -370,16 +451,21 @@ export class Engine {
    * reconnect until the server confirms it.
    *
    * @param topic - The topic.
-   * @param payload - The body.
+   * @param payload - The body: text, or base64 when `encoding` says so.
+   * @param encoding - How `payload` encodes the body, or `null` for text.
    * @returns A promise that settles with the `seq` and id once stored.
    */
-  publishConfirmed(topic: string, payload: string): Promise<Published> {
+  publishConfirmed(topic: string, payload: string, encoding: Encoding | null = null): Promise<Published> {
     if (this.#stopped !== null) {
       return Promise.reject(PopSubError.closed(this.#stopped.code));
     }
     return new Promise<Published>((resolve, reject) => {
       const id = this.#takeId();
-      const message: ClientMessage = { type: "publish", topic, payload, message_id: uuid(), qos: 1 };
+      const message: ClientMessage = {
+        ...publishFrame(topic, payload, encoding),
+        message_id: uuid(),
+        qos: 1,
+      };
       this.#pending.set(id, { kind: "publish", settle: { resolve, reject } });
       this.#unconfirmed.set(id, message);
       if (this.#connection !== null) {
@@ -585,7 +671,9 @@ export class Engine {
   }
 
   /**
-   * Opens a connection, logs in if needed, and authenticates.
+   * Opens a connection, logs in if needed, and authenticates. With a
+   * session id the `auth` asks the server to hold the session's topics
+   * (`hold_resumed`), and `#held` records whether it did.
    *
    * @returns The authenticated connection with the topics the server
    *   restored, a failure saying whether retrying could help, or `stopped`
@@ -625,6 +713,7 @@ export class Engine {
       const auth: ClientMessage = { type: "auth", token, protocol: PROTOCOL_VERSION };
       if (this.#config.sessionId !== null) {
         auth.session_id = this.#config.sessionId;
+        auth.hold_resumed = true;
       }
       if (this.#config.cleanStart && !this.#connectedOnce) {
         auth.clean_start = true;
@@ -634,6 +723,7 @@ export class Engine {
         throw refusal(reply);
       }
       this.#applyLimits(reply.limits);
+      this.#held = reply.held === true;
       return { kind: "connected", handshake, resumed: reply.resumed ?? [] };
     } catch (reason) {
       handshake.close();
@@ -670,8 +760,10 @@ export class Engine {
   }
 
   /**
-   * Serves one connection until it ends. Restores subscriptions and resends
-   * first, then handles frames as they arrive. A timer sends `ping` while
+   * Serves one connection until it ends. Works out which restored topics
+   * are unclaimed (those the engine isn't tracking, or none when the server
+   * holds the session's topics), restores subscriptions
+   * and resends, then handles frames as they arrive. A timer sends `ping` while
    * the connection is silent and ends it as lost once the silence passes
    * `idle_timeout_secs + heartbeat_secs`.
    *
@@ -724,6 +816,7 @@ export class Engine {
           finish({ kind: "lost", code: closeCode(code) });
         },
       });
+      this.#unclaimed = new Set(resumed.filter((name) => !this.#held && !this.#topics.has(name)));
       this.#restore(resumed);
       for (const text of early) {
         if (!live()) {
@@ -738,9 +831,15 @@ export class Engine {
    * Restores state on a new connection: resubscribes, resends unconfirmed
    * publishes, and sends queued frames.
    *
-   * Topics the server restored for the session are left to it, except
-   * those whose buffer overflowed; every other topic is subscribed again
-   * from the next `seq` it expects, so nothing still in the log is missed.
+   * When the server holds the session's topics (`#held`), each topic it
+   * lists as resumed that the engine tracks is subscribed again from
+   * `resume`, which is one past the session's cursor. Otherwise
+   * topics the server restored for the session are left to it, except
+   * those whose buffer overflowed and those still waiting for the
+   * `subscribed` that claims them, which are subscribed again the way the
+   * application asked (`resume` for one owned by a pattern); every other
+   * topic is subscribed again from the next `seq` it expects, so nothing
+   * still in the log is missed.
    * A shared subscription always rejoins its group with `resume`, because
    * the group's position is on the server. Wildcard patterns are sent
    * after the topics, in name order, from `{"seq": 1}`: the server skips
@@ -754,9 +853,13 @@ export class Engine {
     for (const [name, topic] of this.#topics) {
       if (topic.group !== null) {
         this.#sendSubscribe(name, topic.generation, "resume", topic.group);
+      } else if (topic.claiming) {
+        this.#sendSubscribe(name, topic.generation, topic.owner === null ? topic.from : "resume", null);
       } else if (!restored.has(name) || topic.overflowed) {
         const next = topic.tracker.nextExpected;
         this.#sendSubscribe(name, topic.generation, next === null ? topic.from : { seq: next }, null);
+      } else if (this.#held) {
+        this.#sendSubscribe(name, topic.generation, "resume", null);
       }
       topic.overflowed = false;
     }
@@ -889,9 +992,69 @@ export class Engine {
       overflowed: false,
       owner,
       group: null,
+      claiming: false,
     };
     this.#topics.set(name, topic);
     return topic;
+  }
+
+  /**
+   * Moves a held pattern to a new subscription. The topics it owned are
+   * pointed at the new channel and generation and keep their trackers, so
+   * each keeps the next `seq` it expects: the server sends nothing again
+   * for topics the connection holds. The earlier channel ends; what it
+   * still holds can be taken or dropped without any effect on the topics.
+   * Acknowledgements held back for the earlier channel's full buffer are
+   * sent now, because nothing will report those messages as taken to the
+   * new subscription.
+   *
+   * @param pattern - The pattern, which must be held.
+   * @param channel - The new subscription's channel.
+   * @param generation - The new subscription.
+   */
+  #replacePattern(pattern: string, channel: Channel, generation: number): void {
+    this.#patterns.get(pattern)?.channel.end();
+    for (const [name, topic] of this.#topics) {
+      if (topic.owner !== pattern) {
+        continue;
+      }
+      topic.channel = channel;
+      topic.generation = generation;
+      for (const seq of topic.tracker.deferred) {
+        topic.tracker.acked.insert(seq);
+        this.#send({ type: "ack", topic: name, seq });
+      }
+      topic.tracker.deferred.clear();
+    }
+  }
+
+  /**
+   * Claims every unclaimed topic of the session a pattern matches: each
+   * stops being unclaimed and is tracked as owned by the pattern, with
+   * `claiming` set until its own `subscribed` arrives.
+   *
+   * @param pattern - The pattern.
+   * @param channel - The pattern's channel.
+   * @param generation - The pattern's subscription.
+   * @returns The claimed topics in name order, each of which needs a
+   *   subscribe by name with `from: "resume"`.
+   */
+  #claimMatching(pattern: string, channel: Channel, generation: number): string[] {
+    const claimed = [...this.#unclaimed].filter((name) => matchesPattern(pattern, name)).sort();
+    for (const name of claimed) {
+      this.#unclaimed.delete(name);
+      this.#topics.set(name, {
+        channel,
+        from: "resume",
+        generation,
+        tracker: new DeliveryTracker(),
+        overflowed: false,
+        owner: pattern,
+        group: null,
+        claiming: true,
+      });
+    }
+    return claimed;
   }
 
   /**
@@ -985,7 +1148,9 @@ export class Engine {
   /**
    * Acts on a frame from the server. A reply's pending entry is removed by
    * its id first, so a `pong` needs nothing more: hearing it at all is what
-   * keeps the connection from being given up as silent.
+   * keeps the connection from being given up as silent. A `subscribed` for
+   * a topic being claimed ends the claim and starts its next expected `seq`
+   * over at `replay_from`.
    *
    * @param frame - The frame.
    */
@@ -1016,6 +1181,10 @@ export class Engine {
           if (tracked === undefined) {
             this.#adopt(frame.topic, frame.replay_from);
           } else {
+            if (tracked.claiming) {
+              tracked.claiming = false;
+              tracked.tracker.nextExpected = null;
+            }
             tracked.tracker.moveTo(frame.replay_from);
           }
         }
@@ -1130,11 +1299,19 @@ export class Engine {
    * full. A message for an untracked topic is adopted by the oldest
    * matching wildcard pattern; when none matches it is acknowledged and dropped.
    *
+   * A message on a topic the server holds for the session that the
+   * application hasn't subscribed to here, or whose subscribe is still
+   * unanswered, is dropped without an acknowledgement: the server keeps it
+   * and replays it when the application's subscribe is handled.
+   *
    * @param delivery - The delivered message.
    */
   #deliver(delivery: Extract<ServerMessage, { type: "message" }>): void {
     const { topic: name, seq } = delivery;
     const qos: 0 | 1 = delivery.qos === 1 ? 1 : 0;
+    if (this.#unclaimed.has(name)) {
+      return;
+    }
     const topic = this.#topics.get(name) ?? this.#adopt(name, null);
     if (topic === undefined) {
       if (qos === 1) {
@@ -1142,7 +1319,7 @@ export class Engine {
       }
       return;
     }
-    if (topic.overflowed) {
+    if (topic.overflowed || topic.claiming) {
       return;
     }
     const automatic = this.#config.ackMode === "auto";
@@ -1179,6 +1356,7 @@ export class Engine {
           seq,
           messageId: delivery.message_id,
           payload: delivery.payload,
+          encoding: delivery.encoding === "base64" ? "base64" : null,
           qos,
           publishedAtMs: delivery.published_at_ms,
         },
@@ -1267,6 +1445,7 @@ export class Engine {
       pattern.channel.end();
     }
     this.#patterns.clear();
+    this.#unclaimed.clear();
     this.emitter.clear();
     this.#finish();
   }

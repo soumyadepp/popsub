@@ -32,20 +32,27 @@ This document describes how the system works today, where its guarantees hold an
 
 ### 3.1 Crates
 
-```
-                 popsub (CLI: server, client)
-                   |
- popsub_transport (WebSocket, protocol, auth and limit enforcement)
-        |                 |                    |
- popsub_broker      popsub_auth          popsub_ratelimit
- (topics, QoS 1)    (users, JWT, RBAC)   (token bucket, sliding window, lockouts)
-        |
- popsub_connection (per-connection record)   popsub_config (settings loader)
-        |                                        |
- popsub_utils (errors, logging)          popsub_storage (topic logs, Storage traits, backends)
+```mermaid
+flowchart TD
+    cli["popsub<br/>the binary"]
+    transport["popsub_transport<br/>WebSocket server"]
+    sdk["popsub_sdk<br/>Rust client"]
+    broker["popsub_broker<br/>topics and delivery"]
+    auth["popsub_auth<br/>users and permissions"]
+    ratelimit["popsub_ratelimit<br/>rate limits"]
+    connection["popsub_connection<br/>one connected socket"]
+    storage["popsub_storage<br/>topic logs"]
 
- popsub_protocol (every frame type; used by transport, broker, binary and client SDKs)
+    cli --> transport
+    cli --> sdk
+    transport --> broker
+    transport --> auth
+    transport --> ratelimit
+    broker --> connection
+    broker --> storage
 ```
+
+An arrow means "depends on". Three crates are left out because nearly everything uses them: `popsub_protocol` (the frame types), `popsub_config` (settings) and `popsub_utils` (errors, logging, metrics). `popsub_scenarios`, the client scenario suite, sits beside the binary.
 
 | Crate | Responsibility |
 |---|---|
@@ -65,14 +72,20 @@ Dependencies point downwards only. The broker knows nothing about WebSockets, us
 
 ### 3.2 Runtime
 
+```mermaid
+flowchart LR
+    in(["socket in"]) --> session["Session"]
+    session -- "publish, subscribe" --> writer["Topic writer"]
+    session -- "ack, unsubscribe" --> broker["Broker"]
+    writer -- "append, read" --> storage[("Storage")]
+    writer -- "fan out" --> broker
+    broker -- "deliveries" --> send["Send loop"]
+    send --> out(["socket out"])
+    storage -.- retention["Retention loop"]
+    broker -.- retry["Retry loop"]
 ```
- socket --> Session (connection task) --publish/subscribe--> topic writer (one task per topic) --append/read--> Storage
-            |                                                      |
-            |                                                      +--SharedBroker::with--> Broker --> client channel --> send loop --> socket
-            |--SharedBroker::with (unsubscribe, ack, auth state)-->                          ^
-            |  replies go straight to the session's own channel          retry loop (1s) ---+
-            +--> AuthService                                              retention loop (60s) --> Storage
-```
+
+Solid arrows are the path of a message; dotted lines attach the background loops to what they work on. Replies to a request skip the broker and go from the session straight to the send loop, and the session calls `AuthService` for register, login and auth.
 
 - **Server.** Holds what every connection shares (broker, auth service, rate limiters) and runs the accept loop. A failed `accept` is logged and retried after 100 ms instead of stopping the server.
 - **Session.** One per socket, in its own task. Reads frames, parses JSON, and calls the method for the message type. Replies are queued on the session's own outgoing channel, so replying never takes the broker lock.
@@ -129,10 +142,10 @@ Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend'
 |---|---|---|
 | `register` | `username`, `password` | `registered`. Only when `server.allow_registration` is on. Usernames are 3 to 32 letters, digits, `_`, `.` or `-`; passwords at least 8 characters. Allowed before `auth`. |
 | `login` | `username`, `password` | `logged_in` with a JWT. Checked against the user store (Argon2id). Rate limited, see section 10. |
-| `auth` | `token`, optional `protocol`, optional `session_id`, optional `clean_start` | `authenticated`. Must succeed before anything below is accepted. A bad token, an unsupported `protocol` or a bad `session_id` closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
+| `auth` | `token`, optional `protocol`, optional `session_id`, optional `clean_start`, optional `hold_resumed` | `authenticated`. With `hold_resumed` the session's stored subscriptions are listed in `resumed` but left unattached (`held: true` in the reply): nothing is sent on one until the client subscribes to it. Must succeed before anything below is accepted. A bad token, an unsupported `protocol` or a bad `session_id` closes the connection. A `session_id` (1 to 128 characters, no control characters) makes the connection hold that durable session of the token's user; see section 5.4. |
 | `subscribe` | `topic`, optional `from` | `subscribed`, then history, then live records. Requires subscribe permission. `from` is `"resume"` (the default: one past a durable session's stored cursor, otherwise no replay), `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`. `storage_unavailable` if the log or session store can't be read, in which case the client is not subscribed. |
 | `unsubscribe` | `topic` | `unsubscribed`, even if the client wasn't subscribed. |
-| `publish` | `topic`, `payload`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
+| `publish` | `topic`, `payload`, optional `encoding`, optional `message_id`, optional `qos` (0 or 1) | `published` for QoS 1, nothing for QoS 0. `payload` is always a string: the text itself, or with `encoding: "base64"` the base64 of a body that isn't text. The server checks an encoded payload is valid base64 (`bad_request` otherwise), stores the string and its encoding unchanged, and never decodes it. Requires publish permission and is rate limited per user. A repeated `message_id` from the same user is stored and delivered once while the original is retained. If storage fails, either QoS gets `storage_unavailable`. Payloads over `server.max_payload_bytes` get `payload_too_large`, and a `message_id` must be 1 to 128 characters. |
 | `ack` | `topic`, `seq` | None. Confirms one QoS 1 record delivered to this connection. Anything not in flight to this connection is ignored. |
 | `ping` | none | `pong`. Accepted before `auth`. For clients that can't see WebSocket pings (browsers) to check the connection is alive; it also counts as activity for the idle timeout. |
 
@@ -181,7 +194,7 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 | Registered | `{"type":"registered"}` |
 | Pong | `{"type":"pong"}`, the answer to `ping` |
 | Logged in | `{"type":"logged_in","token":"..."}` |
-| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90,"max_payload_bytes":1048576,"max_topic_bytes":120}}`, plus `session_id` and `resumed` (the restored topics) for a durable session |
+| Authenticated | `{"type":"authenticated","protocol":1,"limits":{"max_inflight":100,"session_expiry_secs":86400,"heartbeat_secs":30,"idle_timeout_secs":90,"max_payload_bytes":1048576,"max_topic_bytes":120}}`, plus `session_id` and `resumed` (the session's topics) for a durable session, and `held: true` when `hold_resumed` was asked for |
 | Auth expiring | `{"type":"auth_expiring","expires_at_ms":1794800000000}`, a minute before the token expires |
 | Subscribed | `{"type":"subscribed","topic":"...","replay_from":41,"replay_to":90}`. Records `replay_from` to `replay_to` are history; later ones are live. Also sent, without an `id`, for each subscription a session restores. |
 | Unsubscribed | `{"type":"unsubscribed","topic":"..."}`. Also sent, without an `id`, when an admin change ends a subscription the user may no longer read. |
@@ -191,7 +204,7 @@ Changes take effect on live connections at once. After `set_role`, `grant` or `r
 | Topic info | `{"type":"topic_info","topic":{"name":"orders","first_seq":3,"last_seq":9,"messages":7,"subscribers":2}}` |
 | Topics | `{"type":"topics","topics":[...]}`, the same objects |
 | Published | `{"type":"published","message_id":"...","seq":42}`, for QoS 1 only, once the record is stored |
-| Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}` |
+| Message | `{"type":"message","topic":"...","seq":42,"message_id":"...","payload":"...","qos":0,"published_at_ms":1794800000000}`, plus `"encoding":"base64"` when the publisher sent one |
 | Truncated | `{"type":"truncated","topic":"...","first_available":1300}`, before records that start later than the subscriber expected |
 | Stalled | `{"type":"stalled","topic":"...","seq":42}`, when a record runs out of retries |
 | Error | `{"type":"error","code":"not_authorized","message":"..."}`, plus `retry_after` for limits |
@@ -261,6 +274,26 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 - `auth` with a `session_id` binds the connection to a durable session keyed by the token's username and that id, so two users with the same id get different sessions.
 - Any other connection holding the same session is sent a close frame and removed. This is how a client reconnecting before the server noticed its old connection drop takes the session back.
 - `clean_start` discards the stored subscriptions. Otherwise each stored subscription is checked against the user's current permissions (forgotten if no longer allowed), listed in `authenticated.resumed`, and subscribed again with `resume`, so everything after the stored cursor (sent but unacknowledged, or published while away) is replayed.
+- A session can outlive the application that opened it, so a new process can authenticate with the same `session_id` before it has subscribed to anything. With `hold_resumed` in `auth`, the server lists the stored subscriptions in `resumed`, answers `held: true`, and leaves them unattached: nothing is sent or put in flight until the client subscribes.
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Client as Client library
+    participant Server
+    Client->>Server: auth with session_id, hold_resumed
+    Server-->>Client: authenticated, resumed jobs, held
+    Note over Server: jobs stays stored, nothing is sent
+    App->>Client: subscribe jobs
+    Client->>Server: subscribe jobs from resume
+    Server-->>Client: subscribed, replay from 2
+    Server-->>Client: jobs 2
+    Client->>App: jobs 2
+    Client->>Server: ack jobs 2
+```
+
+  `subscribe` with `from: "resume"` starts one past the stored cursor. A pattern that matches a held topic joins it from that cursor too, whatever the pattern's `from`, and `unsubscribe` forgets a held topic. After a reconnect the client subscribes to its resumed topics again itself. The client libraries always ask for the hold.
+- Without `hold_resumed` the stored subscriptions are attached as soon as `auth` succeeds and their records start arriving at once. A client that isn't ready for them must not acknowledge them: the cursor then stays put and a later `subscribe` from `resume` replays them. The client libraries do this when a server doesn't answer `held` (`clients/README.md`); a topic left that way stalls or is dead-lettered after `max_retries`.
 - Sessions are touched on connect, on disconnect, and every minute while connected. A session not touched for `storage.session_expiry_secs` is removed with its subscriptions.
 
 ## 6. Delivery semantics
@@ -272,6 +305,7 @@ The codes are `popsub_protocol::CloseCode`, whose `should_reconnect` encodes the
 | QoS 1, with `broker.dead_letter_topic` set | A record a subscription never acknowledges is, after `max_retries` resends, copied to the dead-letter topic and dropped for that subscription, which then carries on. So for that subscription the record is delivered at least once but never acknowledged, and what remains of it is the copy on the dead-letter topic. If that copy can't be stored it is logged and lost as a dead letter; the original stays in its topic's log until trimmed. |
 | QoS 1, ephemeral subscriber disconnects | Not at least once. Its subscriptions and windows are discarded. |
 | QoS 1, durable session disconnects and reconnects | At least once, provided it reconnects within `session_expiry_secs` and the records are still retained. Everything after its stored cursor is replayed. Records trimmed meanwhile are reported with `truncated`. |
+| QoS 1, durable session, the application restarts | At least once, on the same terms as a reconnect. With `hold_resumed` in `auth` (the client libraries always send it) the server sends nothing on the session's topics until the new process subscribes, and its subscribe replays from the stored cursor. Without it the server starts sending as soon as the process authenticates, and a client that acknowledges a record its application hasn't subscribed for loses it. |
 | QoS 1, broker restarts | With the `file` backend (the default), durable sessions resume from their stored cursors. Records are kept as firmly as `storage.durability` says: `buffered` survives a crash of the server, `synced` also a power loss. A cursor move is lost only to a power loss, which means resending records already acknowledged. With the `memory` backend nothing survives a restart. |
 | Shared subscriptions | At least once to the group as a whole: each record is sent to one member, and one that member never acknowledges goes to another when it disconnects, or is retried to it. Two members never hold the same record at once, but a record can be delivered to a second member after the first disconnects, so workers must tolerate a repeat. Order across members is not kept. The group's stored position gives the same restart behaviour as a durable session. |
 | Ordering | Per topic, every subscriber receives new records in `seq` order, and a replay followed by live delivery has no gap or repeat. Retries are resent out of order. |
@@ -317,7 +351,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `server.heartbeat_secs` | `30` | Transport. How often each connection is pinged |
 | `server.idle_timeout_secs` | `90` | Transport. How long a connection may send nothing before it is closed |
 | `server.outbound_queue_bytes` | `16777216` | Transport. The hard byte limit of each connection's outgoing queue; the soft limit is a sixteenth of it, at least 64 KiB |
-| `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
+| `server.max_payload_bytes` | `1048576` | Transport. The longest publish payload, counted on the payload string as sent, so a base64 body of N bytes counts as about 4N/3; WebSocket frames over twice this plus 64 KiB are refused before they are buffered |
 | `server.trusted_proxies` | `[]` | Transport. Reverse proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` is believed; see section 10. From the environment, separate entries with commas. An invalid entry stops startup |
 | `server.proxy_protocol` | `false` | Transport. Connections from `server.trusted_proxies` must start with a PROXY protocol header (version 1 or 2), whose address is the client's. Needs `server.trusted_proxies`, or startup stops |
 | `server.max_connections_per_address` | `0` | Transport. The most connections one client address may hold; more are closed with `try_again_later` (1013). `0` means no limit. Behind a proxy, set `server.trusted_proxies` first, or every client counts as the proxy |
@@ -409,7 +443,7 @@ The defaults below are set in the `[limits]` section (section 9).
 | The server is stopped with Ctrl+C or `SIGTERM` | `/readyz` turns to 503, every client is sent `going_away`, and the process exits half a second later. |
 | Subscriber reads slowly | Once its queue passes the soft limit, deliveries wait in the topic log and are sent as it catches up, in order. Server memory for it stays near the soft limit. If it falls behind retention, it gets `truncated`. |
 | Publisher sends to a topic nobody subscribes to | Stored in the topic log until retention trims it. |
-| A subscriber never acknowledges one record, with `broker.dead_letter_topic` set | After `max_retries` resends the record is copied to the dead-letter topic as a JSON envelope (the original `topic`, `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, the `subscriber` username and `reason: "max_retries"`), dropped from that subscription's window, and the subscription carries on; a durable session's cursor moves past it. Other subscribers are unaffected. The dead-letter topic is an ordinary topic: subscribe to it to handle failures, and give it its own retention. Its own subscribers stall as usual, so a dead letter is never dead-lettered again. |
+| A subscriber never acknowledges one record, with `broker.dead_letter_topic` set | After `max_retries` resends the record is copied to the dead-letter topic as a JSON envelope (the original `topic`, `seq`, `message_id`, `publisher`, `payload` and `published_at_ms`, its `encoding` when it had one, the `subscriber` username and `reason: "max_retries"`), dropped from that subscription's window, and the subscription carries on; a durable session's cursor moves past it. Other subscribers are unaffected. The dead-letter topic is an ordinary topic: subscribe to it to handle failures, and give it its own retention. Its own subscribers stall as usual, so a dead letter is never dead-lettered again. |
 | A subscriber stops acknowledging | Its window fills and delivery to it pauses; after `max_retries` it gets `stalled`. Other subscribers are unaffected, and nothing is queued in memory for it. |
 | A client acknowledges a record it wasn't sent | Ignored. |
 | A publisher retries a message after a dropped connection | Same user and `message_id`: stored and delivered once, while the original is retained. |
@@ -500,4 +534,4 @@ Replicate topic logs across three nodes with Raft (for example `openraft`). Only
 ## 16. Open questions
 
 - Is a per-topic task model enough, or do hot topics need sharding by subscriber?
-- Should payloads become bytes, with JSON as just one encoding?
+- Payloads stay JSON strings, with `encoding: "base64"` for bodies that aren't text. That costs a third more room for binary data on the wire and in the log. Binary WebSocket frames would avoid it, at the price of a second frame format in every client; is the saving ever worth that?

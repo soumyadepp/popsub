@@ -138,7 +138,7 @@ Where to find the full protocol:
 |---|---|
 | QoS 0 | At most once, to subscribers connected when it is published. |
 | QoS 1 | At least once to every connected subscriber, independently. Each subscriber's acknowledgement clears only its own copy. A message that runs out of retries pauses that subscription and tells the client, instead of disappearing; or, with `broker.dead_letter_topic` set, is copied to that topic and the subscription carries on. |
-| Durable sessions | At least once across disconnects and server restarts, as long as the session reconnects within `session_expiry_secs` and the messages are still retained. |
+| Durable sessions | At least once across disconnects, restarts of the application and server restarts, as long as the session reconnects within `session_expiry_secs` and the messages are still retained. |
 | Ordering | Per topic, in `seq` order. A retry of an unacknowledged message can arrive after later ones. |
 | Duplicates | Possible, and always detectable by `(topic, seq)`. The Rust client drops them for you. |
 | Retention | Each topic keeps `max_messages`, `max_age_secs` and `max_bytes` of history. A subscriber that asks for trimmed history is told with a `truncated` frame. |
@@ -161,7 +161,7 @@ The settings you are most likely to change:
 | `broker.dead_letter_topic` | none | Copy messages that run out of retries here and keep the subscription going, instead of pausing it |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
 | `[[storage.topic_retention]]` | none | Different limits for topics matching a pattern, such as `audit/#` for 30 days; first match wins |
-| `server.max_payload_bytes` | 1 MiB | Largest publish |
+| `server.max_payload_bytes` | 1 MiB | Largest publish payload. A binary body travels as base64, so it counts as about a third more |
 | `server.proxy_protocol` | `false` | Read PROXY protocol headers from trusted TCP load balancers |
 | `server.trusted_proxies` | none | Proxies whose `X-Forwarded-For` is believed; see [Running behind a proxy](#running-behind-a-proxy) |
 | `broker.max_connections` | `1000` | Connections at once; more are told to try again later. `0` means no limit |
