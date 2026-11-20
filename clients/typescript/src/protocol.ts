@@ -18,6 +18,12 @@ export type RequestId = number | string;
 /** Where replay starts when subscribing, as it is written on the wire. */
 export type WireStartFrom = "resume" | "new" | { last: number } | { since_ms: number } | { seq: number };
 
+/**
+ * How a payload string encodes a message's bytes when it isn't text.
+ * `base64` is standard padded base64; a frame without an encoding carries text.
+ */
+export type Encoding = "base64";
+
 /** What a topic grant allows. */
 export type Access = "subscribe" | "publish" | "both";
 
@@ -98,6 +104,7 @@ export type ClientMessage =
       type: "publish";
       topic: string;
       payload: string;
+      encoding?: Encoding;
       message_id?: string;
       qos?: 0 | 1;
     }
@@ -142,6 +149,7 @@ export type ServerMessage =
       seq: number;
       message_id: string;
       payload: string;
+      encoding?: Encoding | null;
       qos: number;
       published_at_ms: number;
     }
@@ -308,6 +316,25 @@ export function parseServerFrame(text: string): ServerFrame | null {
     }
   }
   return record as unknown as ServerFrame;
+}
+
+/**
+ * Builds a QoS 0 `publish` frame. A text publish carries no `encoding`
+ * field at all, which is what a server reads as text.
+ *
+ * @param topic - The topic.
+ * @param payload - The body: text, or base64 when `encoding` says so.
+ * @param encoding - How `payload` encodes the body, or `null` for text.
+ * @returns The frame.
+ */
+export function publishFrame(
+  topic: string,
+  payload: string,
+  encoding: Encoding | null,
+): Extract<ClientMessage, { type: "publish" }> {
+  return encoding === null
+    ? { type: "publish", topic, payload }
+    : { type: "publish", topic, payload, encoding };
 }
 
 /**

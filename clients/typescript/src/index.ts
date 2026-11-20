@@ -11,10 +11,15 @@
  * });
  * const orders = await client.subscribe("orders", "resume");
  * const stored = await client.publishConfirmed("orders", "order 42 shipped");
+ * client.publishBytes("orders", new Uint8Array([0x00, 0xff]));
  * for await (const message of orders) {
  *   console.log(message.topic, message.seq, message.payload);
  * }
  * ```
+ *
+ * A payload is a string. `publishBytes` and `publishBytesConfirmed` send a
+ * body that isn't text as base64, and `Message.bytes` returns the bytes of
+ * any message.
  *
  * The protocol is documented in the repository's `docs/DESIGN.md` section 4.
  *
@@ -50,6 +55,7 @@ export {
   ERROR_CODES,
   PROTOCOL_VERSION,
   type Access,
+  type Encoding,
   type ErrorCode,
   type RoleKind,
   type RoleSpec,

@@ -66,6 +66,23 @@ async def watch(client: Client) -> None:
         print(event.to_json())
 ```
 
+### Binary payloads
+
+A payload is a string. For a body that isn't text, publish bytes and read them back with `message.data`:
+
+```python
+async def send_and_read(client: Client) -> None:
+    blobs = await client.subscribe("blobs", StartFrom.new())
+    await client.publish_bytes_confirmed("blobs", b"\x00\xff\xfe\x80")
+    message = await blobs.next()
+    if message is not None:
+        print(message.encoding, message.data)
+```
+
+`publish_bytes` (QoS 0) and `publish_bytes_confirmed` (QoS 1) send the bytes as standard padded base64 in `payload` with `encoding: "base64"`, and otherwise behave like `publish` and `publish_confirmed`: held while disconnected, and resent with the same request id and `message_id`. Base64 adds about a third, and it is the encoded string that counts against the server's payload limit (`payload_too_large`).
+
+On a received message, `payload` is the string as it arrived, `encoding` is `None` for text or `Encoding.BASE64`, and `data` is the bytes: the decoded payload for base64, otherwise the payload's UTF-8. The server checks base64 on publish and never decodes it. If a payload claims base64 and doesn't decode, the message is still delivered and `data` raises `ProtocolError`.
+
 ### Wildcard subscriptions
 
 A pattern uses `+` for any one level and a trailing `#` for the rest. One subscription yields the messages of every matching topic the user may read, including topics created later, each under its own topic and `seq`:
@@ -107,12 +124,14 @@ Everything below is importable from `popsub`.
 | `await client.unsubscribe(topic)` | Unsubscribes from a topic or pattern; its `Subscription` ends. |
 | `await client.publish(topic, payload)` | QoS 0. Returns once queued; server failures arrive as `ServerErrorEvent`. |
 | `await client.publish_confirmed(topic, payload)` | QoS 1 with a new UUID `message_id`. Returns `Published(seq, message_id)` once stored. |
+| `await client.publish_bytes(topic, data)` | `publish` for `bytes`: sent as base64 with `encoding: "base64"`. |
+| `await client.publish_bytes_confirmed(topic, data)` | `publish_confirmed` for `bytes`. Returns `Published(seq, message_id)` once stored. |
 | `client.admin()` | `Admin` with `create_user`, `get_user`, `list_users`, `set_role`, `grant`, `revoke`, `set_password`, `set_enabled`, `delete_user`. They return `UserInfo` (a list for `list_users`, None for `delete_user`). The topic calls `list_topics`, `get_topic(topic)` and `purge_topic(topic)` return `TopicInfo` (`name`, `first_seq`, `last_seq`, `messages`, `subscribers`; a list for `list_topics`); a topic nothing was published to gives `ServerError` with code `topic_not_found`. |
 | `client.events()` | An `EventStream`: an async iterator of events from now on, ending after the client stops. It keeps the latest 256 events for a slow reader. |
 | `await client.close()` | Closes the connection and stops the client. Every task it started has finished when this returns. |
 | `client.stopped`, `client.close_code` | Whether the client stopped for good, and the close code that stopped it. |
 | `Subscription` | `async for message in subscription`, or `await subscription.next()` (None at the end). `subscription.close()` stops listening and unsubscribes without waiting. `replay_from` and `replay_to` come from the server's `subscribed`. |
-| `Message` | `topic`, `seq`, `message_id`, `payload`, `qos`, `published_at_ms`, and `ack()`, which does something only for QoS 1 in manual mode and is safe to call twice. |
+| `Message` | `topic`, `seq`, `message_id`, `payload`, `qos`, `published_at_ms`, `encoding` (`None` for text, or `Encoding.BASE64`), `data` (the message's bytes; raises `ProtocolError` when a base64 payload doesn't decode), and `ack()`, which does something only for QoS 1 in manual mode and is safe to call twice. |
 
 Events: `Connected(resumed)`, `Disconnected(code, reconnecting)`, `Truncated(topic, first_available)`, `Stalled(topic, seq)`, `AuthExpiring(expires_at_ms)`, `AuthRefreshed()`, `Unsubscribed(topic)` and `ServerErrorEvent(code, message)`. Each has `to_json()`.
 
@@ -171,6 +190,6 @@ uv sync
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest
 ```
 
-That runs the formatter check, the linter, `mypy --strict` over the package and tests, and the tests. The tests cover backoff, deduplication (by next expected seq, and by the seen set for shared subscriptions), the wildcard pattern matcher and the wire types, feed the engine frames directly to check how a new process claims a durable session's topics and how a repeated pattern subscribe moves its topics, and run the client against a small in-process fake server to check that resent copies are dropped and acknowledged again, that a reconnect resubscribes from the next expected seq, and that `close()` leaves no task running.
+That runs the formatter check, the linter, `mypy --strict` over the package and tests, and the tests. The tests cover backoff, deduplication (by next expected seq, and by the seen set for shared subscriptions), the wildcard pattern matcher, the wire types and a message's bytes, feed the engine frames directly to check how a new process claims a durable session's topics and how a repeated pattern subscribe moves its topics, and run the client against a small in-process fake server to check that resent copies are dropped and acknowledged again, that a reconnect resubscribes from the next expected seq, that byte publishes carry base64 and the encoding (also when resent) while text publishes carry none, and that `close()` leaves no task running.
 
 `uv build` writes the wheel and source distribution to `dist/`.

@@ -7,6 +7,10 @@ to), resubscribing without gaps, resending confirmed publishes without
 duplicating them, acknowledging QoS 1 messages, and making sure each
 `(topic, seq)` reaches the application once.
 
+A payload is a string. For a body that isn't text, `publish_bytes` and
+`publish_bytes_confirmed` send bytes as base64, and `Message.data` gives a
+received message's bytes whatever its `encoding`.
+
 Example:
     import asyncio
     from popsub import Client, ClientConfig, PasswordCredentials, StartFrom
@@ -63,6 +67,7 @@ from popsub.protocol import (
     PROTOCOL_VERSION,
     Access,
     CloseCode,
+    Encoding,
     RoleKind,
     RoleSpec,
     StartFrom,
@@ -87,6 +92,7 @@ __all__ = [
     "Connected",
     "Credentials",
     "Disconnected",
+    "Encoding",
     "Event",
     "EventStream",
     "Message",

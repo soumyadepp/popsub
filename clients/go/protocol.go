@@ -238,8 +238,11 @@ type publishRequest struct {
 	Type string `json:"type"`
 	// Topic is the topic.
 	Topic string `json:"topic"`
-	// Payload is the body.
+	// Payload is the body: text, or base64 when Encoding says so.
 	Payload string `json:"payload"`
+	// Encoding is EncodingBase64 for a body published as bytes, and
+	// omitted for text.
+	Encoding Encoding `json:"encoding,omitempty"`
 	// MessageID is the idempotency key of a confirmed publish.
 	MessageID string `json:"message_id,omitempty"`
 	// QoS is 1 for a confirmed publish, and omitted (0) otherwise.
@@ -428,6 +431,8 @@ type serverFrame struct {
 	MessageID string `json:"message_id"`
 	// Payload is the body, in message.
 	Payload string `json:"payload"`
+	// Encoding is how Payload encodes the body, in message; absent for text.
+	Encoding Encoding `json:"encoding"`
 	// QoS is 0 or 1, in message.
 	QoS uint8 `json:"qos"`
 	// PublishedAtMs is when the record was published, in message.

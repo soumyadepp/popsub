@@ -5,7 +5,8 @@ writes, to check the two things the fake server can't show: what a new
 process does with a durable session's topics before and while the
 application claims them, what it does instead when the server holds those
 topics (`authenticated.held`), and what subscribing again to a held wildcard
-pattern does to the topics it owned.
+pattern does to the topics it owned. One more checks that a message whose
+payload claims base64 and isn't is still delivered.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from typing import Any, cast
 
 import pytest
 
-from popsub import ClientConfig, PasswordCredentials, StartFrom
+from popsub import ClientConfig, Encoding, PasswordCredentials, ProtocolError, StartFrom
 from popsub._engine import Engine, _Connection, _Subscribe
 from popsub._state import Channel
 from popsub.message import EventHub, Message, Subscription
@@ -341,3 +342,18 @@ async def test_closing_a_replaced_pattern_subscription_loses_nothing() -> None:
     second.close()
     assert not await engine._run_commands(wire.connection())
     assert [frame["topic"] for frame in wire.of_type("unsubscribe")] == ["orders/#", "orders/eu", "orders/us"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_base64_message_is_still_delivered() -> None:
+    """A message whose payload claims base64 and isn't reaches the application and is acknowledged."""
+    engine, wire = make_engine(), Wire()
+    blobs = await subscribe(engine, wire, "blobs", StartFrom.new(), 1)
+    await receive(engine, wire, {"type": "subscribed", "id": wire.sent[-1]["id"], "topic": "blobs", "replay_from": 1})
+    await receive(engine, wire, {**delivery("blobs", 1), "payload": "not base64!", "encoding": "base64"})
+    message = await blobs.next()
+    assert message is not None
+    assert (message.payload, message.encoding) == ("not base64!", Encoding.BASE64)
+    with pytest.raises(ProtocolError):
+        _ = message.data
+    assert wire.of_type("ack") == [{"type": "ack", "topic": "blobs", "seq": 1}]

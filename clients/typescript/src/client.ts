@@ -5,6 +5,7 @@
  */
 
 import { Admin } from "./admin.js";
+import { encodeBase64 } from "./base64.js";
 import { resolveConfig, type ClientConfig, type ResolvedConfig } from "./config.js";
 import { Engine, type Published } from "./engine.js";
 import { PopSubError } from "./errors.js";
@@ -245,6 +246,22 @@ export class Client {
   }
 
   /**
+   * Publishes bytes at QoS 0, for a body that isn't text. They travel as
+   * standard padded base64 in `payload` with `encoding: "base64"`, so they
+   * take about a third more room against the server's payload limit;
+   * subscribers read them back with `Message.bytes`.
+   *
+   * Otherwise it behaves like `publish`, queue while disconnected included.
+   *
+   * @param topic - The topic.
+   * @param bytes - The body.
+   * @throws PopSubError of kind `closed` when the client has stopped.
+   */
+  publishBytes(topic: string, bytes: Uint8Array): void {
+    this.#engine.publish(topic, encodeBase64(bytes), "base64");
+  }
+
+  /**
    * Publishes a message at QoS 1 and waits until the server has stored it.
    *
    * The message gets a new `message_id` (a UUID) and is resent under it,
@@ -261,6 +278,31 @@ export class Client {
    */
   publishConfirmed(topic: string, payload: string): Promise<Published> {
     return withTimeout(this.#engine.publishConfirmed(topic, payload), this.#config.requestTimeoutMs);
+  }
+
+  /**
+   * Publishes bytes at QoS 1 and waits until the server has stored them,
+   * for a body that isn't text. They travel as standard padded base64 in
+   * `payload` with `encoding: "base64"`, so they take about a third more
+   * room against the server's payload limit; subscribers read them back
+   * with `Message.bytes`.
+   *
+   * Otherwise it behaves like `publishConfirmed`: one `message_id`, resent
+   * with the same request id after every reconnect until confirmed.
+   *
+   * @param topic - The topic.
+   * @param bytes - The body.
+   * @returns Its `seq` and `messageId`.
+   * @throws PopSubError of kind `server` when the server refused it (for
+   *   example `not_authorized`, `rate_limited` or `payload_too_large`),
+   *   `timeout` when it wasn't confirmed in time (it may still be stored,
+   *   and is still resent until confirmed), or `closed`.
+   */
+  publishBytesConfirmed(topic: string, bytes: Uint8Array): Promise<Published> {
+    return withTimeout(
+      this.#engine.publishConfirmed(topic, encodeBase64(bytes), "base64"),
+      this.#config.requestTimeoutMs,
+    );
   }
 
   /**

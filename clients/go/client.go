@@ -3,6 +3,7 @@ package popsub
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"sync"
 	"time"
@@ -174,7 +175,26 @@ func (c *Client) Unsubscribe(ctx context.Context, topic string) error {
 //
 // It fails with KindClosed when the client has stopped.
 func (c *Client) Publish(topic, payload string) error {
-	if !c.engine.queue.push(publishCommand{topic: topic, payload: payload}) {
+	return c.publish(topic, payload, "")
+}
+
+// PublishBytes publishes bytes at QoS 0, for a body that isn't text. They
+// travel as standard padded base64 with the message's Encoding set to
+// EncodingBase64, so they take about a third more room against the
+// server's payload limit; subscribers read them back with Message.Bytes.
+// The client keeps no reference to body after the call returns.
+//
+// Otherwise it behaves like Publish.
+//
+// It fails with KindClosed when the client has stopped.
+func (c *Client) PublishBytes(topic string, body []byte) error {
+	return c.publish(topic, base64.StdEncoding.EncodeToString(body), EncodingBase64)
+}
+
+// publish queues a QoS 0 publish of a payload already in its wire form,
+// for Publish and PublishBytes.
+func (c *Client) publish(topic, payload string, encoding Encoding) error {
+	if !c.engine.queue.push(publishCommand{topic: topic, payload: payload, encoding: encoding}) {
 		return c.closedErr()
 	}
 	return nil
@@ -189,8 +209,31 @@ func (c *Client) Publish(topic, payload string) error {
 // not_authorized, rate_limited or payload_too_large), KindTimeout (it may
 // still have been stored), or KindClosed.
 func (c *Client) PublishConfirmed(ctx context.Context, topic, payload string) (Published, error) {
+	return c.publishConfirmed(ctx, topic, payload, "")
+}
+
+// PublishBytesConfirmed publishes bytes at QoS 1 and waits until the
+// server has stored them, for a body that isn't text. They travel as
+// standard padded base64 with the message's Encoding set to
+// EncodingBase64, so they take about a third more room against the
+// server's payload limit; subscribers read them back with Message.Bytes.
+// The client keeps no reference to body after the call returns.
+//
+// Otherwise it behaves like PublishConfirmed, resends included.
+//
+// It fails with KindServer when the server refused (for example
+// not_authorized, rate_limited or payload_too_large), KindTimeout (it may
+// still have been stored), or KindClosed.
+func (c *Client) PublishBytesConfirmed(ctx context.Context, topic string, body []byte) (Published, error) {
+	return c.publishConfirmed(ctx, topic, base64.StdEncoding.EncodeToString(body), EncodingBase64)
+}
+
+// publishConfirmed queues a QoS 1 publish of a payload already in its wire
+// form under a new message_id and waits for the server to confirm it, for
+// PublishConfirmed and PublishBytesConfirmed.
+func (c *Client) publishConfirmed(ctx context.Context, topic, payload string, encoding Encoding) (Published, error) {
 	reply := make(chan publishResult, 1)
-	command := publishCommand{topic: topic, payload: payload, messageID: newUUID(), reply: reply}
+	command := publishCommand{topic: topic, payload: payload, encoding: encoding, messageID: newUUID(), reply: reply}
 	if !c.engine.queue.push(command) {
 		return Published{}, c.closedErr()
 	}

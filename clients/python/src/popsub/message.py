@@ -1,13 +1,22 @@
-"""What the application receives: messages, subscriptions and events."""
+"""What the application receives: messages, subscriptions and events.
+
+A message's `payload` is the string that travelled. `Message.data` gives its
+bytes: the decoded payload when `encoding` is base64, otherwise the payload's
+UTF-8.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Protocol
 
 from popsub._state import Channel
+from popsub.errors import ProtocolError
+from popsub.protocol import Encoding
 
 EVENT_BUFFER = 256
 """How many events an `EventStream` holds before dropping the oldest."""
@@ -56,10 +65,13 @@ class Message:
         topic: The topic it was published to.
         seq: Its position in the topic.
         message_id: The publisher's id for it.
-        payload: The body.
+        payload: The body as it travelled: the text itself, or base64 when
+            `encoding` says so. `data` gives the bytes either way.
         qos: 0 or 1.
         published_at_ms: When it was published, in milliseconds since the
             Unix epoch.
+        encoding: How `payload` encodes the message's bytes. None means it
+            is text; `Encoding.BASE64` means it was published as bytes.
     """
 
     topic: str
@@ -68,7 +80,28 @@ class Message:
     payload: str
     qos: int
     published_at_ms: int
+    encoding: Encoding | None = None
     _engine: _Engine | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def data(self) -> bytes:
+        """The message's bytes.
+
+        Returns:
+            The payload's UTF-8 bytes for a text message, or the decoded
+            payload for one published as bytes.
+
+        Raises:
+            ProtocolError: When the payload says it is base64 and isn't. The
+                server checks this on publish, so it means the record was
+                stored some other way.
+        """
+        if self.encoding is None:
+            return self.payload.encode("utf-8")
+        try:
+            return base64.b64decode(self.payload, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ProtocolError(f"the payload isn't valid base64: {error}") from error
 
     def ack(self) -> None:
         """Acknowledges the message.

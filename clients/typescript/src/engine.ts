@@ -107,9 +107,11 @@ import {
   errorCode,
   parseServerFrame,
   PROTOCOL_VERSION,
+  publishFrame,
   shouldReconnect,
   type ClientMessage,
   type CloseCode,
+  type Encoding,
   type Limits,
   type ServerFrame,
   type ServerMessage,
@@ -434,12 +436,13 @@ export class Engine {
    * Publishes at QoS 0. While disconnected the publish is queued.
    *
    * @param topic - The topic.
-   * @param payload - The body.
+   * @param payload - The body: text, or base64 when `encoding` says so.
+   * @param encoding - How `payload` encodes the body, or `null` for text.
    * @throws PopSubError of kind `closed` when the client has stopped.
    */
-  publish(topic: string, payload: string): void {
+  publish(topic: string, payload: string, encoding: Encoding | null = null): void {
     this.#throwIfStopped();
-    this.#queueOffline({ type: "publish", topic, payload });
+    this.#queueOffline(publishFrame(topic, payload, encoding));
     this.#flushOffline();
   }
 
@@ -448,16 +451,21 @@ export class Engine {
    * reconnect until the server confirms it.
    *
    * @param topic - The topic.
-   * @param payload - The body.
+   * @param payload - The body: text, or base64 when `encoding` says so.
+   * @param encoding - How `payload` encodes the body, or `null` for text.
    * @returns A promise that settles with the `seq` and id once stored.
    */
-  publishConfirmed(topic: string, payload: string): Promise<Published> {
+  publishConfirmed(topic: string, payload: string, encoding: Encoding | null = null): Promise<Published> {
     if (this.#stopped !== null) {
       return Promise.reject(PopSubError.closed(this.#stopped.code));
     }
     return new Promise<Published>((resolve, reject) => {
       const id = this.#takeId();
-      const message: ClientMessage = { type: "publish", topic, payload, message_id: uuid(), qos: 1 };
+      const message: ClientMessage = {
+        ...publishFrame(topic, payload, encoding),
+        message_id: uuid(),
+        qos: 1,
+      };
       this.#pending.set(id, { kind: "publish", settle: { resolve, reject } });
       this.#unconfirmed.set(id, message);
       if (this.#connection !== null) {
@@ -1348,6 +1356,7 @@ export class Engine {
           seq,
           messageId: delivery.message_id,
           payload: delivery.payload,
+          encoding: delivery.encoding === "base64" ? "base64" : null,
           qos,
           publishedAtMs: delivery.published_at_ms,
         },

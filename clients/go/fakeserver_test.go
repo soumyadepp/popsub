@@ -17,7 +17,8 @@ import (
 // fakeServer is a small in-process stand-in for a PopSub server, enough
 // for unit tests: it logs in any password except "wrong", authenticates,
 // confirms subscribes (except to topics named "hang", which it never
-// answers), confirms publishes and delivers them to the same connection,
+// answers), confirms publishes and delivers them to the same connection with the
+// encoding they were published with,
 // answers unsubscribe and list_users, and lets a test write raw frames,
 // choose the topics it reports as resumed and whether it holds them when
 // asked, and read the frames it received.
@@ -134,8 +135,12 @@ func (f *fakeServer) answer(ctx context.Context, conn *websocket.Conn, frame map
 		if qos == 1 {
 			reply(map[string]any{"type": "published", "message_id": messageID, "seq": seq})
 		}
-		f.send(ctx, conn, map[string]any{"type": "message", "topic": topic, "seq": seq, "message_id": messageID,
-			"payload": frame["payload"], "qos": qos, "published_at_ms": 1794800000000})
+		message := map[string]any{"type": "message", "topic": topic, "seq": seq, "message_id": messageID,
+			"payload": frame["payload"], "qos": qos, "published_at_ms": 1794800000000}
+		if encoding, ok := frame["encoding"]; ok {
+			message["encoding"] = encoding
+		}
+		f.send(ctx, conn, message)
 	case "list_users":
 		reply(map[string]any{"type": "users", "users": []any{}})
 	}

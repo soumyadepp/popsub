@@ -1,8 +1,9 @@
 """Wire-level types of PopSub protocol version 1.
 
 These mirror `popsub_protocol` in the Rust workspace and the JSON Schemas in
-`docs/protocol/`: where a subscription starts, roles and grants for the admin
-requests, account records, close codes and error codes.
+`docs/protocol/`: where a subscription starts, how a payload encodes bytes,
+roles and grants for the admin requests, account records, close codes and
+error codes.
 """
 
 from __future__ import annotations
@@ -220,6 +221,29 @@ class StartFrom:
             if kind in ("last", "since_ms", "seq") and isinstance(number, int) and not isinstance(number, bool):
                 return cls(kind, number)
         raise ValueError(f"not a start position: {value!r}")
+
+
+class Encoding(str, enum.Enum):
+    """How a payload string encodes a message's bytes, when it isn't text."""
+
+    BASE64 = "base64"
+
+    @classmethod
+    def from_json(cls, value: Any) -> Encoding | None:
+        """Decodes the `encoding` field of a `message` frame.
+
+        Args:
+            value: The field's value, or None when the frame has none.
+
+        Returns:
+            The encoding, or None for a text payload. A value protocol
+            version 1 doesn't define also gives None, so the payload is read
+            as text.
+        """
+        try:
+            return cls(value)
+        except ValueError:
+            return None
 
 
 class Access(str, enum.Enum):

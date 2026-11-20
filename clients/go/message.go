@@ -1,6 +1,17 @@
 package popsub
 
-import "sync"
+import (
+	"encoding/base64"
+	"sync"
+)
+
+// Encoding says how a message's Payload string encodes its bytes. The
+// zero value means the payload is text.
+type Encoding string
+
+// EncodingBase64 marks a payload that is standard padded base64 of the
+// message's bytes, as PublishBytes and PublishBytesConfirmed send it.
+const EncodingBase64 Encoding = "base64"
 
 // Message is a message delivered on a subscription.
 type Message struct {
@@ -11,8 +22,12 @@ type Message struct {
 	Seq uint64
 	// MessageID is the publisher's id for it.
 	MessageID string
-	// Payload is the body.
+	// Payload is the body as it travelled: the text itself, or base64 when
+	// Encoding says so. Bytes decodes it either way.
 	Payload string
+	// Encoding is how Payload encodes the message's bytes: empty for text,
+	// EncodingBase64 for a message published as bytes.
+	Encoding Encoding
 	// QoS is 0 or 1.
 	QoS uint8
 	// PublishedAtMs is when it was published, in milliseconds since the
@@ -21,6 +36,25 @@ type Message struct {
 	// ack sends the acknowledgement, for QoS 1 messages in AckManual; nil
 	// otherwise.
 	ack func()
+}
+
+// Bytes returns the message's bytes: the decoded Payload when Encoding is
+// EncodingBase64, and the Payload's UTF-8 bytes otherwise. Each call
+// returns a new slice.
+//
+// It fails with KindProtocol when the payload says it is base64 and is not
+// standard padded base64. The server checks this on publish, so it means
+// the record was stored some other way. The message was still delivered,
+// and Payload holds the string as it arrived.
+func (m Message) Bytes() ([]byte, error) {
+	if m.Encoding != EncodingBase64 {
+		return []byte(m.Payload), nil
+	}
+	decoded, err := base64.StdEncoding.Strict().DecodeString(m.Payload)
+	if err != nil {
+		return nil, protocolError("the payload isn't valid base64: " + err.Error())
+	}
+	return decoded, nil
 }
 
 // Ack acknowledges the message, so the server stops resending it and a

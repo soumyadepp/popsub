@@ -1,7 +1,10 @@
 /**
  * The scenario driver for the TypeScript client: reads commands from
  * standard input and writes responses and events to standard output, one
- * JSON object per line, as `clients/DRIVER.md` describes. Each command is
+ * JSON object per line, as `clients/DRIVER.md` describes. A publish command
+ * may give its body as base64 in `bytes`, which is published through the
+ * library's byte calls, and every `message` event carries the message's
+ * bytes in base64 as `Message.bytes` returns them. Each command is
  * handled concurrently and answered when it completes. Not part of the
  * library's public entry point.
  *
@@ -13,6 +16,7 @@
 import { createInterface } from "node:readline";
 
 import type { TopicInfo, User } from "./admin.js";
+import { decodeBase64, encodeBase64 } from "./base64.js";
 import { Client, type StartFrom } from "./client.js";
 import type { ClientConfig } from "./config.js";
 import { PopSubError } from "./errors.js";
@@ -101,6 +105,40 @@ function integer(source: Json, key: string): number | null {
 function object(source: Json, key: string): Json {
   const value = source[key];
   return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Json) : {};
+}
+
+/**
+ * Reads a publish command's `bytes`: the body to publish as bytes, in base64.
+ *
+ * @param command - The command.
+ * @returns The bytes, or `null` when the command carries a text `payload` instead.
+ * @throws PopSubError of kind `config` when `bytes` isn't base64.
+ */
+function bodyBytes(command: Command): Uint8Array | null {
+  const encoded = command.bytes;
+  if (typeof encoded !== "string") {
+    return null;
+  }
+  const decoded = decodeBase64(encoded);
+  if (decoded === null) {
+    throw failure("config", "bytes isn't valid base64");
+  }
+  return decoded;
+}
+
+/**
+ * Reads a message's bytes through the library's accessor, for the
+ * `message` event.
+ *
+ * @param message - The message.
+ * @returns The bytes in base64, or `null` when the accessor refused the payload.
+ */
+function messageBytes(message: Message): string | null {
+  try {
+    return encodeBase64(message.bytes());
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -255,6 +293,7 @@ async function forward(state: State, topic: string, messages: AsyncIterable<Mess
       topic: message.topic,
       seq: message.seq,
       payload: message.payload,
+      bytes: messageBytes(message),
       message_id: message.messageId,
       qos: message.qos,
     });
@@ -345,11 +384,21 @@ async function handle(state: State, command: Command): Promise<Json> {
       state.leaving.add(topic);
       await client.unsubscribe(topic);
       return {};
-    case "publish":
-      client.publish(topic, text(command, "payload"));
+    case "publish": {
+      const bytes = bodyBytes(command);
+      if (bytes === null) {
+        client.publish(topic, text(command, "payload"));
+      } else {
+        client.publishBytes(topic, bytes);
+      }
       return {};
+    }
     case "publish_confirmed": {
-      const published = await client.publishConfirmed(topic, text(command, "payload"));
+      const bytes = bodyBytes(command);
+      const published =
+        bytes === null
+          ? await client.publishConfirmed(topic, text(command, "payload"))
+          : await client.publishBytesConfirmed(topic, bytes);
       return { seq: published.seq, message_id: published.messageId };
     }
     case "ack": {

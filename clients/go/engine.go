@@ -67,8 +67,11 @@ type forgetCommand struct {
 type publishCommand struct {
 	// topic is the topic.
 	topic string
-	// payload is the body.
+	// payload is the body: text, or base64 when encoding says so.
 	payload string
+	// encoding is EncodingBase64 for a body published as bytes, and empty
+	// for text.
+	encoding Encoding
 	// messageID is the idempotency key of a confirmed publish.
 	messageID string
 	// reply gets the outcome of a confirmed publish; nil for QoS 0.
@@ -760,14 +763,14 @@ func (e *engine) queuePublish(c publishCommand) uint64 {
 	if c.reply != nil {
 		id := e.takeID()
 		e.pending[id] = pendingPublish{reply: c.reply}
-		e.unconfirmed[id] = publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload, MessageID: c.messageID, QoS: 1}
+		e.unconfirmed[id] = publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload, Encoding: c.encoding, MessageID: c.messageID, QoS: 1}
 		return id
 	}
 	if len(e.offline) >= offlinePublishes {
 		e.offline[0] = nil
 		e.offline = e.offline[1:]
 	}
-	e.offline = append(e.offline, publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload})
+	e.offline = append(e.offline, publishRequest{Type: "publish", Topic: c.topic, Payload: c.payload, Encoding: c.encoding})
 	return 0
 }
 
@@ -1108,6 +1111,7 @@ func (e *engine) deliver(conn *websocket.Conn, frame *serverFrame) error {
 		Seq:           frame.Seq,
 		MessageID:     frame.MessageID,
 		Payload:       frame.Payload,
+		Encoding:      frame.Encoding,
 		QoS:           frame.QoS,
 		PublishedAtMs: frame.PublishedAtMs,
 	}

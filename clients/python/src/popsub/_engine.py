@@ -10,7 +10,9 @@ expects (topics a durable session restored are subscribed again from
 `resume` when the server holds them, and otherwise left to the server unless
 one is still being claimed), resends
 confirmed publishes still waiting for `published` under the same request id
-and `message_id`, and sends QoS 0 publishes held while disconnected.
+and `message_id`, and sends QoS 0 publishes held while disconnected. A
+publish of bytes is the same frame with a base64 payload and `encoding`, so
+it is queued and resent the same way.
 
 Each delivered message is checked against the next seq its topic expects,
 so a resend or replay never reaches the application twice. A duplicate that
@@ -95,7 +97,7 @@ from popsub.message import (
     Truncated,
     Unsubscribed,
 )
-from popsub.protocol import PROTOCOL_VERSION, CloseCode, StartFrom
+from popsub.protocol import PROTOCOL_VERSION, CloseCode, Encoding, StartFrom
 
 log = logging.getLogger("popsub")
 
@@ -200,12 +202,14 @@ class _Publish:
         payload: The body.
         message_id: The idempotency key of a confirmed publish; None for QoS 0.
         reply: Gets the confirmation of a confirmed publish; None for QoS 0.
+        encoding: How the payload encodes bytes; None for text.
     """
 
     topic: str
     payload: str
     message_id: str | None = None
     reply: asyncio.Future[Published] | None = None
+    encoding: Encoding | None = None
 
 
 @dataclass
@@ -1151,21 +1155,18 @@ class Engine:
         Returns:
             The request id of a confirmed publish, otherwise None.
         """
+        frame: dict[str, Any] = {"type": "publish", "topic": command.topic, "payload": command.payload}
+        if command.encoding is not None:
+            frame["encoding"] = command.encoding.value
         if command.reply is not None and command.message_id is not None:
             request_id = self._take_id()
             self._pending[request_id] = _PendingPublish(command.reply)
-            self._unconfirmed[request_id] = {
-                "type": "publish",
-                "topic": command.topic,
-                "payload": command.payload,
-                "message_id": command.message_id,
-                "qos": 1,
-            }
+            self._unconfirmed[request_id] = {**frame, "message_id": command.message_id, "qos": 1}
             return request_id
         if len(self._offline) >= OFFLINE_PUBLISHES:
             self._offline.popleft()
             log.warning("dropped the oldest publish held while disconnected")
-        self._offline.append({"type": "publish", "topic": command.topic, "payload": command.payload})
+        self._offline.append(frame)
         return None
 
     def _add_topic(self, command: _Subscribe) -> list[str]:
@@ -1658,6 +1659,7 @@ class Engine:
             payload=str(frame.get("payload", "")),
             qos=qos,
             published_at_ms=int(frame.get("published_at_ms", 0)),
+            encoding=Encoding.from_json(frame.get("encoding")),
             _engine=self if manual else None,
         )
         delivered = await topic.channel.put(message, self._close_requested)

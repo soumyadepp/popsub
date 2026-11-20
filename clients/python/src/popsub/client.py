@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import itertools
 import uuid
 from typing import Any, TypeVar
@@ -13,9 +14,21 @@ from popsub.admin import Admin
 from popsub.config import ClientConfig
 from popsub.errors import PopSubError, RequestTimeoutError
 from popsub.message import EventHub, EventStream, Message, Published, Subscription
-from popsub.protocol import StartFrom
+from popsub.protocol import Encoding, StartFrom
 
 T = TypeVar("T")
+
+
+def _base64(data: bytes) -> str:
+    """Encodes bytes as a payload string.
+
+    Args:
+        data: The bytes.
+
+    Returns:
+        Standard padded base64.
+    """
+    return base64.b64encode(data).decode("ascii")
 
 
 class Client:
@@ -265,6 +278,49 @@ class Client:
         """
         reply: asyncio.Future[Published] = asyncio.get_running_loop().create_future()
         self._engine.submit(_Publish(topic, payload, str(uuid.uuid4()), reply))
+        return await self._wait(reply)
+
+    async def publish_bytes(self, topic: str, data: bytes) -> None:
+        """Publishes bytes at QoS 0, for a body that isn't text.
+
+        They travel as standard padded base64 with `encoding: "base64"`, so
+        they take about a third more room against the server's payload
+        limit; subscribers read them back with `Message.data`. Otherwise it
+        behaves like `publish`.
+
+        Args:
+            topic: The topic.
+            data: The body.
+
+        Raises:
+            ClosedError: When the client has stopped.
+        """
+        self._engine.submit(_Publish(topic, _base64(data), encoding=Encoding.BASE64))
+
+    async def publish_bytes_confirmed(self, topic: str, data: bytes) -> Published:
+        """Publishes bytes at QoS 1 and waits until the server has stored them.
+
+        They travel as standard padded base64 with `encoding: "base64"`, so
+        they take about a third more room against the server's payload
+        limit; subscribers read them back with `Message.data`. Otherwise it
+        behaves like `publish_confirmed`.
+
+        Args:
+            topic: The topic.
+            data: The body.
+
+        Returns:
+            Its seq and message_id.
+
+        Raises:
+            ServerError: When the server refused it, for example
+                `not_authorized`, `rate_limited` or `payload_too_large`.
+            RequestTimeoutError: When it wasn't confirmed in time. It may
+                still have been stored.
+            ClosedError: When the client has stopped.
+        """
+        reply: asyncio.Future[Published] = asyncio.get_running_loop().create_future()
+        self._engine.submit(_Publish(topic, _base64(data), str(uuid.uuid4()), reply, Encoding.BASE64))
         return await self._wait(reply)
 
     def admin(self) -> Admin:

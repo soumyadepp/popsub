@@ -50,6 +50,25 @@
 //		fmt.Printf("%s #%d: %s\n", message.Topic, message.Seq, message.Payload)
 //	}
 //
+// A payload is a string. For a body that isn't text, PublishBytes and
+// PublishBytesConfirmed send the bytes as standard padded base64 and mark
+// the message with EncodingBase64; the server carries the string and the
+// mark without decoding. Message.Bytes returns a message's bytes either
+// way: the decoded payload for such a message, and the payload's UTF-8 for
+// text. Base64 is about a third larger than the bytes, and it is the
+// base64 string that counts against the server's payload limit.
+//
+//	if _, err := client.PublishBytesConfirmed(ctx, "blobs", []byte{0x00, 0xff}); err != nil {
+//		return err
+//	}
+//	for message := range blobs.Messages() {
+//		body, err := message.Bytes()
+//		if err != nil {
+//			continue
+//		}
+//		fmt.Printf("%s #%d: %d bytes\n", message.Topic, message.Seq, len(body))
+//	}
+//
 // The protocol is described in the PopSub repository's docs/DESIGN.md
 // section 4, and the behaviour every PopSub client shares in clients/README.md.
 package popsub

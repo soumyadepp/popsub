@@ -25,6 +25,8 @@ class FakeServer:
         received: Every frame received, in order.
         duplicate_deliveries: Send every message twice, as a server resending
             an unacknowledged message would.
+        swallow_publishes: Neither store nor answer a publish, as when the
+            connection drops before the server handles it.
         honours_hold: Answer an `auth` that carries `hold_resumed` with
             `held`, as a server that holds a session's topics does.
     """
@@ -33,6 +35,7 @@ class FakeServer:
         """Builds a server that hasn't started."""
         self.received: list[dict[str, Any]] = []
         self.duplicate_deliveries = False
+        self.swallow_publishes = False
         self.honours_hold = False
         self._logs: dict[str, list[dict[str, Any]]] = {}
         self._connections: list[ServerConnection] = []
@@ -227,8 +230,11 @@ class FakeServer:
             subscribed: This connection's subscribed topics.
 
         Returns:
-            `published` for QoS 1, then the delivery (twice when duplicating).
+            `published` for QoS 1, then the delivery (twice when duplicating);
+            nothing while publishes are swallowed.
         """
+        if self.swallow_publishes:
+            return []
         topic = str(frame.get("topic", ""))
         qos = int(frame.get("qos") or 0)
         with self._lock:
@@ -243,6 +249,8 @@ class FakeServer:
                 "qos": qos,
                 "published_at_ms": 1_794_800_000_000,
             }
+            if "encoding" in frame:
+                message["encoding"] = frame["encoding"]
             log.append(message)
         replies: list[dict[str, Any]] = []
         if qos == 1:
