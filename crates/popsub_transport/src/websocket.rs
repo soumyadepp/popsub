@@ -1568,7 +1568,7 @@ impl Session {
         let claims = match self.server.auth.validate_token(token) {
             Ok(claims) => claims,
             Err(e) => {
-                warn!(client_id = %self.client_id, "authentication failed: {}", e);
+                warn!(client_id = %self.client_id, error = e.kind(), "authentication failed");
                 self.fail(id, ErrorCode::AuthFailed, "authentication failed", None)?;
                 return Ok(Flow::Close(CloseCode::AuthFailed));
             }
@@ -1596,7 +1596,7 @@ impl Session {
                 return Ok(Flow::Close(CloseCode::AccountDisabled));
             }
             Err(e) => {
-                warn!(client_id = %self.client_id, "looking up the token's account failed: {}", e);
+                warn!(client_id = %self.client_id, error = e.kind(), "looking up the token's account failed");
                 self.fail(id, ErrorCode::Internal, "the user store failed", None)?;
                 return Ok(Flow::Close(CloseCode::AuthFailed));
             }

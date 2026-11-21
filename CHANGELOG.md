@@ -8,6 +8,7 @@ Each release lists what changed for people running the server and people using a
 
 - A `publish` with a `qos` other than 0 or 1 is refused with `bad_request`. It used to be stored and treated as QoS 0.
 - `storage.backend = "memory"` starts with the default settings: the default `buffered` durability runs as `none`, with a warning. It used to refuse to start until `storage.durability` was set to `none`. An explicit `synced` is still refused.
+- Auth errors are logged by kind, never by their full message, in three places that printed it: creating the default admin, a refused token and a failed account lookup at `auth`. The full message can carry a username.
 - A shared subscription group now belongs to the account that uses it: two accounts naming the same group get a group each, and another account can't join a group by guessing its name. Workers in one group must log in as the same account. A group's stored position from 0.1.0 isn't carried over, so each group starts again from its `from` the first time it is joined after upgrading; the old position is removed after `storage.session_expiry_secs`.
 
 ## [0.1.0] - 2026-11-20
