@@ -2,14 +2,27 @@
 
 Each release lists what changed for people running the server and people using a client library. Versions follow [Semantic Versioning](https://semver.org); while the version is 0.x, a minor release may change the protocol or a library's API, and the notes say so.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-21
+
+Two changes can affect an upgrade from 0.1.0. Read "Upgrading from 0.1.0" first.
+
+### Upgrading from 0.1.0
+
+- **Shared subscription groups belong to one account.** A group used to be global: any account allowed to read a topic could join another account's group by naming it, and take a share of its records. Now two accounts naming the same group get a group each. Workers that split a topic must log in as the same account. Group positions stored by 0.1.0 aren't carried over, so each group starts again from its `from` the first time it is joined after upgrading; the old entries are removed after `storage.session_expiry_secs`.
+- **A `publish` with a `qos` other than 0 or 1 is refused** with `bad_request`. It used to be stored and handled as QoS 0, with no sign that the requested level didn't exist.
 
 ### Server
 
-- A `publish` with a `qos` other than 0 or 1 is refused with `bad_request`. It used to be stored and treated as QoS 0.
-- `storage.backend = "memory"` starts with the default settings: the default `buffered` durability runs as `none`, with a warning. It used to refuse to start until `storage.durability` was set to `none`. An explicit `synced` is still refused.
-- Auth errors are logged by kind, never by their full message, in three places that printed it: creating the default admin, a refused token and a failed account lookup at `auth`. The full message can carry a username.
-- A shared subscription group now belongs to the account that uses it: two accounts naming the same group get a group each, and another account can't join a group by guessing its name. Workers in one group must log in as the same account. A group's stored position from 0.1.0 isn't carried over, so each group starts again from its `from` the first time it is joined after upgrading; the old position is removed after `storage.session_expiry_secs`.
+- `storage.backend = "memory"` starts with the default settings. The default `buffered` durability runs as `none`, with a warning; it used to refuse to start until `storage.durability` was set to `none`. An explicit `synced` is still refused.
+- Auth errors are logged by kind, never by their full message, which can carry a username. Three log lines printed it: creating the default admin, a refused token, and a failed account lookup at `auth`.
+
+### Client libraries
+
+- No code changes. Each library has two runnable examples, a durable subscriber and a publisher, and [`examples/README.md`](https://github.com/soumyadepp/popsub/blob/v0.2.0/examples/README.md) walks through running them against a local server, across languages.
+
+### Documentation
+
+- Every document was checked against the code and corrected. `docs/DESIGN.md` section 12 now lists, in priority order, what PopSub still lacks for production use by small applications and IoT devices.
 
 ## [0.1.0] - 2026-11-20
 
@@ -41,4 +54,5 @@ Each library reconnects with backoff, resubscribes without gaps, resends confirm
 - One server process: no clustering or replication.
 - `server.max_payload_bytes` is measured on the payload string, so a binary body counts about a third more.
 
+[0.2.0]: https://github.com/soumyadepp/popsub/releases/tag/v0.2.0
 [0.1.0]: https://github.com/soumyadepp/popsub/releases/tag/v0.1.0
