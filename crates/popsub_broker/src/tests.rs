@@ -130,6 +130,24 @@ fn connect_with(
     (id, rx)
 }
 
+/// Registers a fake client logged in as `username`, as a real connection is
+/// before it can join a shared subscription.
+///
+/// Args:
+///     broker: The broker to register with.
+///     username: The account the client is logged in as.
+///
+/// Returns:
+///     The client's id and its inbox.
+fn connect_user(broker: &mut Broker, username: &str) -> (String, Inbox) {
+    let (tx, rx) = Outbox::channel(QueueLimits::default());
+    let mut client = Client::new(tx);
+    client.username = Some(username.to_string());
+    let id = client.id.clone();
+    broker.register_client(client);
+    (id, rx)
+}
+
 /// Builds a record as the log would store it.
 ///
 /// Args:
@@ -1384,8 +1402,8 @@ async fn records_out_of_retries_go_to_the_dead_letter_topic() {
 #[tokio::test]
 async fn a_shared_subscription_gives_each_record_to_one_member() {
     let broker = shared(Retention::default());
-    let (a, mut a_rx) = broker.with(connect);
-    let (b, mut b_rx) = broker.with(connect);
+    let (a, mut a_rx) = broker.with(|broker| connect_user(broker, "alice"));
+    let (b, mut b_rx) = broker.with(|broker| connect_user(broker, "alice"));
     let (watcher, mut watcher_rx) = broker.with(connect);
     for member in [&a, &b] {
         let joined = broker
@@ -1436,7 +1454,7 @@ async fn a_shared_subscription_gives_each_record_to_one_member() {
             .await
             .expect("publish");
     }
-    let (c, mut c_rx) = broker.with(connect);
+    let (c, mut c_rx) = broker.with(|broker| connect_user(broker, "alice"));
     let joined = broker
         .subscribe_shared("jobs", "workers", &c, StartFrom::Seq(1), None)
         .await
@@ -1445,4 +1463,30 @@ async fn a_shared_subscription_gives_each_record_to_one_member() {
     let received = wait_for_messages(&mut c_rx, 2).await;
     assert_eq!(received[0]["group"], "workers");
     assert_eq!(seqs(&received), vec![5, 6]);
+}
+
+/// Checks that a shared subscription group belongs to the account that uses
+/// it: two accounts naming the same group get a group each, so each gets
+/// every record, while two members of one account still split them.
+#[tokio::test]
+async fn shared_subscription_groups_are_scoped_to_the_account() {
+    let broker = shared(Retention::default());
+    let (alice, mut alice_rx) = broker.with(|broker| connect_user(broker, "alice"));
+    let (bob, mut bob_rx) = broker.with(|broker| connect_user(broker, "bob"));
+    for member in [&alice, &bob] {
+        let joined = broker
+            .subscribe_shared("jobs", "workers", member, StartFrom::New, None)
+            .await
+            .expect("join");
+        assert!(joined.added);
+    }
+    for n in 1..=2 {
+        broker
+            .publish("jobs", new_record(&format!("job-{n}"), 1))
+            .await
+            .expect("publish");
+    }
+
+    assert_eq!(seqs(&frames(&mut alice_rx)), vec![1, 2]);
+    assert_eq!(seqs(&frames(&mut bob_rx)), vec![1, 2]);
 }

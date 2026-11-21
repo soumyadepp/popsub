@@ -266,6 +266,21 @@ impl Broker {
         self.clients.get(client_id)?.session.clone()
     }
 
+    /// Looks up the subscriber id of the shared subscription a client would
+    /// join under a group name, which belongs to the client's account.
+    ///
+    /// Args:
+    ///     client_id: The client.
+    ///     group: The group's name.
+    ///
+    /// Returns:
+    ///     The group's subscriber id, or `None` for an unknown client or one
+    ///     that hasn't logged in.
+    pub fn group_id_for(&self, client_id: &str, group: &str) -> Option<SubscriberId> {
+        let username = self.clients.get(client_id)?.username.as_deref()?;
+        Some(group_subscriber_id(username, group))
+    }
+
     /// Finds the connected client holding a durable session.
     ///
     /// Args:
@@ -423,7 +438,10 @@ impl Broker {
         let Some(client) = self.clients.get(client_id) else {
             return false;
         };
-        let group_id = group_subscriber_id(group);
+        let Some(username) = client.username.as_deref() else {
+            return false;
+        };
+        let group_id = group_subscriber_id(username, group);
         let topic = self
             .topics
             .entry(topic.to_string())

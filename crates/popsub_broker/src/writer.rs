@@ -24,7 +24,6 @@
 //! until it finishes. Other topics are unaffected.
 
 use crate::health::StorageHealth;
-use crate::topic::group_subscriber_id;
 use popsub_utils::metrics::{attr, metrics};
 use std::sync::Arc;
 
@@ -420,7 +419,18 @@ impl TopicWriter {
     ) -> StorageResult<SubscribeOutcome> {
         let bounds = self.storage.bounds(&self.topic).await?;
         self.last_seq = Some(bounds.last_seq);
-        let group_id = group_subscriber_id(group);
+        let Some(group_id) = self
+            .broker
+            .with(|broker| broker.group_id_for(client_id, group))
+        else {
+            return Ok(SubscribeOutcome {
+                replay_from: bounds.last_seq + 1,
+                replay_to: bounds.last_seq,
+                replayed: 0,
+                truncated: false,
+                added: false,
+            });
+        };
         let live = self
             .broker
             .with(|broker| broker.subscriber_next_seq(&self.topic, &group_id));

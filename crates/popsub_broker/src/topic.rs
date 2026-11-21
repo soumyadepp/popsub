@@ -151,13 +151,19 @@ pub const GROUP_PREFIX: &str = "$share/";
 /// The subscriber id, and the key its cursor is stored under, of a shared
 /// subscription.
 ///
+/// A group belongs to the account that uses it, so two accounts naming the
+/// same group get a group each, and one can't take records meant for the
+/// other's workers.
+///
 /// Args:
+///     username: The account whose group it is.
 ///     group: The group's name.
 ///
 /// Returns:
-///     `$share/<group>`.
-pub fn group_subscriber_id(group: &str) -> SubscriberId {
-    format!("{GROUP_PREFIX}{group}")
+///     `$share/<username>/<group>`. Usernames can't contain `/`, so two
+///     accounts' ids can't collide.
+pub fn group_subscriber_id(username: &str, group: &str) -> SubscriberId {
+    format!("{GROUP_PREFIX}{username}/{group}")
 }
 
 /// The connections sharing one subscription. Each record goes to one of

@@ -70,7 +70,7 @@ A server that doesn't know `hold_resumed` ignores it, answers without `held`, an
 
 **Shared subscriptions**
 
-- Subscribing with a `group` joins a shared subscription: the client receives only some of the topic's messages (other members get the rest), not in strict `seq` order.
+- Subscribing with a `group` joins a shared subscription: the client receives only some of the topic's messages (other members get the rest), not in strict `seq` order. A group belongs to the account the client logs in as, so the members of one group share an account.
 - So a shared subscription doesn't use a next expected `seq`. The client remembers the `seq`s it has handed to the application (a bounded set is enough) and treats a repeat as a duplicate, with the usual re-acknowledge rule. `subscribed.replay_from` and `truncated` don't move anything.
 - After reconnecting, rejoin with the same `group` and `from: "resume"`; the group's position is on the server. A shared subscription is never in `authenticated.resumed`.
 - Acknowledgements, manual or automatic, work as for any subscription.

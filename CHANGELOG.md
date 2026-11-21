@@ -7,6 +7,7 @@ Each release lists what changed for people running the server and people using a
 ### Server
 
 - A `publish` with a `qos` other than 0 or 1 is refused with `bad_request`. It used to be stored and treated as QoS 0.
+- A shared subscription group now belongs to the account that uses it: two accounts naming the same group get a group each, and another account can't join a group by guessing its name. Workers in one group must log in as the same account. A group's stored position from 0.1.0 isn't carried over, so each group starts again from its `from` the first time it is joined after upgrading; the old position is removed after `storage.session_expiry_secs`.
 
 ## [0.1.0] - 2026-11-20
 
