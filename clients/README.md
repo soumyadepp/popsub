@@ -7,7 +7,7 @@
 | Python 3.10+ | [`clients/python`](python) | Passes the scenario suite |
 | Go 1.23+ | [`clients/go`](go) | Passes the scenario suite |
 
-Each client's README covers installing it, its API, and its own checks. CI (`.github/workflows/clients.yml`) runs every client's lint, type check and tests and the whole scenario suite against it, on the oldest and newest language versions it supports.
+Each client's README covers installing it, its API, and its own checks. In CI, `.github/workflows/rust.yml` checks the Rust client on stable Rust, and its tests run the whole scenario suite against it (`crates/popsub_scenarios/tests/rust_sdk.rs`). `.github/workflows/clients.yml` runs the lint, type check, tests and the whole scenario suite for TypeScript on Node 22 and 24, Python on 3.10 and 3.13, and Go on 1.23 and the latest stable release (staticcheck on stable only).
 
 | Client | Driver command, from the repository root |
 |---|---|

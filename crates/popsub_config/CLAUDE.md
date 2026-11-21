@@ -6,7 +6,7 @@ Loads `Settings` for the server and broker.
 
 1. Read `config/default.toml` relative to the working directory, if it exists.
 2. Overlay environment variables. One-word keys take one underscore after the section (`SERVER_PORT`); keys containing an underscore take two (`SERVER__JWT_SECRET`, `BROKER__MAX_RETRIES`). Both forms are read.
-3. Deserialise straight into `Settings`. Every settings struct is `#[serde(default)]`, so anything neither source sets comes from that struct's `Default`. A value of the wrong type is an error, not a silent fallback.
+3. Deserialise straight into `Settings`. Every settings struct except `TopicRetentionSettings` is `#[serde(default)]`, so anything neither source sets comes from that struct's `Default`. A `TopicRetentionSettings` entry must name its `pattern`; its limits are optional. A value of the wrong type is an error, not a silent fallback.
 
 `load_config()` reads `config/default.toml` and the process environment. `load_config_from(path, env)` takes both explicitly, which is what tests use.
 
@@ -14,8 +14,8 @@ Loads `Settings` for the server and broker.
 
 Update all of these together:
 
-- the field in `ServerSettings`, `BrokerSettings`, `StorageSettings`, `RetentionSettings` or `LimitSettings`, with a one-line docstring
-- that struct's `Default` impl
+- the field in `ServerSettings`, `BrokerSettings`, `StorageSettings`, `RetentionSettings`, `LimitSettings`, `TelemetrySettings` or `TopicRetentionSettings`, with a one-line docstring
+- that struct's `Default` impl (`TopicRetentionSettings` has none; give a new field there `#[serde(default)]`)
 - `config/default.toml` at the repo root
 - the table in `docs/DESIGN.md` section 9
 

@@ -117,8 +117,8 @@ Everything below is importable from `popsub`.
 | Name | What it is |
 |---|---|
 | `await Client.connect(config)` | Connects and waits for the first authenticated connection, retrying with the reconnect policy for up to `request_timeout`. |
-| `await client.subscribe(topic, start_from=StartFrom.resume())` | Returns a `Subscription`. `topic` may be a wildcard pattern. `StartFrom.resume()`, `.new()`, `.last(n)`, `.since_ms(t)` or `.seq(s)`. |
-| `await client.subscribe_shared(topic, group, start_from=StartFrom.resume())` | Joins a shared subscription on an exact topic and returns a `Subscription` with this member's share. |
+| `await client.subscribe(topic, start_from=None)` | Returns a `Subscription`. `topic` may be a wildcard pattern. `start_from` is `StartFrom.resume()` (what `None` means), `.new()`, `.last(n)`, `.since_ms(t)` or `.seq(s)`. |
+| `await client.subscribe_shared(topic, group, start_from=None)` | Joins a shared subscription on an exact topic and returns a `Subscription` with this member's share. |
 | `await client.unsubscribe(topic)` | Unsubscribes from a topic or pattern; its `Subscription` ends. |
 | `await client.publish(topic, payload)` | QoS 0. Returns once queued; server failures arrive as `ServerErrorEvent`. |
 | `await client.publish_confirmed(topic, payload)` | QoS 1 with a new UUID `message_id`. Returns `Published(seq, message_id)` once stored. |

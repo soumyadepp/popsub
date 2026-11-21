@@ -13,7 +13,7 @@ The first release.
 - Durable sessions that keep subscriptions and acknowledgement positions across disconnects, application restarts and server restarts. A client can ask the server to hold a session's topics until it subscribes (`hold_resumed`).
 - Wildcard subscriptions (`orders/#`, `sensors/+/temp`) and shared subscriptions, where each message goes to one member of a group.
 - Binary payloads, sent as base64 with `encoding: "base64"`.
-- Users with per-topic permissions, Argon2id passwords and JWTs, managed with `popsub users` or the admin requests. Rate limits on logins, registration and publishing, connection limits, heartbeats and backpressure for slow readers.
+- Users with per-topic permissions, Argon2id passwords and JWTs, managed with `popsub users` or the admin requests. Topics can be listed, inspected and purged with `popsub topics` or the topic admin requests. Rate limits on logins, registration and publishing, connection limits, heartbeats and backpressure for slow readers.
 - A file storage backend (the default), an in-memory one, and per-topic retention.
 - TLS, trusted proxies and the PROXY protocol, health endpoints, and OpenTelemetry metrics, traces and logs with PII masking.
 - Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Apple silicon), and a container image at `ghcr.io/soumyadepp/popsub`.

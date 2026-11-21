@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Implemented except step 5. Steps 1 to 4 and 6 are done (the storage crate, the broker on the log, sessions and cursors, the `file` backend, removing `sled`); step 5 (Postgres) is parked until clients need it |
+| Status | Implemented except step 5. Steps 1 to 4 and 6 are done (the storage crate, the broker on the log, sessions and cursors, the `file` backend without its index and group commit, removing `sled`). Step 5, the `postgres` backend, is not built: it is parked until clients need it, and everything about it below is a proposal |
 | Owner | Soumyadeep Ghosh |
 | Replaces | `popsub_persistence` (the `sled` replay store) and the in-memory `pending_acks` table |
 | Related | `docs/DESIGN.md` sections 6, 7, 12 and 13 (phase 1) |
@@ -33,7 +33,7 @@ This proposal meets all three with one idea: **every topic is an append-only log
 - Exactly-once delivery. Consumers deduplicate by `(topic, seq)`.
 - Replication or clustering. A backend may be replicated underneath (Postgres can be), but PopSub itself stays single node. The log design is chosen so clustering can build on it later.
 - Transactions across topics.
-- Binary payloads. Payloads stay strings; the record format leaves room to change that.
+- Raw bytes in records. Payloads stay strings; a body that isn't text is stored as base64 with its `encoding` beside it, and the record format leaves room for raw bytes later.
 
 ## 3. Concepts
 
@@ -69,6 +69,7 @@ pub struct Record {
     pub message_id: String,
     pub publisher: String,
     pub payload: String,
+    pub encoding: Option<PayloadEncoding>,
     pub qos: u8,
     pub published_at_ms: i64,
 }
@@ -83,6 +84,7 @@ pub struct Subscription {
 
 - `seq` is assigned by the log at append time, never by the publisher.
 - `message_id` is the publisher's idempotency key (or a generated UUID). Within one `(topic, publisher)`, a repeated `message_id` returns the original `seq` instead of appending again, so a publisher retrying after a lost confirmation doesn't create duplicates. Backends keep this lookup for a bounded window (default: the retention window).
+- `encoding` is `Some(Base64)` for a body that isn't text and `None` otherwise, including records stored before the field existed.
 - A subscription's `acked_seq` only moves forward.
 
 ## 6. The storage interface
@@ -156,22 +158,25 @@ pub enum Durability { None, Buffered, Synced }
 
 **Errors.** One `StorageError` with variants `Unavailable` (retry may help), `Corrupt` (data failed a checksum), `Unsupported` (for example `Synced` on a backend that can't), and `Other`. The server never panics on a storage error; see section 10.
 
-**Plugging in your own.** The server is built with any `Arc<dyn Storage>`:
+**Plugging in your own.** The broker is built with any `Arc<dyn Storage>`, and the server is built on the broker:
 
 ```rust
 let storage: Arc<dyn Storage> = Arc::new(MyRedisStorage::connect(url).await?);
-Server::from_settings(broker, &settings.server).await.with_storage(storage)
+let broker = SharedBroker::new(Broker::new(settings.broker.clone()), storage, log)?;
+let server = Server::from_settings(broker, &settings.server).await;
 ```
+
+`SharedBroker::new` refuses, with `Unsupported`, a `log.durability` stronger than the backend's `capabilities()`.
 
 Built-in backends are also selectable from config (section 9), so most operators never write code.
 
 ## 7. Built-in backends
 
-| Backend | Feature flag | Persistent | Max durability | For |
+| Backend | Built | Persistent | Max durability | For |
 |---|---|---|---|---|
-| `memory` | always | No | `none` | Tests, demos, pure replay buffer with no disk |
-| `file` | default | Yes | `synced` | The default: one binary, one directory |
-| `postgres` | `postgres` | Yes | `synced` | Operators who already run Postgres and want backups and replicas |
+| `memory` | Yes, always compiled | No | `none` | Tests, demos, pure replay buffer with no disk |
+| `file` | Yes, always compiled; the default backend | Yes | `synced` | The default: one binary, one directory |
+| `postgres` | No, proposed (step 5, parked) | Yes | `synced` | Operators who already run Postgres and want backups and replicas |
 
 ### 7.1 `memory`
 
@@ -202,6 +207,8 @@ Replaces `sled`. One directory per topic, holding **segment files** of records:
 - **The crash test** kills a child process with `SIGKILL` while it appends with `synced` durability, four rounds in one directory, and checks every confirmed record. It proves recovery from interrupted writes; it can't simulate a power loss.
 
 ### 7.3 `postgres`
+
+Not built. This is the proposed design for step 5, which is parked.
 
 ```sql
 CREATE TABLE popsub_records (
@@ -257,22 +264,22 @@ Ordering: per topic, every subscriber sees records in `seq` order, live and on r
 | `{"seq": 1200}` | That `seq`, or the first retained one if it was trimmed |
 | `"resume"` (default for sessions with a stored subscription) | One past the subscription's cursor |
 
-Replay is read from the log in pages and sent before live records, without gaps or overlaps between the two. As built, a subscription remembers the next `seq` it expects and is only ever sent that one; anything it misses (because it is replaying, or its window is full) is read back from the log by the topic's writer rather than buffered in memory. The client is first sent `{"type":"subscribed","topic":"chat","replay_from":41,"replay_to":90}`, so it knows which records are history.
+Replay is read from the log in pages and sent before live records, without gaps or overlaps between the two. As built, a subscription remembers the next `seq` it expects and is only ever sent that one; anything it misses (because it is replaying, or its window is full) is read back from the log by the topic's writer rather than buffered in memory. The client is first sent `{"type":"subscribed","topic":"chat","replay_from":41,"replay_to":90}`, so it knows which records are history. A `subscribe` that names a shared subscription `group` gets that `group` back in `subscribed`, and `replay_from` is then the group's position.
 
 If the requested start has already been trimmed, the subscriber gets `{"type":"truncated","topic":"chat","first_available":1300}` before the records, so it knows it missed something. **Retention always wins over slow subscribers**: storage stays bounded, and data loss is visible rather than silent.
 
 ### 8.3 Acknowledgement and retry
 
-- Deliveries become `{"type":"message","topic":"chat","seq":42,"message_id":"...","payload":"...","qos":1,"published_at_ms":...}`. This also fixes today's untagged delivery frames.
+- Deliveries become `{"type":"message","topic":"chat","seq":42,"message_id":"...","payload":"...","qos":1,"published_at_ms":...}`, plus `"encoding":"base64"` when the publisher marked the payload as base64. This also fixes today's untagged delivery frames.
 - A client acknowledges with `{"type":"ack","topic":"chat","seq":42}`. Acks are only accepted for records sent to that session, which closes today's "anyone can ack anything" gap.
 - The cursor advances to the highest contiguous acknowledged `seq`. Out-of-order acks above it are held in memory until the gap fills.
-- At most `max_inflight` unacknowledged records are outstanding per subscription. A record not acknowledged within `ack_timeout_ms` is resent, up to `max_retries`; after that, the subscription is reported to the client as `{"type":"stalled","topic":"chat","seq":42}` and delivery for it pauses until the client acks or resubscribes. (Today the message is silently dropped.)
+- At most `max_inflight` unacknowledged records are outstanding per subscription. A record not acknowledged within `ack_timeout_ms` is resent, up to `max_retries`; after that, the subscription is reported to the client as `{"type":"stalled","topic":"chat","seq":42}` and delivery for it pauses until the client acks or resubscribes. (Today the message is silently dropped.) As built, with `broker.dead_letter_topic` set, the record is instead copied to that topic, dropped from the subscription's window, and the subscription carries on (`docs/DESIGN.md` section 11).
 - QoS 0 records take no space in the window and need no ACK. They count as done once sent, so they move a durable session's cursor as soon as they go out. While the window is full, QoS 0 records wait too, to keep order.
 
 ### 8.4 Sessions
 
 - `auth` gains optional `session_id` and `clean_start` fields. Without `session_id`, the connection is ephemeral and behaves as today, except that deliveries are tagged.
-- With a `session_id`, subscriptions and cursors are stored and restored on reconnect, and replay defaults to `resume`. `clean_start: true` discards the stored subscriptions.
+- With a `session_id`, subscriptions and cursors are stored and restored on reconnect, and replay defaults to `resume`. `clean_start: true` discards the stored subscriptions. As built, `auth` also takes `hold_resumed: true`, which lists the stored subscriptions in `authenticated` (with `held` set) without attaching them; each stays stored until the client subscribes to it.
 - A session is bound to the authenticated username. Another user can't claim it.
 - Sessions not seen for `session_expiry_secs` are removed by a background task.
 
@@ -284,7 +291,7 @@ The server loads nothing up front. When a session reconnects, its subscriptions 
 
 ```toml
 [storage]
-backend = "file"            # memory | file | postgres
+backend = "file"            # memory | file
 path = "pubsub_data"        # file backend
 durability = "buffered"     # none | buffered | synced
 session_expiry_secs = 86400
@@ -294,8 +301,9 @@ max_messages = 1000
 max_age_secs = 3600
 max_bytes = 67108864
 
-[storage.postgres]
-url_env = "POPSUB_DATABASE_URL"   # read the URL from this variable, never from the file
+[[storage.topic_retention]]  # optional, per topic pattern; first match wins
+pattern = "metrics/#"
+max_age_secs = 600
 
 [broker]
 ack_timeout_ms = 5000
@@ -305,18 +313,19 @@ max_inflight = 100
 
 - `broker.message_ttl_secs` is replaced by `storage.retention.max_age_secs`, and the hard-coded `pubsub_db` path and 1000-message cap become settings.
 - Startup fails, rather than silently downgrading, if `durability` exceeds what the backend can provide.
-- Per-topic retention overrides are an open question (section 14).
+- Per-topic retention is implemented as `[[storage.topic_retention]]` entries. The first entry whose pattern matches a topic applies to it, and a limit an entry leaves out comes from `[storage.retention]`. A malformed pattern stops startup.
+- `postgres` is not an accepted `backend`, and there is no `[storage.postgres]` section, because that backend is not built. The proposal was a `[storage.postgres]` section with `url_env`, naming the environment variable that holds the database URL so it is never written in the file.
 
 ## 10. Failure handling
 
 | Failure | Behaviour |
 |---|---|
-| Append fails | QoS 1 publisher gets `{"type":"error","message":"storage unavailable"}` and no `published` frame, so it retries. QoS 0 is logged and dropped. |
+| Append fails | The failure is logged and nothing is delivered. The publisher gets an `error` frame with code `storage_unavailable` at either QoS, and a QoS 1 publisher gets no `published` frame, so it retries. |
 | Read fails during replay | Subscriber gets an error for that topic and is not subscribed, so it never receives live records with a gap before them. It can subscribe again. |
-| Cursor update fails | Logged and retried in the background. The worst case is resending records the client already acknowledged, which at-least-once allows. |
-| `file` finds a corrupt record mid-segment | Startup fails with the segment and offset, rather than serving data that failed its checksum. A repair command can truncate at that point. |
+| Cursor update fails | Logged, not retried. The cursor in memory still moves, and the next cursor write for that subscription stores the newer value. The worst case is resending records the client already acknowledged, which at-least-once allows. |
+| `file` finds a corrupt record mid-segment | Startup fails with the segment and offset, rather than serving data that failed its checksum. There is no repair command. |
 | Disk full | Appends fail as above. The server stays up and keeps delivering what is already stored. |
-| Postgres unreachable | Appends and cursor updates fail as above, and a health metric reports it. |
+| Postgres unreachable | Not applicable yet: the `postgres` backend is not built. As proposed, appends and cursor updates would fail as above, and a health metric would report it. |
 
 ## 11. Conformance suite
 
@@ -355,12 +364,12 @@ The `file` backend also gets a crash test: a child process appends with `synced`
 
 ## 12. Performance expectations
 
-To be measured, not assumed; the benchmarks will be published with the implementation.
+To be measured, not assumed. The implementation shipped without benchmarks; they are still planned (`docs/DESIGN.md` section 13).
 
 - `memory`: bounded by fan-out, not storage.
 - `file`, `buffered`: close to sequential write speed of the disk.
-- `file`, `synced`: limited by `fsync` latency, recovered by group commit; batch size and wait time are tunable.
-- `postgres`: a round trip per append; batching appends per topic is a later optimisation.
+- `file`, `synced`: limited by `fsync` latency, one flush per append. Group commit, which would share a flush across appends, is not built, so there is nothing to tune.
+- `postgres` (not built): a round trip per append; batching appends per topic is a later optimisation.
 
 Moving appends out of the broker lock (into per-topic writers) is itself expected to remove today's main contention point.
 
@@ -371,8 +380,8 @@ Stacked pull requests, each merged on its own with tests:
 1. **`popsub_storage` crate:** types, traits, `memory` backend, conformance suite. Nothing uses it yet.
 2. **Broker on the log:** per-topic writers, `seq` on every record, tagged `message` delivery frames, `subscribe` with `from`, `truncated` frames, the `[storage]` settings and the retention loop. Ephemeral connections only. Protocol change, documented in the README and design doc. Until step 4, the only backend is `memory`, so history no longer survives a restart.
 3. **Sessions and cursors:** `session_id` and `clean_start`, per-subscription in-flight windows, `ack` by `topic` and `seq`, `published` confirmations, `stalled` frames, and a `subscribed` reply carrying the replay range. Removes `pending_acks`. Tests for several subscribers, reconnects and acks from the wrong session.
-4. **`file` backend:** segments, index, recovery, group commit, crash test. Becomes the default.
-5. **`postgres` backend**, run against a real database in CI. Parked: client protocol work comes first.
+4. **`file` backend:** segments, index, recovery, group commit, crash test. Becomes the default. Shipped without the index files and without group commit (section 7.2, as built).
+5. **`postgres` backend**, run against a real database in CI. Not built. Parked: client protocol work comes first.
 6. **Remove `popsub_persistence` and `sled`.** Existing `pubsub_db` data is replay history only, so it is not migrated; the release notes say so.
 
 The delivery semantics table in `docs/DESIGN.md` section 6 is updated in PR 3, where the guarantees actually change.
@@ -381,7 +390,7 @@ The delivery semantics table in `docs/DESIGN.md` section 6 is updated in PR 3, w
 
 These were open questions in the proposal. Implementation goes ahead with the proposal's defaults; any of them can still change before the step that depends on it.
 
-1. **Per-topic retention:** one global policy for now. Overrides by topic pattern can be added later without changing the traits, because `trim` already takes the policy per call.
+1. **Per-topic retention:** one global policy at first. Overrides by topic pattern are now implemented (`[[storage.topic_retention]]`, section 9) without changing the traits, because `trim` already takes the policy per call.
 2. **Default for ephemeral subscribers:** `"new"`. This is a visible change from today's replay-everything behaviour and is called out in the README when it ships (step 2).
 3. **Slow subscribers versus retention:** retention wins, and the client is told with a `truncated` frame.
 4. **Payload type:** strings stay. The record format can move to bytes later as its own change.
