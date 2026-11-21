@@ -68,7 +68,7 @@ In place of `payload`, `"bytes": "AP8="` gives the body as base64: the driver de
 
 ### `ack`
 
-`{"id": 6, "op": "ack", "topic": "orders", "seq": 12}`. Acknowledges a message the driver reported earlier, through the library's own acknowledgement call on that message (manual mode). Responds `{"ok": true}`. Acknowledging a message the driver never reported is a `protocol` error.
+`{"id": 6, "op": "ack", "topic": "orders", "seq": 12}`. Acknowledges a message the driver reported earlier, through the library's own acknowledgement call on that message (manual mode). Responds `{"ok": true}`. The driver holds only QoS 1 messages for `ack`, and forgets one once it is acknowledged, so acknowledging a message the driver never reported, a QoS 0 message, or the same message a second time is a `protocol` error.
 
 ### `admin`
 
@@ -88,7 +88,7 @@ Events have no `id`: `{"event": "<name>", ...}`.
 
 | Event | Fields | When |
 |---|---|---|
-| `message` | `topic`, `seq`, `payload`, `bytes`, `message_id`, `qos` | The library handed a message to the application. `payload` is the payload string as it arrived; `bytes` is the message's bytes as the library's own accessor returns them, in base64 (for a text message, its UTF-8) |
+| `message` | `topic`, `seq`, `payload`, `bytes`, `message_id`, `qos` | The library handed a message to the application. `payload` is the payload string as it arrived; `bytes` is the message's bytes as the library's own accessor returns them, in base64 (for a text message, its UTF-8), or `null` when the accessor refuses the payload |
 | `subscription_ended` | `topic` | The application's subscription to the topic ended without the application asking (revoked access, or the client stopped) |
 | `connected` | `resumed`: topic list | A connection came up |
 | `disconnected` | `code`: close code or `null`, `reconnecting`: boolean | A connection went down |

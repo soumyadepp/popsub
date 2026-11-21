@@ -34,6 +34,15 @@ async fn main() -> Result<(), popsub_sdk::Error> {
 
 Bodies that aren't text go through `publish_bytes` and `publish_bytes_confirmed`, and come back through `Message::bytes`.
 
+Also on `Client` and `ClientConfig`:
+
+- `subscribe_shared(topic, group, from)` joins a shared subscription: the group's members split the topic's messages.
+- `subscribe` accepts a wildcard pattern (`orders/#`, `sensors/+/temp`) and yields every matching topic's messages, each under its own topic and `seq`.
+- `events()` reports connects, disconnects, truncations, stalls, token refreshes, subscriptions the server ended and server errors.
+- `admin()` sends the admin requests for accounts, grants and topics. They are never queued or resent.
+- `ack_mode(AckMode::Manual)` leaves acknowledging to the application, through `Message::ack`.
+- `add_root_certificates_pem` trusts a private CA for `wss://`.
+
 What the delivery guarantees are, and where they stop, is in the repository's [design document](https://github.com/soumyadepp/popsub/blob/main/docs/DESIGN.md). Version 0.x: the protocol and this API may still change between minor versions.
 
 Licensed under Apache-2.0.

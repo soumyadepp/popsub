@@ -5,9 +5,9 @@ The WebSocket protocol: every frame clients and the server exchange. The server 
 ## Files
 
 - `src/lib.rs`: `PROTOCOL_VERSION`, `RequestId` (a number or a string, echoed back in the same form), and the evolution rules.
-- `src/client.rs`: `ClientFrame` (an optional `id` plus a `ClientMessage`) and `StartFrom`.
+- `src/client.rs`: `ClientFrame` (an optional `id` plus a `ClientMessage`), `StartFrom`, `Encoding` (the `publish` payload encoding; `accepts` checks a payload against it), and the admin request types `RoleSpec`, `RoleKind`, `TopicGrant` and `Access`.
 - `src/close.rs`: `CloseCode`, the WebSocket close codes the server sends, with `should_reconnect`.
-- `src/server.rs`: `ServerFrame` (an optional `id` plus a `ServerMessage`), `ErrorCode`, `Limits`, and the structs inside frames (`Delivery`, `Subscribed`, `Truncated`, `Stalled`).
+- `src/server.rs`: `ServerFrame` (an optional `id` plus a `ServerMessage`), `ErrorCode`, `Limits`, and the structs inside frames (`Delivery`, `Subscribed`, `Truncated`, `Stalled`, and the admin replies' `UserInfo` and `TopicInfo`).
 - `src/topics.rs`: topic patterns (`matches_pattern`, `is_pattern`, `validate_pattern`), shared by the server crates and the Rust client.
 - `src/schema.rs` (feature `schema`): builds `docs/protocol/client.schema.json`, `server.schema.json` and `close-codes.json` from the types with `schemars`.
 - `src/tests.rs`: the exact JSON of every frame, plus (with `schema`) a check that the committed schema files match the types and that sample frames validate against them.

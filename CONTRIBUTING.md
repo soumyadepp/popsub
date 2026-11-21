@@ -23,22 +23,28 @@ make demo         # start a server, run the client against it, stop
 
 If a build runs out of memory, add `JOBS=2` to any target. If port 8080 is taken, use `make demo PORT=8090`.
 
+To work on a client library you also need its toolchain: Node 22 or newer for TypeScript, [uv](https://docs.astral.sh/uv/) with Python 3.10 or newer for Python, and Go 1.23 or newer for Go. Each client's README lists its commands. `make scenarios` runs the shared client scenario suite against the Rust client, and `make scenarios DRIVER="..."` against another.
+
 ## Making a change
 
 1. **Branch from `main`.** Name it for what it does: `feat/...`, `fix/...`, `docs/...` or `chore/...`.
 2. **Keep each pull request to one concern.** A refactor and a behaviour change are two pull requests. When one change depends on another that isn't merged yet, stack them: one pull request per step, each based on the one before, with the merge order in the description.
 3. **Write the failing test first** for a bug fix or a behaviour change, then make it pass. Tests should check behaviour (what a client sees, what the server stores), not implementation details.
-4. **Run `make ci`** before pushing. It runs exactly what CI runs: the format check, clippy with warnings as errors, every test, and the protocol schema check.
+4. **Run the checks** before pushing. `make ci` runs what the Rust CI workflow runs: the format check, clippy with warnings as errors, every test, and the protocol schema check. A change to a client library also runs that client's own checks and the scenario suite against it in CI (`.github/workflows/clients.yml`); run them locally first.
 
 ## What each kind of change must also update
 
 | If you change... | Also... |
 |---|---|
-| The protocol: any frame, field, error code or close code | Change the types in `popsub_protocol` and its exact-JSON tests, run `make schema` and commit `docs/protocol/`, update `docs/DESIGN.md` section 4 and the WebSocket tests, and the README's example session if it shows that frame. Within a protocol version, only add things: never remove, rename or change the meaning of a field, code or frame. |
+| The protocol: any frame, field, error code or close code | Change the types in `popsub_protocol` and its exact-JSON tests, run `make schema` and commit `docs/protocol/`, update `docs/DESIGN.md` section 4 and the WebSocket tests, and the README's example session if it shows that frame. The TypeScript, Python and Go clients write their protocol types by hand, so update them too. Within a protocol version, only add things: never remove, rename or change the meaning of a field, code or frame. |
 | Delivery behaviour: ordering, acknowledgements, retries, replay, sessions | Add a test that fails without your change, and update the guarantees table in `docs/DESIGN.md` section 6 and the README's **Delivery guarantees**. Never describe a guarantee more strongly than the code provides it. |
 | A setting | Add the field and its default in `popsub_config/src/settings.rs`, add it to `config/default.toml`, and document it in `docs/DESIGN.md` section 9. Security-related defaults stay closed (registration off, new users with no topics). |
 | Storage behaviour | Update `docs/STORAGE.md`. A new rule every backend must follow goes into the conformance suite in `popsub_storage/src/conformance.rs`. |
 | A storage backend | Run the conformance suite against it with `conformance_tests!`; every check must pass. |
+| How a client behaves (anything in `clients/README.md`) | Add a scenario to `crates/popsub_scenarios/src/scenarios.rs` that fails without the change, and update every client library and its driver so `make scenarios` passes for each. |
+| A metric | Add it in `popsub_utils::metrics` and to the table in `docs/DESIGN.md` section 3.3. |
+| A new crate | Give it `publish = false` unless it is meant for crates.io (see `docs/RELEASING.md`). |
+| Anything a user would notice | Add a line to `CHANGELOG.md` under the next version. |
 | A crate's structure or invariants | Update that crate's `CLAUDE.md`. These files are the maintainers' notes on each crate (and what coding assistants read), so they must stay accurate. |
 
 ## Code style
@@ -55,7 +61,7 @@ The full rules are in [`docs/STYLE.md`](docs/STYLE.md). In short:
 Before you push, this should print nothing:
 
 ```bash
-grep -rnE '^\s*//[^/!]' crates
+grep -rnE --include='*.rs' '^\s*//[^/!]' crates
 ```
 
 ## Pull requests

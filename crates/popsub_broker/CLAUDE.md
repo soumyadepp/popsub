@@ -10,7 +10,7 @@ Topic writers, the broker engine, replay, per-subscriber acknowledgement and dur
 - `src/engine.rs`: `Broker`, synchronous: clients, subscriptions, `deliver`, `send_records`, `skip_to`, `ack`, `retry_overdue` (resends per subscription, stalls after `max_retries`), session lookups, and `subscriptions_of_user` for ending subscriptions after an admin change.
 - `src/topic.rs`: `Topic` and each subscription's `DeliveryState` (`next_seq`, the in-flight window, stall, and the derived `cursor`), plus `CursorUpdate`.
 - `src/replay.rs`: `plan`, which turns a `StartFrom` and the log's bounds into a starting `seq` and whether to report a truncation. Pure, unit tested.
-- `src/frame.rs`: `delivery` (a stored record as a `message` frame) and `to_ws`. The frame types themselves come from `popsub_protocol`.
+- `src/frame.rs`: `delivery` (a stored record as a `message` frame), `to_ws`, and the public `close_message` (a close frame with a `CloseCode`). The frame types themselves come from `popsub_protocol`.
 - `src/tests.rs`: unit tests with `mpsc` channels as fake clients and `MemoryStorage` as the log and session store.
 
 - Wildcards: `Broker::add_pattern`/`remove_pattern`/`pattern_holders` track each client's patterns and which topics it joined through them (`PatternState`); `SharedBroker::join` subscribes without an id and marks the topic joined; `publish` calls `join_pattern_holders` after a topic's first record, which is what makes a concurrent pattern subscribe and first publish safe (the pattern is registered before topics are listed, and holders are read after the append). `set_authorizer` is how the transport's permission check gets in without the broker depending on auth.

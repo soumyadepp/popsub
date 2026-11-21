@@ -4,7 +4,7 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
 
 ## Files
 
-- `src/record.rs`: `NewRecord` (what a publisher sends), `Record` (what the log stores, with `seq`), `Subscription` (a session's cursor), `LogBounds`.
+- `src/record.rs`: `NewRecord` (what a publisher sends), `Record` (what the log stores, with `seq`), `Subscription` (a session's cursor), `LogBounds`, and `PayloadEncoding`, the optional `encoding` both records carry beside the payload string (never decoded; records stored before the field existed read back as `None`).
 - `src/storage.rs`: the `MessageLog`, `SubscriptionStore` and `Storage` traits, `Durability`, `Capabilities`, `Retention`.
 - `src/error.rs`: `StorageError` (`Unavailable`, `Corrupt`, `Unsupported`, `Other`) and `Result`.
 - `src/index.rs`: `LogIndex<T>`, the per-topic numbering, retry detection, publish-time and retention rules. Both backends use it; `T` is the whole record in memory and its disk location in the file backend.
@@ -17,6 +17,7 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
   - `codec.rs`: the `length | crc32 | body` frame.
   - `tests.rs`: the suite with 256-byte segments, and the recovery and damage tests.
 - `src/faulty.rs`: `FaultyStorage`, a wrapper that fails appends while switched on and passes everything else through. For tests of what breaks when storage does.
+- `src/tests.rs`: tests for the storage types, and the conformance suite run against `MemoryStorage`.
 - `tests/crash.rs`: the crash test, in its own test binary (see below).
 - `src/conformance.rs`: the `Fixture` trait, one public async check per rule, and the `conformance_tests!` macro. Compiled for this crate's tests and behind the `conformance` feature.
 
