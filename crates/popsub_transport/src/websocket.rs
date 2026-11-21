@@ -2073,7 +2073,8 @@ impl Session {
     ///         isn't the text itself. A payload that isn't valid in it is
     ///         refused with `bad_request`.
     ///     message_id: The publisher's idempotency key.
-    ///     qos: The delivery level, 0 or 1. Defaults to 0.
+    ///     qos: The delivery level, 0 or 1. Defaults to 0; any other value is
+    ///         refused with `bad_request`.
     ///
     /// Returns:
     ///     A closing flow when the client isn't authenticated, otherwise
@@ -2110,6 +2111,10 @@ impl Session {
                 ),
                 None,
             )?;
+            return Ok(Flow::Continue);
+        }
+        if qos.is_some_and(|qos| qos > 1) {
+            self.fail(id, ErrorCode::BadRequest, "qos must be 0 or 1", None)?;
             return Ok(Flow::Continue);
         }
         if encoding.is_some_and(|encoding| !encoding.accepts(&payload)) {

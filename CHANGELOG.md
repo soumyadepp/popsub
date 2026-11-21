@@ -2,6 +2,12 @@
 
 Each release lists what changed for people running the server and people using a client library. Versions follow [Semantic Versioning](https://semver.org); while the version is 0.x, a minor release may change the protocol or a library's API, and the notes say so.
 
+## [Unreleased]
+
+### Server
+
+- A `publish` with a `qos` other than 0 or 1 is refused with `bad_request`. It used to be stored and treated as QoS 0.
+
 ## [0.1.0] - 2026-11-20
 
 The first release.
