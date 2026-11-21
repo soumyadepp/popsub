@@ -34,7 +34,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["src/driver.ts", "test/**/*.ts"],
+    files: ["src/driver.ts", "test/**/*.ts", "examples/**/*.ts"],
     rules: {
       "no-console": "off",
     },

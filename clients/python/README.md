@@ -110,6 +110,8 @@ async def work(client: Client) -> None:
 
 `start_from` only decides where a group starts the first time it is used on a topic; after that the group's position is on the server.
 
+`examples/subscribe.py` and `examples/publish.py` are runnable versions of this, and [`examples/README.md`](../../examples/README.md) walks through running them against a local server.
+
 ## API
 
 Everything below is importable from `popsub`.

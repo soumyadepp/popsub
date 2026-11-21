@@ -30,6 +30,8 @@ async fn main() -> Result<(), popsub_sdk::Error> {
 }
 ```
 
+`cargo run -p popsub_sdk --example subscribe` and `--example publish` run the same thing against a local server; the repository's [`examples/README.md`](https://github.com/soumyadepp/popsub/blob/main/examples/README.md) walks through it.
+
 Bodies that aren't text go through `publish_bytes` and `publish_bytes_confirmed`, and come back through `Message::bytes`.
 
 Also on `Client` and `ClientConfig`:

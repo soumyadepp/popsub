@@ -123,6 +123,8 @@ while let Some(message) = orders.next().await {
 
 The client logs in, refreshes its token, and reconnects with backoff. It knows from the server's close code when not to reconnect, and resubscribes from the next message it expects. It resends confirmed publishes without duplicating them, acknowledges QoS 1 messages (automatically, or when you call `message.ack()`), and never hands you the same `(topic, seq)` twice within one client. `client.events()` tells you about disconnects, truncated history and stalled subscriptions.
 
+[`examples/`](examples) has a subscriber and a publisher for each client library, with a walkthrough that runs them against a local server.
+
 ## Use it from any language
 
 Client libraries for other languages live in [`clients/`](clients), each held to the same behaviour by one shared scenario suite (server restarts, dropped connections, duplicates, manual acks, revoked access). [`clients/README.md`](clients/README.md) says what every client must do.
