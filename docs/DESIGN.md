@@ -369,7 +369,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `broker.max_retries` | `5` | Retry loop. After this many resends the subscription stalls |
 | `broker.dead_letter_topic` | empty | Retry loop. Where a QoS 1 record is copied when a subscription runs out of retries for it; empty stalls the subscription instead |
 | `broker.max_inflight` | `100` | Window of unacknowledged QoS 1 records per subscription |
-| `storage.backend` | `file` | The binary. `file` or `memory`. `memory` keeps nothing on disk and only supports `storage.durability = "none"`, so it needs that set too, or the server refuses to start |
+| `storage.backend` | `file` | The binary. `file` or `memory`. `memory` keeps nothing on disk: it runs the default `storage.durability = "buffered"` as `none`, with a warning, and refuses `synced` |
 | `storage.path` | `pubsub_data` | The `file` backend's directory |
 | `storage.durability` | `buffered` | Topic writers. `none`, `buffered` or `synced`; refused at startup if the backend can't provide it |
 | `storage.session_expiry_secs` | `86400` | Session expiry loop. How long a durable session is kept after its last connection |

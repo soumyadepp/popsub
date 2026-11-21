@@ -25,7 +25,7 @@ use popsub_broker::{Broker, LogSettings, SharedBroker};
 use popsub_config::{Settings, StorageBackend, StorageSettings, load_config};
 use popsub_protocol::CloseCode;
 use popsub_sdk::{Client, ClientConfig, Credentials, StartFrom};
-use popsub_storage::{FileStorage, MemoryStorage, Storage};
+use popsub_storage::{Durability, FileStorage, MemoryStorage, Storage};
 use popsub_transport::{
     FileUserStore, Health, InMemoryUserStore, RateLimiters, Server, ServerTls, TrustedProxies,
     UserStore,
@@ -230,8 +230,14 @@ async fn run_server(
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let tls = open_tls(&config.server.tls_cert, &config.server.tls_key)?;
     let storage = open_storage(&config.storage).await?;
+    let durability = effective_durability(config.storage.backend, config.storage.durability);
+    if durability != config.storage.durability {
+        warn!(
+            "the memory backend keeps nothing on disk, so storage.durability = \"buffered\" runs as \"none\""
+        );
+    }
     let log = LogSettings {
-        durability: config.storage.durability,
+        durability,
         retention: config.storage.retention.to_retention(),
         session_expiry: Duration::from_secs(config.storage.session_expiry_secs),
     };
@@ -359,6 +365,26 @@ async fn open_storage(settings: &StorageSettings) -> Result<Arc<dyn Storage>, St
             );
             Ok(Arc::new(MemoryStorage::new()))
         }
+    }
+}
+
+/// Works out the durability to open the log with.
+///
+/// The `memory` backend keeps nothing on disk, so it runs the default
+/// `buffered` as `none` rather than refusing to start. Any other setting is
+/// used as given: an explicit `synced` with `memory` is still refused by
+/// `SharedBroker::new`, because it asks for records to survive a power cut.
+///
+/// Args:
+///     backend: `storage.backend`.
+///     requested: `storage.durability`.
+///
+/// Returns:
+///     The durability to use.
+fn effective_durability(backend: StorageBackend, requested: Durability) -> Durability {
+    match (backend, requested) {
+        (StorageBackend::Memory, Durability::Buffered) => Durability::None,
+        _ => requested,
     }
 }
 
@@ -493,3 +519,6 @@ fn trust(
     let pem = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
     Ok(config.add_root_certificates_pem(&pem)?)
 }
+
+#[cfg(test)]
+mod tests;
