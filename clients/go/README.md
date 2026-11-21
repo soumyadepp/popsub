@@ -41,6 +41,8 @@ for message := range orders.Messages() {
 }
 ```
 
+`examples/subscribe` and `examples/publish` are runnable versions of this, and [`examples/README.md`](../../examples/README.md) walks through running them against a local server.
+
 ## API
 
 | Call | What it does |

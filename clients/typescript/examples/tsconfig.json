@@ -1,0 +1,7 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "paths": { "popsub": ["../src/index.ts"] }
+  },
+  "include": ["."]
+}

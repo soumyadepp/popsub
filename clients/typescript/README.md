@@ -54,6 +54,8 @@ try {
 await client.close();
 ```
 
+`examples/subscribe.ts` and `examples/publish.ts` are runnable versions of this, and [`examples/README.md`](../../examples/README.md) walks through running them against a local server.
+
 ## API
 
 ### `Client`

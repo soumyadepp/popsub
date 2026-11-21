@@ -33,7 +33,7 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p examples/tsconfig.json",
     "lint": "eslint --max-warnings 0 .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

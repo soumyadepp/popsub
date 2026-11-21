@@ -61,13 +61,13 @@ filterwarnings = ["error"]
 [tool.mypy]
 strict = true
 python_version = "3.10"
-files = ["src", "tests"]
+files = ["src", "tests", "examples"]
 mypy_path = "src"
 
 [tool.ruff]
 target-version = "py310"
 line-length = 120
-src = ["src", "tests"]
+src = ["src", "tests", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "ASYNC", "PL", "D", "ANN", "N"]
