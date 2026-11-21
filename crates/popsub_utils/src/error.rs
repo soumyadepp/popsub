@@ -5,8 +5,8 @@ use thiserror::Error;
 /// Errors returned across PopSub crates.
 ///
 /// Variants marked `#[from]` convert automatically with `?`. `Config` wraps
-/// `config` 0.13 errors, while `popsub_config` uses `config` 0.15, so errors
-/// from the settings loader don't convert into it.
+/// `config` 0.15 errors, the same version `popsub_config` uses, so errors
+/// from the settings loader convert into it.
 #[derive(Error, Debug)]
 pub enum PopSubError {
     /// A value couldn't be encoded or decoded as JSON.

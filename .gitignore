@@ -34,3 +34,6 @@ cobertura.xml
 # Coverage output
 *.profraw
 cobertura.xml
+
+# Local environment overrides
+.env

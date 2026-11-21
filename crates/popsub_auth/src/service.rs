@@ -317,7 +317,9 @@ impl AuthService {
             .await
         {
             Ok(()) => info!(username = %pii(username), "created the default admin user"),
-            Err(e) => warn!("Failed to create default admin: {}", e),
+            Err(e) => {
+                warn!(username = %pii(username), error = e.kind(), "failed to create the default admin user")
+            }
         }
     }
 

@@ -9,7 +9,7 @@ A single-process WebSocket publish/subscribe broker in Rust, with users, per-top
 - **No rustdoc headings** (`# Arguments`, `# Errors`, `# Example`). Use `Example:` above a fenced block so doc tests still run.
 - **No slop.** No emoji in code or docs. No stock phrases such as "This ensures", "robust", "comprehensive", "seamless", "leverage", "production-ready", "for backward compatibility". No em or en dashes. Docstrings say specifically what the item does and why, never that it is good, and never just restate the name.
 - **Accurate over flattering.** Docs must match the code. If a guarantee is partial, say so.
-- Check before finishing: `grep -rnE '^\s*//[^/!]' crates` prints nothing, and every `.rs` file starts with `//!`.
+- Check before finishing: `grep -rnE --include='*.rs' '^\s*//[^/!]' crates` prints nothing, and every `.rs` file starts with `//!`.
 
 ## Commands
 
@@ -21,7 +21,8 @@ Use the Makefile. `make` lists everything.
 | End-to-end smoke test | `make demo PORT=8090` |
 | All tests | `make test` |
 | One crate | `make test-crate CRATE=popsub_broker` |
-| What CI runs | `make ci` (fmt check, clippy with `-D warnings`, tests) |
+| The Rust checks CI runs | `make ci` (fmt check, clippy with `-D warnings`, tests, schema check) |
+| Client scenario suite | `make scenarios` (the Rust client), or `make scenarios DRIVER="..."` for another |
 | Format | `make fmt` |
 | Wipe stored messages | `make reset-data` |
 
@@ -47,13 +48,13 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 
 Each crate has its own `CLAUDE.md` with its invariants and gotchas.
 
-Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then client and config, with storage and utils at the bottom. Never make a lower crate depend on a higher one. `popsub_protocol` sits beside them and is used by transport, broker and binary. The broker writes protocol frames to channels but must not know about sockets or the transport's types.
+Dependencies only point downwards: binary, then transport, then broker, auth and ratelimit, then client and config, with storage and utils at the bottom. Never make a lower crate depend on a higher one. `popsub_protocol` sits beside them and is used by the binary, transport, broker, auth, config, connection, the SDK and the scenarios. The broker writes protocol frames to channels but must not know about sockets or the transport's types.
 
 ## Conventions
 
 - Rust 2024 edition. Let-chains (`if let ... && let ...`) are used and fine.
 - `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` must pass. CI fails on any warning.
-- Unit tests live in a `tests.rs` module per crate, wired with `#[cfg(test)] mod tests;`. Transport has `websocket_tests.rs` for tests that start a real server on a free port via `portpicker`.
+- Unit tests live in a `tests.rs` module per crate, wired with `#[cfg(test)] mod tests;`. Transport has `websocket_tests.rs` for tests that start a real server on port 0 and pass the bound listener to `Server::serve`.
 - Errors go through `popsub_utils::error::PopSubError`. Don't add `unwrap()` on paths that handle client input.
 - Log with `tracing` and structured fields (`client_id = %id`), not `println!`. The CLI client in `crates/popsub` is the exception.
 - Never log passwords, tokens, payloads or raw frame text. Wrap every username, client address, rate limiter key and session id in `popsub_utils::pii::pii` as a field (`username = %pii(username)`), never inside the message text, and log auth errors as `e.kind()`, not `%e`. `crates/popsub_transport/tests/pii.rs` fails if a session's logs show any of them; extend it when you add a log path that handles identities.
@@ -76,12 +77,12 @@ Dependencies only point downwards: binary, then transport, then broker, auth and
 
 ## Gotchas
 
-- Deliveries, `subscribed`, `truncated` and `stalled` are written by the broker, not the transport, using the same `popsub_protocol::ServerFrame`.
-- A subscribe is answered by a `subscribed` frame from the broker, but a QoS 0 publish and an `ack` have no reply.
+- Deliveries, `subscribed`, `truncated` and `stalled` are written by the broker, not the transport, using the same `popsub_protocol::ServerFrame`. The exception is a wildcard subscribe: the transport replies to it with `subscribed` for the pattern itself (`Session::subscribe_pattern`), and the broker sends a `subscribed` with no id for each topic it joins.
+- A subscribe to a topic is answered by a `subscribed` frame from the broker, but a QoS 0 publish and an `ack` have no reply.
 - Connections get WebSocket pings. Test helpers that read frames must skip pings (`next_text` in `websocket_tests.rs` does), and a test client that stops reading for longer than the idle timeout will be closed.
 - Every close the server starts must go through `Flow::Close(CloseCode)` (or `close_message` in the broker), never a bare drop, so clients get a code. Tests that need a connection's earlier frames handled publish to a topic of their own and wait for it to come back (`settle` in `websocket_tests.rs`).
 - A wildcard subscription is server-side expansion, not a different kind of delivery: the broker records the pattern per connection and joins matching topics as ordinary per-topic subscriptions (`SharedBroker::join`), at subscribe time and when a topic gets its first record (`publish`, after the append, asking the transport's authorizer). Keep everything else per topic.
-- A shared subscription is one virtual subscriber per (topic, group), with id and storage key `$share/<group>` (`group_subscriber_id`), plus a `Group` listing its member connections and which member holds each unacknowledged record. Anything in the engine that looks up a subscriber's client must go through the group when there is one (`pick_member`, `send_to_subscriber`, `subscriber_outbox`); `self.clients.get(subscriber)` alone silently skips groups.
+- A shared subscription is one virtual subscriber per (topic, group), with id and storage key `$share/<username>/<group>` (`group_subscriber_id`), so a group belongs to one account, plus a `Group` listing its member connections and which member holds each unacknowledged record. Anything in the engine that looks up a subscriber's client must go through the group when there is one (`pick_member`, `send_to_subscriber`, `subscriber_outbox`); `self.clients.get(subscriber)` alone silently skips groups.
 - `auth` with `hold_resumed` lists a session's stored subscriptions without attaching them (`authenticated.held`); they stay in storage until the client subscribes. `SharedBroker::join` starts a pattern's topic from the session's stored cursor when there is one, and `SharedBroker::unsubscribe` forgets a stored subscription even when it was never attached. The client libraries always ask for the hold.
 - A payload is always a string. `encoding: "base64"` on `publish` marks a body that isn't text; the transport checks it with `Encoding::accepts`, and the broker and storage carry the string and its encoding (`PayloadEncoding`) without decoding. A record stored before the field existed reads back with no encoding.
 - Durable sessions are keyed by `session_key(username, session_id)`. Never key them by the client's `session_id` alone, or one user could attach to another's session.

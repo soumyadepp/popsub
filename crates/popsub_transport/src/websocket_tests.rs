@@ -938,6 +938,43 @@ async fn a_held_session_sends_nothing_until_the_client_subscribes() {
     );
 }
 
+/// Checks that a publish asking for a QoS other than 0 or 1 is refused with
+/// `bad_request` and stores nothing.
+#[tokio::test]
+async fn a_qos_other_than_zero_or_one_is_refused() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut ws = admin_connection(addr, &settings).await;
+
+    send_json(
+        &mut ws,
+        serde_json::json!({"type": "publish", "id": 1, "topic": "jobs", "payload": "x", "qos": 2}),
+    )
+    .await;
+    assert!(
+        matches!(
+            next_frame(&mut ws).await,
+            ServerMessage::Error {
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ),
+        "a qos of 2 should be refused"
+    );
+
+    send_json(
+        &mut ws,
+        serde_json::json!({"type": "publish", "id": 2, "topic": "jobs", "payload": "y", "qos": 1}),
+    )
+    .await;
+    match next_frame(&mut ws).await {
+        ServerMessage::Published { seq, .. } => {
+            assert_eq!(seq, 1, "the refused publish stored nothing")
+        }
+        other => panic!("expected published, got {other:?}"),
+    }
+}
+
 /// Checks that a publish with `encoding: "base64"` is delivered with the
 /// same payload and encoding, live and on replay, and that a payload that
 /// isn't valid base64 is refused with `bad_request` and stores nothing.

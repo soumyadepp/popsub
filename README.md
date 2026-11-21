@@ -2,7 +2,7 @@
 
 A publish/subscribe broker over WebSockets, written in Rust. One binary, a data directory, and a JSON protocol any language can speak.
 
-Every message gets a sequence number in its topic's log, so subscribers can replay history, resume where they left off after a disconnect or a server restart, and spot duplicates. QoS 1 messages are acknowledged per subscriber and retried until they are.
+Every message gets a sequence number in its topic's log, so subscribers can replay history, resume where they left off after a disconnect or a server restart, and spot duplicates. QoS 1 messages are acknowledged per subscriber and retried until they are, up to a limit, after which the subscription pauses or the message goes to a dead-letter topic.
 
 ```
 cargo run -p popsub -- server
@@ -18,7 +18,7 @@ cargo run -p popsub -- server
 - **Storage you choose.** A file backend (the default), an in-memory one, or your own through the `Storage` trait, held to a shared conformance suite.
 - **Users you can manage.** Create accounts, grant and revoke topic patterns, and disable or delete accounts with `popsub users` or the admin requests. Changes reach live connections at once: a revoke ends the subscriptions it no longer allows, and disabling an account disconnects it.
 - **Safe defaults.** Users with per-topic permissions, Argon2id passwords, JWTs, rate limits on logins, registration and publishing, size limits, heartbeats, and backpressure for slow readers.
-- **A Rust client** (`popsub_sdk`) that handles reconnection, resubscription and deduplication for you, and a JSON Schema for building clients in other languages.
+- **Client libraries for Rust, TypeScript, Python and Go** that handle login, reconnection, resubscription, acknowledgements and deduplication for you, each held to one shared scenario suite, and a JSON Schema for building clients in other languages.
 
 ## Install
 
@@ -31,7 +31,7 @@ cargo run -p popsub -- server
 | Python client | `pip install popsub` |
 | Go client | `go get github.com/soumyadepp/popsub/clients/go@v0.1.0` |
 
-The container listens on all interfaces, so the server refuses to start until you set your own JWT secret and admin password; the defaults are published. It keeps its data in the `/data` volume, serves the health endpoints on port 9090, and runs as an unprivileged user. Any setting can be passed as an environment variable (see [Configuration](#configuration)).
+The container listens on all interfaces, so the server refuses to start until you set your own JWT secret and admin password; the defaults are published. It keeps its data in the `/data` volume, serves the health endpoints on port 9090, and runs as an unprivileged user. Every setting except per-topic retention can be passed as an environment variable (see [Configuration](#configuration)).
 
 Version 0.x: the protocol and the client APIs may still change between minor versions. [`CHANGELOG.md`](CHANGELOG.md) lists what changed in each release.
 
@@ -157,12 +157,13 @@ Where to find the full protocol:
 |---|---|
 | QoS 0 | At most once, to subscribers connected when it is published. |
 | QoS 1 | At least once to every connected subscriber, independently. Each subscriber's acknowledgement clears only its own copy. A message that runs out of retries pauses that subscription and tells the client, instead of disappearing; or, with `broker.dead_letter_topic` set, is copied to that topic and the subscription carries on. |
-| Durable sessions | At least once across disconnects, restarts of the application and server restarts, as long as the session reconnects within `session_expiry_secs` and the messages are still retained. |
+| Durable sessions | At least once across disconnects and restarts of the application, as long as the session reconnects within `session_expiry_secs` and the messages are still retained, and across server restarts with the `file` backend (the default; with `memory` nothing survives a restart). A restarted application gets what it missed because the client libraries ask the server to hold the session's topics until it subscribes; a hand-written client must do the same (`hold_resumed`, see `docs/DESIGN.md` section 5.4). |
+| Shared subscriptions | At least once to the group as a whole: each message goes to one member, and one a member never acknowledges goes to another when that member disconnects, so a worker can see a repeat. No order across members. |
 | Ordering | Per topic, in `seq` order. A retry of an unacknowledged message can arrive after later ones. |
-| Duplicates | Possible, and always detectable by `(topic, seq)`. The Rust client drops them for you. |
+| Duplicates | Possible, and always detectable by `(topic, seq)`. The client libraries drop them for you. |
 | Retention | Each topic keeps `max_messages`, `max_age_secs` and `max_bytes` of history. A subscriber that asks for trimmed history is told with a `truncated` frame. |
 
-PopSub is a single process. There is no clustering or replication. For a production system that needs those today, use NATS or Redis Streams. PopSub is small enough to read end to end, and its guarantees are written down precisely.
+PopSub is a single process, with no clustering or replication, and it speaks its own JSON protocol over WebSocket rather than MQTT. It is aimed at small applications that want durable realtime messaging on one box, with guarantees written down precisely. If you need replication or high throughput today, use NATS JetStream or Kafka; for devices that only speak MQTT, use an MQTT broker such as Mosquitto or EMQX. What stands between PopSub and production use for small applications and IoT is listed in section 12 of [`docs/DESIGN.md`](docs/DESIGN.md#12-known-gaps-in-priority-order).
 
 ## Configuration
 
@@ -175,7 +176,7 @@ The settings you are most likely to change:
 | `server.host`, `server.port` | `127.0.0.1`, `8080` | Where to listen |
 | `server.jwt_secret`, `server.password` | published defaults | Change both before listening anywhere but `localhost`; the server refuses to start otherwise |
 | `server.allow_registration` | `false` | Let clients create accounts; `server.registration_role` decides what they may use |
-| `storage.backend` | `file` | `file` keeps history, sessions and user accounts in `storage.path` (`pubsub_data`); `memory` loses them on restart |
+| `storage.backend` | `file` | `file` keeps history, sessions and user accounts in `storage.path` (`pubsub_data`); `memory` loses them on restart, and runs the default durability as `none` |
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
 | `broker.dead_letter_topic` | none | Copy messages that run out of retries here and keep the subscription going, instead of pausing it |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
@@ -189,7 +190,7 @@ The settings you are most likely to change:
 | `telemetry.enabled`, `telemetry.sample_ratio` | `false`, `1.0` | Export metrics, traces and logs over OTLP; see [Metrics, traces and logs](#metrics-traces-and-logs) |
 | `server.health_address` | none | Serve `/healthz` and `/readyz` here, such as `0.0.0.0:9091` |
 | `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
-| `limits.*` | see section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
+| `limits.*` | see [`docs/DESIGN.md`](docs/DESIGN.md) section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
 
 Topics can keep different amounts of history:
 
@@ -342,12 +343,15 @@ admin.revoke("alice", "orders/#").await?;
 ```bash
 make            # list every target
 make test       # all tests
-make ci         # what CI runs: format check, clippy, tests, schema check
+make ci         # the Rust checks CI runs: format check, clippy, tests, schema check
+make scenarios  # the client scenario suite, against the Rust client by default
 make demo       # start a server, run the client against it, stop
 make schema     # regenerate docs/protocol/ after changing a protocol type
 ```
 
 Add `JOBS=2` to any target if a full build runs out of memory.
+
+The client libraries have their own checks, which CI also runs: `npm run check` in `clients/typescript`, `uv run ruff check . && uv run mypy && uv run pytest` in `clients/python`, and `make check` in `clients/go`. Each client's README has the details, and `make scenarios DRIVER="..."` runs the scenario suite against it.
 
 Releases are cut by pushing a version tag; [`docs/RELEASING.md`](docs/RELEASING.md) has the steps.
 

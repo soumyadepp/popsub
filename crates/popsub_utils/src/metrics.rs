@@ -37,8 +37,9 @@ pub struct Metrics {
     /// Connections turned away, by `reason`: `server_limit`, `address_limit`,
     /// `handshake`, `tls` or `proxy_header`.
     pub connections_refused: Counter<u64>,
-    /// Connections ended, by `reason`: a close code's reason, `client` when
-    /// the client closed it, or `dropped` when it went away without a close.
+    /// Connections ended, by `reason`: the reason of the close code the server
+    /// sent, or `client` for every other ending (the client closed it, or the
+    /// connection dropped).
     pub connections_closed: Counter<u64>,
     /// Login attempts, by `outcome`: `success`, `invalid_credentials` or `locked_out`.
     pub logins: Counter<u64>,

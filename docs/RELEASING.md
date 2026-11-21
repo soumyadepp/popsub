@@ -21,6 +21,8 @@ The last job, `verify`, asks each registry for the new version (the two crates, 
 
 ## The first release (0.1.0)
 
+Done for this repository on 2026-11-20. The steps stay here for reference, and for anyone setting the pipeline up again, such as on a fork or a new registry. For a release now, see "Every later release" below.
+
 Do this once, in this order. Allow about an hour. You need accounts on crates.io (signed in with GitHub, with a verified email address under https://crates.io/settings/profile, or it refuses to publish), npmjs.com with two-factor authentication on (https://www.npmjs.com/settings/~/tfa, set to cover writes, or it refuses with E403), and pypi.org.
 
 ### 1. Merge the release pipeline

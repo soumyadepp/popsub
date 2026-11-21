@@ -8,7 +8,7 @@ Authentication and authorization module for PopSub.
 - **Password Hashing**: Argon2id hashes with a random salt per password
 - **Role-Based Access Control (RBAC)**: Subscribe and publish flags per topic pattern
 - **Wildcard Topic Patterns**: MQTT-style wildcards (`+` and `#`) in topic grants
-- **Pluggable User Storage**: A `UserStore` trait, with an in-memory store by default
+- **Pluggable User Storage**: A `UserStore` trait, with an in-memory store, a JSON file store (`FileUserStore`, which the `popsub` server uses) and an optional PostgreSQL store
 
 ## Architecture
 
@@ -147,7 +147,7 @@ let auth_service = AuthService::with_store(AuthConfig::default(), my_store).awai
 
 ### Implementing a Custom Store
 
-Implement the `UserStore` trait for your database:
+Implement the `UserStore` trait for your database. Each method is one query against your users table: look an account up, insert, update or delete one, check one exists, list the usernames, and count them.
 
 ```rust
 use async_trait::async_trait;
@@ -162,37 +162,30 @@ pub struct PostgresUserStore {
 #[async_trait]
 impl UserStore for PostgresUserStore {
     async fn get_user(&self, username: &str) -> Result<Option<User>> {
-        // Query: SELECT * FROM users WHERE username = $1
         todo!()
     }
 
     async fn add_user(&self, user: User) -> Result<()> {
-        // Query: INSERT INTO users (username, password_hash, role, ...) VALUES (...)
         todo!()
     }
 
     async fn update_user(&self, user: User) -> Result<()> {
-        // Query: UPDATE users SET ... WHERE username = $1
         todo!()
     }
 
     async fn remove_user(&self, username: &str) -> Result<bool> {
-        // Query: DELETE FROM users WHERE username = $1
         todo!()
     }
 
     async fn user_exists(&self, username: &str) -> Result<bool> {
-        // Query: SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)
         todo!()
     }
 
     async fn list_usernames(&self) -> Result<Vec<String>> {
-        // Query: SELECT username FROM users
         todo!()
     }
 
     async fn user_count(&self) -> Result<usize> {
-        // Query: SELECT COUNT(*) FROM users
         todo!()
     }
 }
@@ -203,6 +196,7 @@ impl UserStore for PostgresUserStore {
 | Backend    | Status      | Notes                             |
 | ---------- | ----------- | --------------------------------- |
 | In-Memory  | Built in    | Default, for development and tests |
+| JSON file  | Built in    | `FileUserStore::open(path)`, one file written atomically; the `popsub` server keeps `users.json` in its storage directory |
 | PostgreSQL | Built in    | `PostgresUserStore`, behind the `postgres` feature |
 | SQLite     | Example     | Implement with `rusqlite`         |
 | Redis      | Example     | Implement with `redis-rs`         |

@@ -7,7 +7,7 @@
 | Python 3.10+ | [`clients/python`](python) | Passes the scenario suite |
 | Go 1.23+ | [`clients/go`](go) | Passes the scenario suite |
 
-Each client's README covers installing it, its API, and its own checks. CI (`.github/workflows/clients.yml`) runs every client's lint, type check and tests and the whole scenario suite against it, on the oldest and newest language versions it supports.
+Each client's README covers installing it, its API, and its own checks. In CI, `.github/workflows/rust.yml` checks the Rust client on stable Rust, and its tests run the whole scenario suite against it (`crates/popsub_scenarios/tests/rust_sdk.rs`). `.github/workflows/clients.yml` runs the lint, type check, tests and the whole scenario suite for TypeScript on Node 22 and 24, Python on 3.10 and 3.13, and Go on 1.23 and the latest stable release (staticcheck on stable only).
 
 | Client | Driver command, from the repository root |
 |---|---|
@@ -70,7 +70,7 @@ A server that doesn't know `hold_resumed` ignores it, answers without `held`, an
 
 **Shared subscriptions**
 
-- Subscribing with a `group` joins a shared subscription: the client receives only some of the topic's messages (other members get the rest), not in strict `seq` order.
+- Subscribing with a `group` joins a shared subscription: the client receives only some of the topic's messages (other members get the rest), not in strict `seq` order. A group belongs to the account the client logs in as, so the members of one group share an account.
 - So a shared subscription doesn't use a next expected `seq`. The client remembers the `seq`s it has handed to the application (a bounded set is enough) and treats a repeat as a duplicate, with the usual re-acknowledge rule. `subscribed.replay_from` and `truncated` don't move anything.
 - After reconnecting, rejoin with the same `group` and `from: "resume"`; the group's position is on the server. A shared subscription is never in `authenticated.resumed`.
 - Acknowledgements, manual or automatic, work as for any subscription.
