@@ -25,11 +25,11 @@ cargo run -p popsub -- server
 | What | How |
 |---|---|
 | Server, prebuilt | Download a `.tar.gz` for Linux (x86_64, aarch64) or macOS (Apple silicon) from [Releases](https://github.com/soumyadepp/popsub/releases), check it against its `.sha256`, and run `./popsub server` |
-| Server, container | `docker run -p 8080:8080 -v popsub-data:/data -e SERVER__JWT_SECRET=... -e SERVER_PASSWORD=... ghcr.io/soumyadepp/popsub:0.1` |
+| Server, container | `docker run -p 8080:8080 -v popsub-data:/data -e SERVER__JWT_SECRET=... -e SERVER_PASSWORD=... ghcr.io/soumyadepp/popsub:0.2` |
 | Rust client | `cargo add popsub_sdk` |
 | TypeScript client | `npm install popsub` |
 | Python client | `pip install popsub` |
-| Go client | `go get github.com/soumyadepp/popsub/clients/go@v0.1.0` |
+| Go client | `go get github.com/soumyadepp/popsub/clients/go@latest` |
 
 The container listens on all interfaces, so the server refuses to start until you set your own JWT secret and admin password; the defaults are published. It keeps its data in the `/data` volume, serves the health endpoints on port 9090, and runs as an unprivileged user. Every setting except per-topic retention can be passed as an environment variable (see [Configuration](#configuration)).
 

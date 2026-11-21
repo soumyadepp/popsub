@@ -6,7 +6,7 @@ The client handles what every application would otherwise write itself: logging 
 
 ```toml
 [dependencies]
-popsub_sdk = "0.1"
+popsub_sdk = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
