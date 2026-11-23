@@ -37,3 +37,8 @@ cobertura.xml
 
 # Local environment overrides
 .env
+node_modules
+
+# Website build output
+web/dist/
+web/.astro/

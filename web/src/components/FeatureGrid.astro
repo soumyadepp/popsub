@@ -1,0 +1,115 @@
+---
+/**
+ * The home page's feature tiles. Each line restates what the README promises, no more.
+ */
+import { Icon } from "@astrojs/starlight/components";
+
+const features = [
+  {
+    icon: "list-format",
+    title: "Topic logs",
+    text: "Every message gets a sequence number in its topic's log. Subscribers replay history, resume after a disconnect or a server restart, and spot duplicates.",
+  },
+  {
+    icon: "random",
+    title: "Durable sessions",
+    text: "Name a session when you connect, and your subscriptions and acknowledgement positions survive disconnects and server restarts.",
+  },
+  {
+    icon: "approve-check-circle",
+    title: "QoS 0 and QoS 1",
+    text: "QoS 1 is at-least-once per subscriber. A message that runs out of retries pauses that subscription, or goes to a dead-letter topic if you set one.",
+  },
+  {
+    icon: "puzzle",
+    title: "Wildcards and groups",
+    text: "Subscribe to orders/# or sensors/+/temp, or share a topic across a group of workers so each message goes to one of them.",
+  },
+  {
+    icon: "padlock",
+    title: "Users and permissions",
+    text: "Per-topic grants, Argon2id passwords, JWTs and rate limits. Change accounts on a running server, and live connections follow at once.",
+  },
+  {
+    icon: "seti:json",
+    title: "Four client libraries",
+    text: "Rust, TypeScript, Python and Go handle login, reconnection, resubscription, acknowledgements and deduplication, each held to one shared scenario suite.",
+  },
+] as const;
+---
+
+<div class="grid not-content">
+  {
+    features.map((f) => (
+      <article class="tile">
+        <span class="icon">
+          <Icon name={f.icon} size="1.25rem" />
+        </span>
+        <h3>{f.title}</h3>
+        <p>{f.text}</p>
+      </article>
+    ))
+  }
+</div>
+
+<style>
+  .grid {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 40rem) {
+    .grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+  @media (min-width: 64rem) {
+    .grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .tile {
+    position: relative;
+    padding: 1.5rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 1rem;
+    background: linear-gradient(180deg, var(--sl-color-gray-6), transparent 140%);
+    transition:
+      transform 0.2s ease,
+      border-color 0.2s ease,
+      box-shadow 0.2s ease;
+  }
+  .tile:hover {
+    transform: translateY(-3px);
+    border-color: color-mix(in srgb, var(--sl-color-accent) 55%, var(--sl-color-hairline));
+    box-shadow: 0 18px 40px -24px color-mix(in srgb, var(--sl-color-accent) 70%, transparent);
+  }
+  .icon {
+    display: inline-grid;
+    place-items: center;
+    width: 2.4rem;
+    height: 2.4rem;
+    border-radius: 0.75rem;
+    color: var(--sl-color-accent-high);
+    background: color-mix(in srgb, var(--sl-color-accent) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--sl-color-accent) 35%, transparent);
+  }
+  h3 {
+    margin: 1rem 0 0.4rem;
+    font-size: var(--sl-text-lg);
+    color: var(--sl-color-white);
+  }
+  p {
+    margin: 0;
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+    line-height: 1.6;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .tile,
+    .tile:hover {
+      transition: none;
+      transform: none;
+    }
+  }
+</style>

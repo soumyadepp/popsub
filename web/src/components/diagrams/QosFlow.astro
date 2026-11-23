@@ -1,0 +1,146 @@
+---
+/**
+ * A QoS 1 message from publish to acknowledgement: the server stores it, confirms it to the
+ * publisher and delivers it, then either gets an ack or resends it until the subscription stalls.
+ */
+const col = { pub: 100, server: 380, sub: 660 };
+const top = 44;
+const bottom = 334;
+
+type Arrow = { from: number; to: number; y: number; label: string; kind?: string };
+const arrows: Arrow[] = [
+  { from: col.pub, to: col.server, y: 80, label: "publish, qos 1" },
+  { from: col.server, to: col.pub, y: 152, label: "published, seq 42" },
+  { from: col.server, to: col.sub, y: 152, label: "message #42" },
+  { from: col.sub, to: col.server, y: 198, label: "ack #42", kind: "ack" },
+  { from: col.server, to: col.sub, y: 284, label: "resent every 5 s, up to 5 times", kind: "retry" },
+  { from: col.server, to: col.sub, y: 322, label: "stalled #42", kind: "stall" },
+];
+const head = (a: Arrow) => {
+  const dir = a.to > a.from ? 1 : -1;
+  const tip = a.to - dir * 2;
+  return `M${tip - dir * 9} ${a.y - 5} L${tip} ${a.y} L${tip - dir * 9} ${a.y + 5} Z`;
+};
+---
+
+<figure class="diagram not-content">
+  <div class="scroll">
+    <svg viewBox={`0 0 760 ${bottom + 10}`} role="img" aria-labelledby="qos-flow-title">
+      <title id="qos-flow-title">
+        A publisher sends a QoS 1 publish. The server stores it as message 42, replies published
+        with seq 42, and sends the message to the subscriber. The subscriber acknowledges it. If
+        no acknowledgement arrives, the server resends it every five seconds, up to five times,
+        and then tells the subscriber the subscription has stalled.
+      </title>
+
+      {
+        Object.entries({ publisher: col.pub, server: col.server, subscriber: col.sub }).map(([name, x]) => (
+          <g class="actor">
+            <rect x={x - 62} y="6" width="124" height="30" rx="7" />
+            <text x={x} y="26">{name}</text>
+            <line x1={x} x2={x} y1={top - 8} y2={bottom} />
+          </g>
+        ))
+      }
+
+      <g class="store">
+        <rect x={col.server - 62} y="100" width="124" height="30" rx="6" />
+        <text x={col.server} y="120">stored as #42</text>
+      </g>
+
+      <line class="divider" x1={col.server + 12} x2={col.sub + 60} y1="222" y2="222" />
+      <text class="aside" x={(col.server + col.sub) / 2} y="244">if no ack arrives</text>
+
+      {
+        arrows.map((a) => (
+          <g class:list={["arrow", a.kind]}>
+            <line x1={a.from} x2={a.to} y1={a.y} y2={a.y} />
+            <path d={head(a)} />
+            <text x={(a.from + a.to) / 2} y={a.y - 9}>{a.label}</text>
+          </g>
+        ))
+      }
+    </svg>
+  </div>
+</figure>
+
+<style>
+  .diagram {
+    margin: 1.75rem 0;
+    padding: 1.25rem 1.25rem 0.75rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.75rem;
+    background: var(--sl-color-gray-7, var(--sl-color-black));
+  }
+  .scroll {
+    overflow-x: auto;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    min-width: 34rem;
+    height: auto;
+    font-family: var(--sl-font-mono);
+  }
+  text {
+    font-size: 13.5px;
+    text-anchor: middle;
+    fill: var(--sl-color-gray-2);
+  }
+  .actor rect {
+    fill: var(--sl-color-gray-6);
+    stroke: var(--sl-color-gray-4);
+  }
+  .actor text {
+    fill: var(--sl-color-white);
+  }
+  .actor line {
+    stroke: var(--sl-color-gray-5);
+    stroke-dasharray: 3 4;
+  }
+  .store rect {
+    fill: var(--sl-color-bg);
+    stroke: var(--sl-color-accent);
+  }
+  .store text {
+    fill: var(--sl-color-white);
+    font-size: 12.5px;
+  }
+  .arrow line {
+    stroke: var(--sl-color-gray-2);
+    stroke-width: 1.5;
+  }
+  .arrow path {
+    fill: var(--sl-color-gray-2);
+  }
+  .arrow.ack line {
+    stroke: var(--sl-color-accent);
+    stroke-width: 2;
+  }
+  .arrow.ack path,
+  .arrow.ack text {
+    fill: var(--sl-color-accent);
+  }
+  .arrow.retry line {
+    stroke: var(--sl-color-gray-3);
+    stroke-dasharray: 5 4;
+  }
+  .arrow.retry path,
+  .arrow.retry text,
+  .arrow.stall path,
+  .arrow.stall text {
+    fill: var(--sl-color-gray-3);
+  }
+  .arrow.stall line {
+    stroke: var(--sl-color-gray-3);
+  }
+  .divider {
+    stroke: var(--sl-color-hairline);
+  }
+  .aside {
+    font-size: 11.5px;
+    fill: var(--sl-color-gray-3);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+</style>

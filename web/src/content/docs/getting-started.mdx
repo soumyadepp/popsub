@@ -1,0 +1,230 @@
+---
+title: Get started
+description: Run a PopSub server, create an account, subscribe from TypeScript, Python, Go or Rust, and watch a stopped subscriber catch up on what it missed.
+---
+
+import { Aside, Code, Steps, Tabs, TabItem } from "@astrojs/starlight/components";
+import jsExample from "../../snippets/example.mjs?raw";
+import pyExample from "../../snippets/example.py?raw";
+import goExample from "../../snippets/main.go?raw";
+import rsExample from "../../snippets/main.rs?raw";
+
+In about five minutes you'll run a server, create an account, subscribe from the language you
+use, and see a subscriber that was stopped pick up every message it missed.
+
+<Aside>
+  Everything below uses port 8080. If something else already uses it, start the server with
+  `SERVER_PORT=8090` (with Docker, `-p 8090:8080`), and use `ws://127.0.0.1:8090` in the code
+  and add `--url ws://127.0.0.1:8090` to the `popsub` commands.
+</Aside>
+
+<Steps>
+
+1. **Start a server.** Pick one way and keep it running in its own terminal.
+
+    <Tabs syncKey="server">
+      <TabItem label="Download">
+        Download the archive for your machine and its checksum from
+        [Releases](https://github.com/soumyadepp/popsub/releases). This is macOS on Apple
+        silicon; for Linux, use `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`, and
+        `sha256sum -c` instead of `shasum -a 256 -c`.
+
+        ```bash
+        curl -LO https://github.com/soumyadepp/popsub/releases/download/v0.2.0/popsub-0.2.0-aarch64-apple-darwin.tar.gz
+        curl -LO https://github.com/soumyadepp/popsub/releases/download/v0.2.0/popsub-0.2.0-aarch64-apple-darwin.tar.gz.sha256
+        shasum -a 256 -c popsub-0.2.0-aarch64-apple-darwin.tar.gz.sha256
+        tar -xzf popsub-0.2.0-aarch64-apple-darwin.tar.gz
+        cd popsub-0.2.0-aarch64-apple-darwin
+        ./popsub server
+        ```
+
+        It listens on `127.0.0.1:8080` and creates the admin account `admin` with the password
+        `password`. Those published defaults are only accepted on `localhost`.
+      </TabItem>
+      <TabItem label="Docker">
+        The container listens on all interfaces, so it refuses to start with the published
+        defaults. Give it your own JWT secret and admin password:
+
+        ```bash
+        docker run --name popsub -p 8080:8080 -v popsub-data:/data \
+          -e SERVER__JWT_SECRET="$(openssl rand -hex 32)" \
+          -e SERVER_PASSWORD=choose-an-admin-password \
+          ghcr.io/soumyadepp/popsub:0.2
+        ```
+
+        The admin account is `admin`, with the password you chose. Data lives in the
+        `popsub-data` volume.
+      </TabItem>
+      <TabItem label="From source">
+        You need Rust 1.89 or newer.
+
+        ```bash
+        git clone https://github.com/soumyadepp/popsub.git
+        cd popsub
+        make server
+        ```
+
+        It listens on `127.0.0.1:8080` and creates the admin account `admin` with the password
+        `password`. Those published defaults are only accepted on `localhost`.
+      </TabItem>
+    </Tabs>
+
+2. **Create an account.** In a second terminal, in the same folder, create `alice`, allowed to
+   publish and subscribe to every topic under `orders/`. The admin's password comes from
+   `POPSUB_PASSWORD` and the new account's from `POPSUB_NEW_PASSWORD`; leave either out and
+   `popsub` asks for it without echoing what you type.
+
+    <Tabs syncKey="server">
+      <TabItem label="Download">
+        ```bash
+        POPSUB_PASSWORD=password POPSUB_NEW_PASSWORD=alice-password \
+          ./popsub users add alice --topic 'orders/#'
+        ```
+      </TabItem>
+      <TabItem label="Docker">
+        ```bash
+        docker exec -e POPSUB_PASSWORD=choose-an-admin-password \
+          -e POPSUB_NEW_PASSWORD=alice-password \
+          popsub popsub users add alice --topic 'orders/#'
+        ```
+      </TabItem>
+      <TabItem label="From source">
+        ```bash
+        POPSUB_PASSWORD=password POPSUB_NEW_PASSWORD=alice-password \
+          cargo run -p popsub -- users add alice --topic 'orders/#'
+        ```
+      </TabItem>
+    </Tabs>
+
+    It prints the new account:
+
+    ```text
+    Name:    alice
+    Role:    user
+    Enabled: yes
+    Topics:  orders/#:both
+    ```
+
+3. **Run a subscriber.** In a third terminal, set up a project in your language and save the
+   example as shown. It logs in as `alice` with a session called `orders-worker`, subscribes
+   to every topic under `orders/`, publishes one message, and prints everything that arrives.
+
+    <Tabs syncKey="lang">
+      <TabItem label="TypeScript">
+        Node 22 or newer.
+
+        ```bash
+        mkdir popsub-try && cd popsub-try
+        npm init -y
+        npm install popsub
+        ```
+
+        Save this as `example.mjs` and run `node example.mjs`:
+
+        <Code code={jsExample} lang="js" title="example.mjs" />
+      </TabItem>
+      <TabItem label="Python">
+        Python 3.10 or newer.
+
+        ```bash
+        mkdir popsub-try && cd popsub-try
+        python3 -m venv .venv && . .venv/bin/activate
+        pip install popsub
+        ```
+
+        Save this as `example.py` and run `python example.py`:
+
+        <Code code={pyExample} lang="python" title="example.py" />
+      </TabItem>
+      <TabItem label="Go">
+        Go 1.23 or newer.
+
+        ```bash
+        mkdir popsub-try && cd popsub-try
+        go mod init example.com/popsub-try
+        go get github.com/soumyadepp/popsub/clients/go@latest
+        ```
+
+        Save this as `main.go` and run `go run .`:
+
+        <Code code={goExample} lang="go" title="main.go" />
+      </TabItem>
+      <TabItem label="Rust">
+        ```bash
+        cargo new popsub-try && cd popsub-try
+        cargo add popsub_sdk
+        cargo add tokio --features macros,rt-multi-thread
+        ```
+
+        Replace `src/main.rs` with this and run `cargo run`:
+
+        <Code code={rsExample} lang="rust" title="src/main.rs" />
+      </TabItem>
+    </Tabs>
+
+    On a new server it prints its own message, then waits:
+
+    ```text
+    orders/42 #1: order 42 shipped
+    ```
+
+    `#1` is the message's sequence number in the topic `orders/42`. Every topic numbers its
+    messages 1, 2, 3 and so on.
+
+4. **Publish from somewhere else.** Back in the second terminal, the `popsub client` command
+   logs in, subscribes to a topic, publishes `Hello from popsub client` to it and exits.
+
+    <Tabs syncKey="server">
+      <TabItem label="Download">
+        ```bash
+        ./popsub client --username alice --password alice-password --topic orders/cli
+        ```
+      </TabItem>
+      <TabItem label="Docker">
+        ```bash
+        docker exec popsub popsub client --username alice --password alice-password --topic orders/cli
+        ```
+      </TabItem>
+      <TabItem label="From source">
+        ```bash
+        cargo run -p popsub -- client --username alice --password alice-password --topic orders/cli
+        ```
+      </TabItem>
+    </Tabs>
+
+    Your subscriber prints it straight away, because `orders/cli` matches `orders/#`:
+
+    ```text
+    orders/cli #1: Hello from popsub client
+    ```
+
+5. **Watch it catch up.** Stop the subscriber with Ctrl+C. Run the `popsub client` command
+   from step 4 twice more, then start the subscriber again. It prints the two messages it
+   missed, in order, then the new one it publishes itself:
+
+    ```text
+    orders/cli #2: Hello from popsub client
+    orders/cli #3: Hello from popsub client
+    orders/42 #2: order 42 shipped
+    ```
+
+    That's the durable session at work. The server kept `orders-worker`'s place in each topic
+    it had joined, so `orders/cli` carried on from `#2` and `orders/42` didn't repeat `#1`. The
+    example subscribes from `seq` 1, which only matters for topics the session hasn't joined
+    yet: a topic created while it was stopped is read from its first message, so that isn't
+    missed either. A session survives disconnects and server restarts, as long as it comes back
+    within a day and the messages are still kept, which by default is the last 1,000 per topic
+    for up to an hour.
+
+</Steps>
+
+## Where to go next
+
+- [`examples/`](https://github.com/soumyadepp/popsub/tree/main/examples) has a separate
+  subscriber and publisher for each language.
+- The [README](https://github.com/soumyadepp/popsub#readme) covers configuration, TLS,
+  running behind a proxy, health checks and managing users.
+- [`docs/DESIGN.md`](https://github.com/soumyadepp/popsub/blob/main/docs/DESIGN.md) describes
+  the protocol and every delivery guarantee precisely, and
+  [`docs/protocol/`](https://github.com/soumyadepp/popsub/tree/main/docs/protocol) has a JSON
+  Schema for every frame, for writing a client in another language.

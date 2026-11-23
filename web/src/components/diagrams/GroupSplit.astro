@@ -1,0 +1,117 @@
+---
+/**
+ * A shared subscription: two workers in the group `workers` split a topic's messages between
+ * them, while a subscriber outside the group still gets every message.
+ */
+const topic = { x: 20, y: 96, w: 180, h: 40 };
+const boxX = 470;
+const boxW = 150;
+const chip0 = boxX + boxW + 26;
+const rows = [
+  { name: "worker A", y: 42, seqs: [1, 3] },
+  { name: "worker B", y: 102, seqs: [2, 4] },
+  { name: "dashboard", y: 186, seqs: [1, 2, 3, 4], outside: true },
+];
+const startX = topic.x + topic.w;
+const startY = topic.y + topic.h / 2;
+const curve = (y: number) => {
+  const cy = y + 18;
+  return `M${startX} ${startY} C${startX + 110} ${startY} ${boxX - 110} ${cy} ${boxX} ${cy}`;
+};
+---
+
+<figure class="diagram not-content">
+  <div class="scroll">
+    <svg viewBox="0 0 760 236" role="img" aria-labelledby="group-split-title">
+      <title id="group-split-title">
+        Messages 1 to 4 on orders/jobs. Worker A and worker B are in the group workers: A gets 1
+        and 3, B gets 2 and 4. A dashboard subscribed outside the group gets all four.
+      </title>
+      <rect class="group" x={boxX - 22} y="8" width="300" height="152" rx="10" />
+      <text class="group-label" x={boxX - 8} y="28">group "workers"</text>
+
+      {rows.map((r) => <path class:list={["link", { outside: r.outside }]} d={curve(r.y)} />)}
+
+      <g class="topic">
+        <rect x={topic.x} y={topic.y} width={topic.w} height={topic.h} rx="7" />
+        <text x={topic.x + topic.w / 2} y={topic.y + 25}>orders/jobs</text>
+      </g>
+
+      {
+        rows.map((r) => (
+          <g>
+            <g class="box">
+              <rect x={boxX} y={r.y} width={boxW} height="36" rx="7" />
+              <text x={boxX + boxW / 2} y={r.y + 23}>{r.name}</text>
+            </g>
+            {r.seqs.map((s, i) => (
+              <g class="chip">
+                <circle cx={chip0 + i * 26} cy={r.y + 18} r="11" />
+                <text x={chip0 + i * 26} y={r.y + 22.5}>{s}</text>
+              </g>
+            ))}
+          </g>
+        ))
+      }
+    </svg>
+  </div>
+</figure>
+
+<style>
+  .diagram {
+    margin: 1.75rem 0;
+    padding: 1.25rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.75rem;
+    background: var(--sl-color-gray-7, var(--sl-color-black));
+  }
+  .scroll {
+    overflow-x: auto;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    min-width: 34rem;
+    height: auto;
+    font-family: var(--sl-font-mono);
+  }
+  text {
+    font-size: 14px;
+    text-anchor: middle;
+    fill: var(--sl-color-white);
+  }
+  .group {
+    fill: none;
+    stroke: var(--sl-color-accent);
+    stroke-dasharray: 5 4;
+  }
+  .group-label {
+    text-anchor: start;
+    font-size: 12px;
+    fill: var(--sl-color-accent);
+  }
+  .topic rect {
+    fill: var(--sl-color-bg);
+    stroke: var(--sl-color-accent);
+    stroke-width: 1.5;
+  }
+  .box rect {
+    fill: var(--sl-color-gray-6);
+    stroke: var(--sl-color-gray-4);
+  }
+  .link {
+    fill: none;
+    stroke: var(--sl-color-accent);
+    stroke-width: 1.75;
+  }
+  .link.outside {
+    stroke: var(--sl-color-gray-3);
+  }
+  .chip circle {
+    fill: var(--sl-color-gray-6);
+    stroke: var(--sl-color-gray-3);
+  }
+  .chip text {
+    font-size: 12px;
+  }
+</style>

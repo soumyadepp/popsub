@@ -1,0 +1,194 @@
+---
+/**
+ * The hero's terminal: real output from a subscriber that is stopped, misses two messages on a
+ * topic created while it was away, and prints them when it starts again. A small script plays it
+ * line by line; without the script, or with reduced motion, the whole transcript shows at once.
+ */
+const lines = [
+  { kind: "cmd", text: "$ node example.mjs" },
+  { kind: "out", text: "orders/42 #1: order 42 shipped" },
+  { kind: "muted", text: "^C" },
+  { kind: "cmd", text: '$ node publish.mjs orders/cli "order 43 placed"' },
+  { kind: "out", text: "published orders/cli #1" },
+  { kind: "cmd", text: '$ node publish.mjs orders/cli "order 44 placed"' },
+  { kind: "out", text: "published orders/cli #2" },
+  { kind: "cmd", text: "$ node example.mjs" },
+  { kind: "new", text: "orders/cli #1: order 43 placed" },
+  { kind: "new", text: "orders/cli #2: order 44 placed" },
+  { kind: "out", text: "orders/42 #2: order 42 shipped" },
+];
+---
+
+<figure class="term" data-terminal>
+  <div class="window">
+    <div class="bar">
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <p>popsub-try</p>
+      <p class="status" data-status aria-hidden="true"></p>
+    </div>
+    <pre><code>{lines.map((l) => <span class:list={["line", l.kind]} data-kind={l.kind}>{l.text}</span>)}</code></pre>
+  </div>
+  <figcaption>
+    The subscriber stops, two messages go to a topic it has never seen, and it starts again. It
+    prints both, in order, and doesn't repeat <code>orders/42 #1</code>.
+  </figcaption>
+</figure>
+
+<script>
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function play(root: HTMLElement) {
+    const lines = [...root.querySelectorAll<HTMLElement>(".line")];
+    const status = root.querySelector<HTMLElement>("[data-status]");
+    const texts = lines.map((line) => line.textContent ?? "");
+    const setStatus = (text: string, stopped = false) => {
+      if (!status) return;
+      status.textContent = text;
+      status.classList.toggle("stopped", stopped);
+    };
+
+    for (;;) {
+      lines.forEach((line) => {
+        line.classList.add("hidden");
+        line.classList.remove("typing", "flash");
+      });
+      setStatus("");
+      await wait(600);
+
+      let stopped = false;
+      for (const [i, line] of lines.entries()) {
+        const kind = line.dataset.kind;
+        line.classList.remove("hidden");
+        if (kind === "cmd") {
+          const publishing = texts[i].includes("publish.mjs");
+          setStatus(publishing ? "subscriber stopped" : "subscriber running", publishing);
+          line.classList.add("typing");
+          for (let n = 1; n <= texts[i].length; n++) {
+            line.textContent = texts[i].slice(0, n);
+            await wait(n <= 2 ? 110 : 32);
+          }
+          line.classList.remove("typing");
+          await wait(450);
+        } else if (kind === "muted") {
+          stopped = true;
+          setStatus("subscriber stopped", stopped);
+          await wait(900);
+        } else {
+          if (kind === "new") line.classList.add("flash");
+          await wait(kind === "new" ? 500 : 650);
+        }
+      }
+      setStatus("subscriber running");
+      await wait(5000);
+    }
+  }
+
+  if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    document.querySelectorAll<HTMLElement>("[data-terminal]").forEach((root) => {
+      void play(root);
+    });
+  }
+</script>
+
+<style>
+  .term {
+    margin: 0;
+  }
+  .window {
+    overflow: hidden;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.9rem;
+    background: var(--sl-color-gray-6);
+    box-shadow: 0 24px 60px -32px rgb(0 0 0 / 0.6);
+  }
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.7rem 0.9rem;
+    border-bottom: 1px solid var(--sl-color-hairline);
+  }
+  .dot {
+    width: 0.65rem;
+    height: 0.65rem;
+    border-radius: 50%;
+    background: var(--sl-color-gray-5);
+  }
+  .bar p {
+    margin: 0 0 0 0.6rem;
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-xs);
+    font-family: var(--sl-font-mono);
+  }
+  .bar .status {
+    margin-left: auto;
+    color: var(--sl-color-gray-3);
+    transition: color 0.3s ease;
+  }
+  .bar .status.stopped {
+    color: var(--sl-color-accent-high);
+  }
+  pre {
+    margin: 0;
+    min-height: 21rem;
+    padding: 1.1rem 1.2rem 1.3rem;
+    overflow-x: auto;
+    background: transparent;
+    border: 0;
+    font-family: var(--sl-font-mono);
+    font-size: var(--sl-text-sm);
+    line-height: 1.75;
+    color: var(--sl-color-gray-2);
+  }
+  .line {
+    display: block;
+    min-height: 1.75em;
+  }
+  .line.hidden {
+    visibility: hidden;
+  }
+  .cmd {
+    color: var(--sl-color-white);
+  }
+  .muted {
+    color: var(--sl-color-gray-4);
+  }
+  .new {
+    color: var(--sl-color-accent-high);
+  }
+  .typing::after {
+    content: "";
+    display: inline-block;
+    width: 0.55em;
+    height: 1.1em;
+    margin-left: 1px;
+    vertical-align: text-bottom;
+    background: var(--sl-color-accent);
+    animation: blink 0.9s steps(1) infinite;
+  }
+  .flash {
+    animation: flash 1.2s ease-out;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+  @keyframes flash {
+    from {
+      background: color-mix(in srgb, var(--sl-color-accent) 25%, transparent);
+    }
+    to {
+      background: transparent;
+    }
+  }
+  figcaption code {
+    font-size: 0.9em;
+  }
+  figcaption {
+    margin-top: 0.9rem;
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-sm);
+    line-height: 1.5;
+  }
+</style>

@@ -1,0 +1,106 @@
+---
+title: Users and permissions
+description: Create PopSub accounts, decide which topics each one may publish and subscribe to, and how changes, tokens and rate limits behave.
+sidebar:
+  order: 5
+---
+
+Every connection logs in as an account, and every account starts with access to nothing. You
+open up topics by granting patterns, the same `+` and `#` patterns used for
+[wildcard subscriptions](/guides/wildcards-and-groups/).
+
+## A worked example
+
+Create `alice`, who handles orders and may read the news:
+
+```bash
+export POPSUB_PASSWORD=password
+POPSUB_NEW_PASSWORD=alice-password \
+  popsub users add alice --topic 'orders/#' --topic 'news/+:subscribe'
+```
+
+```text
+Name:    alice
+Role:    user
+Enabled: yes
+Topics:  orders/#:both, news/+:subscribe
+```
+
+A grant without an access level means `both`. Here's what alice can now do:
+
+| Alice tries to | Result |
+|---|---|
+| publish to `orders/42` | allowed, by `orders/#` |
+| subscribe to `orders/eu/7` | allowed, by `orders/#` |
+| subscribe to `news/today` | allowed, by `news/+` |
+| publish to `news/today` | `not_authorized`, she may only subscribe there |
+| subscribe to `news/eu/today` | `not_authorized`, `+` is exactly one level |
+| subscribe to `invoices/#` | accepted, but empty: she can't read any of them |
+
+`popsub users` talks to a running server, as `admin` on `ws://127.0.0.1:8080` unless you pass
+`--username` or `--url`. Passwords come from `POPSUB_PASSWORD` and `POPSUB_NEW_PASSWORD`, or
+from a prompt that doesn't echo, never from the command line.
+
+## Roles
+
+Most accounts are `user`, which gets exactly what its grants say. A `readonly` account can only
+ever subscribe, whatever you grant it. An `admin` can use every topic and manage accounts,
+and grants don't apply to it.
+
+## Managing accounts
+
+```bash
+popsub users list
+popsub users grant alice audit --access publish
+popsub users revoke alice 'news/+'
+popsub users role bob readonly --topic 'metrics/#'
+popsub users passwd alice
+popsub users disable alice
+popsub users delete alice
+```
+
+`role` replaces an account's role and all its grants at once. `grant` adds one, replacing any
+grant for exactly the same pattern. The last enabled admin can't be disabled, deleted or
+demoted, so you can't lock yourself out.
+
+Changes apply to open connections immediately. Revoke a topic and alice's subscription to it
+ends right away, with an `unsubscribed` frame. Change her password and her connections are
+closed with code 4004, so she has to log in again. Disable or delete her and they're closed
+with 4009, and the client libraries don't try to reconnect.
+
+Every client library has the same requests on `client.admin()`, if you'd rather manage accounts
+from code.
+
+## Letting people sign up
+
+By default nobody can create their own account. Set `server.allow_registration = true` to accept
+the `register` request. New accounts get no topics unless you also set
+`server.registration_role` to `readonly` (subscribe to everything) or `full` (publish and
+subscribe to everything). Registration is rate limited, and a taken username gets the same
+generic error as any other refusal, so it can't be used to find out who has an account.
+
+## Tokens
+
+Logging in returns a token that's valid for 24 hours (`server.jwt_expiration_hours`). A minute
+before it runs out, the server warns the connection with `auth_expiring`, and the client can
+log in again and send the new token on the same connection. The client libraries do this
+for you when they have a password. If you gave them only a token, the connection closes when it
+expires.
+
+## Rate limits
+
+Out of the box:
+
+- Five wrong passwords for one username from one address locks that pair out for 5 minutes.
+  Twenty from one address, across any usernames, locks the address out for 15 minutes. Repeat
+  lockouts double, up to an hour.
+- Each account can publish 100 messages a second, in bursts of up to 50, shared across all its
+  connections.
+- An address can try to register 5 times an hour.
+
+Going over gets `locked_out` or `rate_limited`, with a `retry_after` in seconds, and the
+connection stays open. Locking out the username and address together means someone guessing
+alice's password from one machine doesn't stop alice logging in from hers.
+
+Limits are keyed on the client's address. Behind a reverse proxy, every client looks like the
+proxy unless you list it in `server.trusted_proxies`.

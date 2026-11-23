@@ -1,0 +1,213 @@
+---
+/**
+ * One topic's log, with the first three records trimmed, and a row per `from` option showing
+ * which records the server replays and where live delivery takes over.
+ */
+const cell = { x0: 168, w: 44, step: 50, y: 34, h: 36 };
+const kept = { first: 4, last: 10 };
+const cellX = (seq: number) => cell.x0 + (seq - 1) * cell.step;
+const liveStart = cellX(kept.last + 1);
+const liveEnd = liveStart + cell.w + 10;
+const rowY = (k: number) => 110 + k * 42;
+
+const cells = Array.from({ length: kept.last + 1 }, (_, i) => {
+  const seq = i + 1;
+  const kind = seq < kept.first ? "trimmed" : seq > kept.last ? "next" : "kept";
+  return { seq, kind, x: cellX(seq) };
+});
+
+const rows = [
+  { label: '{"seq": 1}', note: "1 was trimmed", from: kept.first, truncatedFrom: 1 },
+  { label: '{"seq": 6}', from: 6 },
+  { label: '{"last": 3}', from: 8 },
+  { label: '"resume"', note: "session read to 8", from: 9 },
+  { label: '"new"', from: null },
+];
+const height = rowY(rows.length - 1) + 20;
+---
+
+<figure class="diagram not-content">
+  <div class="scroll">
+    <svg viewBox={`0 0 730 ${height}`} role="img" aria-labelledby="replay-start-title">
+      <title id="replay-start-title">
+        A topic log holding records 4 to 10, with 1 to 3 trimmed. Subscribing from seq 1 starts at
+        4 after a truncated notice, from seq 6 replays 6 to 10, from last 3 replays 8 to 10, resume
+        after a session that read to 8 replays 9 and 10, and new replays nothing. All of them then
+        receive live records from 11.
+      </title>
+
+      <text class="head muted" x={(cellX(1) + cellX(3) + cell.w) / 2} y="16">trimmed</text>
+      <text class="head" x={(cellX(kept.first) + cellX(kept.last) + cell.w) / 2} y="16">kept in the log</text>
+      <text class="head accent" x={liveStart + cell.w / 2} y="16">next</text>
+      <path class="bracket muted-line" d={`M${cellX(1)} 26 V22 H${cellX(3) + cell.w} V26`} />
+      <path class="bracket" d={`M${cellX(kept.first)} 26 V22 H${cellX(kept.last) + cell.w} V26`} />
+
+      {
+        cells.map((c) => (
+          <g class={`cell ${c.kind}`}>
+            <rect x={c.x} y={cell.y} width={cell.w} height={cell.h} rx="6" />
+            <text x={c.x + cell.w / 2} y={cell.y + cell.h / 2 + 4.5}>{c.seq}</text>
+          </g>
+        ))
+      }
+
+      <text class="axis" x="0" y={cell.y + cell.h / 2 + 4.5}>seq</text>
+      <line class="rule" x1="0" x2="730" y1={rowY(0) - 28} y2={rowY(0) - 28} />
+
+      {
+        rows.map((r, k) => {
+          const y = rowY(k);
+          return (
+            <g>
+              <text class="label" x="0" y={r.note ? y - 2 : y + 4.5}>{r.label}</text>
+              {r.note && <text class="note" x="0" y={y + 12}>{r.note}</text>}
+              {r.truncatedFrom && (
+                <>
+                  <line class="skipped" x1={cellX(r.truncatedFrom) + cell.w / 2} x2={cellX(r.from) - 4} y1={y} y2={y} />
+                  <circle class="skip-dot" cx={cellX(r.truncatedFrom) + cell.w / 2} cy={y} r="3.5" />
+                  <text class="note" x={(cellX(r.truncatedFrom) + cellX(r.from)) / 2 + cell.w / 4} y={y - 8}>truncated</text>
+                </>
+              )}
+              {r.from && <rect class="bar" x={cellX(r.from)} y={y - 5} width={cellX(kept.last) + cell.w - cellX(r.from)} height="10" rx="5" />}
+              <line class="live" x1={liveStart} x2={liveEnd - 8} y1={y} y2={y} />
+              <path class="arrow" d={`M${liveEnd - 9} ${y - 5} L${liveEnd} ${y} L${liveEnd - 9} ${y + 5} Z`} />
+            </g>
+          );
+        })
+      }
+    </svg>
+  </div>
+  <figcaption>
+    <span class="key"><span class="swatch bar-swatch"></span>replayed from the log</span>
+    <span class="key"><span class="swatch live-swatch"></span>live, as new records are published</span>
+  </figcaption>
+</figure>
+
+<style>
+  .diagram {
+    margin: 1.75rem 0;
+    padding: 1.25rem 1.25rem 1rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.75rem;
+    background: var(--sl-color-gray-7, var(--sl-color-black));
+  }
+  .scroll {
+    overflow-x: auto;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    min-width: 34rem;
+    height: auto;
+    font-family: var(--sl-font-mono);
+  }
+  text {
+    fill: var(--sl-color-gray-2);
+    font-size: 14px;
+  }
+  .head {
+    text-anchor: middle;
+    font-size: 12.5px;
+    fill: var(--sl-color-gray-3);
+  }
+  .accent {
+    fill: var(--sl-color-accent);
+  }
+  .muted {
+    fill: var(--sl-color-gray-4);
+  }
+  .bracket {
+    fill: none;
+    stroke: var(--sl-color-gray-4);
+  }
+  .muted-line {
+    stroke: var(--sl-color-gray-5);
+  }
+  .cell text {
+    text-anchor: middle;
+  }
+  .cell.kept rect {
+    fill: var(--sl-color-gray-6);
+    stroke: var(--sl-color-gray-4);
+  }
+  .cell.trimmed rect {
+    fill: none;
+    stroke: var(--sl-color-gray-5);
+    stroke-dasharray: 4 3;
+  }
+  .cell.trimmed text {
+    fill: var(--sl-color-gray-4);
+  }
+  .cell.next rect {
+    fill: none;
+    stroke: var(--sl-color-accent);
+    stroke-dasharray: 4 3;
+  }
+  .cell.next text {
+    fill: var(--sl-color-accent);
+  }
+  .axis {
+    font-size: 11.5px;
+    fill: var(--sl-color-gray-3);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .rule {
+    stroke: var(--sl-color-hairline);
+  }
+  .label {
+    fill: var(--sl-color-white);
+  }
+  .note {
+    font-size: 12px;
+    fill: var(--sl-color-gray-3);
+  }
+  .bar {
+    fill: var(--sl-color-accent);
+  }
+  .live {
+    stroke: var(--sl-color-accent);
+    stroke-width: 2.5;
+    stroke-dasharray: 5 4;
+  }
+  .arrow {
+    fill: var(--sl-color-accent);
+  }
+  .skipped {
+    stroke: var(--sl-color-gray-4);
+    stroke-width: 1.5;
+    stroke-dasharray: 2 3;
+  }
+  .skip-dot {
+    fill: none;
+    stroke: var(--sl-color-gray-4);
+    stroke-width: 1.5;
+  }
+  figcaption {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.5rem;
+    margin-top: 0.9rem;
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-xs);
+  }
+  .key {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .swatch {
+    display: inline-block;
+    width: 1.6rem;
+    height: 0.45rem;
+    border-radius: 999px;
+  }
+  .bar-swatch {
+    background: var(--sl-color-accent);
+  }
+  .live-swatch {
+    height: 0;
+    border-top: 2.5px dashed var(--sl-color-accent);
+    border-radius: 0;
+  }
+</style>
