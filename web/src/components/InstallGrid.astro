@@ -1,0 +1,109 @@
+---
+/**
+ * One tile per way to install PopSub, each with the command from the README and a link to
+ * the place it is published.
+ */
+import { Code } from "@astrojs/starlight/components";
+
+const installs = [
+  {
+    name: "Server",
+    where: "ghcr.io",
+    href: "https://github.com/soumyadepp/popsub/pkgs/container/popsub",
+    command: "docker pull ghcr.io/soumyadepp/popsub:0.2",
+    note: "Or a binary for Linux and macOS from Releases.",
+    noteHref: "https://github.com/soumyadepp/popsub/releases",
+  },
+  {
+    name: "TypeScript",
+    where: "npm",
+    href: "https://www.npmjs.com/package/popsub",
+    command: "npm install popsub",
+  },
+  {
+    name: "Python",
+    where: "PyPI",
+    href: "https://pypi.org/project/popsub/",
+    command: "pip install popsub",
+  },
+  {
+    name: "Go",
+    where: "Go modules",
+    href: "https://pkg.go.dev/github.com/soumyadepp/popsub/clients/go",
+    command: "go get github.com/soumyadepp/popsub/clients/go@latest",
+  },
+  {
+    name: "Rust",
+    where: "crates.io",
+    href: "https://crates.io/crates/popsub_sdk",
+    command: "cargo add popsub_sdk",
+  },
+];
+---
+
+<div class="grid not-content">
+  {
+    installs.map((i) => (
+      <article class:list={["tile", i.name === "Server" && "wide"]}>
+        <header>
+          <h3>{i.name}</h3>
+          <a href={i.href}>{i.where} ↗</a>
+        </header>
+        <Code code={i.command} lang="bash" frame="none" />
+        {i.note && (
+          <p>
+            <a href={i.noteHref}>{i.note}</a>
+          </p>
+        )}
+      </article>
+    ))
+  }
+</div>
+
+<style>
+  .grid {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 48rem) {
+    .grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+  .wide {
+    grid-column: 1 / -1;
+  }
+  .tile {
+    min-width: 0;
+    padding: 1.25rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 1rem;
+    background: var(--sl-color-gray-6);
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+  }
+  h3 {
+    margin: 0;
+    font-size: var(--sl-text-base);
+    color: var(--sl-color-white);
+  }
+  header a,
+  p a {
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-xs);
+    text-decoration: none;
+  }
+  header a:hover,
+  p a:hover {
+    color: var(--sl-color-accent-high);
+  }
+  p {
+    margin: 0.6rem 0 0;
+  }
+</style>

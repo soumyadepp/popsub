@@ -1,0 +1,56 @@
+:root {
+  --sl-color-accent-low: #2a1a0c;
+  --sl-color-accent: #e8772e;
+  --sl-color-accent-high: #ffd2ad;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #ffe6d1;
+  --sl-color-accent: #c2410c;
+  --sl-color-accent-high: #5c1d05;
+}
+
+html[data-has-hero] body {
+  background:
+    radial-gradient(60rem 32rem at 75% -6rem, color-mix(in srgb, var(--sl-color-accent) 16%, transparent), transparent 70%),
+    radial-gradient(40rem 24rem at 0% 10%, color-mix(in srgb, var(--sl-color-accent) 6%, transparent), transparent 70%),
+    var(--sl-color-bg);
+}
+
+html[data-has-hero] .main-pane {
+  isolation: isolate;
+}
+
+.section-head {
+  margin: 5rem auto 2rem;
+  max-width: 50rem;
+  text-align: center;
+}
+
+.section-head .kicker {
+  margin: 0;
+  color: var(--sl-color-accent);
+  font-size: var(--sl-text-xs);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.section-head h2 {
+  margin: 0.5rem 0 0;
+  border: 0;
+  font-size: clamp(1.6rem, 3vw, 2.2rem);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  text-wrap: balance;
+}
+
+.section-head p:not(.kicker) {
+  margin: 0.9rem 0 0;
+  color: var(--sl-color-gray-2);
+}
+
+.center {
+  margin-top: 1.5rem;
+  text-align: center;
+}

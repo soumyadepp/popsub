@@ -1,0 +1,57 @@
+---
+/**
+ * When to use PopSub and when not to, in the README's own terms.
+ */
+---
+
+<div class="panels not-content">
+  <section class="panel good">
+    <h3>A good fit</h3>
+    <ul>
+      <li>Small applications that want durable realtime messaging on one machine.</li>
+      <li>Browsers, services and workers in different languages on one broker.</li>
+      <li>Teams that want delivery guarantees written down precisely.</li>
+    </ul>
+  </section>
+  <section class="panel elsewhere">
+    <h3>Look elsewhere</h3>
+    <ul>
+      <li>Replication or high throughput today: NATS JetStream or Kafka.</li>
+      <li>Devices that only speak MQTT: Mosquitto or EMQX.</li>
+      <li>A stable API: PopSub is 0.x, and the <a href="https://github.com/soumyadepp/popsub/blob/main/docs/DESIGN.md#12-known-gaps-in-priority-order">known gaps</a> are listed in priority order.</li>
+    </ul>
+  </section>
+</div>
+
+<style>
+  .panels {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  }
+  .panel {
+    padding: 1.5rem;
+    border-radius: 1rem;
+    border: 1px solid var(--sl-color-hairline);
+    background: var(--sl-color-gray-6);
+  }
+  .good {
+    border-color: color-mix(in srgb, var(--sl-color-accent) 45%, var(--sl-color-hairline));
+    background: linear-gradient(160deg, color-mix(in srgb, var(--sl-color-accent) 10%, var(--sl-color-gray-6)), var(--sl-color-gray-6));
+  }
+  h3 {
+    margin: 0 0 0.75rem;
+    font-size: var(--sl-text-lg);
+    color: var(--sl-color-white);
+  }
+  ul {
+    margin: 0;
+    padding-left: 1.1rem;
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+    line-height: 1.7;
+  }
+  a {
+    color: var(--sl-color-accent-high);
+  }
+</style>
