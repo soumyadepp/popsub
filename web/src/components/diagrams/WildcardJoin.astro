@@ -1,0 +1,108 @@
+---
+/**
+ * A subscription to `orders/#` joining each matching topic as its own subscription, including a
+ * topic created later, and skipping a topic that doesn't match.
+ */
+const sub = { x: 20, y: 92, w: 210, h: 40 };
+const topicX = 400;
+const topicW = 170;
+const topics = [
+  { name: "orders/42", y: 34, kind: "joined" },
+  { name: "orders/eu/7", y: 86, kind: "joined" },
+  { name: "orders/cli", y: 138, kind: "later", note: "joined when created" },
+  { name: "invoices/9", y: 190, kind: "skip", note: "doesn't match" },
+];
+const startX = sub.x + sub.w;
+const startY = sub.y + sub.h / 2;
+const curve = (y: number) => {
+  const cy = y + 18;
+  return `M${startX} ${startY} C${startX + 90} ${startY} ${topicX - 90} ${cy} ${topicX} ${cy}`;
+};
+---
+
+<figure class="diagram not-content">
+  <div class="scroll">
+    <svg viewBox="0 0 760 236" role="img" aria-labelledby="wildcard-join-title">
+      <title id="wildcard-join-title">
+        A subscription to orders/# joins orders/42 and orders/eu/7 straight away, joins
+        orders/cli when that topic is created, and skips invoices/9, which doesn't match.
+      </title>
+      <g class="sub">
+        <rect x={sub.x} y={sub.y} width={sub.w} height={sub.h} rx="7" />
+        <text x={sub.x + sub.w / 2} y={sub.y + 25}>subscribe orders/#</text>
+      </g>
+      {topics.filter((t) => t.kind !== "skip").map((t) => <path class:list={["link", t.kind]} d={curve(t.y)} />)}
+      {
+        topics.map((t) => (
+          <g class:list={["topic", t.kind]}>
+            <rect x={topicX} y={t.y} width={topicW} height="36" rx="7" />
+            <text x={topicX + topicW / 2} y={t.y + 23}>{t.name}</text>
+            {t.note && <text class="note" x={topicX + topicW + 14} y={t.y + 23}>{t.note}</text>}
+          </g>
+        ))
+      }
+    </svg>
+  </div>
+</figure>
+
+<style>
+  .diagram {
+    margin: 1.75rem 0;
+    padding: 1.25rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.75rem;
+    background: var(--sl-color-gray-7, var(--sl-color-black));
+  }
+  .scroll {
+    overflow-x: auto;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    min-width: 34rem;
+    height: auto;
+    font-family: var(--sl-font-mono);
+  }
+  text {
+    font-size: 14px;
+    text-anchor: middle;
+    fill: var(--sl-color-white);
+  }
+  .sub rect {
+    fill: var(--sl-color-bg);
+    stroke: var(--sl-color-accent);
+    stroke-width: 1.5;
+  }
+  .topic rect {
+    fill: var(--sl-color-gray-6);
+    stroke: var(--sl-color-gray-4);
+  }
+  .topic.later rect {
+    stroke: var(--sl-color-accent);
+    stroke-dasharray: 4 3;
+  }
+  .topic.skip rect {
+    fill: none;
+    stroke: var(--sl-color-gray-5);
+    stroke-dasharray: 4 3;
+  }
+  .topic.skip text {
+    fill: var(--sl-color-gray-4);
+  }
+  .note {
+    text-anchor: start;
+    font-size: 12.5px;
+    fill: var(--sl-color-gray-3);
+  }
+  .topic.skip .note {
+    fill: var(--sl-color-gray-4);
+  }
+  .link {
+    fill: none;
+    stroke: var(--sl-color-accent);
+    stroke-width: 1.75;
+  }
+  .link.later {
+    stroke-dasharray: 5 4;
+  }
+</style>

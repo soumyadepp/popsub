@@ -22,7 +22,11 @@ export default defineConfig({
       },
       customCss: ["./src/styles/custom.css"],
       components: { Hero: "./src/components/Hero.astro" },
-      sidebar: [{ label: "Get started", slug: "getting-started" }],
+      sidebar: [
+        { label: "Get started", slug: "getting-started" },
+        { label: "Guides", items: [{ autogenerate: { directory: "guides" } }] },
+        { label: "Reference", items: [{ autogenerate: { directory: "reference" } }] },
+      ],
     }),
   ],
 });

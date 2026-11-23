@@ -1,0 +1,95 @@
+---
+title: Durable sessions
+description: Give a PopSub connection a session id and the server remembers how far it has read in each topic, across disconnects, restarts of your app and restarts of the server.
+sidebar:
+  order: 3
+---
+
+import SessionResume from "../../../components/diagrams/SessionResume.astro";
+
+A plain connection forgets everything when it drops. Give it a session id, and the server
+remembers how far that session has read in each topic it subscribed to. Start your worker
+again with the same id and it carries on from there, even if it was down for an hour and the
+server restarted in between.
+
+<SessionResume />
+
+## Using a session
+
+Pass a session id when you connect, and subscribe the way you always do:
+
+```js
+const client = await Client.connect({
+  url: "ws://127.0.0.1:8080",
+  credentials: { username: "alice", password: "alice-password" },
+  sessionId: "orders-worker",
+});
+
+const orders = await client.subscribe("orders/#", { seq: 1 });
+```
+
+The option is `sessionId` in TypeScript, `session_id` in Python, `SessionID` in Go and
+`.session(...)` in Rust. Pick a name that describes the job, not the process. Ids belong to
+an account, so two accounts can both use `orders-worker` without meeting.
+
+## What the server remembers
+
+For each topic, the session stores the subscription and a cursor: the highest `seq` with
+nothing unacknowledged at or below it. With QoS 1 the cursor moves as you acknowledge, so a
+message you received but never acknowledged is sent again next time. With QoS 0 it moves as
+messages are sent.
+
+The messages themselves aren't part of the session. They stay in the topic's log, under the
+normal [retention limits](/guides/topics-and-replay/#how-long-messages-are-kept). If your
+worker is gone so long that the messages it was owed have been trimmed, it gets a `truncated`
+notice and carries on from the oldest one left.
+
+## Why the examples use `{seq: 1}`
+
+Look at `orders/cli` in the diagram. It was created while the worker was stopped, so the
+session had never seen it. The server doesn't store wildcard patterns, only the topics a
+pattern has joined, so when the worker subscribes to `orders/#` again, a brand new topic gets
+whatever `from` you pass.
+
+With the default `"resume"`, there's no cursor to resume from, and the new topic starts at
+`"new"`. Its first two messages are never delivered. With `{seq: 1}`, topics the session
+already knows still carry on from their cursors, and new ones are read from the start. That's
+what you want for a worker, and it's why every example on this site does it.
+
+## One connection per session
+
+Only one connection holds a session at a time. If a second one authenticates with the same
+account and session id, the first is closed with code 4003, `session_taken_over`. That's how a
+worker that reconnects before the server noticed it was gone takes its session back.
+
+It also means two copies of a worker must not share an id. The client libraries don't
+reconnect after 4003, so the two can't keep kicking each other off, but one of them stops. To
+spread work across several workers, use a
+[shared subscription](/guides/wildcards-and-groups/#sharing-work-between-workers) instead.
+
+## Starting over
+
+To throw a session's subscriptions away, connect with `cleanStart: true` (`clean_start` in
+Python, `CleanStart` in Go). The libraries only send it on the first connection, not when
+they reconnect. To drop a single topic, unsubscribe from it.
+
+## How long a session lasts
+
+A session that has been disconnected for a day is deleted, along with its cursors. While
+connected it's kept alive automatically. The limit is `storage.session_expiry_secs`, and
+clients are told it when they connect.
+
+Sessions survive a server restart with the default `file` storage. With the `memory` backend,
+a restart loses everything, sessions included.
+
+The cursor is written to disk without waiting for it to be flushed. A power cut can lose the
+last few moves, and the session then gets a handful of messages it had already acknowledged.
+The client libraries drop those as duplicates, since every message carries its topic and
+`seq`. If you consume messages some other way, make handling them idempotent.
+
+## Writing your own client
+
+A session can outlive the process that opened it, so a new process shouldn't be sent the
+session's topics before it has subscribed to anything. Send `hold_resumed: true` in `auth` and
+the server lists the session's topics in `resumed` but holds them until you subscribe. The
+client libraries always do this. See [Protocol](/reference/protocol/) for the frames.

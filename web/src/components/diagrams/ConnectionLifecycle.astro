@@ -1,0 +1,151 @@
+---
+/**
+ * The life of a PopSub connection: connected, logged in, authenticated, and the close codes the
+ * server can end it with from each stage.
+ */
+const y = 58;
+const h = 46;
+const states = [
+  { name: "connected", x: 20, w: 170, closes: ["request before auth: 4002"] },
+  { name: "has a token", x: 300, w: 170, closes: ["bad token: 4001"] },
+  { name: "authenticated", x: 590, w: 160, closes: ["token expired: 4004", "idle 90 s: 4005", "taken over: 4003"] },
+];
+const steps = [
+  { from: 0, to: 1, send: "login", reply: "logged_in" },
+  { from: 1, to: 2, send: "auth", reply: "authenticated" },
+];
+const closedY = 228;
+const dropX = (i: number) => states[i].x + 22;
+---
+
+<figure class="diagram not-content">
+  <div class="scroll">
+    <svg viewBox="0 0 770 262" role="img" aria-labelledby="lifecycle-title">
+      <title id="lifecycle-title">
+        A connection sends login and gets a token, then sends auth and is authenticated, after which
+        it subscribes, publishes and acknowledges, and sends auth again with a fresh token before the
+        old one expires. The server closes it with 4002 for a request before auth, 4001 for a bad
+        token, and once authenticated with 4004 when the token expires, 4005 after 90 seconds of
+        silence, or 4003 when another connection takes over its session.
+      </title>
+
+      <path class="loop" d={`M${states[2].x + 50} ${y} C${states[2].x + 50} 16 ${states[2].x + 130} 16 ${states[2].x + 130} ${y - 3}`} />
+      <path class="loop-head" d={`M${states[2].x + 125} ${y - 12} L${states[2].x + 130} ${y - 2} L${states[2].x + 135} ${y - 12} Z`} />
+      <text class="loop-label" x="750" y="12">subscribe, publish, ack, re-auth</text>
+
+      {
+        steps.map((s) => {
+          const x1 = states[s.from].x + states[s.from].w;
+          const x2 = states[s.to].x;
+          const mid = (x1 + x2) / 2;
+          return (
+            <g class="step">
+              <line x1={x1} x2={x2 - 2} y1={y + h / 2} y2={y + h / 2} />
+              <path d={`M${x2 - 11} ${y + h / 2 - 5} L${x2 - 1} ${y + h / 2} L${x2 - 11} ${y + h / 2 + 5} Z`} />
+              <text class="send" x={mid} y={y + h / 2 - 9}>{s.send}</text>
+              <text class="reply" x={mid} y={y + h / 2 + 20}>{s.reply}</text>
+            </g>
+          );
+        })
+      }
+
+      {
+        states.map((s, i) => (
+          <g>
+            <line class="drop" x1={dropX(i)} x2={dropX(i)} y1={y + h} y2={closedY - 2} />
+            <path class="drop-head" d={`M${dropX(i) - 5} ${closedY - 11} L${dropX(i)} ${closedY - 1} L${dropX(i) + 5} ${closedY - 11} Z`} />
+            {s.closes.map((c, k) => (
+              <text class="close" x={dropX(i) + 12} y={y + h + 34 + k * 20}>{c}</text>
+            ))}
+            <g class:list={["state", { final: i === states.length - 1 }]}>
+              <rect x={s.x} y={y} width={s.w} height={h} rx="8" />
+              <text x={s.x + s.w / 2} y={y + h / 2 + 5}>{s.name}</text>
+            </g>
+          </g>
+        ))
+      }
+
+      <g class="closed">
+        <rect x="20" y={closedY} width="730" height="30" rx="8" />
+        <text x="385" y={closedY + 20}>closed, with a code that says whether to reconnect</text>
+      </g>
+    </svg>
+  </div>
+</figure>
+
+<style>
+  .diagram {
+    margin: 1.75rem 0;
+    padding: 1.25rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.75rem;
+    background: var(--sl-color-gray-7, var(--sl-color-black));
+  }
+  .scroll {
+    overflow-x: auto;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    min-width: 34rem;
+    height: auto;
+    font-family: var(--sl-font-mono);
+  }
+  text {
+    font-size: 14px;
+    text-anchor: middle;
+    fill: var(--sl-color-white);
+  }
+  .state rect {
+    fill: var(--sl-color-gray-6);
+    stroke: var(--sl-color-gray-4);
+  }
+  .state.final rect {
+    stroke: var(--sl-color-accent);
+  }
+  .step line {
+    stroke: var(--sl-color-accent);
+    stroke-width: 2;
+  }
+  .step path,
+  .loop-head {
+    fill: var(--sl-color-accent);
+  }
+  .send {
+    fill: var(--sl-color-accent);
+  }
+  .reply {
+    font-size: 12px;
+    fill: var(--sl-color-gray-3);
+  }
+  .loop {
+    fill: none;
+    stroke: var(--sl-color-accent);
+    stroke-width: 1.75;
+  }
+  .loop-label {
+    text-anchor: end;
+    font-size: 12px;
+    fill: var(--sl-color-gray-2);
+  }
+  .drop {
+    stroke: var(--sl-color-gray-4);
+    stroke-dasharray: 3 4;
+  }
+  .drop-head {
+    fill: var(--sl-color-gray-4);
+  }
+  .close {
+    text-anchor: start;
+    font-size: 12.5px;
+    fill: var(--sl-color-gray-3);
+  }
+  .closed rect {
+    fill: none;
+    stroke: var(--sl-color-gray-5);
+  }
+  .closed text {
+    font-size: 12.5px;
+    fill: var(--sl-color-gray-3);
+  }
+</style>

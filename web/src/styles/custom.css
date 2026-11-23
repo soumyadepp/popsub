@@ -54,3 +54,24 @@ html[data-has-hero] .main-pane {
   margin-top: 1.5rem;
   text-align: center;
 }
+
+.sl-markdown-content table {
+  font-size: var(--sl-text-sm);
+}
+
+.sl-markdown-content td:first-child code,
+.sl-markdown-content th:first-child code {
+  white-space: nowrap;
+}
+
+.sl-markdown-content td,
+.sl-markdown-content th {
+  vertical-align: top;
+}
+
+@media (min-width: 50rem) {
+  .sl-markdown-content table {
+    display: table;
+    width: 100%;
+  }
+}
