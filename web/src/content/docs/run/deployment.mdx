@@ -1,0 +1,106 @@
+---
+title: Deploy to a server
+description: Run PopSub on a server with Docker, serve wss:// with TLS or behind a reverse proxy, and add health checks and metrics.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+<p class="lede">
+  PopSub is one process and one data folder. Deploying it means keeping that process running,
+  keeping the folder on a disk that survives restarts, and putting TLS in front.
+</p>
+
+<Aside type="caution" title="One server only">
+  PopSub doesn't cluster or replicate yet. One machine is the whole deployment, so back up its
+  data folder.
+</Aside>
+
+## With Docker
+
+```bash
+docker run -d --name popsub --restart unless-stopped \
+  -p 8080:8080 -v popsub-data:/data \
+  -e SERVER__JWT_SECRET="$(openssl rand -hex 32)" \
+  -e SERVER_PASSWORD=choose-an-admin-password \
+  ghcr.io/soumyadepp/popsub:0.2
+```
+
+- The **volume** keeps messages, sessions and accounts across container restarts.
+- **`docker stop`** shuts it down cleanly. Clients are told the server is going away, and
+  they reconnect on their own when it's back.
+
+## TLS
+
+Browsers on an `https://` page can only connect to `wss://`. There are two ways to get there.
+
+**PopSub serves TLS itself.** Point it at a certificate and key:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 443
+tls_cert = "/etc/popsub/fullchain.pem"
+tls_key = "/etc/popsub/privkey.pem"
+```
+
+The files are read at startup, so a renewed certificate needs a restart.
+
+**A reverse proxy serves TLS.** Useful when the proxy already renews certificates, or shares
+port 443 with other services. See the next section.
+
+## Behind a reverse proxy
+
+Keep PopSub on `localhost`, and tell it to trust the proxy's forwarded client address:
+
+```toml
+[server]
+host = "127.0.0.1"
+trusted_proxies = ["127.0.0.1"]
+```
+
+Without `trusted_proxies`, every client looks like the proxy, and they all share one rate
+limit.
+
+With nginx:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 120s;
+}
+```
+
+`proxy_read_timeout` must be longer than the server's 30-second heartbeat, or quiet
+connections get cut.
+
+A TCP load balancer can't add `X-Forwarded-For`. Turn on its PROXY protocol option instead,
+list it in `trusted_proxies`, and set `proxy_protocol = true`.
+
+## Health checks
+
+Set `server.health_address`, such as `0.0.0.0:9091`, to serve two plain HTTP endpoints:
+
+| Endpoint | Answers 200 when | Use it for |
+|---|---|---|
+| `/healthz` | The process is up | Liveness |
+| `/readyz` | It should get traffic. 503 while shutting down or when the disk is failing. | Readiness and load balancers |
+
+## Metrics, traces and logs
+
+PopSub exports all three with OpenTelemetry. Turn it on, and point it at a collector with the
+standard `OTEL_EXPORTER_OTLP_ENDPOINT` variable:
+
+```toml
+[telemetry]
+enabled = true
+```
+
+Logs always go to standard output too. Passwords, tokens and payloads are never logged.
+Usernames and addresses are masked unless you set `telemetry.mask_pii = false`.
+
+The full list of metrics is in the
+[README](https://github.com/soumyadepp/popsub#metrics-traces-and-logs).

@@ -1,0 +1,73 @@
+---
+title: Live sensor dashboard
+description: Devices publish temperature readings to their own PopSub topics. A dashboard subscribes to all of them with one wildcard and shows each room's latest value.
+---
+
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+
+<p class="lede">
+  Each sensor publishes to its own topic, like `sensors/attic/temp`. The dashboard subscribes
+  to all of them with one pattern, and shows every room's latest reading the moment it starts.
+</p>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once), then let `alice` use the sensor topics:
+
+```bash
+popsub users grant alice 'sensors/#'
+```
+
+## The sensor
+
+<ExampleCode example="dashboard" file="sensor" />
+
+It publishes a made-up temperature every second. In a real device, this is where you'd read
+the hardware.
+
+## The dashboard
+
+<ExampleCode example="dashboard" file="dashboard" />
+
+- **`sensors/+/temp`** matches one level in the middle, so it covers every room, including
+  rooms that come online later.
+- **Last 1** means each room's newest reading is sent first. The dashboard is filled in at
+  once instead of waiting a second for the next update.
+- The room name is the middle part of the topic.
+
+## Run it
+
+Start a sensor in the attic, then the dashboard, then a second sensor in the kitchen, each in
+its own terminal:
+
+<ExampleRun file="sensor" args="attic" />
+
+<ExampleRun file="dashboard" />
+
+<ExampleRun file="sensor" args="kitchen" />
+
+<p class="output-label">Dashboard output</p>
+
+```text
+attic 20.3
+attic 20.4
+attic 20.4  kitchen 20.0
+attic 20.5  kitchen 20.0
+attic 20.5  kitchen 20.1
+```
+
+Stop the dashboard and start it again. Both rooms appear on the first lines, because each
+topic hands over its latest reading.
+
+## Make it yours
+
+- **Readings you can lose:** these publishes are QoS 0. A missed reading is replaced a second
+  later, so there's nothing to confirm or resend.
+- **Keep less history:** a dashboard only needs the newest value. Keep one message per topic
+  with a [retention rule](/run/configuration/#keeping-history) for `sensors/+/temp`.
+
+## Concepts used
+
+- [Wildcards and groups](/concepts/wildcards-and-groups/): how `+` and `#` match topics.
+- [Topics and replay](/concepts/topics-and-replay/): the `last` starting point.

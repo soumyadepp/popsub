@@ -1,0 +1,93 @@
+---
+title: Examples
+description: Complete PopSub programs in TypeScript, Python, Go and Rust, one page per use case, each run against a real server.
+sidebar:
+  label: Overview
+---
+
+import { CardGrid, LinkCard, Steps } from "@astrojs/starlight/components";
+import ProjectSetup from "../../../components/ProjectSetup.astro";
+
+<p class="lede">
+  Each example is a small, complete program for one real job. Every one exists in TypeScript,
+  Python, Go and Rust, and every one was run against a PopSub 0.2 server before it went on
+  this page.
+</p>
+
+Pick a language tab once and every page remembers it.
+
+## Pick an example
+
+<CardGrid>
+  <LinkCard
+    title="Chat room with history"
+    description="Join a room, see the last 20 messages, then chat live."
+    href="/examples/chat-room/"
+  />
+  <LinkCard
+    title="Live sensor dashboard"
+    description="Many devices publish readings. One dashboard shows the latest of each."
+    href="/examples/live-dashboard/"
+  />
+  <LinkCard
+    title="Worker that survives restarts"
+    description="Stop it, restart it, and it handles exactly what it missed."
+    href="/examples/restartable-worker/"
+  />
+  <LinkCard
+    title="Job queue with several workers"
+    description="Each job goes to one worker. Add workers to go faster."
+    href="/examples/job-queue/"
+  />
+  <LinkCard
+    title="Publish from your backend"
+    description="Send a message, know it was stored, and handle a refusal."
+    href="/examples/publish-from-backend/"
+  />
+  <LinkCard
+    title="A private inbox per user"
+    description="Create accounts from code. Each user reads only their own topics."
+    href="/examples/private-inboxes/"
+  />
+  <LinkCard
+    title="Replay history from a time"
+    description="Read everything an audit log recorded in the last ten minutes."
+    href="/examples/replay-history/"
+  />
+  <LinkCard
+    title="Live updates in a browser"
+    description="A web page that shows messages as your backend publishes them."
+    href="/examples/browser/"
+  />
+</CardGrid>
+
+## Set up once
+
+You need a running server, an account for the examples, and a project to keep them in.
+
+<Steps>
+
+1. **Start a server.** Follow step 1 of the [Quickstart](/quickstart/) and leave it running.
+   The examples expect it on `ws://127.0.0.1:8080`.
+
+2. **Create the account the examples use.** In another terminal:
+
+    ```bash
+    POPSUB_PASSWORD=password POPSUB_NEW_PASSWORD=alice-password popsub users add alice
+    ```
+
+    If you did the Quickstart, `alice` already exists, so skip this step. She starts with
+    access to nothing, and each example names the one grant it needs.
+
+    These pages write the command as `popsub`. From a download, run `./popsub` in its folder.
+    With Docker, run `docker exec -it popsub popsub` instead.
+
+3. **Make a project for the examples.** One project holds all of them. If you did the
+   Quickstart, use the project you made there.
+
+    <ProjectSetup />
+
+</Steps>
+
+Every example hardcodes `ws://127.0.0.1:8080` and the `alice` account, so you can read it top
+to bottom. In your own code, read them from configuration instead.

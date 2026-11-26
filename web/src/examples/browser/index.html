@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Newsroom</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fefefe;
+        --panel: #f6f6f5;
+        --border: #e7e7e5;
+        --ink: #111111;
+        --muted: #6e6e6a;
+        --live: #1a9d5b;
+        --down: #d9481c;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0c0c0b;
+          --panel: #151514;
+          --border: #262624;
+          --ink: #f4f4f2;
+          --muted: #8f8f8a;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 36rem;
+        margin: 0 auto;
+        padding: 3rem 1rem;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1.5rem;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.75rem;
+        font-weight: 500;
+        letter-spacing: -0.03em;
+      }
+      #status {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 0.2rem 0.7rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      #status::before {
+        content: "";
+        width: 0.45rem;
+        height: 0.45rem;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      #status.live::before {
+        background: var(--live);
+      }
+      #status.down::before {
+        background: var(--down);
+      }
+      ol {
+        display: grid;
+        gap: 0.6rem;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      li {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: var(--panel);
+        padding: 0.85rem 1rem;
+        animation: arrive 0.4s ease-out;
+      }
+      li p {
+        margin: 0;
+        font-weight: 500;
+      }
+      li small {
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      #empty {
+        color: var(--muted);
+      }
+      @keyframes arrive {
+        from {
+          opacity: 0;
+          transform: translateY(-4px);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Newsroom</h1>
+        <span id="status">connecting</span>
+      </header>
+      <p id="empty">No headlines yet.</p>
+      <ol id="headlines"></ol>
+    </main>
+
+    <script type="module">
+      import { Client } from "https://cdn.jsdelivr.net/npm/popsub@0.2.0/dist/index.js";
+
+      const status = document.querySelector("#status");
+      const list = document.querySelector("#headlines");
+
+      const client = await Client.connect({
+        url: "ws://127.0.0.1:8080",
+        credentials: { username: "reader", password: "reader-password" },
+      });
+
+      status.textContent = "live";
+      status.className = "live";
+      client.on((event) => {
+        if (event.type === "connected") {
+          status.textContent = "live";
+          status.className = "live";
+        } else if (event.type === "disconnected") {
+          status.textContent = "reconnecting";
+          status.className = "down";
+        }
+      });
+
+      const headlines = await client.subscribe("news/#", { last: 10 });
+
+      for await (const headline of headlines) {
+        document.querySelector("#empty").hidden = true;
+        const item = document.createElement("li");
+        const text = document.createElement("p");
+        const meta = document.createElement("small");
+        text.textContent = headline.payload;
+        meta.textContent = `${headline.topic} at ${new Date(headline.publishedAtMs).toLocaleTimeString()}`;
+        item.append(text, meta);
+        item.dataset.at = headline.publishedAtMs;
+        const older = [...list.children].find((li) => Number(li.dataset.at) < headline.publishedAtMs);
+        list.insertBefore(item, older ?? null);
+      }
+    </script>
+  </body>
+</html>

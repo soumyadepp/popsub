@@ -1,0 +1,154 @@
+---
+title: Quickstart
+description: Run a PopSub server, subscribe to a topic from TypeScript, Python, Go or Rust, and receive your first message. About five minutes.
+---
+
+import { Aside, CardGrid, LinkCard, Steps, Tabs, TabItem } from "@astrojs/starlight/components";
+import ExampleCode from "../../components/ExampleCode.astro";
+import ExampleRun from "../../components/ExampleRun.astro";
+import ProjectSetup from "../../components/ProjectSetup.astro";
+
+<p class="lede">
+  In about five minutes you'll run a PopSub server, subscribe to a topic from your language,
+  and watch a message arrive.
+</p>
+
+You'll need three terminals: one for the server, one for your program, and one to send
+messages from.
+
+<Steps>
+
+1. **Start the server.**
+
+    <Tabs syncKey="server">
+      <TabItem label="Download">
+        Get the release for your machine from
+        [Releases](https://github.com/soumyadepp/popsub/releases). This is macOS on Apple
+        silicon. On Linux, swap the name for `x86_64-unknown-linux-gnu` or
+        `aarch64-unknown-linux-gnu`.
+
+        ```bash
+        curl -LO https://github.com/soumyadepp/popsub/releases/download/v0.2.0/popsub-0.2.0-aarch64-apple-darwin.tar.gz
+        tar -xzf popsub-0.2.0-aarch64-apple-darwin.tar.gz
+        cd popsub-0.2.0-aarch64-apple-darwin
+        ./popsub server
+        ```
+
+        It listens on `127.0.0.1:8080`. It also creates an admin account, `admin`, with the
+        password `password`. That default only works on your own machine.
+      </TabItem>
+      <TabItem label="Docker">
+        A container listens on every interface, so choose your own admin password and secret:
+
+        ```bash
+        docker run --name popsub -p 8080:8080 -v popsub-data:/data \
+          -e SERVER__JWT_SECRET="$(openssl rand -hex 32)" \
+          -e SERVER_PASSWORD=choose-an-admin-password \
+          ghcr.io/soumyadepp/popsub:0.2
+        ```
+
+        The admin account is `admin`, with the password you chose.
+      </TabItem>
+    </Tabs>
+
+2. **Create an account.** In a second terminal, create `alice` and let her use the topic
+   `greetings`:
+
+    <Tabs syncKey="server">
+      <TabItem label="Download">
+        ```bash
+        POPSUB_PASSWORD=password POPSUB_NEW_PASSWORD=alice-password \
+          ./popsub users add alice --topic greetings
+        ```
+      </TabItem>
+      <TabItem label="Docker">
+        ```bash
+        docker exec -e POPSUB_PASSWORD=choose-an-admin-password \
+          -e POPSUB_NEW_PASSWORD=alice-password \
+          popsub popsub users add alice --topic greetings
+        ```
+      </TabItem>
+    </Tabs>
+
+    New accounts can't use any topic until you grant one. That's on purpose.
+
+3. **Make a project.** In a third terminal, pick your language. Keep this project afterwards:
+   every [example](/examples/) uses it.
+
+    <ProjectSetup />
+
+4. **Subscribe.** Save this program and run it:
+
+    <ExampleCode example="quickstart" file="subscribe" />
+
+    <ExampleRun file="subscribe" />
+
+    It connects as `alice`, subscribes to `greetings`, and waits:
+
+    ```text
+    waiting for messages on greetings
+    ```
+
+5. **Send a message.** Back in the second terminal, publish to `greetings` with the
+   `popsub client` command:
+
+    <Tabs syncKey="server">
+      <TabItem label="Download">
+        ```bash
+        ./popsub client --username alice --password alice-password --topic greetings
+        ```
+      </TabItem>
+      <TabItem label="Docker">
+        ```bash
+        docker exec popsub popsub client --username alice --password alice-password --topic greetings
+        ```
+      </TabItem>
+    </Tabs>
+
+    Your program prints it straight away:
+
+    ```text
+    greetings #1: Hello from popsub client
+    ```
+
+    Run the command again and you'll see `#2`. Every topic numbers its messages in order.
+
+</Steps>
+
+<Aside title="Port 8080 already taken?">
+  Start the server with `SERVER_PORT=8090 ./popsub server` (with Docker, `-p 8090:8080`). Then
+  use `ws://127.0.0.1:8090` in the code, and add `--url ws://127.0.0.1:8090` to `popsub`
+  commands.
+</Aside>
+
+## What you just did
+
+- The **server** stores every message in its topic and hands it to subscribers.
+- Your **program** subscribed to `greetings` and printed each message as it arrived.
+- `#1`, `#2` is the message's **`seq`**, its position in the topic. PopSub keeps messages, so
+  a subscriber can come back later and ask for what it missed.
+
+## Next steps
+
+<CardGrid>
+  <LinkCard
+    title="Worker that survives restarts"
+    description="Stop your program, send messages, start it again, and watch it catch up."
+    href="/examples/restartable-worker/"
+  />
+  <LinkCard
+    title="All examples"
+    description="Chat, dashboards, job queues, browsers and more."
+    href="/examples/"
+  />
+  <LinkCard
+    title="Core concepts"
+    description="Topics, sessions, acknowledgements and permissions, on one page."
+    href="/concepts/"
+  />
+  <LinkCard
+    title="Deploy to a server"
+    description="Run PopSub somewhere other than your laptop, with TLS."
+    href="/run/deployment/"
+  />
+</CardGrid>

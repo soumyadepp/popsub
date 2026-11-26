@@ -1,0 +1,88 @@
+---
+title: Configuration
+description: How to configure a PopSub server with a config file or environment variables, and the settings you're most likely to change.
+---
+
+<p class="lede">
+  PopSub runs with sensible defaults. Change a setting in a config file, or with an
+  environment variable, which wins over the file.
+</p>
+
+## Two ways to set things
+
+**A config file.** Start from `config/default.toml` in the release and change what you need:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8080
+```
+
+**Environment variables.** Take the section and the key, upper-case them, and join them:
+
+| Setting | Variable |
+|---|---|
+| `server.port` | `SERVER_PORT=9000` |
+| `server.jwt_secret` | `SERVER__JWT_SECRET=...` |
+| `storage.retention.max_messages` | `STORAGE__RETENTION__MAX_MESSAGES=5000` |
+
+A one-word key takes one underscore. A key that contains an underscore, or sits in a nested
+section, takes two.
+
+## Before you listen on a network
+
+On anything other than `localhost`, the server refuses to start with the published defaults.
+Set both of these:
+
+| Setting | What it is |
+|---|---|
+| `server.jwt_secret` | Signs login tokens. Use a long random value, such as `openssl rand -hex 32`. |
+| `server.password` | The `admin` account's password, used the first time the server starts. |
+
+## Settings you'll likely change
+
+| Setting | Default | What it does |
+|---|---|---|
+| `server.host`, `server.port` | `127.0.0.1`, `8080` | Where to listen |
+| `storage.path` | `pubsub_data` | Where messages, sessions and accounts are kept |
+| `storage.durability` | `buffered` | `buffered` survives a crash. `synced` also survives a power cut, but is slower. |
+| `server.allow_registration` | `false` | Let clients create their own accounts |
+| `server.max_payload_bytes` | 1 MiB | The largest message |
+| `broker.max_connections` | `1000` | Connections at once. `0` means no limit. |
+| `broker.dead_letter_topic` | none | Where messages go after running out of retries |
+| `server.tls_cert`, `server.tls_key` | none | Serve `wss://`. See [Deploy](/run/deployment/#tls). |
+| `server.health_address` | none | Serve health checks, such as `0.0.0.0:9091` |
+
+## Keeping history
+
+By default each topic keeps its newest 1,000 messages, for up to an hour, and up to 64 MiB.
+Whichever limit is hit first removes the oldest messages.
+
+Change the defaults for every topic:
+
+```toml
+[storage.retention]
+max_messages = 10000
+max_age_secs = 86400
+```
+
+Or set limits for topics that match a pattern. The first matching rule wins, so put specific
+ones first:
+
+```toml
+[[storage.topic_retention]]
+pattern = "audit/#"
+max_age_secs = 2592000
+
+[[storage.topic_retention]]
+pattern = "sensors/+/temp"
+max_messages = 1
+```
+
+A limit a rule leaves out comes from `[storage.retention]`. Rules only work in the config
+file, and changes need a restart.
+
+## Everything else
+
+Rate limits, timeouts, telemetry and the rest are listed with their defaults in
+[section 9 of the design doc](https://github.com/soumyadepp/popsub/blob/main/docs/DESIGN.md).

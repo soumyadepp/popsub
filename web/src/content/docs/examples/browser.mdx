@@ -1,0 +1,84 @@
+---
+title: Live updates in a browser
+description: A web page that connects to PopSub, shows the latest headlines, and adds new ones the moment your backend publishes them.
+---
+
+import { Code } from "@astrojs/starlight/components";
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+import newsroomPage from "../../../examples/browser/index.html?raw";
+import newsroom from "../../../assets/examples/newsroom.png";
+
+<p class="lede">
+  A news page that updates itself. It shows the last ten headlines when it opens, then adds
+  each new one at the top as your backend publishes it. No polling and no page reloads.
+</p>
+
+<img
+  class="example-shot"
+  src={newsroom.src}
+  width={newsroom.width}
+  height={newsroom.height}
+  alt="The Newsroom page with a green live indicator and four headline cards, newest first."
+/>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once). The page logs in as its own account,
+`reader`, which may only **read** `news/`. Then let `alice`, standing in for your backend,
+publish there:
+
+```bash
+POPSUB_PASSWORD=password POPSUB_NEW_PASSWORD=reader-password \
+  popsub users add reader --role readonly --topic 'news/#'
+popsub users grant alice 'news/#'
+```
+
+## The page
+
+One HTML file. The client library loads from a CDN, so there's nothing to install or build.
+
+<Code code={newsroomPage.trimEnd()} lang="html" title="index.html" />
+
+- **Last 10** fills the page with recent headlines straight away.
+- **Each headline is placed by its publish time.** History arrives topic by topic, so sorting
+  keeps the newest on top.
+- **The status pill** follows the connection. If the network drops, the library reconnects
+  and carries on from the last headline it showed.
+- **`textContent`** puts headlines on the page as text, so a headline can't inject HTML.
+
+## The backend
+
+Your backend publishes with any client library. This is the program from
+[Publish from your backend](/examples/publish-from-backend/):
+
+<ExampleCode example="publish" file="publish" />
+
+## Run it
+
+Serve the page from its folder, so the browser allows the module import:
+
+```bash
+python3 -m http.server 8000
+```
+
+Open [http://localhost:8000](http://localhost:8000). Then publish a headline, and watch it
+appear at the top:
+
+<ExampleRun file="publish" args={`news/world "Breaking: rain expected all weekend"`} />
+
+## Before you ship it
+
+The password is in the page, so anyone who opens it can read it. That's acceptable here only
+because `reader` can do nothing but read public headlines. For anything private:
+
+- Have your backend log in for the user and hand the page a **token** instead of a password.
+  Pass it as `credentials: { token }`.
+- Serve PopSub over **`wss://`** with TLS. See [Deploy to a server](/run/deployment/).
+- Give each user an account limited to their own topics, as in
+  [A private inbox per user](/examples/private-inboxes/).
+
+## Concepts used
+
+- [Users and permissions](/concepts/users-and-permissions/): read-only accounts and tokens.
+- [Topics and replay](/concepts/topics-and-replay/): the `last` starting point.

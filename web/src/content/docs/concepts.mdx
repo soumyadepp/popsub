@@ -1,0 +1,81 @@
+---
+title: Core concepts
+description: Every PopSub idea on one page, in plain words, with a link to the full explanation of each.
+---
+
+<p class="lede">
+  Everything in PopSub builds on six ideas. Read this page once and the rest of the docs will
+  make sense.
+</p>
+
+## Topics hold messages
+
+A **topic** is a named stream of messages, like `orders/42`. You never create one. It
+appears the first time something is published to it.
+
+Each topic keeps its messages in order and numbers them 1, 2, 3. That number is the
+message's **`seq`**. Because messages are kept, a subscriber can choose where to start
+reading: only new ones, the last 10, everything since a time, or from the beginning.
+
+[Topics and replay →](/concepts/topics-and-replay/)
+
+## Delivery can be confirmed
+
+Every publish has a **QoS**, quality of service:
+
+| | QoS 0 | QoS 1 |
+|---|---|---|
+| Publisher hears back | No | Yes, once it's stored |
+| Subscriber must acknowledge | No | Yes, or it's sent again |
+| Good for | Live updates you can afford to miss | Work that must not be lost |
+
+[Delivery and acknowledgements →](/concepts/delivery-and-acks/)
+
+## Sessions remember your place
+
+Connect with a **session id** and the server remembers how far you got in each topic. When
+your program restarts, it picks up where it stopped, even if the server restarted too.
+
+[Durable sessions →](/concepts/durable-sessions/)
+
+## Patterns cover many topics
+
+Subscribe to a **pattern** instead of one topic. `+` matches one level and `#` matches
+everything below:
+
+- `sensors/+/temp` matches `sensors/attic/temp` and `sensors/garage/temp`.
+- `orders/#` matches every topic under `orders/`.
+
+A **shared subscription** does the opposite: a group of workers shares one topic, and each
+message goes to just one of them.
+
+[Wildcards and groups →](/concepts/wildcards-and-groups/)
+
+## Accounts decide who sees what
+
+Every connection logs in as an **account**. A new account can use nothing until an admin
+grants it topic patterns, each for publishing, subscribing or both.
+
+[Users and permissions →](/concepts/users-and-permissions/)
+
+## Clients do the hard parts
+
+The client libraries reconnect when the network drops, subscribe again from the right
+place, resend confirmed publishes, and drop duplicates. Your code just handles messages.
+
+[Client libraries →](/reference/client-libraries/)
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| Acknowledge (ack) | Tell the server a QoS 1 message was handled, so it stops resending it |
+| Admin | An account that can use every topic and manage other accounts |
+| Cursor | Where a durable session got to in one topic |
+| Frame | One JSON message on the WebSocket, such as `publish` or `subscribed` |
+| Grant | Permission for an account to use topics matching a pattern |
+| Payload | The body of a message. Always a string; bytes travel as base64 |
+| Retention | How many messages, for how long, a topic keeps |
+| `seq` | A message's number within its topic, starting at 1 |
+| Session id | The name that lets a program pick up where it stopped |
+| Truncated | Told to a subscriber when messages it wanted were already deleted |

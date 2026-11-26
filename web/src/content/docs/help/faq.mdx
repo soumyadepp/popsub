@@ -1,0 +1,102 @@
+---
+title: FAQ and troubleshooting
+description: Answers to the questions people hit first with PopSub, from missing messages to refused connections.
+---
+
+<p class="lede">
+  The problems people run into most, each with the cause and the fix.
+</p>
+
+## Messages
+
+### My subscriber doesn't get messages sent before it started
+
+By default a subscription starts with **new** messages only. Ask for history when you
+subscribe:
+
+- `{ last: 20 }` for the most recent 20.
+- `{ seq: 1 }` for everything the topic still keeps.
+
+See [Topics and replay](/concepts/topics-and-replay/#picking-a-starting-point).
+
+### My restarted worker skipped messages on a brand new topic
+
+It subscribed to a pattern with the default starting point. A topic created while it was
+stopped is new to its session, so it starts at new messages. Subscribe from `{ seq: 1 }`
+instead. Topics the session already knows still carry on from where they were.
+
+### Messages are missing after a long downtime
+
+Each topic keeps its newest 1,000 messages for an hour by default. Older ones are deleted,
+even if a subscriber hasn't read them. The client gets a `truncated` notice when that
+happens. [Keep more history](/run/configuration/#keeping-history) for topics that need it.
+
+### I got the same message twice
+
+PopSub delivers QoS 1 messages **at least once**, so a resend can repeat one. The client
+libraries drop repeats by topic and `seq`. If you consume messages another way, make handling
+them safe to repeat.
+
+### Messages from different topics arrive out of order
+
+Order is only kept within one topic. If you need a single timeline, publish to one topic, or
+sort by each message's publish time.
+
+## Permissions
+
+### I get `not_authorized`
+
+The account has no grant for that topic, or only for the other direction. Check with
+`popsub users show <name>`, then add one with `popsub users grant`.
+
+### My pattern subscription works but nothing arrives
+
+A pattern quietly skips topics the account can't read. Subscribing to `invoices/#` without a
+grant succeeds but delivers nothing. Check the account's grants.
+
+## Connections
+
+### The server won't start: "refusing to listen ... with published defaults"
+
+It's listening on something other than `localhost` with the default secret and admin
+password. Set `server.jwt_secret` and `server.password`. See
+[Configuration](/run/configuration/#before-you-listen-on-a-network).
+
+### Other machines can't connect
+
+The server listens on `127.0.0.1` by default. Set `server.host = "0.0.0.0"`, along with the
+two settings above.
+
+### Port 8080 is already in use
+
+Start the server with `SERVER_PORT=8090` and connect to `ws://127.0.0.1:8090`.
+
+### My worker stopped with close code 4003
+
+Another connection logged in with the same account and session id, and took the session
+over. Run one copy per session id. To share work, use a
+[job queue](/examples/job-queue/).
+
+### Connections closed with 4004 or 4009
+
+- **4004:** the account's password changed. Log in again.
+- **4009:** the account was disabled or deleted. The libraries don't reconnect.
+
+Every code is in [Errors and close codes](/reference/errors-and-close-codes/).
+
+## Choosing PopSub
+
+### Does it support MQTT?
+
+Not yet. It speaks its own JSON protocol over WebSockets. For MQTT devices, use Mosquitto or
+EMQX.
+
+### Can I run more than one server?
+
+Not yet. PopSub is a single process. See
+[Status and comparisons](/help/status-and-comparisons/).
+
+### Can I use it from a language without a library?
+
+Yes, if it has a WebSocket library and a JSON parser. [Protocol](/reference/protocol/)
+describes every message.

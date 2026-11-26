@@ -92,45 +92,53 @@ const lines = [
 
 <style>
   .term {
+    --term-bg: #111110;
+    --term-bar: #191918;
+    --term-line: #262624;
+    --term-text: #b9b9b4;
+    --term-ink: #f4f4f2;
+    --term-faint: #63635f;
+    --term-signal: #f2784b;
     margin: 0;
   }
   .window {
     overflow: hidden;
-    border: 1px solid var(--sl-color-hairline);
-    border-radius: 0.9rem;
-    background: var(--sl-color-gray-6);
-    box-shadow: 0 24px 60px -32px rgb(0 0 0 / 0.6);
+    border: 1px solid #000;
+    border-radius: var(--pop-radius-lg);
+    background: var(--term-bg);
+    box-shadow: var(--pop-shadow-float);
   }
   .bar {
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    padding: 0.7rem 0.9rem;
-    border-bottom: 1px solid var(--sl-color-hairline);
+    padding: 0.65rem 0.9rem;
+    border-bottom: 1px solid var(--term-line);
+    background: var(--term-bar);
   }
   .dot {
-    width: 0.65rem;
-    height: 0.65rem;
+    width: 0.6rem;
+    height: 0.6rem;
     border-radius: 50%;
-    background: var(--sl-color-gray-5);
+    background: #33332f;
   }
   .bar p {
     margin: 0 0 0 0.6rem;
-    color: var(--sl-color-gray-3);
+    color: var(--term-faint);
     font-size: var(--sl-text-xs);
     font-family: var(--sl-font-mono);
   }
   .bar .status {
     margin-left: auto;
-    color: var(--sl-color-gray-3);
+    color: var(--term-faint);
     transition: color 0.3s ease;
   }
   .bar .status.stopped {
-    color: var(--sl-color-accent-high);
+    color: var(--term-signal);
   }
   pre {
     margin: 0;
-    min-height: 21rem;
+    min-height: 20rem;
     padding: 1.1rem 1.2rem 1.3rem;
     overflow-x: auto;
     background: transparent;
@@ -138,7 +146,7 @@ const lines = [
     font-family: var(--sl-font-mono);
     font-size: var(--sl-text-sm);
     line-height: 1.75;
-    color: var(--sl-color-gray-2);
+    color: var(--term-text);
   }
   .line {
     display: block;
@@ -148,22 +156,22 @@ const lines = [
     visibility: hidden;
   }
   .cmd {
-    color: var(--sl-color-white);
+    color: var(--term-ink);
   }
   .muted {
-    color: var(--sl-color-gray-4);
+    color: var(--term-faint);
   }
   .new {
-    color: var(--sl-color-accent-high);
+    color: var(--term-signal);
   }
   .typing::after {
     content: "";
     display: inline-block;
-    width: 0.55em;
+    width: 0.5em;
     height: 1.1em;
     margin-left: 1px;
     vertical-align: text-bottom;
-    background: var(--sl-color-accent);
+    background: var(--term-ink);
     animation: blink 0.9s steps(1) infinite;
   }
   .flash {
@@ -176,19 +184,24 @@ const lines = [
   }
   @keyframes flash {
     from {
-      background: color-mix(in srgb, var(--sl-color-accent) 25%, transparent);
+      background: rgba(242, 120, 75, 0.18);
     }
     to {
       background: transparent;
     }
   }
-  figcaption code {
-    font-size: 0.9em;
-  }
   figcaption {
     margin-top: 0.9rem;
-    color: var(--sl-color-gray-3);
+    color: var(--pop-muted);
     font-size: var(--sl-text-sm);
-    line-height: 1.5;
+    line-height: 1.55;
+  }
+  figcaption code {
+    border: 1px solid var(--pop-border);
+    border-radius: var(--pop-radius-sm);
+    background: var(--pop-bg);
+    padding: 0.05em 0.3em;
+    color: var(--pop-ink);
+    font-size: 0.88em;
   }
 </style>

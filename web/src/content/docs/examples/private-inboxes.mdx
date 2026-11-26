@@ -1,0 +1,77 @@
+---
+title: A private inbox per user
+description: Create PopSub accounts from code, give each user read access to their own topics only, and see the server refuse everything else.
+---
+
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+
+<p class="lede">
+  Each user of your app gets an inbox, `inbox/<name>/...`, that only they can read. Your
+  backend creates the account when the user signs up, and writes to the inbox when it has
+  something to say.
+</p>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once). This example doesn't use `alice`: it logs in
+as the admin to create accounts, and then as the new user.
+
+## Create an account from code
+
+<ExampleCode example="permissions" file="provision" />
+
+The new account gets one grant: it may **subscribe** to `inbox/<name>/#`. It can't publish
+anywhere, and it can't read anyone else's inbox.
+
+This uses the admin password `password`, the local default. Never ship an admin password in
+an app. Run this part on your backend only.
+
+## Read the inbox
+
+<ExampleCode example="permissions" file="inbox" />
+
+It tries one publish first, to show the server refusing it, then reads its inbox from the
+start.
+
+## Run it
+
+Create `bob`:
+
+<ExampleRun file="provision" args="bob" />
+
+```text
+created bob, may read inbox/bob/#
+```
+
+Send him something, as the admin. The `popsub client` command publishes a test message to the
+topic you name:
+
+```bash
+popsub client --username admin --password password --topic inbox/bob/welcome
+```
+
+Now read bob's inbox:
+
+<ExampleRun file="inbox" args="bob" />
+
+```text
+publish refused: not_authorized
+inbox/bob/welcome: Hello from popsub client
+```
+
+Run `provision bob` again and it prints `bob already exists`.
+
+## Things to know
+
+- **Changes apply at once.** Revoke a grant and the user's live subscription to it ends
+  immediately. Disable the account and its connections close.
+- **Patterns quietly skip what you can't read.** If `bob` subscribed to `inbox/#`, he'd get
+  his own topics and nothing else, with no error.
+- **The same requests work from the CLI.** `popsub users add`, `grant`, `revoke` and
+  `disable` send exactly what this code sends.
+
+## Concepts used
+
+- [Users and permissions](/concepts/users-and-permissions/): roles, grants and what changes
+  do to live connections.

@@ -1,0 +1,75 @@
+---
+title: Job queue with several workers
+description: Spread PopSub messages across a group of workers with a shared subscription. Each job goes to exactly one of them.
+---
+
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+
+<p class="lede">
+  A queue of image-resize jobs and a pool of workers. Each job goes to exactly one worker, and
+  adding a worker makes the pool faster.
+</p>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once), then let `alice` use the job topics:
+
+```bash
+popsub users grant alice 'jobs/#'
+```
+
+## The worker
+
+<ExampleCode example="queue" file="job-worker" />
+
+- **`subscribeShared`** joins the group `resizers`. Everyone in the group shares one stream of
+  jobs, and each job goes to one member.
+- It acknowledges only after the work is done. If a worker dies mid-job, the job moves to
+  another member straight away.
+- The one-second wait stands in for real work.
+
+## The producer
+
+<ExampleCode example="queue" file="producer" />
+
+## Run it
+
+Start two workers, each in its own terminal, then the producer in a third:
+
+<ExampleRun file="job-worker" args="w1" />
+
+<ExampleRun file="job-worker" args="w2" />
+
+<ExampleRun file="producer" />
+
+<p class="output-label">Output from w1 and w2</p>
+
+```text
+w1 took job-1
+w2 took job-2
+w1 finished job-1
+w1 took job-3
+w2 finished job-2
+w2 took job-4
+```
+
+The workers take turns, and no job runs twice. Which worker gets which job can differ from
+run to run.
+
+## Things to know
+
+- **The group remembers its place.** If every worker stops, new jobs wait on the server. The
+  next worker to join picks them up.
+- **A job can run twice** when a worker crashes after doing it but before acknowledging it.
+  Make jobs safe to repeat.
+- **No order inside a group.** Jobs are handed out in turn, but a slow worker can finish an
+  earlier job after a later one.
+- **One account per group.** All the workers log in as the same user.
+
+## Concepts used
+
+- [Wildcards and groups](/concepts/wildcards-and-groups/#sharing-work-between-workers): how
+  shared subscriptions hand out work.
+- [Delivery and acknowledgements](/concepts/delivery-and-acks/): what happens to an
+  unacknowledged message.

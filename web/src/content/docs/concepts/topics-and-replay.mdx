@@ -1,0 +1,147 @@
+---
+title: Topics and replay
+description: Each PopSub topic is a numbered log. How a subscriber picks where to start reading it, how history hands over to live delivery, and how long messages are kept.
+sidebar:
+  order: 1
+---
+
+import ReplayStart from "../../../components/diagrams/ReplayStart.astro";
+
+<p class="lede">A topic is a numbered log of messages. Subscribing means choosing where in that log to start reading.</p>
+
+A topic in PopSub is a log. When you publish to `orders/42`, the server appends the message to
+that topic's log, numbers it, and only then sends it to subscribers.
+
+That number is the message's `seq`:
+
+- The first message in a topic is 1, the next is 2.
+- The count never goes back, even after old messages are deleted.
+
+Since the messages are kept, subscribing comes down to one question: where in the log do you
+want to start reading?
+
+<ReplayStart />
+
+The top row is a topic that has had ten messages. The first three are old enough to have been
+trimmed.
+
+Each row below is a different subscriber. The solid part is what the server replays from the
+log, and every subscriber then carries on with live messages from 11.
+
+## Picking a starting point
+
+You choose with `from` when you subscribe:
+
+| `from` | Where you start |
+|---|---|
+| `{seq: 1}` | The usual way to say "everything you still have" |
+| `{last: N}` | Recent activity: the last N messages |
+| `{since_ms: T}` | The first message published at or after a time, in milliseconds since the epoch |
+| `"new"` | Skips history altogether |
+| `"resume"` | The default. Continues from where your durable session got to |
+
+If the message you asked for is gone, as in the first row, you start at the oldest one left.
+You get a `truncated` notice first, so you know you missed something.
+
+`"resume"` is what makes a worker pick up after a restart. Without a session there's nothing to
+resume from, so it behaves like `"new"`.
+
+[Durable sessions](/concepts/durable-sessions/) explains how that works, and one case where
+`{seq: 1}` is the better choice.
+
+Each client library spells these slightly differently:
+
+| Wire | TypeScript | Python | Go | Rust |
+|---|---|---|---|---|
+| `"resume"` | `"resume"` | `StartFrom.resume()` | `popsub.FromResume` | `StartFrom::Resume` |
+| `"new"` | `"new"` | `StartFrom.new()` | `popsub.FromNew` | `StartFrom::New` |
+| `{"last": N}` | `{ last: n }` | `StartFrom.last(n)` | `popsub.FromLast(n)` | `StartFrom::Last(n)` |
+| `{"since_ms": T}` | `{ sinceMs: t }` | `StartFrom.since_ms(t)` | `popsub.FromSinceMs(t)` | `StartFrom::SinceMs(t)` |
+| `{"seq": S}` | `{ seq: s }` | `StartFrom.seq(s)` | `popsub.FromSeq(s)` | `StartFrom::Seq(s)` |
+
+So in TypeScript, the last ten orders and then everything new looks like this:
+
+```js
+const orders = await client.subscribe("orders/42", { last: 10 });
+
+for await (const message of orders) {
+  console.log(`#${message.seq}: ${message.payload}`);
+}
+```
+
+## From history to live, with no gap
+
+Before replaying anything, the server tells you exactly which range it's about to send:
+
+```json
+{ "type": "subscribed", "topic": "orders/42", "replay_from": 33, "replay_to": 42 }
+```
+
+You get 33 to 42 from the log, then 43 onwards as they're published. Nothing slips between
+the two and nothing arrives twice.
+
+This works because each topic has a single writer that handles its publishes and subscribes one
+at a time. A publish can't land halfway through setting up your subscription.
+
+Order only holds within a topic:
+
+- Two messages on `orders/42` always arrive in `seq` order.
+- A message on `orders/42` and one on `orders/43` can arrive either way round.
+
+## How long messages are kept
+
+By default each topic keeps messages within three limits:
+
+| Limit | Default |
+|---|---|
+| Messages | The last 1,000 |
+| Age | Up to an hour |
+| Size | Up to 64 MiB |
+
+Whichever limit is hit first trims the oldest messages. The server checks after every publish
+and once a minute, so a quiet topic still ages out.
+
+Retention doesn't wait for slow readers. If a subscriber falls so far behind that the messages
+it was owed are gone, it gets a `truncated` frame saying where the log now starts, and carries
+on from there:
+
+```json
+{ "type": "truncated", "topic": "orders/42", "first_available": 1300 }
+```
+
+### Per-topic limits
+
+Some topics deserve more history than others. You can set limits per topic in the config file:
+
+```toml
+[[storage.topic_retention]]
+pattern = "audit/#"
+max_age_secs = 2592000
+
+[[storage.topic_retention]]
+pattern = "presence/+"
+max_messages = 1
+```
+
+How these entries behave:
+
+- The first entry a topic matches wins, so put specific patterns first.
+- Any limit an entry leaves out comes from the defaults. `audit/#` above keeps 30 days, but
+  still no more than 1,000 messages.
+- These entries only work in the config file, and changing them needs a restart.
+
+## Naming topics
+
+A topic exists the moment something is published to it, so there's nothing to create first.
+
+- Use `/` between levels, as in `orders/42` or `sensors/attic/temp`.
+- Keep names under 120 bytes.
+- `+` and `#` aren't allowed in a topic name because they're wildcards; see
+  [Wildcards and groups](/concepts/wildcards-and-groups/).
+
+Topic names appear unmasked in logs and metrics, so keep personal data out of them.
+
+## Next
+
+- [Delivery and acknowledgements](/concepts/delivery-and-acks/): what QoS 0 and QoS 1 promise.
+- [Replay history from a time](/examples/replay-history/): an example that reads the last ten minutes.

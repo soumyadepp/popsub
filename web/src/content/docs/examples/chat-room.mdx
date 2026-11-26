@@ -1,0 +1,68 @@
+---
+title: Chat room with history
+description: A terminal chat room on PopSub. New members see the last 20 messages, then everything said after they join.
+---
+
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+
+<p class="lede">
+  A chat room where someone who joins late still sees what was just said. Every message goes to
+  the topic `chat/lobby`, and each member reads the last 20 before following along live.
+</p>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once), then let `alice` use the chat topics:
+
+```bash
+popsub users grant alice 'chat/#'
+```
+
+## The code
+
+<ExampleCode example="chat" file="chat" />
+
+Three things happen:
+
+- `subscribe` with **last 20** replays the room's recent history, then keeps delivering new
+  messages.
+- Each line you type is **published** to `chat/lobby`, prefixed with your name.
+- Your own messages come back to you too, because you're subscribed to the same topic. That's
+  how they appear in your window.
+
+## Run it
+
+Open two terminals. In the first, join as `ana` and type `hi`:
+
+<ExampleRun file="chat" args="ana" />
+
+In the second, join as `bob`. He sees `ana`'s message straight away, even though he wasn't
+there when she sent it. Type `hello`:
+
+<ExampleRun file="chat" args="bob" />
+
+<p class="output-label">Output in bob's terminal</p>
+
+```text
+ana: hi
+bob: hello
+```
+
+Press Ctrl+D to leave the room.
+
+## Make it yours
+
+- **More rooms:** use the room's name in the topic, such as `chat/rust` or `chat/random`.
+  The grant `chat/#` already covers them.
+- **Longer history:** change `20`. PopSub keeps the last 1,000 messages per topic for an hour
+  by default, and you can [keep more](/concepts/topics-and-replay/#how-long-messages-are-kept).
+- **Messages as JSON:** payloads are plain strings, so send `JSON.stringify(...)` and parse it
+  on the way in.
+
+## Concepts used
+
+- [Topics and replay](/concepts/topics-and-replay/): why a topic remembers its messages, and
+  the starting points you can ask for.
+- [Delivery and acknowledgements](/concepts/delivery-and-acks/): this example uses QoS 0, the
+  default, which is right for chat.

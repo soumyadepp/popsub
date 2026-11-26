@@ -1,0 +1,92 @@
+---
+title: Worker that survives restarts
+description: A PopSub worker with a durable session and manual acknowledgements. Stop it, restart it, and it handles exactly the messages it missed.
+---
+
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+
+<p class="lede">
+  A worker that processes invoices. Stop it for a deploy or a crash, start it again, and it
+  picks up exactly where it stopped: nothing skipped, nothing done twice.
+</p>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once), then let `alice` use the invoice topics:
+
+```bash
+popsub users grant alice 'invoices/#'
+```
+
+## The worker
+
+<ExampleCode example="worker" file="invoice-worker" />
+
+Two settings make it restartable:
+
+- **A session id**, `invoice-worker`. The server remembers how far this session got in each
+  topic, even while the worker is stopped.
+- **Manual acknowledgements.** The worker calls `ack` only after it has handled an invoice.
+  If it dies halfway, that invoice is sent again next time.
+
+It subscribes from **seq 1**. Topics the session already knows carry on from where it got
+to. A topic created while the worker was stopped is read from its first message, so that
+isn't missed either.
+
+## Something to process
+
+`enqueue` publishes a few invoices, each to its own topic, and waits until each is stored:
+
+<ExampleCode example="worker" file="enqueue" />
+
+## Run it
+
+Start the worker in one terminal and queue two invoices in another:
+
+<ExampleRun file="invoice-worker" />
+
+<ExampleRun file="enqueue" args="2" />
+
+<p class="output-label">Worker output</p>
+
+```text
+processing invoices/1 #1: invoice 1
+processing invoices/2 #1: invoice 2
+```
+
+Now stop the worker with Ctrl+C and queue three more while it's down:
+
+<ExampleRun file="enqueue" args="3" />
+
+```text
+queued invoices/1 as #2
+queued invoices/2 as #2
+queued invoices/3 as #1
+```
+
+Start the worker again. It prints only the three it missed. `invoices/3` didn't exist when it
+stopped, and it's still there:
+
+```text
+processing invoices/1 #2: invoice 1
+processing invoices/2 #2: invoice 2
+processing invoices/3 #1: invoice 3
+```
+
+Start it a third time and it prints nothing, because there's nothing left to do.
+
+## Things to know
+
+- **Run one copy per session id.** A second worker with the same id takes the session over and
+  the first one stops. To run several workers, use a [job queue](/examples/job-queue/).
+- **History has limits.** A stopped worker catches up on messages the server still keeps: by
+  default the last 1,000 per topic, for an hour. A session itself is kept for a day.
+- **Make handling safe to repeat.** If the worker crashes after the work but before `ack`,
+  that invoice comes back.
+
+## Concepts used
+
+- [Durable sessions](/concepts/durable-sessions/): what the server remembers, and for how long.
+- [Delivery and acknowledgements](/concepts/delivery-and-acks/): manual acknowledgements and
+  QoS 1.

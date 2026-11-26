@@ -16,8 +16,9 @@ When a request fails, the server answers with an `error` frame that carries the 
 }
 ```
 
-Match on `code`, never on `message`. `locked_out` and `rate_limited` also carry `retry_after`
-in seconds. Later releases may add codes, so treat one you don't recognise as `internal`.
+- Match on `code`, never on `message`.
+- `locked_out` and `rate_limited` also carry `retry_after` in seconds.
+- Later releases may add codes, so treat one you don't recognise as `internal`.
 
 ## Errors that only fail the request
 
@@ -39,8 +40,9 @@ The connection stays open after these.
 | `user_exists` | That username is taken |
 | `topic_not_found` | Nothing was ever published to that topic |
 
-`invalid_credentials` and `registration_failed` never say whether a username exists. A
-confirmed publish that got `storage_unavailable` was not stored, so retry it with the same
+`invalid_credentials` and `registration_failed` never say whether a username exists.
+
+A confirmed publish that got `storage_unavailable` was not stored, so retry it with the same
 `message_id`.
 
 ## Errors that close the connection
@@ -57,9 +59,11 @@ The server sends the error, then closes with the code shown.
 | `session_unavailable` | 4007 | The session store was down |
 | `internal` | 1011 | Something failed inside the server |
 
-Two exceptions stay open: a second `auth` on a live connection with another user's token gets
-`auth_failed` and keeps its original token, and an `internal` answering an admin request
-fails only that request.
+Two exceptions stay open:
+
+- A second `auth` on a live connection with another user's token gets `auth_failed` and keeps
+  its original token.
+- An `internal` answering an admin request fails only that request.
 
 ## Close codes
 
@@ -79,5 +83,5 @@ fails only that request.
 | 4008 | `slow_consumer` | Yes. The client fell too far behind reading. |
 | 4009 | `account_disabled` | No. |
 
-The client libraries follow this table for you, with one difference: after 4004 they only
+The client libraries follow this table for you, with one difference. After 4004 they only
 reconnect if they were given a password, since a bare token can't be renewed.
