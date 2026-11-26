@@ -74,7 +74,7 @@
   --sl-line-height: 1.7;
   --sl-line-height-headings: 1.15;
   --sl-nav-height: 3.5rem;
-  --sl-content-width: 44rem;
+  --sl-content-width: 46rem;
   --sl-sidebar-width: 17rem;
 
   --pop-radius-sm: 6px;
@@ -303,6 +303,12 @@ h1#_top {
   padding: 0.08em 0.36em;
   color: var(--pop-ink);
   font-size: 0.84em;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.sl-markdown-content code.nowrap {
+  white-space: nowrap;
 }
 
 .sl-markdown-content hr {
@@ -314,22 +320,31 @@ h1#_top {
   color: var(--pop-muted);
 }
 
+.sl-markdown-content .table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--pop-border);
+  border-radius: var(--pop-radius-lg);
+}
+
 .sl-markdown-content table {
   display: table;
   width: 100%;
+  margin: 0;
+  border: 0;
   border-collapse: separate;
   border-spacing: 0;
-  border: 1px solid var(--pop-border);
-  border-radius: var(--pop-radius-lg);
-  overflow: hidden;
   font-size: var(--sl-text-sm);
 }
 
 .sl-markdown-content :is(th, td) {
   border: 0;
   border-bottom: 1px solid var(--pop-border);
-  padding: 0.6rem 0.85rem;
+  padding: 0.6rem 0.6rem;
   vertical-align: top;
+}
+
+.sl-markdown-content :is(th, td):first-child {
+  padding-inline-start: 0.85rem;
 }
 
 .sl-markdown-content tr:last-child td {
@@ -343,18 +358,21 @@ h1#_top {
   font-weight: 550;
   letter-spacing: 0.01em;
   text-align: start;
-}
-
-.sl-markdown-content td:first-child code,
-.sl-markdown-content th:first-child code {
   white-space: nowrap;
 }
 
-@media (max-width: 50rem) {
-  .sl-markdown-content table {
-    display: block;
-    overflow-x: auto;
-  }
+.sl-markdown-content .table-scroll code {
+  padding: 0.05em 0.3em;
+  font-size: 0.8em;
+  white-space: nowrap;
+}
+
+.sl-markdown-content td {
+  min-width: 7rem;
+}
+
+.sl-markdown-content td:has(> code:only-child) {
+  min-width: 0;
 }
 
 .starlight-aside {
