@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/soumyadepp/popsub"
+Homepage = "https://popsub.dev"
 Repository = "https://github.com/soumyadepp/popsub"
 Documentation = "https://github.com/soumyadepp/popsub/tree/main/clients/python#readme"
 Issues = "https://github.com/soumyadepp/popsub/issues"

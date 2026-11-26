@@ -5,6 +5,7 @@ edition = "2024"
 description = "The PopSub WebSocket protocol: every frame clients and the server exchange"
 license = "Apache-2.0"
 repository = "https://github.com/soumyadepp/popsub"
+homepage = "https://popsub.dev"
 readme = "README.md"
 exclude = ["CLAUDE.md"]
 documentation = "https://docs.rs/popsub_protocol"

@@ -2,6 +2,8 @@
 
 A publish/subscribe broker over WebSockets, written in Rust. One binary, a data directory, and a JSON protocol any language can speak.
 
+Documentation, a quickstart and examples in TypeScript, Python, Go and Rust are at **[popsub.dev](https://popsub.dev)**.
+
 Every message gets a sequence number in its topic's log, so subscribers can replay history, resume where they left off after a disconnect or a server restart, and spot duplicates. QoS 1 messages are acknowledged per subscriber and retried until they are, up to a limit, after which the subscription pauses or the message goes to a dead-letter topic.
 
 ```
