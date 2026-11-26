@@ -1,8 +1,13 @@
 import starlight from "@astrojs/starlight";
 import { defineConfig } from "astro/config";
+import { satteri } from "@astrojs/markdown-satteri";
+import readable from "./src/plugins/readable.mjs";
 
 export default defineConfig({
   site: "https://popsub.dev",
+  markdown: {
+    processor: satteri({ hastPlugins: [readable] }),
+  },
   redirects: {
     "/getting-started/": "/quickstart/",
     "/guides/topics-and-replay/": "/concepts/topics-and-replay/",
