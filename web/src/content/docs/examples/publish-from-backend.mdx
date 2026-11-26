@@ -1,0 +1,68 @@
+---
+title: Publish from your backend
+description: Publish a PopSub message from a service, wait until the server has stored it, and handle a refusal by its error code.
+---
+
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+
+<p class="lede">
+  Your backend often needs to know a message was actually stored before it tells a user
+  "done". This program publishes with confirmation and handles the server saying no.
+</p>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once), then let `alice` publish to the order topics:
+
+```bash
+popsub users grant alice 'orders/#'
+```
+
+## The code
+
+<ExampleCode example="publish" file="publish" />
+
+- **A confirmed publish** returns once the message is stored, with its position in the topic,
+  `seq`.
+- **A refusal** carries an error code such as `not_authorized`. Check the code, not the
+  message text, which can change.
+- If the connection drops while you wait, the library reconnects and sends the message again.
+  The server recognises the retry, so it's stored once.
+
+## Run it
+
+Publish an order update:
+
+<ExampleRun file="publish" args={`orders/42 "order 42 shipped"`} />
+
+```text
+stored on orders/42 as #1
+```
+
+Now publish somewhere `alice` has no access to:
+
+<ExampleRun file="publish" args={`billing/7 "refund"`} />
+
+```text
+refused: not_authorized
+```
+
+The program exits with status 1, so a script or a CI job can tell it failed.
+
+## Error codes worth handling
+
+| Code | What to do |
+|---|---|
+| `not_authorized` | The account may not publish there. Fix its grants. |
+| `rate_limited` | Too many publishes. Wait `retry_after` seconds and try again. |
+| `storage_unavailable` | The server couldn't store it, for example a full disk. Retry later. |
+| `invalid_topic` | The topic name is malformed. Fix the name. |
+
+The full list is in [Errors and close codes](/reference/errors-and-close-codes/).
+
+## Concepts used
+
+- [Delivery and acknowledgements](/concepts/delivery-and-acks/#publishing): confirmed
+  publishes and safe retries.
+- [Users and permissions](/concepts/users-and-permissions/): grants.

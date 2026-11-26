@@ -63,7 +63,7 @@ const installs = [
 <style>
   .grid {
     display: grid;
-    gap: 1rem;
+    gap: 0.75rem;
     grid-template-columns: 1fr;
   }
   @media (min-width: 48rem) {
@@ -76,32 +76,39 @@ const installs = [
   }
   .tile {
     min-width: 0;
-    padding: 1.25rem;
-    border: 1px solid var(--sl-color-hairline);
-    border-radius: 1rem;
-    background: var(--sl-color-gray-6);
+    padding: 1.1rem 1.2rem 1.2rem;
+    border: 1px solid var(--pop-border);
+    border-radius: var(--pop-radius-lg);
+    background: var(--pop-panel);
   }
   header {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
     gap: 1rem;
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.65rem;
   }
   h3 {
     margin: 0;
+    color: var(--pop-ink);
+    font-family: var(--pop-font-display);
     font-size: var(--sl-text-base);
-    color: var(--sl-color-white);
+    font-weight: 550;
+    letter-spacing: -0.01em;
   }
   header a,
   p a {
-    color: var(--sl-color-gray-3);
+    color: var(--pop-muted);
     font-size: var(--sl-text-xs);
     text-decoration: none;
   }
   header a:hover,
   p a:hover {
-    color: var(--sl-color-accent-high);
+    color: var(--pop-ink);
+  }
+  .tile :global(.expressive-code pre) {
+    border-radius: var(--pop-radius);
+    background: var(--pop-bg);
   }
   p {
     margin: 0.6rem 0 0;

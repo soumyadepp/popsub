@@ -1,0 +1,71 @@
+---
+title: Replay history from a time
+description: Read every message an audit trail recorded in the last few minutes, then keep following it live, using PopSub's since_ms starting point.
+---
+
+import ExampleCode from "../../../components/ExampleCode.astro";
+import ExampleRun from "../../../components/ExampleRun.astro";
+
+<p class="lede">
+  Something went wrong ten minutes ago. This program replays every event on the audit topics
+  since then, and keeps printing new ones as they happen.
+</p>
+
+## Before you start
+
+Do the [one-time setup](/examples/#set-up-once), then let `alice` use the audit topics:
+
+```bash
+popsub users grant alice 'audit/#'
+```
+
+## The code
+
+<ExampleCode example="replay" file="replay" />
+
+- **`since_ms`** starts each topic at the first message published at or after that time.
+- **`published_at_ms`** on each message is when the server stored it. The program shows it
+  as "seconds ago".
+
+## Run it
+
+Record a few events, then replay the last ten minutes:
+
+```bash
+popsub client --username alice --password alice-password --topic audit/login
+popsub client --username alice --password alice-password --topic audit/billing
+```
+
+<ExampleRun file="replay" args="10" />
+
+```text
+5 s ago  audit/login  Hello from popsub client
+3 s ago  audit/billing  Hello from popsub client
+```
+
+The program keeps running and prints new events as they arrive.
+
+## Order across topics
+
+Within one topic, messages always arrive in order. Across topics they don't: history is
+replayed topic by topic, so you may see `audit/billing` before an older `audit/login`. If you
+need one timeline, sort by `published_at_ms`, or publish everything to a single topic.
+
+## Keep audit history longer
+
+By default a topic keeps its last 1,000 messages for an hour, so this can only look back an
+hour. Give audit topics their own limits in the server's config file:
+
+```toml
+[[storage.topic_retention]]
+pattern = "audit/#"
+max_age_secs = 2592000
+max_messages = 100000
+```
+
+That keeps 30 days, up to 100,000 messages per topic. See
+[Configuration](/run/configuration/#keeping-history).
+
+## Concepts used
+
+- [Topics and replay](/concepts/topics-and-replay/): starting points and retention.

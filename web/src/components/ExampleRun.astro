@@ -1,0 +1,62 @@
+---
+/**
+ * The command that runs an example program, shown for the language the reader picked in the
+ * code tabs above it. It renders one block per language and shows only the chosen one, so the
+ * page doesn't repeat a second row of tabs. Without JavaScript, TypeScript is shown.
+ */
+import { Code } from "@astrojs/starlight/components";
+import { languages } from "./examples";
+
+interface Props {
+  file: string;
+  args?: string;
+}
+
+const { file, args = "" } = Astro.props;
+---
+
+<div class="example-run not-content">
+  {
+    languages.map((language, index) => (
+      <div data-run-lang={language.label} hidden={index !== 0}>
+        <Code code={language.run(file, args)} lang="bash" />
+      </div>
+    ))
+  }
+</div>
+
+<script>
+  const storageKey = "starlight-synced-tabs__lang";
+
+  function show(label: string | null) {
+    if (!label) return;
+    document.querySelectorAll<HTMLElement>(".example-run").forEach((run) => {
+      const match = run.querySelector(`[data-run-lang="${CSS.escape(label)}"]`);
+      if (!match) return;
+      run.querySelectorAll<HTMLElement>("[data-run-lang]").forEach((block) => {
+        block.hidden = block !== match;
+      });
+    });
+  }
+
+  try {
+    show(localStorage.getItem(storageKey));
+  } catch {}
+
+  document.addEventListener("click", (event) => {
+    const tab = (event.target as Element | null)?.closest('starlight-tabs[data-sync-key="lang"] [role="tab"]');
+    if (tab) show(tab.textContent?.trim() ?? null);
+  });
+
+  document.addEventListener("keyup", (event) => {
+    const list = (event.target as Element | null)?.closest('starlight-tabs[data-sync-key="lang"]');
+    const selected = list?.querySelector('[role="tab"][aria-selected="true"]');
+    if (selected) show(selected.textContent?.trim() ?? null);
+  });
+</script>
+
+<style>
+  .example-run {
+    margin-top: 1rem;
+  }
+</style>

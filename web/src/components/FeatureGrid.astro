@@ -55,8 +55,12 @@ const features = [
 <style>
   .grid {
     display: grid;
-    gap: 1rem;
     grid-template-columns: 1fr;
+    overflow: hidden;
+    border: 1px solid var(--pop-border);
+    border-radius: var(--pop-radius-xl);
+    background: var(--pop-border);
+    gap: 1px;
   }
   @media (min-width: 40rem) {
     .grid {
@@ -69,47 +73,35 @@ const features = [
     }
   }
   .tile {
-    position: relative;
-    padding: 1.5rem;
-    border: 1px solid var(--sl-color-hairline);
-    border-radius: 1rem;
-    background: linear-gradient(180deg, var(--sl-color-gray-6), transparent 140%);
-    transition:
-      transform 0.2s ease,
-      border-color 0.2s ease,
-      box-shadow 0.2s ease;
+    padding: 1.6rem 1.6rem 1.75rem;
+    background: var(--pop-bg);
+    transition: background-color 0.15s ease;
   }
   .tile:hover {
-    transform: translateY(-3px);
-    border-color: color-mix(in srgb, var(--sl-color-accent) 55%, var(--sl-color-hairline));
-    box-shadow: 0 18px 40px -24px color-mix(in srgb, var(--sl-color-accent) 70%, transparent);
+    background: var(--pop-panel);
   }
   .icon {
     display: inline-grid;
     place-items: center;
-    width: 2.4rem;
-    height: 2.4rem;
-    border-radius: 0.75rem;
-    color: var(--sl-color-accent-high);
-    background: color-mix(in srgb, var(--sl-color-accent) 18%, transparent);
-    border: 1px solid color-mix(in srgb, var(--sl-color-accent) 35%, transparent);
+    width: 2rem;
+    height: 2rem;
+    border: 1px solid var(--pop-border);
+    border-radius: 9px;
+    background: var(--pop-panel);
+    color: var(--pop-ink);
   }
   h3 {
-    margin: 1rem 0 0.4rem;
-    font-size: var(--sl-text-lg);
-    color: var(--sl-color-white);
+    margin: 1.1rem 0 0.4rem;
+    color: var(--pop-ink);
+    font-family: var(--pop-font-display);
+    font-size: 1rem;
+    font-weight: 550;
+    letter-spacing: -0.015em;
   }
   p {
     margin: 0;
-    color: var(--sl-color-gray-2);
+    color: var(--pop-muted);
     font-size: var(--sl-text-sm);
     line-height: 1.6;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .tile,
-    .tile:hover {
-      transition: none;
-      transform: none;
-    }
   }
 </style>

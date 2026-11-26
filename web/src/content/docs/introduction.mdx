@@ -1,0 +1,87 @@
+---
+title: What is PopSub?
+description: PopSub is a message broker. Programs send messages to named topics, and every program listening on a topic gets them, even if it was offline when they were sent.
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+<p class="lede">
+  PopSub is a message broker: a small server that passes messages between your programs. One
+  program publishes a message to a named topic, and every program subscribed to that topic
+  receives it.
+</p>
+
+That pattern is called publish/subscribe, or pub/sub. It's how a chat app shows a new message
+to everyone in the room, how a dashboard updates when a sensor reports, and how a backend hands
+work to a pool of workers. The programs never talk to each other directly. They only talk to
+PopSub, so each one can start, stop and scale on its own.
+
+## A minute of vocabulary
+
+| Word | Meaning |
+|---|---|
+| **Topic** | A name messages are sent to, like `orders/42` or `sensors/attic/temp`. Topics appear the first time something is published to them. |
+| **Publish** | Send a message to a topic. |
+| **Subscribe** | Ask to receive a topic's messages. With a pattern like `orders/#`, you get every topic under `orders/`. |
+| **Message** | A piece of text (or base64 bytes) plus its topic and its position in the topic, `seq`. |
+
+[Core concepts](/concepts/) has the rest, in one page.
+
+## What PopSub does differently
+
+Many pub/sub systems forget a message as soon as they've sent it. If your subscriber was
+restarting at that moment, the message is gone. PopSub keeps every topic as a numbered log, so
+a subscriber can:
+
+- **Catch up after downtime.** Connect with a session name and PopSub sends what you missed,
+  in order, then carries on with new messages.
+- **Read history.** Ask for the last 20 messages, everything since 10 minutes ago, or
+  everything from message 1.
+- **Confirm it handled a message.** With QoS 1, PopSub resends a message until the subscriber
+  acknowledges it.
+
+It also has accounts with per-topic permissions, shared subscriptions that spread work across
+workers, and client libraries for TypeScript, Python, Go and Rust that reconnect on their
+own. Anything else that can open a WebSocket and parse JSON can use it too.
+
+## When to use it
+
+PopSub is a good fit when:
+
+- You run a small or medium application on one machine and want realtime messaging with a
+  written-down delivery guarantee.
+- Your browsers, services and workers are in different languages and need one place to meet.
+- A worker that restarts, or a phone that drops off the network, must not miss messages.
+
+Look elsewhere when:
+
+- You need more than one server for redundancy or throughput. PopSub is a single process; use
+  NATS JetStream or Kafka.
+- Your devices only speak MQTT. Use Mosquitto or EMQX.
+- You need a stable API today. PopSub is at version 0.x and still changing. See
+  [Status and comparisons](/help/status-and-comparisons/).
+
+## Where to go next
+
+<CardGrid>
+  <LinkCard
+    title="Quickstart"
+    description="Run a server and receive your first message. About five minutes."
+    href="/quickstart/"
+  />
+  <LinkCard
+    title="Examples"
+    description="Complete programs for chat, dashboards, job queues and more, in four languages."
+    href="/examples/"
+  />
+  <LinkCard
+    title="Core concepts"
+    description="Topics, sessions, acknowledgements and permissions on one page."
+    href="/concepts/"
+  />
+  <LinkCard
+    title="FAQ and troubleshooting"
+    description="Answers to the questions people hit first."
+    href="/help/faq/"
+  />
+</CardGrid>

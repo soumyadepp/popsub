@@ -1,0 +1,29 @@
+---
+/**
+ * One example program in four language tabs. The sources live in src/examples/<example>/, one
+ * file per language, and were each run against a real server before they were added.
+ */
+import { Code, Tabs, TabItem } from "@astrojs/starlight/components";
+import { languages, sourceFor } from "./examples";
+
+interface Props {
+  example: string;
+  file: string;
+}
+
+const { example, file } = Astro.props;
+---
+
+<Tabs syncKey="lang">
+  {
+    languages.map((language) => (
+      <TabItem label={language.label}>
+        <Code
+          code={sourceFor(example, file, language)}
+          lang={language.highlight}
+          title={language.path(file)}
+        />
+      </TabItem>
+    ))
+  }
+</Tabs>

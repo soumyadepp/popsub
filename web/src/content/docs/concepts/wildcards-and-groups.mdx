@@ -1,0 +1,120 @@
+---
+title: Wildcards and groups
+description: Subscribe to many PopSub topics with one pattern, and spread one topic's messages across several workers with a shared subscription.
+sidebar:
+  order: 4
+---
+
+import WildcardJoin from "../../../components/diagrams/WildcardJoin.astro";
+import GroupSplit from "../../../components/diagrams/GroupSplit.astro";
+
+<p class="lede">A wildcard gives one subscriber many topics. A group gives many workers one topic, each message going to just one of them.</p>
+
+These two features solve opposite problems:
+
+- A **wildcard** gives one subscriber the messages from many topics.
+- A **group** gives many workers one topic's messages, each message going to just one of them.
+
+## Subscribing to many topics
+
+Subscribe to a pattern instead of a topic name:
+
+- `+` stands for exactly one level.
+- `#`, at the end, stands for everything below.
+
+| Pattern | Matches | Doesn't match |
+|---|---|---|
+| `sensors/+/temp` | `sensors/attic/temp` | `sensors/attic/humidity` |
+| `orders/#` | `orders/42`, `orders/eu/42`, `orders` | `order/42` |
+| `#` | everything | |
+
+A pattern isn't a special kind of subscription. The server finds every topic it matches and
+subscribes you to each one on its own. It keeps doing that as new topics appear:
+
+<WildcardJoin />
+
+So everything on the [Topics and replay](/concepts/topics-and-replay/) page still applies, one
+topic at a time:
+
+- Each message arrives with its own topic and `seq`.
+- History is replayed per topic.
+- Order holds within a topic but not across them.
+
+```js
+const orders = await client.subscribe("orders/#", { seq: 1 });
+
+for await (const message of orders) {
+  console.log(`${message.topic} #${message.seq}: ${message.payload}`);
+}
+```
+
+Use `{seq: 1}` here if the worker has a durable session. A topic created while the worker was
+stopped is new to the session, and with the default `"resume"` its first messages would be
+skipped.
+
+[Durable sessions](/concepts/durable-sessions/#why-the-examples-use-seq-1) walks through it.
+
+### Permissions with patterns
+
+Permissions are checked topic by topic as each one is joined, so a pattern quietly leaves out
+topics you can't read.
+
+If an admin takes away access later, only the affected topics end, and the rest of the pattern
+carries on.
+
+## Sharing work between workers
+
+Say you have a queue of jobs on `orders/jobs` and two workers. You don't want both doing every
+job, you want them to take turns.
+
+Subscribe both to the same group:
+
+```js
+const jobs = await client.subscribeShared("orders/jobs", "workers", "new");
+
+for await (const job of jobs) {
+  await handle(job.payload);
+  job.ack();
+}
+```
+
+<GroupSplit />
+
+Each message goes to one member of the group, in turn. Anyone subscribed outside the group, like
+the dashboard here, still gets every message.
+
+In Python and Rust it's `subscribe_shared`, and in Go `SubscribeShared`.
+
+### Where a group reads from
+
+The group keeps one position in the topic, shared by its members, and it's stored on the server.
+
+- A worker that joins later picks up from where the group is, not from its own `from`.
+- Its `from` only matters the first time the group is used.
+- If every worker stops, messages wait in the log for the next one, for up to a day.
+
+### When a worker dies
+
+Each message has to be acknowledged by the worker it was sent to. If that worker disconnects
+first, its unacknowledged messages go to another member straight away.
+
+That's why the example acknowledges after the work is done. A worker that crashes mid-job hands
+the job on instead of losing it.
+
+It also means a job can run twice, once on the worker that crashed and again on the one that
+took over. Make jobs safe to repeat.
+
+For the same reason a member can see an older `seq` after a newer one, so don't rely on order
+inside a group.
+
+### A few rules
+
+- Groups only work with exact topic names, not patterns.
+- A group belongs to one account, so all the workers log in as the same user. Another account
+  can't join it by guessing the name.
+- A connection can be in a group or subscribed to the topic directly, but not both at once.
+
+## Next
+
+- [Users and permissions](/concepts/users-and-permissions/): who may use which topics.
+- [Job queue with several workers](/examples/job-queue/): a shared subscription in practice.

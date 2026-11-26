@@ -8,9 +8,12 @@ sidebar:
 import ConnectionLifecycle from "../../../components/diagrams/ConnectionLifecycle.astro";
 
 You only need this page to write a client in a new language. All you need is a WebSocket
-library and a JSON parser. Everything here is defined in the
-[`popsub_protocol`](https://github.com/soumyadepp/popsub/tree/main/crates/popsub_protocol/src)
-crate, and [`docs/protocol/`](#json-schemas) has a JSON Schema for every frame.
+library and a JSON parser.
+
+- Everything here is defined in the
+  [`popsub_protocol`](https://github.com/soumyadepp/popsub/tree/main/crates/popsub_protocol/src)
+  crate.
+- [`docs/protocol/`](#json-schemas) has a JSON Schema for every frame.
 
 ## Frames
 
@@ -20,31 +23,44 @@ Each frame is one JSON object in a WebSocket text message, with a `type` saying 
 { "type": "publish", "id": 4, "topic": "orders/42", "payload": "order 42 shipped", "qos": 1 }
 ```
 
-Put an `id` on any request, a number or a string, and the reply carries it back. Match replies
-by `id`, not by the order they arrive in: in the session below, a `message` overtakes the
-`published` reply to the same publish.
+Put an `id` on any request, a number or a string, and the reply carries it back.
+
+Match replies by `id`, not by the order they arrive in. In the session below, a `message`
+overtakes the `published` reply to the same publish.
 
 Frames the server sends on its own, like `message`, `truncated` and `stalled`, have no `id`.
 
-Payloads are always strings. To send bytes, base64 them and add `"encoding": "base64"`. The
-server stores the string as it is and never decodes it.
+Payloads are always strings:
+
+- To send bytes, base64 them and add `"encoding": "base64"`.
+- The server stores the string as it is and never decodes it.
 
 ## A connection's life
 
 <ConnectionLifecycle />
 
 A connection logs in, then sends `auth` with the token. Anything other than `login`, `register`
-or `ping` before that is refused and the connection is closed. Once authenticated, it can do
-everything else. A minute before the token expires the server sends `auth_expiring`, and the
-client logs in again and sends a fresh `auth` on the same connection.
+or `ping` before that is refused and the connection is closed.
 
-The server sends a WebSocket ping every 30 seconds and closes a connection it hasn't heard from
-in 90. WebSocket libraries answer pings on their own. In a browser, where you can't see them,
-send `{"type":"ping"}` now and then instead.
+Once authenticated, it can do everything else.
+
+A minute before the token expires the server sends `auth_expiring`. The client logs in again and
+sends a fresh `auth` on the same connection.
+
+### Keeping the connection alive
+
+- The server sends a WebSocket ping every 30 seconds.
+- It closes a connection it hasn't heard from in 90.
+- WebSocket libraries answer pings on their own. In a browser, where you can't see them, send
+  `{"type":"ping"}` now and then instead.
+
+### Versioning
 
 `auth` also carries the protocol version, currently 1. Within a version, frames, fields and
-error codes are only ever added. Ignore fields and frame types you don't know, and treat an
-unknown error code like `internal`.
+error codes are only ever added.
+
+- Ignore fields and frame types you don't know.
+- Treat an unknown error code like `internal`.
 
 ## A real session
 
@@ -66,8 +82,11 @@ and only the token is shortened.
 ← {"id":6,"type":"error","code":"not_authorized","message":"not authorized to publish to 'news/today'"}
 ```
 
-`replay_from` 1 and `replay_to` 0 means there was no history to replay. The `ack` has no reply.
-The error carries the `id` of the request it answers, and the connection stays open.
+A few things to notice:
+
+- `replay_from` 1 and `replay_to` 0 means there was no history to replay.
+- The `ack` has no reply.
+- The error carries the `id` of the request it answers, and the connection stays open.
 
 Connecting again later with the same `session_id`, the server lists the session's topics and
 resumes after the acknowledged message:
@@ -91,10 +110,12 @@ resumes after the acknowledged message:
 | `ack` | `topic`, `seq` | nothing |
 | `ping` | | `pong` |
 
-Only `topic`, `payload`, `token`, `username`, `password` and `seq` are required. `from` takes
-`"resume"`, `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`, as described in
-[Topics and replay](/guides/topics-and-replay/). `hold_resumed` is explained in
-[Durable sessions](/guides/durable-sessions/#writing-your-own-client).
+Only `topic`, `payload`, `token`, `username`, `password` and `seq` are required.
+
+- `from` takes `"resume"`, `"new"`, `{"last": N}`, `{"since_ms": T}` or `{"seq": S}`, as
+  described in [Topics and replay](/concepts/topics-and-replay/).
+- `hold_resumed` is explained in
+  [Durable sessions](/concepts/durable-sessions/#writing-your-own-client).
 
 ## What the server sends
 
@@ -108,14 +129,21 @@ Only `topic`, `payload`, `token`, `username`, `password` and `seq` are required.
 | `auth_expiring` | `expires_at_ms` | A minute before the token expires |
 | `error` | `code`, `message`, `retry_after` | A request failed. See [Errors and close codes](/reference/errors-and-close-codes/). |
 
-`authenticated` carries a `limits` object with the numbers a client needs: `max_inflight`,
-`session_expiry_secs`, `heartbeat_secs`, `idle_timeout_secs`, `max_payload_bytes` and
-`max_topic_bytes`.
+`authenticated` carries a `limits` object with the numbers a client needs:
+
+- `max_inflight`
+- `session_expiry_secs`
+- `heartbeat_secs`
+- `idle_timeout_secs`
+- `max_payload_bytes`
+- `max_topic_bytes`
 
 ## Admin requests
 
 An enabled admin can manage accounts and topics over the same connection. Anyone else gets
-`forbidden`. These are what `popsub users` and `popsub topics` send.
+`forbidden`.
+
+These are what `popsub users` and `popsub topics` send.
 
 | Request | Fields |
 |---|---|
@@ -129,16 +157,33 @@ An enabled admin can manage accounts and topics over the same connection. Anyone
 | `set_enabled` | `username`, `enabled` |
 | `get_topic`, `purge_topic` | `topic` |
 
-A role looks like `{"kind": "user", "topics": [{"pattern": "orders/#", "access": "both"}]}`,
-where `kind` is `admin`, `user` or `readonly` and `access` is `subscribe`, `publish` or `both`.
+A role looks like this:
+
+```json
+{"kind": "user", "topics": [{"pattern": "orders/#", "access": "both"}]}
+```
+
+- `kind` is `admin`, `user` or `readonly`.
+- `access` is `subscribe`, `publish` or `both`.
 
 ## JSON Schemas
 
 [`docs/protocol/`](https://github.com/soumyadepp/popsub/tree/main/docs/protocol) is generated
-from the protocol types, and CI fails if it falls out of date. `client.schema.json` covers every
-frame a client sends, `server.schema.json` every frame the server sends, and `close-codes.json`
-the close codes and whether to reconnect after each. Generate your client's types from them.
+from the protocol types, and CI fails if it falls out of date.
 
-A library needs more than the frames to be reliable: reconnecting, resubscribing without
-gaps, dropping duplicates. [`clients/README.md`](https://github.com/soumyadepp/popsub/blob/main/clients/README.md)
-lists all of it, and a shared scenario suite holds every library in the repository to it.
+| File | Covers |
+|---|---|
+| `client.schema.json` | Every frame a client sends |
+| `server.schema.json` | Every frame the server sends |
+| `close-codes.json` | The close codes and whether to reconnect after each |
+
+Generate your client's types from them.
+
+A library needs more than the frames to be reliable:
+
+- reconnecting
+- resubscribing without gaps
+- dropping duplicates
+
+[`clients/README.md`](https://github.com/soumyadepp/popsub/blob/main/clients/README.md) lists
+all of it, and a shared scenario suite holds every library in the repository to it.

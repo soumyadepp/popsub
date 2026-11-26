@@ -1,78 +1,72 @@
 ---
 title: PopSub
-description: A publish/subscribe broker over WebSockets, written in Rust. One binary, a data directory, and a JSON protocol any language can speak.
+description: A small, self-hosted message broker. Subscribers that drop off get everything they missed, in order, when they come back.
 template: splash
 head:
   - tag: title
-    content: PopSub, a pub/sub broker over WebSockets
+    content: PopSub, a message broker that remembers
 hero:
-  title: Pub/sub that remembers <span>where you left off.</span>
-  tagline: A publish/subscribe broker over WebSockets, written in Rust. One binary, a data directory, and a JSON protocol any language can speak.
+  title: Publish once. <span>Every subscriber catches up.</span>
+  tagline: A small, self-hosted message broker. Subscribers that drop off get everything they missed, in order, when they come back.
   actions:
-    - text: Get started
-      link: /getting-started/
+    - text: Quickstart
+      link: /quickstart/
       icon: right-arrow
-    - text: View on GitHub
-      link: https://github.com/soumyadepp/popsub
-      icon: external
-      variant: minimal
+    - text: See examples
+      link: /examples/
+      variant: secondary
 ---
 
-import { Code, Tabs, TabItem, LinkButton } from "@astrojs/starlight/components";
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
 import FeatureGrid from "../../components/FeatureGrid.astro";
 import InstallGrid from "../../components/InstallGrid.astro";
 import FitPanels from "../../components/FitPanels.astro";
-import jsExample from "../../snippets/example.mjs?raw";
-import pyExample from "../../snippets/example.py?raw";
-import goExample from "../../snippets/main.go?raw";
-import rsExample from "../../snippets/main.rs?raw";
+import ExampleCode from "../../components/ExampleCode.astro";
+
+<div class="section-head">
+  <p class="kicker">Start here</p>
+  <h2>New to PopSub? <span class="quiet">Pick a door.</span></h2>
+</div>
+
+<CardGrid>
+  <LinkCard title="What is PopSub?" description="Pub/sub in plain words, and when to use it." href="/introduction/" />
+  <LinkCard title="Quickstart" description="Your first message in five minutes." href="/quickstart/" />
+  <LinkCard title="Examples" description="Chat, dashboards, job queues and more, in four languages." href="/examples/" />
+  <LinkCard title="Core concepts" description="The six ideas everything builds on." href="/concepts/" />
+</CardGrid>
 
 <div class="section-head">
   <p class="kicker">What you get</p>
-  <h2>Small enough to read. Careful where it counts.</h2>
+  <h2>Small enough to read. <span class="quiet">Careful where it counts.</span></h2>
 </div>
 
 <FeatureGrid />
 
 <div class="section-head">
-  <p class="kicker">Thirty seconds of code</p>
-  <h2>Subscribe, publish, and pick up where you stopped</h2>
+  <p class="kicker">A restartable worker</p>
+  <h2>Stop it. Restart it. <span class="quiet">Nothing is lost.</span></h2>
   <p>
-    Subscribe to every topic under <code>orders/</code>, publish one message and wait until it is stored,
-    then print what arrives. The session name means a restart carries on from where it stopped,
-    and starting from <code>seq</code> 1 also picks up topics created while it was away.
+    A session id and manual acknowledgements are all it takes. Stop this worker, publish while
+    it's down, and start it again: it handles exactly what it missed, in order.
   </p>
 </div>
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    <Code code={jsExample} lang="js" />
-  </TabItem>
-  <TabItem label="Python">
-    <Code code={pyExample} lang="python" />
-  </TabItem>
-  <TabItem label="Go">
-    <Code code={goExample} lang="go" />
-  </TabItem>
-  <TabItem label="Rust">
-    <Code code={rsExample} lang="rust" />
-  </TabItem>
-</Tabs>
+<ExampleCode example="worker" file="invoice-worker" />
 
 <div class="center">
-  <LinkButton href="/getting-started/" icon="right-arrow">Run it against a local server</LinkButton>
+  <a class="text-link" href="/examples/restartable-worker/">See it run, step by step →</a>
 </div>
 
 <div class="section-head">
   <p class="kicker">Install</p>
-  <h2>One server, four client libraries</h2>
+  <h2>One server. <span class="quiet">Four client libraries.</span></h2>
 </div>
 
 <InstallGrid />
 
 <div class="section-head">
   <p class="kicker">Where it fits</p>
-  <h2>One process, no clustering, honest about it</h2>
+  <h2>One process, no clustering. <span class="quiet">Honest about it.</span></h2>
 </div>
 
 <FitPanels />
