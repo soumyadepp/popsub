@@ -92,6 +92,7 @@ const lines = [
 
 <style>
   .term {
+    min-width: 0;
     --term-bg: #111110;
     --term-bar: #191918;
     --term-line: #262624;
@@ -151,6 +152,13 @@ const lines = [
   .line {
     display: block;
     min-height: 1.75em;
+  }
+  @media (max-width: 40rem) {
+    pre {
+      min-height: 24rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
   }
   .line.hidden {
     visibility: hidden;

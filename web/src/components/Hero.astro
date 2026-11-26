@@ -71,6 +71,7 @@ const pullCommand = "docker pull ghcr.io/soumyadepp/popsub:0.2";
 <style>
   .hero {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 2.5rem;
     padding: 2.5rem 0 1rem;
   }
@@ -103,12 +104,13 @@ const pullCommand = "docker pull ghcr.io/soumyadepp/popsub:0.2";
   }
   .top {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 1.75rem;
     align-items: end;
   }
   @media (min-width: 60rem) {
     .top {
-      grid-template-columns: 1.35fr 1fr;
+      grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
       gap: 4rem;
     }
   }
@@ -123,7 +125,9 @@ const pullCommand = "docker pull ghcr.io/soumyadepp/popsub:0.2";
     text-wrap: balance;
   }
   h1 :global(span) {
+    display: block;
     color: var(--pop-faint);
+    text-wrap: balance;
   }
   .tagline {
     margin: 0;
@@ -207,6 +211,11 @@ const pullCommand = "docker pull ghcr.io/soumyadepp/popsub:0.2";
     border-radius: var(--pop-radius-xl);
     background: var(--pop-panel);
     padding: clamp(1rem, 4vw, 3.5rem);
+  }
+  .copy,
+  .stage,
+  .stage-inner {
+    min-width: 0;
   }
   .stage-inner {
     max-width: 44rem;
