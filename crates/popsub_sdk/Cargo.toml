@@ -5,6 +5,7 @@ edition = "2024"
 description = "Rust client for PopSub: reconnection, durable sessions, acknowledgements and deduplication"
 license = "Apache-2.0"
 repository = "https://github.com/soumyadepp/popsub"
+homepage = "https://popsub.dev"
 readme = "README.md"
 exclude = ["CLAUDE.md"]
 documentation = "https://docs.rs/popsub_sdk"
