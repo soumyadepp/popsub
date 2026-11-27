@@ -5,7 +5,7 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
 ## Files
 
 - `src/record.rs`: `NewRecord` (what a publisher sends), `Record` (what the log stores, with `seq`), `Subscription` (a session's cursor), `LogBounds`, and `PayloadEncoding`, the optional `encoding` both records carry beside the payload string (never decoded; records stored before the field existed read back as `None`).
-- `src/storage.rs`: the `MessageLog`, `SubscriptionStore` and `Storage` traits, `Durability`, `Capabilities`, `Retention`.
+- `src/storage.rs`: the `MessageLog`, `SubscriptionStore` and `Storage` traits, `Durability`, `Capabilities`, `Retention`, `BackupSummary`. `Storage::backup` refuses with `Unsupported` unless a backend overrides it; `MemoryStorage` doesn't.
 - `src/error.rs`: `StorageError` (`Unavailable`, `Corrupt`, `Unsupported`, `Other`) and `Result`.
 - `src/index.rs`: `LogIndex<T>`, the per-topic numbering, retry detection, publish-time and retention rules. Both backends use it; `T` is the whole record in memory and its disk location in the file backend.
 - `src/sessions.rs`: `SessionTable`, the session and cursor rules, used by both backends.
@@ -13,7 +13,8 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
 - `src/file/`: `FileStorage`, the default backend.
   - `mod.rs`: the store, the `LOCK` file, topic directory names (`t` + hex), and running file I/O on the blocking pool.
   - `topic.rs`: one topic's segment files, `head.json`, recovery and trimming.
-  - `sessions.rs`: the session write-ahead log and its compaction.
+  - `sessions.rs`: the session write-ahead log and its compaction. `write_compacted` writes a log holding exactly a snapshot; compaction and backups both use it.
+  - `backup.rs`: `Storage::backup` for the file backend. Sessions are captured first, then each topic (`TopicFiles::snapshot`) under its own lock; files are copied after the lock is released, into `<dest>.partial`, which is renamed to `dest` at the end.
   - `codec.rs`: the `length | crc32 | body` frame.
   - `body.rs`: what goes in a frame's body. Records are written in a compact binary form without the topic (the directory names it), with a server-assigned UUID id as 16 bytes; `decode` also reads the JSON records older versions wrote. A new `Record` field needs a flag or a new `FORMAT` byte there, and the JSON reader keeps working.
   - `tests.rs`: the suite with 256-byte segments, and the recovery and damage tests.
@@ -32,6 +33,9 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
 - A durability level above `capabilities().max_durability` is refused with `Unsupported`, never silently downgraded.
 - File backend: the head is written before segments are deleted; a bad frame is only truncated at the end of the newest segment, anything else is `Corrupt`; nothing confirmed as `synced` is acknowledged before `sync_data` returns.
 - File backend: a trim that doesn't empty a segment only changes the index (`trim_index`) and marks the head stale; `persist_trim` writes it when a segment or the whole log empties, and `Drop` writes a stale one. So after a crash up to a segment of trimmed records is back until the next trim. A purge always persists.
+
+- Backups: capture sessions before topics, so no cursor in a copy points past its topic. A topic's snapshot builds its head from the index (unpersisted trims already applied) and keeps the newest segment even when it holds no retained records, as `persist_trim` does. Copy only up to the lengths recorded under the lock.
+- The on-disk format is a promise to later releases: `crates/popsub/tests/upgrade.rs` opens data written by every release. A format change must keep reading the old one.
 
 ## Adding a backend
 

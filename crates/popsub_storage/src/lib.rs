@@ -34,4 +34,6 @@ pub use faulty::FaultyStorage;
 pub use file::{DEFAULT_SEGMENT_BYTES, FileOptions, FileStorage, MAX_TOPIC_BYTES};
 pub use memory::MemoryStorage;
 pub use record::{LogBounds, NewRecord, PayloadEncoding, Record, Subscription, push_json_str};
-pub use storage::{Capabilities, Durability, MessageLog, Retention, Storage, SubscriptionStore};
+pub use storage::{
+    BackupSummary, Capabilities, Durability, MessageLog, Retention, Storage, SubscriptionStore,
+};

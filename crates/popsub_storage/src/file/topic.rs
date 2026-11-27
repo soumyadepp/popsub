@@ -633,6 +633,106 @@ impl TopicFiles {
     }
 }
 
+/// A topic's retained state captured under its lock for a backup: the head as
+/// the index sees it, and an open handle on each segment that holds retained
+/// records with its length at that moment.
+///
+/// The handles keep the files readable even if a trim deletes them before the
+/// copy, and appends after the capture land past the recorded lengths, so the
+/// copy is the topic exactly as it was when captured.
+#[derive(Debug)]
+pub(crate) struct TopicSnapshot {
+    /// The head to write beside the copied segments.
+    head: Head,
+    /// Each kept segment's first `seq`, an open handle on it, and its length.
+    segments: Vec<(u64, File, u64)>,
+    /// How many records the topic retains.
+    records: u64,
+}
+
+impl TopicFiles {
+    /// Captures the topic for a backup. Call it with the topic locked.
+    ///
+    /// The head is built from the index rather than read from `head.json`,
+    /// so trims that weren't persisted yet are already applied in the copy.
+    /// Segments with no retained records are left out, except the newest,
+    /// which `persist_trim` never deletes either.
+    ///
+    /// Returns:
+    ///     The snapshot.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When a segment can't be opened.
+    pub(crate) fn snapshot(&self) -> Result<TopicSnapshot> {
+        let bounds = self.index.bounds();
+        let mut segments = Vec::new();
+        for (position, segment) in self.segments.iter().enumerate() {
+            let newest = position + 1 == self.segments.len();
+            if !newest && self.segments[position + 1].first_seq <= bounds.first_seq {
+                continue;
+            }
+            let path = segment_path(&self.dir, segment.first_seq);
+            let file = File::open(&path).map_err(|e| io_error(e, &path))?;
+            segments.push((segment.first_seq, file, segment.len));
+        }
+        let records = if bounds.is_empty() {
+            0
+        } else {
+            bounds.last_seq + 1 - bounds.first_seq
+        };
+        Ok(TopicSnapshot {
+            head: Head {
+                first_seq: bounds.first_seq,
+                last_seq: bounds.last_seq,
+                last_published_at_ms: self.index.last_published_at_ms(),
+            },
+            segments,
+            records,
+        })
+    }
+}
+
+impl TopicSnapshot {
+    /// How many records the captured topic retains.
+    ///
+    /// Returns:
+    ///     The count.
+    pub(crate) fn records(&self) -> u64 {
+        self.records
+    }
+
+    /// Writes the captured topic into a new topic directory and flushes it.
+    ///
+    /// Args:
+    ///     dir: The topic's directory in the backup. It is created.
+    ///
+    /// Returns:
+    ///     The bytes of segment data written.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When a file can't be read, written or flushed.
+    pub(crate) fn write_to(self, dir: &Path) -> Result<u64> {
+        fs::create_dir_all(dir).map_err(|e| io_error(e, dir))?;
+        let mut bytes = 0;
+        for (first_seq, file, len) in self.segments {
+            let path = segment_path(dir, first_seq);
+            let mut out = File::create(&path).map_err(|e| io_error(e, &path))?;
+            let copied =
+                std::io::copy(&mut file.take(len), &mut out).map_err(|e| io_error(e, &path))?;
+            if copied != len {
+                return Err(StorageError::Unavailable(format!(
+                    "{}: copied {copied} of {len} bytes",
+                    path.display()
+                )));
+            }
+            out.sync_all().map_err(|e| io_error(e, &path))?;
+            bytes += copied;
+        }
+        write_head(dir, self.head)?;
+        Ok(bytes)
+    }
+}
+
 impl Drop for TopicFiles {
     /// Writes a stale head when the store closes, so a clean restart starts
     /// from the first retained record. A failure is ignored: the next open

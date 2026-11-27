@@ -141,7 +141,8 @@ docker pull ghcr.io/soumyadepp/popsub:0.1.0
 
 1. On a branch, set the new version in `crates/popsub/Cargo.toml`, `crates/popsub_protocol/Cargo.toml`, `crates/popsub_sdk/Cargo.toml` (both its own version and its `popsub_protocol` dependency), `clients/typescript/package.json` and `package-lock.json`, and `clients/python/pyproject.toml`. Add a `## [X.Y.Z]` section to `CHANGELOG.md`.
 2. Run `scripts/check-version.sh X.Y.Z`. It prints every file that disagrees.
-3. Merge the pull request, then tag the merge commit on `main`:
+3. Run `make upgrade-fixture VERSION=X.Y.Z` and commit the new folder under `crates/popsub/tests/fixtures/upgrade/`. It is the data this release writes, so the upgrade test checks every later release can still open it.
+4. Merge the pull request, then tag the merge commit on `main`:
 
    ```bash
    git checkout main && git pull
@@ -149,7 +150,7 @@ docker pull ghcr.io/soumyadepp/popsub:0.1.0
    git push origin vX.Y.Z
    ```
 
-4. On the Release run, click **Review deployments** and approve `release`. Every registry publishes from the workflow, and `verify` confirms it.
+5. On the Release run, click **Review deployments** and approve `release`. Every registry publishes from the workflow, and `verify` confirms it.
 
 ## When something goes wrong
 

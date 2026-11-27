@@ -7,6 +7,8 @@
 //! backends implement both on one type and then `Storage`, which adds what
 //! the backend can promise.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -56,6 +58,17 @@ impl Capabilities {
         }
         Ok(())
     }
+}
+
+/// What a backup copied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackupSummary {
+    /// Topics in the backup, including ones whose records were all trimmed.
+    pub topics: u64,
+    /// Retained records across every topic.
+    pub records: u64,
+    /// Bytes written, counting segments, heads and the session log.
+    pub bytes: u64,
 }
 
 /// Which records a topic log keeps. Records outside any limit are trimmed
@@ -311,10 +324,34 @@ pub trait SubscriptionStore: Send + Sync {
 ///
 /// The server holds an `Arc<dyn Storage>`, so third-party backends plug in by
 /// implementing this and passing the conformance suite.
+#[async_trait]
 pub trait Storage: MessageLog + SubscriptionStore {
     /// Reports the backend's durability and persistence.
     ///
     /// Returns:
     ///     The backend's capabilities.
     fn capabilities(&self) -> Capabilities;
+
+    /// Copies everything the backend holds into a new directory while it
+    /// keeps serving, in a form that opens as a store of the same backend.
+    ///
+    /// The default refuses, for backends with nothing on local disk to copy
+    /// (`MemoryStorage`) or that are backed up by other means (a database).
+    ///
+    /// Args:
+    ///     dest: The directory to create. It must not exist yet.
+    ///
+    /// Returns:
+    ///     What was copied.
+    ///
+    /// Raises:
+    ///     StorageError::Unsupported: When the backend can't be backed up this way.
+    ///     StorageError::Unavailable: When `dest` exists or a file can't be
+    ///         read or written.
+    async fn backup(&self, dest: &Path) -> Result<BackupSummary> {
+        let _ = dest;
+        Err(StorageError::Unsupported(
+            "this storage backend can't be backed up while running".to_string(),
+        ))
+    }
 }

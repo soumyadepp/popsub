@@ -2,6 +2,7 @@
 //! testing how the broker and server behave when storage breaks (a full
 //! disk, a lost volume) without breaking a real one.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -9,7 +10,9 @@ use async_trait::async_trait;
 
 use crate::error::{Result, StorageError};
 use crate::record::{LogBounds, NewRecord, Record, Subscription};
-use crate::storage::{Capabilities, Durability, MessageLog, Retention, Storage, SubscriptionStore};
+use crate::storage::{
+    BackupSummary, Capabilities, Durability, MessageLog, Retention, Storage, SubscriptionStore,
+};
 
 /// Wraps a backend and fails every append with `StorageError::Unavailable`
 /// while switched to failing. Everything else is passed through.
@@ -232,6 +235,7 @@ impl SubscriptionStore for FaultyStorage {
     }
 }
 
+#[async_trait]
 impl Storage for FaultyStorage {
     /// Reports the wrapped backend's capabilities.
     ///
@@ -239,5 +243,20 @@ impl Storage for FaultyStorage {
     ///     The capabilities.
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+
+    /// Backs up the wrapped backend. Failing appends don't affect a backup.
+    ///
+    /// Args:
+    ///     dest: The directory to create.
+    ///
+    /// Returns:
+    ///     What the wrapped backend copied.
+    ///
+    /// Raises:
+    ///     StorageError::Unsupported: When the wrapped backend can't be backed up.
+    ///     StorageError::Unavailable: When the wrapped backend's backup fails.
+    async fn backup(&self, dest: &Path) -> Result<BackupSummary> {
+        self.inner.backup(dest).await
     }
 }

@@ -1,6 +1,6 @@
 //! Tests for `FileStorage`: the conformance suite, recovery from interrupted
 //! writes and damage, trimming across reopens, the directory lock, topic
-//! names and the session log. The crash test that kills a writer process
+//! names, the session log and live backups. The crash test that kills a writer process
 //! is in `tests/crash.rs`, a separate test binary; see there for why.
 
 use std::fs::OpenOptions;
@@ -14,7 +14,7 @@ use crate::file::codec::{self, Decoded};
 use crate::file::sessions::SessionLog;
 use crate::file::{FileOptions, FileStorage, MAX_TOPIC_BYTES, topic_dir_name, topic_from_dir_name};
 use crate::record::{NewRecord, PayloadEncoding, Record};
-use crate::storage::{Durability, MessageLog, Retention, SubscriptionStore};
+use crate::storage::{Durability, MessageLog, Retention, Storage, SubscriptionStore};
 
 /// Segment size used by most tests, small enough that a few records roll
 /// over to new segment files.
@@ -474,5 +474,152 @@ fn a_log_written_as_json_still_reads() {
         let ids: Vec<&str> = records.iter().map(|r| r.message_id.as_str()).collect();
         assert_eq!(ids, ["m1", "m2", "m3"]);
         assert_eq!(records[1], old);
+    });
+}
+
+/// Reads every retained record of a topic as `(seq, payload)` pairs.
+///
+/// Args:
+///     storage: The store.
+///     topic: The topic.
+///
+/// Returns:
+///     The pairs in `seq` order.
+async fn contents(storage: &FileStorage, topic: &str) -> Vec<(u64, String)> {
+    storage
+        .read(topic, 0, usize::MAX)
+        .await
+        .expect("read")
+        .into_iter()
+        .map(|r| (r.seq, r.payload))
+        .collect()
+}
+
+/// Checks that a backup opens as a store with the same topics, records,
+/// numbering and sessions, applies trims that weren't persisted yet, and
+/// leaves the original store working.
+#[test]
+fn a_backup_opens_with_the_same_records_and_sessions() {
+    block_on(async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = open(dir.path()).await;
+        append_range(&storage, 1, 30).await;
+        storage
+            .append("other", record("x"), Durability::Buffered)
+            .await
+            .expect("append");
+        let keep_twenty_five = Retention {
+            max_messages: Some(25),
+            ..Retention::default()
+        };
+        assert_eq!(
+            storage.trim("t", &keep_twenty_five, 0).await.expect("trim"),
+            5
+        );
+        storage.subscribe("s", "t", 3).await.expect("subscribe");
+        storage.ack("s", "t", 12).await.expect("ack");
+        storage.touch("s", 77).await.expect("touch");
+
+        let dest = dir.path().join("backups").join("first");
+        let summary = storage.backup(&dest).await.expect("backup");
+        assert_eq!(summary.topics, 2);
+        assert_eq!(summary.records, 26);
+        assert!(summary.bytes > 0);
+        assert!(!dest.with_file_name("first.partial").exists());
+        assert!(!dest.join("LOCK").exists());
+
+        let copy = open(&dest).await;
+        assert_eq!(contents(&copy, "t").await, contents(&storage, "t").await);
+        assert_eq!(contents(&copy, "other").await, vec![(1, "x".to_string())]);
+        assert_eq!(
+            copy.bounds("t").await.expect("bounds"),
+            storage.bounds("t").await.expect("bounds")
+        );
+        assert_eq!(copy.load("s").await.expect("load")[0].acked_seq, 12);
+        assert_eq!(copy.expire(77).await.expect("expire"), 0);
+        let mut topics = copy.topics().await.expect("topics");
+        topics.sort();
+        assert_eq!(topics, vec!["other".to_string(), "t".to_string()]);
+
+        let next = storage
+            .append("t", record("after"), Durability::Synced)
+            .await
+            .expect("append after the backup");
+        assert_eq!(next.seq, 31);
+        assert_eq!(copy.bounds("t").await.expect("bounds").last_seq, 30);
+    });
+}
+
+/// Checks that a backup taken while records are being appended to several
+/// topics opens cleanly, with each topic holding an unbroken run of records
+/// and every session cursor at or before its topic's last `seq`.
+#[test]
+fn a_backup_taken_while_publishing_is_consistent() {
+    block_on(async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = open(dir.path()).await;
+        let writers: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|topic| {
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    for n in 1..=300u64 {
+                        storage
+                            .append(topic, record(&format!("{topic}{n}")), Durability::Buffered)
+                            .await
+                            .expect("append");
+                        storage.subscribe("s", topic, 0).await.expect("subscribe");
+                        storage.ack("s", topic, n).await.expect("ack");
+                    }
+                })
+            })
+            .collect();
+        while storage.bounds("a").await.expect("bounds").last_seq < 50 {
+            tokio::task::yield_now().await;
+        }
+        let dest = dir.path().join("during");
+        let summary = storage.backup(&dest).await.expect("backup");
+        for writer in writers {
+            writer.await.expect("writer");
+        }
+
+        let copy = open(&dest).await;
+        let mut records = 0;
+        for topic in ["a", "b", "c"] {
+            let seqs: Vec<u64> = contents(&copy, topic)
+                .await
+                .iter()
+                .map(|(s, _)| *s)
+                .collect();
+            let expected: Vec<u64> = (1..=seqs.len() as u64).collect();
+            assert_eq!(seqs, expected, "topic {topic}");
+            records += seqs.len() as u64;
+            let last = copy.bounds(topic).await.expect("bounds").last_seq;
+            for subscription in copy.load("s").await.expect("load") {
+                if subscription.topic == topic {
+                    assert!(
+                        subscription.acked_seq <= last,
+                        "cursor past the log on {topic}"
+                    );
+                }
+            }
+        }
+        assert_eq!(summary.records, records);
+    });
+}
+
+/// Checks that a backup into a directory that already exists is refused and
+/// leaves no partial copy behind.
+#[test]
+fn a_backup_refuses_an_existing_directory() {
+    block_on(async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = open(dir.path()).await;
+        append_range(&storage, 1, 3).await;
+        let dest = dir.path().join("taken");
+        std::fs::create_dir(&dest).expect("create");
+        let result = storage.backup(&dest).await;
+        assert!(matches!(result, Err(StorageError::Unavailable(_))));
+        assert!(!dir.path().join("taken.partial").exists());
     });
 }

@@ -672,6 +672,21 @@ impl AuthService {
         self.user_store.revision()
     }
 
+    /// Writes the accounts into a backup directory through the user store.
+    ///
+    /// Args:
+    ///     dir: The backup directory. It must exist.
+    ///
+    /// Returns:
+    ///     Whether the store wrote anything; false for stores with nothing
+    ///     on local disk.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the backup can't be written.
+    pub async fn backup_users(&self, dir: &std::path::Path) -> Result<bool> {
+        self.user_store.backup(dir).await
+    }
+
     /// Decides whether a user may subscribe to a topic, using the role in the store.
     ///
     /// Unknown users and store errors both count as a refusal.

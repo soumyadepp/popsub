@@ -42,3 +42,6 @@ node_modules
 # Website build output
 web/dist/
 web/.astro/
+
+# Upgrade fixtures are data written by earlier releases, session logs included
+!crates/popsub/tests/fixtures/upgrade/**/sessions.log

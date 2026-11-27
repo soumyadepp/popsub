@@ -4,6 +4,10 @@ Each release lists what changed for people running the server and people using a
 
 ## [Unreleased]
 
+### Server
+
+- Every release is now tested against data written by each earlier one: a newer release opens an older release's data, and an older release can't be assumed to read a newer one's. `make upgrade-fixture` adds a release's data to the test when it is cut.
+
 ### Project
 
 - `SECURITY.md` says how to report a vulnerability privately, what happens next, and which versions get fixes.
