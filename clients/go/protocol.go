@@ -283,6 +283,32 @@ type topicRequest struct {
 	Topic string `json:"topic"`
 }
 
+// backupRequest is the backup admin frame.
+type backupRequest struct {
+	// Type is the frame type.
+	Type string `json:"type"`
+	// Name is the backup's directory name, left out for the default.
+	Name string `json:"name,omitempty"`
+}
+
+// BackupInfo describes a backup the server wrote of itself, as Admin.Backup
+// returns it.
+type BackupInfo struct {
+	// Name is the backup's directory name.
+	Name string `json:"name"`
+	// Path is where the backup is on the server's file system.
+	Path string `json:"path"`
+	// Topics is how many topics it holds.
+	Topics uint64 `json:"topics"`
+	// Records is how many records it holds across every topic.
+	Records uint64 `json:"records"`
+	// Bytes is how many bytes were written.
+	Bytes uint64 `json:"bytes"`
+	// Users says whether accounts were included; false when the server
+	// doesn't keep them in users.json.
+	Users bool `json:"users"`
+}
+
 // TopicInfo describes a topic's log, as the topic admin requests return it.
 type TopicInfo struct {
 	// Name is the topic.
@@ -423,6 +449,8 @@ type serverFrame struct {
 	Topic topicField `json:"topic"`
 	// Topics are the topic objects, in topics.
 	Topics json.RawMessage `json:"topics"`
+	// Backup is the backup object, in backup_created.
+	Backup json.RawMessage `json:"backup"`
 	// ReplayFrom is the first history record, in subscribed.
 	ReplayFrom uint64 `json:"replay_from"`
 	// Seq is the record's seq, in message, published and stalled.

@@ -15,7 +15,7 @@
 
 import { createInterface } from "node:readline";
 
-import type { TopicInfo, User } from "./admin.js";
+import type { BackupInfo, TopicInfo, User } from "./admin.js";
 import { decodeBase64, encodeBase64 } from "./base64.js";
 import { Client, type StartFrom } from "./client.js";
 import type { ClientConfig } from "./config.js";
@@ -200,6 +200,23 @@ function topicJson(topic: TopicInfo): Json {
 }
 
 /**
+ * Describes a backup in its wire form.
+ *
+ * @param backup - The backup.
+ * @returns The wire form.
+ */
+function backupJson(backup: BackupInfo): Json {
+  return {
+    name: backup.name,
+    path: backup.path,
+    topics: backup.topics,
+    records: backup.records,
+    bytes: backup.bytes,
+    users: backup.users,
+  };
+}
+
+/**
  * Describes a client event as a driver event.
  *
  * @param event - The event.
@@ -346,6 +363,10 @@ async function admin(client: Client, command: Command): Promise<Json> {
       return { result: topicJson(await calls.getTopic(text(params, "topic"))) };
     case "purge_topic":
       return { result: topicJson(await calls.purgeTopic(text(params, "topic"))) };
+    case "backup":
+      return {
+        result: backupJson(await calls.backup(typeof params.name === "string" ? params.name : undefined)),
+      };
     default:
       throw failure("protocol", `unknown admin method ${JSON.stringify(command.method)}`);
   }

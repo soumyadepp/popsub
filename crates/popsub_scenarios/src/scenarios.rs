@@ -66,6 +66,7 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
     ("topic_admin_round_trip", |d| {
         Box::pin(topic_admin_round_trip(d))
     }),
+    ("backup_round_trip", |d| Box::pin(backup_round_trip(d))),
     ("wildcard_subscription_follows_topics", |d| {
         Box::pin(wildcard_subscription_follows_topics(d))
     }),
@@ -808,6 +809,42 @@ async fn topic_admin_round_trip(command: String) -> Outcome {
     check(
         missing["kind"] == "server" && missing["code"] == "topic_not_found",
         || format!("expected topic_not_found, got {missing}"),
+    )
+}
+
+/// Checks the backup admin method: a named backup of a file backend server
+/// reports what it holds, and a second one under the same name fails with
+/// `backup_exists`.
+///
+/// Args:
+///     command: The driver command.
+///
+/// Raises:
+///     String: Why it failed.
+async fn backup_round_trip(command: String) -> Outcome {
+    let server = ScenarioServer::start(Backend::File).await?;
+    server.publish("orders", "o1", 1).await?;
+    server.publish("orders", "o2", 1).await?;
+    let boss = admin(&command, &server, "admin").await?;
+    let call = |params: Value| json!({"method": "backup", "params": params});
+    let created = boss.ok("admin", call(json!({"name": "scenario"}))).await?;
+    let backup = &created["result"];
+    check(
+        backup["name"] == "scenario"
+            && backup["topics"] == 1
+            && backup["records"] == 2
+            && backup["users"] == false
+            && backup["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("scenario")),
+        || format!("unexpected backup {created}"),
+    )?;
+    let again = boss
+        .fails("admin", call(json!({"name": "scenario"})))
+        .await?;
+    check(
+        again["kind"] == "server" && again["code"] == "backup_exists",
+        || format!("expected backup_exists, got {again}"),
     )
 }
 

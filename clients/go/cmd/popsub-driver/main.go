@@ -87,6 +87,8 @@ type adminParams struct {
 	Enabled *bool `json:"enabled"`
 	// Topic is a topic, for get_topic and purge_topic.
 	Topic string `json:"topic"`
+	// Name is a backup's name, for backup.
+	Name string `json:"name"`
 }
 
 // heldKey names a reported message by topic and seq.
@@ -461,6 +463,8 @@ func admin(ctx context.Context, client *popsub.Client, c *command) (map[string]a
 		result, err = a.GetTopic(ctx, params.Topic)
 	case "purge_topic":
 		result, err = a.PurgeTopic(ctx, params.Topic)
+	case "backup":
+		result, err = a.Backup(ctx, params.Name)
 	default:
 		return nil, plain("protocol", "unknown admin method "+c.Method)
 	}

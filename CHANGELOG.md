@@ -11,7 +11,7 @@ Each release lists what changed for people running the server and people using a
 
 ### Client libraries
 
-- `admin().backup()` in the Rust client.
+- `admin.backup()` (`Backup` in Go) in the Rust, TypeScript, Python and Go clients. Each knows the two new error codes.
 
 ### Project
 

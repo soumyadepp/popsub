@@ -12,7 +12,15 @@
  */
 
 import { PopSubError } from "./errors.js";
-import type { Access, AdminRequest, RoleSpec, ServerMessage, WireTopicInfo, WireUser } from "./protocol.js";
+import type {
+  Access,
+  AdminRequest,
+  RoleSpec,
+  ServerMessage,
+  WireBackupInfo,
+  WireTopicInfo,
+  WireUser,
+} from "./protocol.js";
 
 /** An account, as admins see it. Never includes the password. */
 export interface User {
@@ -38,6 +46,39 @@ export interface TopicInfo {
   messages: number;
   /** How many live subscriptions it has. */
   subscribers: number;
+}
+
+/** A backup the server wrote of itself. */
+export interface BackupInfo {
+  /** The backup's directory name. */
+  name: string;
+  /** Where the backup is on the server's file system. */
+  path: string;
+  /** How many topics it holds. */
+  topics: number;
+  /** How many records it holds across every topic. */
+  records: number;
+  /** How many bytes were written. */
+  bytes: number;
+  /** Whether accounts were included; false when the server doesn't keep them in `users.json`. */
+  users: boolean;
+}
+
+/**
+ * Converts a backup from its wire form.
+ *
+ * @param backup - The backup as the server sent it.
+ * @returns The backup.
+ */
+function backupFromWire(backup: WireBackupInfo): BackupInfo {
+  return {
+    name: backup.name,
+    path: backup.path,
+    topics: backup.topics,
+    records: backup.records,
+    bytes: backup.bytes,
+    users: backup.users,
+  };
 }
 
 /**
@@ -270,6 +311,28 @@ export class Admin {
    */
   purgeTopic(topic: string): Promise<TopicInfo> {
     return this.#topic({ type: "purge_topic", topic });
+  }
+
+  /**
+   * Asks the server to back itself up while it keeps running: its topic
+   * logs, sessions and accounts, into a new directory under its
+   * `storage.backup_path`. The reply comes when the copy is finished, which
+   * for a large store can take longer than the default `requestTimeoutMs`;
+   * use a client with a longer one for backups.
+   *
+   * @param name - The backup's directory name. Defaults to the time in UTC,
+   *   such as `20261127T101500Z`.
+   * @returns The backup's name, where it is on the server, and what it holds.
+   * @throws PopSubError with code `backup_exists`, `backup_unsupported` for
+   *   the memory backend, `bad_request` for an invalid name, or
+   *   `storage_unavailable` when another backup is running.
+   */
+  async backup(name?: string): Promise<BackupInfo> {
+    const reply = await this.#send(name === undefined ? { type: "backup" } : { type: "backup", name });
+    if (reply.type !== "backup_created") {
+      throw unexpected(reply, "backup_created");
+    }
+    return backupFromWire(reply.backup);
   }
 
   /**

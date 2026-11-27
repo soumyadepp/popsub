@@ -66,6 +66,7 @@ from popsub.message import (
 from popsub.protocol import (
     PROTOCOL_VERSION,
     Access,
+    BackupInfo,
     CloseCode,
     Encoding,
     RoleKind,
@@ -83,6 +84,7 @@ __all__ = [
     "Admin",
     "AuthExpiring",
     "AuthRefreshed",
+    "BackupInfo",
     "Client",
     "ClientConfig",
     "CloseCode",
