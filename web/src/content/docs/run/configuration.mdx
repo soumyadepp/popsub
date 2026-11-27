@@ -45,6 +45,7 @@ Set both of these:
 |---|---|---|
 | `server.host`, `server.port` | `127.0.0.1`, `8080` | Where to listen |
 | `storage.path` | `pubsub_data` | Where messages, sessions and accounts are kept |
+| `storage.backup_path` | `pubsub_backups` | Where backups go. See [Backups and upgrades](/run/backups-and-upgrades/). |
 | `storage.durability` | `buffered` | `buffered` survives a crash. `synced` also survives a power cut, but is slower. |
 | `server.allow_registration` | `false` | Let clients create their own accounts |
 | `server.max_payload_bytes` | 1 MiB | The largest message |

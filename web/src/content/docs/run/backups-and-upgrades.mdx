@@ -1,0 +1,118 @@
+---
+title: Backups and upgrades
+description: Back up a running PopSub server, restore a backup, and upgrade to a new release without losing messages, sessions or accounts.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+<p class="lede">
+  A backup is a copy of the data folder that PopSub makes while it keeps running. Restoring one
+  means putting that copy back where the data folder was.
+</p>
+
+## Take a backup
+
+Ask the running server, as an admin:
+
+```bash
+export POPSUB_PASSWORD=your-admin-password
+popsub backup --url ws://your-host:8080
+```
+
+```
+Backed up to /var/lib/popsub/backups/20261127T101500Z
+Topics:   12
+Messages: 48210
+Bytes:    9134592
+Accounts: included
+```
+
+- The backup goes in a new folder under `storage.backup_path` (`pubsub_backups` by default), on
+  the server's own disk.
+- The folder is named after the time in UTC. Pass `--name nightly-monday` to choose one.
+- Publishing and subscribing carry on while it copies.
+- One backup runs at a time. A second request is refused until the first finishes.
+
+With Docker, run it inside the container:
+
+```bash
+docker exec -e POPSUB_PASSWORD=your-admin-password popsub \
+  /usr/local/bin/popsub backup --url ws://127.0.0.1:8080
+```
+
+The same request is `admin.backup()` in every client library.
+
+### What's in it
+
+| File | What it holds |
+|---|---|
+| `topics/` | Every topic's retained messages and its numbering |
+| `sessions.log` | Durable sessions and how far each one has acknowledged |
+| `users.json` | Accounts, grants and password hashes. Keep backups private |
+| `BACKUP.json` | Written last. A folder without it is an unfinished backup |
+
+### How consistent it is
+
+- Each topic is copied exactly as it was at one moment.
+- Sessions are copied before topics, so no session points past the end of its topic.
+- Topics aren't all copied at the same instant. A message published to one topic during the
+  backup may be in it while a later message on another topic isn't.
+
+<Aside type="caution" title="Copy backups off the machine">
+  A backup on the same disk as the server doesn't help when that disk fails. Copy each finished
+  backup (one with `BACKUP.json`) somewhere else, such as object storage.
+</Aside>
+
+### Schedule it
+
+A cron entry that backs up every night and keeps a week:
+
+```bash
+0 3 * * * POPSUB_PASSWORD=... popsub backup --url ws://127.0.0.1:8080 \
+  && find /var/lib/popsub/backups -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} +
+```
+
+## Restore a backup
+
+1. **Stop the server.** It holds a lock on its data folder while it runs.
+2. **Move the current data folder aside**, in case you need it.
+3. **Copy the backup folder to `storage.path`.** `BACKUP.json` can stay. The server ignores it.
+4. **Start the server.** It checks every message as it opens the folder, and refuses to start if
+   anything is damaged.
+5. **Restart your client processes.**
+
+<Aside type="caution" title="Why clients need a restart">
+  Messages published after the backup was taken are gone, and their numbers are given to new
+  messages. A client that already saw those numbers would skip the new messages as duplicates.
+  A fresh client process starts with no such memory.
+</Aside>
+
+With Docker, the data and backups are two volumes:
+
+```bash
+docker stop popsub
+docker run --rm --user 65532:65532 -v popsub-data:/data -v popsub-backups:/backups busybox \
+  sh -c 'cp -a /data /backups/before-restore && rm -rf /data/* && cp -a /backups/nightly/. /data/'
+docker start popsub
+```
+
+This keeps the data it replaces in `before-restore`, and runs as the same user as the server, so
+the server can write to the restored files.
+
+## Upgrade to a new release
+
+1. **Read the release's notes** in
+   [`CHANGELOG.md`](https://github.com/soumyadepp/popsub/blob/main/CHANGELOG.md). Anything that
+   changes behaviour on upgrade is listed first, under "Upgrading from".
+2. **Take a backup.**
+3. **Stop the server, replace the binary or image, and start it again.**
+
+### What carries over
+
+| | |
+|---|---|
+| Newer release, data from an older one | Always opens. Every release since 0.1.0 is tested against data written by each earlier release |
+| Older release, data from a newer one | Not supported. A release can change how it stores data, and an older one can't read it |
+
+So the backup in step 2 is how you go back. To return to the old release, stop the server and
+restore that backup.

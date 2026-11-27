@@ -39,6 +39,8 @@ The connection stays open after these.
 | `user_not_found` | No such account |
 | `user_exists` | That username is taken |
 | `topic_not_found` | Nothing was ever published to that topic |
+| `backup_exists` | A backup with that name already exists |
+| `backup_unsupported` | The server's storage can't be backed up while it runs, such as the `memory` backend |
 
 `invalid_credentials` and `registration_failed` never say whether a username exists.
 
