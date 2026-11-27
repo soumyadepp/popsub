@@ -15,6 +15,7 @@ The storage layer from `docs/STORAGE.md`: per-topic append-only logs of numbered
   - `topic.rs`: one topic's segment files, `head.json`, recovery and trimming.
   - `sessions.rs`: the session write-ahead log and its compaction.
   - `codec.rs`: the `length | crc32 | body` frame.
+  - `body.rs`: what goes in a frame's body. Records are written in a compact binary form without the topic (the directory names it), with a server-assigned UUID id as 16 bytes; `decode` also reads the JSON records older versions wrote. A new `Record` field needs a flag or a new `FORMAT` byte there, and the JSON reader keeps working.
   - `tests.rs`: the suite with 256-byte segments, and the recovery and damage tests.
 - `src/faulty.rs`: `FaultyStorage`, a wrapper that fails appends while switched on and passes everything else through. For tests of what breaks when storage does.
 - `src/tests.rs`: tests for the storage types, and the conformance suite run against `MemoryStorage`.

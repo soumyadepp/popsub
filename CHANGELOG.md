@@ -11,10 +11,12 @@ A performance release. The server stores and delivers many times more messages a
 - **Replies can arrive in a different order from requests.** A connection no longer waits for a publish to be stored before it reads the next frame. A publish that is refused straight away (a bad frame, no permission, the rate limit) can be answered before an earlier publish that is still being stored. Match replies by `id`, as the client libraries already do. A request other than `publish`, `ack` and `ping` still waits for the connection's earlier publishes.
 - **A publish without a `message_id` is never treated as a retry.** The server gives it a random id, as before, but no longer looks that id up among earlier ones. Only an id the publisher chose makes a publish idempotent.
 - **Trimmed records can come back after a crash.** With the `file` backend, retention no longer writes the topic's head file on every publish. After a stop that wasn't clean, up to one segment of records that had been trimmed is in the log again until the next trim removes it. Purging a topic is still written at once.
+- **A 0.2.0 server can't read logs written by 0.3.0.** Records are now stored in a compact binary form. 0.3.0 reads logs written by earlier versions, but downgrading after writing with 0.3.0 isn't possible: keep a copy of `storage.path` if you might go back.
 - **One log line per publish is gone.** The `published` line is now at `debug`. A publish gets a trace span only while `telemetry.enabled` is on, and the span covers accepting the publish, not storing it.
 
 ### Server
 
+- Stored records are about 40% smaller (about 180 bytes for a 128-byte payload, from about 300), so a busy server writes much less to disk, and replay reads them back without parsing JSON.
 - Publishes waiting for the same topic are stored with one write and, with `synced` durability, one disk flush. A busy topic no longer pays a flush per message.
 - The default retention no longer slows a full topic to the speed of a disk flush per publish.
 - A topic's subscribers each get a waiting batch of messages in one socket write, and delivering to a large fan-out gives the broker lock up every 50 microseconds or so, so one busy topic doesn't hold the others up.

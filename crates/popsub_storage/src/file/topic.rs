@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
+use crate::file::body;
 use crate::file::codec::{self, Decoded, HEADER, MAX_FRAME};
 use crate::file::{io_error, sync_dir};
 use crate::index::LogIndex;
@@ -96,8 +97,8 @@ pub(crate) struct TopicFiles {
     /// The buffer the last batch's frames were written from, kept so the
     /// next batch doesn't allocate and free one of its own.
     frames: Vec<u8>,
-    /// The buffer each record's JSON is written to before it is framed.
-    json: String,
+    /// The buffer each record's stored form is written to before it is framed.
+    scratch: Vec<u8>,
     /// Retained records and where each one is.
     index: LogIndex<Location>,
     /// The size at which a new segment is started.
@@ -180,7 +181,7 @@ impl TopicFiles {
                         )));
                     }
                     Decoded::Frame { body, next } => {
-                        let record: Record = serde_json::from_slice(body).map_err(|e| {
+                        let record: Record = body::decode(body, topic).map_err(|e| {
                             StorageError::Corrupt(format!(
                                 "undecodable record in {} at offset {offset}: {e}",
                                 path.display()
@@ -228,7 +229,7 @@ impl TopicFiles {
             segments,
             active: None,
             frames: Vec::new(),
-            json: String::new(),
+            scratch: Vec::new(),
             head_stale: false,
             index,
             segment_bytes,
@@ -301,7 +302,7 @@ impl TopicFiles {
             bytes: std::mem::take(&mut self.frames),
             ..Run::default()
         };
-        let mut json = std::mem::take(&mut self.json);
+        let mut scratch = std::mem::take(&mut self.scratch);
         for record in records {
             if let Some(original) = self.index.duplicate_of(&record) {
                 let location = original.value;
@@ -327,8 +328,8 @@ impl TopicFiles {
                 (record.publisher.clone(), record.message_id.clone())
             };
             let stored = Record::from_new(&self.topic, slot.seq, record, slot.published_at_ms);
-            json.clear();
-            stored.write_json(&mut json);
+            scratch.clear();
+            body::encode(&stored, &mut scratch);
             let segment = self
                 .segments
                 .last_mut()
@@ -342,7 +343,7 @@ impl TopicFiles {
                 segment: segment.first_seq,
                 offset: segment.len,
             };
-            segment.len += codec::encode_into(&mut run.bytes, json.as_bytes()) as u64;
+            segment.len += codec::encode_into(&mut run.bytes, &scratch) as u64;
             run.results.push(results.len());
             self.index.push(slot, stored.size(), key, location);
             results.push(Ok(stored));
@@ -351,9 +352,9 @@ impl TopicFiles {
         if run.bytes.capacity() <= KEPT_BUFFER_BYTES {
             self.frames = run.bytes;
         }
-        if json.capacity() <= KEPT_BUFFER_BYTES {
-            json.clear();
-            self.json = json;
+        if scratch.capacity() <= KEPT_BUFFER_BYTES {
+            scratch.clear();
+            self.scratch = scratch;
         }
         results
     }
@@ -523,7 +524,7 @@ impl TopicFiles {
                 return Err(corrupt("damaged frame", location.offset));
             };
             records.push(
-                serde_json::from_slice(body)
+                body::decode(body, &self.topic)
                     .map_err(|_| corrupt("undecodable record", location.offset))?,
             );
         }
@@ -573,7 +574,7 @@ impl TopicFiles {
         let Decoded::Frame { body, .. } = codec::decode(&frame, 0) else {
             return Err(corrupt("checksum mismatch"));
         };
-        serde_json::from_slice(body).map_err(|_| corrupt("undecodable record"))
+        body::decode(body, &self.topic).map_err(|_| corrupt("undecodable record"))
     }
 
     /// Drops records outside the policy from the index, without touching a file.

@@ -22,6 +22,7 @@
 //! returns. Each synced append is flushed on its own; flushes are not yet
 //! grouped across appends.
 
+mod body;
 mod codec;
 mod sessions;
 mod topic;
