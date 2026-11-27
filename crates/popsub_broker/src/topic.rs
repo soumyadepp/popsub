@@ -16,6 +16,10 @@ use popsub_storage::Record;
 /// Id of a subscribed client, the same string as `Client::id`.
 pub type SubscriberId = String;
 
+/// A hash map for the lookups made once per record and per subscriber. Its
+/// hash is several times cheaper than the standard one on short string keys.
+pub type FastMap<K, V> = HashMap<K, V, ahash::RandomState>;
+
 /// A QoS 1 record sent to one subscription and not yet acknowledged.
 #[derive(Debug, Clone)]
 pub struct InFlight {
@@ -134,14 +138,18 @@ pub struct Topic {
     /// Topic name, the key the broker routes on.
     pub name: String,
     /// Each subscribed client's delivery state.
-    pub subscribers: HashMap<SubscriberId, DeliveryState>,
+    pub subscribers: FastMap<SubscriberId, DeliveryState>,
+    /// Counts the subscriptions added and removed. A delivery that gives the
+    /// broker lock up part way through `subscribers` compares this to know
+    /// whether its place in the map still means anything.
+    pub epoch: u64,
     /// The highest `seq` delivered or known at subscribe time, used to tell
     /// whether a subscription has fallen behind and needs catching up.
     pub last_seq: u64,
     /// Shared subscriptions on this topic, by their subscriber id (see
     /// `group_subscriber_id`). Each also has an entry in `subscribers`
     /// holding the group's one delivery state.
-    pub groups: HashMap<SubscriberId, Group>,
+    pub groups: FastMap<SubscriberId, Group>,
 }
 
 /// The prefix of a shared subscription's subscriber id and storage key.
@@ -190,9 +198,10 @@ impl Topic {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            subscribers: HashMap::new(),
+            subscribers: FastMap::default(),
+            epoch: 0,
             last_seq: 0,
-            groups: HashMap::new(),
+            groups: FastMap::default(),
         }
     }
 
@@ -202,6 +211,7 @@ impl Topic {
     ///     id: The id of the client.
     ///     state: Where its delivery starts.
     pub fn subscribe(&mut self, id: SubscriberId, state: DeliveryState) {
+        self.epoch += 1;
         self.subscribers.insert(id, state);
     }
 
@@ -213,6 +223,7 @@ impl Topic {
     /// Returns:
     ///     The removed state, if there was one.
     pub fn unsubscribe(&mut self, id: &SubscriberId) -> Option<DeliveryState> {
+        self.epoch += 1;
         self.subscribers.remove(id)
     }
 }

@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
@@ -44,6 +45,8 @@ pub struct FileUserStore {
     path: PathBuf,
     /// Every account, by username.
     users: Mutex<BTreeMap<String, User>>,
+    /// Counts the changes made to `users`, for `UserStore::revision`.
+    revision: AtomicU64,
 }
 
 impl FileUserStore {
@@ -89,6 +92,7 @@ impl FileUserStore {
         Ok(Self {
             path,
             users: Mutex::new(users),
+            revision: AtomicU64::new(0),
         })
     }
 
@@ -132,6 +136,7 @@ impl FileUserStore {
         let result = change(&mut next)?;
         self.write(&next)?;
         *users = next;
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(result)
     }
 
@@ -291,5 +296,14 @@ impl UserStore for FileUserStore {
     ///     Never returns an error.
     async fn user_count(&self) -> Result<usize> {
         Ok(self.users().len())
+    }
+
+    /// Counts the changes made since the store was opened. The file is only
+    /// read at start, so nothing changes the accounts behind the store's back.
+    ///
+    /// Returns:
+    ///     The count, always `Some`.
+    fn revision(&self) -> Option<u64> {
+        Some(self.revision.load(Ordering::Acquire))
     }
 }

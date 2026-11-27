@@ -1490,3 +1490,103 @@ async fn shared_subscription_groups_are_scoped_to_the_account() {
     assert_eq!(seqs(&frames(&mut alice_rx)), vec![1, 2]);
     assert_eq!(seqs(&frames(&mut bob_rx)), vec![1, 2]);
 }
+
+/// Checks that the borrowed delivery serialiser writes exactly what the
+/// protocol's `message` frame serialises to, with and without an encoding.
+#[test]
+fn a_delivery_serialises_the_same_with_and_without_copying() {
+    let mut plain = record(7, 1);
+    plain.payload = "quotes \" and \n newlines".to_string();
+    let mut encoded = record(8, 0);
+    encoded.encoding = Some(popsub_storage::PayloadEncoding::Base64);
+    for record in [plain, encoded] {
+        let copied = crate::frame::to_ws(&crate::frame::delivery(&record)).expect("frame");
+        let borrowed = crate::frame::delivery_ws(&record).expect("frame");
+        assert_eq!(copied, borrowed);
+    }
+}
+
+/// Offers records 1 to `count` on topic `t` as one batch, giving the lock up
+/// whenever `Broker::deliver_batch` asks, and runs `between` after the first
+/// pause.
+///
+/// Args:
+///     broker: The broker.
+///     count: How many records are in the batch.
+///     between: What to do to the broker after the first pause.
+///
+/// Returns:
+///     How many calls the batch took.
+fn deliver_batch_in_slices(
+    broker: &mut Broker,
+    count: u64,
+    mut between: impl FnMut(&mut Broker),
+) -> usize {
+    let records: Vec<Record> = (1..=count).map(|seq| record(seq, 0)).collect();
+    let mut frames = vec![None; records.len()];
+    let mut progress = crate::engine::DeliverProgress::default();
+    let mut outcome = crate::engine::DeliverOutcome::default();
+    let mut calls = 1;
+    while !broker.deliver_batch(
+        "t",
+        &records,
+        &mut frames,
+        &mut progress,
+        0,
+        Duration::ZERO,
+        &mut outcome,
+    ) {
+        if calls == 1 {
+            between(broker);
+        }
+        calls += 1;
+    }
+    calls
+}
+
+/// Checks that a batch delivered over several lock holds reaches every
+/// subscriber once and in order.
+#[test]
+fn a_batch_reaches_every_subscriber_in_order_across_lock_releases() {
+    let mut broker = test_broker();
+    let mut inboxes = Vec::new();
+    for _ in 0..7 {
+        let (id, rx) = connect(&mut broker);
+        broker.add_subscriber("t", id, 1, 0);
+        inboxes.push(rx);
+    }
+    let calls = deliver_batch_in_slices(&mut broker, 40, |_| {});
+    assert!(calls > 1, "the batch was delivered in one hold");
+    let expected: Vec<u64> = (1..=40).collect();
+    for rx in &mut inboxes {
+        assert_eq!(seqs(&frames(rx)), expected);
+    }
+}
+
+/// Checks that when a subscriber leaves while the lock is given up part way
+/// through a batch, the rest still get every record once.
+#[test]
+fn a_batch_survives_a_subscriber_leaving_between_lock_holds() {
+    let mut broker = test_broker();
+    let mut inboxes = Vec::new();
+    for _ in 0..7 {
+        let (id, rx) = connect(&mut broker);
+        broker.add_subscriber("t", id.clone(), 1, 0);
+        inboxes.push((id, rx));
+    }
+    let (leaver, _) = &inboxes[3];
+    let leaver = leaver.clone();
+    let calls = deliver_batch_in_slices(&mut broker, 40, |broker| {
+        broker.unsubscribe("t", &leaver);
+    });
+    assert!(calls > 1, "the batch was delivered in one hold");
+    let expected: Vec<u64> = (1..=40).collect();
+    for (id, rx) in &mut inboxes {
+        let received = seqs(&frames(rx));
+        if *id == leaver {
+            assert!(received.is_empty() || received == expected);
+        } else {
+            assert_eq!(received, expected);
+        }
+    }
+}

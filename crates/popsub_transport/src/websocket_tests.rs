@@ -1931,6 +1931,56 @@ async fn revoking_a_grant_ends_live_subscriptions() {
     assert_eq!(missing["code"], "bad_request", "{missing}");
 }
 
+/// Checks that a connection that has been publishing to a topic is refused
+/// on its next publish after the grant is revoked, and allowed again once
+/// the grant is back.
+#[tokio::test]
+async fn revoking_a_grant_refuses_the_next_publish_on_an_open_connection() {
+    let settings = Settings::default();
+    let (addr, _broker) = start_server(&settings, RateLimiters::default()).await;
+    let mut admin = admin_connection(addr, &settings).await;
+    request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "hana", "password": "hana-password", "role": {"kind": "user", "topics": [{"pattern": "news/#", "access": "publish"}]}}),
+    )
+    .await;
+    let (mut hana, _) = user_connection(addr, "hana", "hana-password").await;
+    for id in [1, 2] {
+        let published = request(
+            &mut hana,
+            serde_json::json!({"type": "publish", "id": id, "topic": "news/today", "payload": "x", "qos": 1}),
+        )
+        .await;
+        assert_eq!(published["type"], "published", "{published}");
+    }
+
+    let revoked = request(
+        &mut admin,
+        serde_json::json!({"type": "revoke", "id": 2, "username": "hana", "pattern": "news/#"}),
+    )
+    .await;
+    assert_eq!(revoked["type"], "user", "{revoked}");
+    let refused = request(
+        &mut hana,
+        serde_json::json!({"type": "publish", "id": 3, "topic": "news/today", "payload": "x", "qos": 1}),
+    )
+    .await;
+    assert_eq!(refused["code"], "not_authorized", "{refused}");
+
+    let granted = request(
+        &mut admin,
+        serde_json::json!({"type": "grant", "id": 3, "username": "hana", "pattern": "news/#", "access": "publish"}),
+    )
+    .await;
+    assert_eq!(granted["type"], "user", "{granted}");
+    let published = request(
+        &mut hana,
+        serde_json::json!({"type": "publish", "id": 4, "topic": "news/today", "payload": "x", "qos": 1}),
+    )
+    .await;
+    assert_eq!(published["type"], "published", "{published}");
+}
+
 /// Checks that disabling an account closes its connections with
 /// `account_disabled`, refuses its password and its outstanding token, and
 /// that enabling it again restores access.
@@ -2826,4 +2876,32 @@ async fn pattern_subscriptions_join_matching_topics() {
     publish(&mut admin, "orders/a", "a2").await;
     publish(&mut admin, "orders/d", "d1").await;
     assert_eq!(nothing_arrives(&mut wren).await, None);
+}
+
+/// Checks that the direct publish parser gives exactly what the general
+/// parser gives, for publishes in several shapes and for frames that only
+/// look like one.
+#[test]
+fn the_publish_fast_path_parses_like_the_general_parser() {
+    let frames = [
+        r#"{"type":"publish","topic":"a/b","payload":"hi"}"#,
+        r#"{"type": "publish", "id": 7, "topic": "a/b", "payload": "hi", "qos": 1}"#,
+        r#"{"id":"x-1","type":"publish","topic":"a","payload":"aGk=","encoding":"base64","message_id":"m1","qos":0}"#,
+        r#"{"type":"publish","topic":"a","payload":"quote \\" and \\n","extra":true}"#,
+        r#"{"type":"publish","topic":"a","payload":"hi","qos":300}"#,
+        r#"{"type":"publish","topic":"a"}"#,
+        r#"{"type":"ack","topic":"publish","seq":3}"#,
+        r#"{"type":"subscribe","topic":"\"publish\""}"#,
+        r#"{"type":"publish","topic":5,"payload":"hi"}"#,
+        r#"not json "publish""#,
+    ];
+    for text in frames {
+        let general = serde_json::from_str::<popsub_protocol::ClientFrame>(text);
+        let fast = crate::websocket::parse_frame(text);
+        match (general, fast) {
+            (Ok(general), Ok(fast)) => assert_eq!(general, fast, "{text}"),
+            (Err(_), Err(_)) => {}
+            (general, fast) => panic!("{text}: general {general:?}, fast {fast:?}"),
+        }
+    }
 }

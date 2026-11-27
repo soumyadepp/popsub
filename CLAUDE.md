@@ -23,6 +23,7 @@ Use the Makefile. `make` lists everything.
 | One crate | `make test-crate CRATE=popsub_broker` |
 | The Rust checks CI runs | `make ci` (fmt check, clippy with `-D warnings`, tests, schema check) |
 | Client scenario suite | `make scenarios` (the Rust client), or `make scenarios DRIVER="..."` for another |
+| Throughput and latency | `make bench`, or `make bench BENCH="--scenario one-topic"` for some. Results and method in `docs/BENCHMARKS.md` |
 | Format | `make fmt` |
 | Wipe stored messages | `make reset-data` |
 
@@ -38,6 +39,7 @@ Builds can run out of memory on a laptop when everything compiles at once. Add `
 | `crates/popsub_auth` | Users, roles, Argon2id passwords, JWTs, topic permission patterns |
 | `crates/popsub_sdk` | The Rust client library: reconnection, durable sessions, acknowledgements, deduplication. The CLI's `client` uses it |
 | `crates/popsub_scenarios` | The client scenario suite (`popsub-scenarios`), its scenario server and driver plumbing, and the Rust client's driver (`popsub-sdk-driver`) |
+| `crates/popsub_bench` | `popsub-bench`, the load generator behind `docs/BENCHMARKS.md`. Runs the release server as a child process and drives it over raw WebSockets |
 | `clients/` | Client libraries in other languages. `clients/README.md` is the behaviour every client must have; `clients/DRIVER.md` is the protocol their scenario drivers speak |
 | `crates/popsub_ratelimit` | Token bucket, sliding window and login lockout limiters |
 | `crates/popsub_broker` | Topic writers, routing, replay, QoS 1 retries |

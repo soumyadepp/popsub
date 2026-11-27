@@ -19,6 +19,7 @@
 
 use crate::engine::{BrokerStats, RetryOutcome};
 use crate::health::StorageHealth;
+use popsub_connection::Outbox;
 use popsub_protocol::TopicInfo;
 use std::collections::HashMap;
 use std::fmt;
@@ -30,9 +31,9 @@ use popsub_storage::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use crate::engine::Broker;
+use crate::sink::{ClientReply, PublishReply, PublishSink};
 use crate::writer::{Command, Published, SubscribeOutcome, TopicWriter};
 use popsub_protocol::{CloseCode, RequestId, StartFrom};
 
@@ -83,19 +84,32 @@ pub struct LogSettings {
 }
 
 /// The broker behind its mutex, the only way any code locks it.
+///
+/// The mutex is `parking_lot`'s, for two reasons. It can hand the lock
+/// straight to a waiting thread (`with_fair`), which a writer fanning out to
+/// many subscribers needs so that it doesn't keep every other topic waiting.
+/// And it has no poisoning: if a holder panics the lock is released as the
+/// panic unwinds, and the next caller carries on with the broker's state.
+/// Every broker operation leaves its maps usable, even when interrupted.
 #[derive(Clone, Debug)]
 pub(crate) struct BrokerCell(
     /// The broker and the lock that guards it.
-    Arc<Mutex<Broker>>,
+    Arc<parking_lot::Mutex<Broker>>,
 );
 
 impl BrokerCell {
-    /// Runs `f` with exclusive access to the broker and returns its result.
+    /// Puts a broker behind its lock.
     ///
-    /// If a previous holder panicked, the lock is poisoned. Rather than taking
-    /// the whole server down with it, the error is logged and the broker is
-    /// used as it was left: every broker operation leaves its maps usable,
-    /// even when interrupted.
+    /// Args:
+    ///     broker: The broker to guard.
+    ///
+    /// Returns:
+    ///     The cell.
+    pub(crate) fn new(broker: Broker) -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(broker)))
+    }
+
+    /// Runs `f` with exclusive access to the broker and returns its result.
     ///
     /// Args:
     ///     f: The work to do while holding the lock. It must not block.
@@ -103,21 +117,43 @@ impl BrokerCell {
     /// Returns:
     ///     Whatever `f` returns.
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Broker) -> R) -> R {
-        let mut guard = self.lock();
+        let mut guard = self.0.lock();
         f(&mut guard)
     }
 
-    /// Takes the lock, recovering from poisoning as `with` describes.
+    /// Runs `f` like `with`, and hands the lock straight to a waiting thread if `f` held it long.
+    ///
+    /// An ordinary unlock lets the thread that just released the lock take it
+    /// again before a waiter wakes up. A writer delivering a batch to a large
+    /// topic would do exactly that, record after record, and other topics
+    /// would wait for the whole batch. Handing the lock over bounds their
+    /// wait to one record's fan-out.
+    ///
+    /// A hand-off costs a switch to the waiting thread, so it is only done
+    /// when `f` held the lock for at least `FAIR_AFTER`. Short holds, such as
+    /// a delivery to a handful of subscribers, unlock the ordinary way;
+    /// handing over after each of those would make busy topics queue behind
+    /// one another.
+    ///
+    /// Args:
+    ///     f: The work to do while holding the lock. It must not block.
     ///
     /// Returns:
-    ///     A guard giving exclusive access to the broker.
-    fn lock(&self) -> MutexGuard<'_, Broker> {
-        self.0.lock().unwrap_or_else(|poisoned| {
-            error!("broker lock was poisoned by a panicking task, continuing with its state");
-            poisoned.into_inner()
-        })
+    ///     Whatever `f` returns.
+    pub(crate) fn with_fair<R>(&self, f: impl FnOnce(&mut Broker) -> R) -> R {
+        let mut guard = self.0.lock();
+        let started = std::time::Instant::now();
+        let result = f(&mut guard);
+        if started.elapsed() >= FAIR_AFTER {
+            parking_lot::MutexGuard::unlock_fair(guard);
+        }
+        result
     }
 }
+
+/// How long one hold of the broker lock may last before the lock is handed
+/// directly to a waiting thread instead of being released for anyone to take.
+const FAIR_AFTER: Duration = Duration::from_micros(20);
 
 /// The queues of the topic writers started so far, by topic.
 type Writers = HashMap<String, mpsc::UnboundedSender<Command>>;
@@ -143,6 +179,8 @@ pub struct SharedBroker {
     /// Decides whether a user may read a topic, when a new topic is about
     /// to be joined through a wildcard subscription. Unset allows everyone.
     authorizer: Arc<std::sync::OnceLock<Authorizer>>,
+    /// The runtime topic writers run on, when they have their own.
+    writer_runtime: Option<tokio::runtime::Handle>,
 }
 
 /// Decides whether a user (first argument) may subscribe to a topic (second).
@@ -186,13 +224,14 @@ impl SharedBroker {
     pub fn new(broker: Broker, storage: Arc<dyn Storage>, log: LogSettings) -> StorageResult<Self> {
         storage.capabilities().check(log.durability)?;
         Ok(Self {
-            broker: BrokerCell(Arc::new(Mutex::new(broker))),
+            broker: BrokerCell::new(broker),
             storage,
             log,
             writers: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(StorageHealth::default()),
             topic_retention: Arc::new(Vec::new()),
             authorizer: Arc::new(std::sync::OnceLock::new()),
+            writer_runtime: None,
         })
     }
 
@@ -257,7 +296,7 @@ impl SharedBroker {
     ///
     /// Args:
     ///     topic: The new topic.
-    async fn join_pattern_holders(&self, topic: &str) {
+    pub(crate) async fn join_pattern_holders(&self, topic: &str) {
         let holders = self.with(|broker| broker.pattern_holders(topic));
         for (client_id, username) in holders {
             let allowed = match self.authorizer.get() {
@@ -271,6 +310,25 @@ impl SharedBroker {
                 warn!(topic, client = %client_id, %e, "joining a new topic for a wildcard subscription failed");
             }
         }
+    }
+
+    /// Runs topic writers on a runtime of their own. Call it before the
+    /// broker is used: a writer stays on the runtime it started on.
+    ///
+    /// A connection's task wakes its topic's writer for every batch of
+    /// publishes. On one runtime the writer is usually run next by the same
+    /// thread, so reading from clients and storing take turns on one core.
+    /// On a runtime of their own, writers run on other threads and the two
+    /// overlap. Without this, writers run wherever they are first used.
+    ///
+    /// Args:
+    ///     runtime: The runtime for topic writers.
+    ///
+    /// Returns:
+    ///     The broker with the runtime.
+    pub fn with_writer_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        self.writer_runtime = Some(runtime);
+        self
     }
 
     /// Sets retention for particular topics. Call it before the broker is
@@ -497,38 +555,109 @@ impl SharedBroker {
         self.broker.with(f)
     }
 
+    /// Creates the sink a client connection publishes through.
+    ///
+    /// Args:
+    ///     outbox: The connection's outgoing queue, where the topic writers
+    ///         send its `published` replies and storage errors.
+    ///
+    /// Returns:
+    ///     The connection's sink, for `publish_from`.
+    pub fn publish_sink(&self, outbox: Outbox) -> Arc<PublishSink> {
+        PublishSink::new(self.clone(), outbox)
+    }
+
+    /// Queues a client's publish and returns without waiting for it to be stored.
+    ///
+    /// The publish time is set to now and the record is put on the topic
+    /// writer's queue before this returns, so one connection's publishes to
+    /// a topic are stored in the order it sent them. The writer answers the
+    /// client through the sink: `published` for a QoS 1 record, an `error`
+    /// frame with `storage_unavailable` if the record couldn't be stored.
+    /// Until then the publish counts as unfinished on the sink.
+    ///
+    /// Args:
+    ///     sink: The publishing connection's sink.
+    ///     topic: The topic to publish to.
+    ///     record: The record. `publisher`, `payload` and `qos` are kept.
+    ///     id: The publish request's id, echoed in the reply.
+    pub fn publish_from(
+        &self,
+        sink: &Arc<PublishSink>,
+        topic: &str,
+        mut record: NewRecord,
+        id: Option<RequestId>,
+    ) {
+        record.published_at_ms = now_ms();
+        let reply =
+            PublishReply::Client(ClientReply::new(sink, id, record.qos, record.payload.len()));
+        sink.queue(topic, Command::Publish { record, reply });
+    }
+
+    /// Returns the queue of a topic's writer, starting the writer if needed.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     replace: Whether the writer on record has stopped and a new one
+    ///         should be started in its place.
+    ///
+    /// Returns:
+    ///     The sending side of the writer's queue.
+    pub(crate) fn writer_for(&self, topic: &str, replace: bool) -> mpsc::UnboundedSender<Command> {
+        if replace {
+            warn!(topic, "topic writer had stopped, starting a new one");
+            self.writers().remove(topic);
+        }
+        self.writer(topic)
+    }
+
     /// Publishes a record to a topic and delivers it to current subscribers.
     ///
-    /// The publish time is set to now and an empty message id is replaced
-    /// with a new UUID. The call returns once the record is stored at the
-    /// configured durability and queued for every subscriber.
+    /// The publish time is set to now. An empty message id is left for the
+    /// storage backend, which gives the record a random id and never treats
+    /// it as a retry. The record is put on the topic writer's queue before
+    /// this returns, so publishes made one after another keep their order
+    /// even when their results aren't awaited in between. The returned
+    /// future finishes once the record is stored at the configured
+    /// durability and queued for every subscriber. Dropping it doesn't take
+    /// the publish back.
     ///
     /// Args:
     ///     topic: The topic to publish to.
     ///     record: The record. `publisher`, `payload` and `qos` are kept.
     ///
     /// Returns:
-    ///     The record's `seq` and whether it was a duplicate.
-    ///
-    /// Raises:
-    ///     StorageError::Unavailable: When storage fails or the topic's
-    ///         writer stopped.
-    ///     StorageError::Unsupported: When the backend refuses the durability.
-    pub async fn publish(&self, topic: &str, mut record: NewRecord) -> StorageResult<Published> {
+    ///     A future of the record's `seq` and whether it was a duplicate. It
+    ///     fails with `StorageError::Unavailable` when storage fails or the
+    ///     topic's writer stopped, and with `StorageError::Unsupported` when
+    ///     the backend refuses the durability.
+    pub fn publish(
+        &self,
+        topic: &str,
+        mut record: NewRecord,
+    ) -> impl Future<Output = StorageResult<Published>> + Send + 'static {
         record.published_at_ms = now_ms();
-        if record.message_id.is_empty() {
-            record.message_id = Uuid::new_v4().to_string();
+        let (reply, result) = oneshot::channel();
+        self.send(
+            topic,
+            Command::Publish {
+                record,
+                reply: PublishReply::Waiter(reply),
+            },
+        );
+        let broker = self.clone();
+        let topic = topic.to_string();
+        async move {
+            let published = result.await.unwrap_or_else(|_| {
+                Err(StorageError::Unavailable(format!(
+                    "the writer for topic '{topic}' stopped"
+                )))
+            })?;
+            if published.seq == 1 && !published.duplicate {
+                broker.join_pattern_holders(&topic).await;
+            }
+            Ok(published)
         }
-        let published = self
-            .request(topic, |reply| Command::Publish {
-                record: record.clone(),
-                reply,
-            })
-            .await?;
-        if published.seq == 1 && !published.duplicate {
-            self.join_pattern_holders(topic).await;
-        }
-        Ok(published)
     }
 
     /// Subscribes a client to a topic and starts replaying the history it asked for.
@@ -875,6 +1004,7 @@ impl SharedBroker {
                         ..self.log
                     },
                     self.health.clone(),
+                    self.writer_runtime.as_ref(),
                 )
             })
             .clone()

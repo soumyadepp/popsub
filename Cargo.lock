@@ -854,6 +854,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "byteorder",
+ "num-traits",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1764,10 +1774,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "popsub_bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures-util",
+ "hdrhistogram",
+ "popsub_protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "popsub_broker"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "chrono",
+ "itoa",
+ "parking_lot",
  "popsub_config",
  "popsub_connection",
  "popsub_protocol",
@@ -1868,13 +1896,16 @@ dependencies = [
 name = "popsub_storage"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "async-trait",
  "crc32fast",
+ "itoa",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3285,6 +3316,7 @@ checksum = "3cf4199d1e5d15ddd86a694e4d0dffa9c323ce759fea589f00fef9d81cc1931d"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
+ "rand 0.9.1",
  "wasm-bindgen",
 ]
 

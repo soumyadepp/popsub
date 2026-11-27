@@ -221,3 +221,34 @@ fn records_keep_their_payload_encoding() {
     let back: Record = serde_json::from_str(&text).expect("parse");
     assert_eq!(back, encoded);
 }
+
+/// Checks that a record's own JSON writer gives exactly what its `Serialize`
+/// gives, for plain text, text that needs escaping, text outside ASCII and a
+/// base64 payload.
+#[test]
+fn a_record_writes_the_same_json_as_serde() {
+    let payloads = [
+        "plain text",
+        "",
+        "quote \" backslash \\\\ newline \n tab \t bell \u{7}",
+        "caf\u{e9} \u{1f600} \u{7f}",
+    ];
+    for (n, payload) in payloads.iter().enumerate() {
+        for encoding in [None, Some(crate::PayloadEncoding::Base64)] {
+            let record = crate::Record {
+                topic: format!("orders/\"{n}\""),
+                seq: u64::MAX - n as u64,
+                message_id: "0b2c-id".to_string(),
+                publisher: "alice".to_string(),
+                payload: (*payload).to_string(),
+                encoding,
+                qos: 1,
+                published_at_ms: -5 + n as i64,
+            };
+            let expected = serde_json::to_string(&record).expect("serialise");
+            assert_eq!(record.to_json(), expected);
+            let read: crate::Record = serde_json::from_str(&record.to_json()).expect("parse");
+            assert_eq!(read, record);
+        }
+    }
+}

@@ -31,6 +31,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use argon2::{
@@ -136,6 +137,20 @@ pub trait UserStore: Send + Sync {
     /// Raises:
     ///     AuthError::Internal: When the backend fails.
     async fn user_count(&self) -> Result<usize>;
+
+    /// A number that is different after any account is added, changed or
+    /// removed, for callers that want to remember a permission check.
+    ///
+    /// A store returns `None`, which is the default, when accounts can change
+    /// without it knowing, such as a database other processes write to.
+    /// Callers then check every time. A store that returns a number must
+    /// change it after the accounts change, never before.
+    ///
+    /// Returns:
+    ///     The revision, or `None` when the store can't tell.
+    fn revision(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A `UserStore` backed by a `HashMap` behind a `std::sync::RwLock`.
@@ -146,6 +161,8 @@ pub trait UserStore: Send + Sync {
 #[derive(Debug)]
 pub struct InMemoryUserStore {
     users: Arc<RwLock<HashMap<String, User>>>,
+    /// Counts the changes made to `users`, for `UserStore::revision`.
+    revision: AtomicU64,
 }
 
 impl Default for InMemoryUserStore {
@@ -166,6 +183,7 @@ impl InMemoryUserStore {
     pub fn new() -> Self {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -261,6 +279,7 @@ impl UserStore for InMemoryUserStore {
         }
 
         users.insert(user.username.clone(), user);
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -283,6 +302,7 @@ impl UserStore for InMemoryUserStore {
         }
 
         users.insert(user.username.clone(), user);
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -301,7 +321,9 @@ impl UserStore for InMemoryUserStore {
             .users
             .write()
             .map_err(|_| AuthError::Internal("lock poisoned".into()))?;
-        Ok(users.remove(username).is_some())
+        let removed = users.remove(username).is_some();
+        self.revision.fetch_add(1, Ordering::Release);
+        Ok(removed)
     }
 
     /// Checks the map for the username under a read lock.
@@ -350,6 +372,14 @@ impl UserStore for InMemoryUserStore {
             .read()
             .map_err(|_| AuthError::Internal("lock poisoned".into()))?;
         Ok(users.len())
+    }
+
+    /// Counts the changes made since the store was built.
+    ///
+    /// Returns:
+    ///     The count, always `Some`.
+    fn revision(&self) -> Option<u64> {
+        Some(self.revision.load(Ordering::Acquire))
     }
 }
 

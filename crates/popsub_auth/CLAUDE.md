@@ -7,7 +7,7 @@ Users, roles, password hashing, JWTs and topic permission patterns. The transpor
 - `src/service.rs`: `AuthService` (register, login, token validation, permission checks, user management including `set_user_enabled` and `enabled_admin_count`) and `AuthConfig`, including the username and password rules and the published-defaults check.
 - `src/jwt.rs`: `Claims` and `JwtService` (HS256 issue, validate, refresh).
 - `src/permission.rs`: `TopicPermission`, `topic_matches_pattern` (the MQTT-style matcher) and `validate_pattern`, which the admin requests use to refuse patterns that could never match as intended.
-- `src/store.rs`: the `UserStore` trait, `InMemoryUserStore`, password hashing with Argon2id, and `PostgresUserStore` behind the `postgres` feature.
+- `src/store.rs`: the `UserStore` trait, `InMemoryUserStore`, password hashing with Argon2id, and `PostgresUserStore` behind the `postgres` feature. `UserStore::revision` is a number that differs after any account changes; the transport uses it (through `AuthService::users_revision`) to keep a connection's last publish permission without reading the account per message. A store bumps it after the change is in place, never before, and returns `None` (the default, and what `PostgresUserStore` does) when accounts can change without it knowing.
 - `src/file_store.rs`: `FileUserStore`, accounts in one JSON file (`{"version": 1, "users": [...]}`). Every change is applied to a copy, written to a temporary file, flushed and renamed into place, and only then applied in memory. The file is mode 0600 on Unix. The binary uses it as `users.json` in the storage directory.
 - `src/user.rs`: `User` and `Role` (`Admin`, `User` with topic permissions, `ReadOnly`).
 - `src/error.rs`: `AuthError`.

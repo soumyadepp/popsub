@@ -144,6 +144,7 @@ async fn start_server() -> ExitCode {
         }
     };
     popsub_utils::pii::set_masking(config.telemetry.mask_pii);
+    popsub_utils::logging::set_publish_spans(config.telemetry.enabled);
     let telemetry = match Telemetry::init(tracing::Level::INFO, &config.telemetry) {
         Ok(telemetry) => telemetry,
         Err(e) => {
@@ -249,7 +250,8 @@ async fn run_server(
                 config.storage.backend
             )
         })?
-        .with_topic_retention(topic_retention);
+        .with_topic_retention(topic_retention)
+        .with_writer_runtime(writer_runtime()?);
     info!(backend = ?config.storage.backend, durability = ?log.durability, "storage opened");
     telemetry.register_gauges(&broker);
     tokio::spawn(broker.clone().run_retry_loop());
@@ -337,6 +339,29 @@ async fn shutdown_signal() -> &'static str {
         let _ = tokio::signal::ctrl_c().await;
         "Ctrl+C"
     }
+}
+
+/// Starts the runtime topic writers run on.
+///
+/// Writers get threads of their own so that storing and delivering overlap
+/// with reading from clients, instead of sharing a thread with the
+/// connection that woke them. The runtime is never shut down: it lives until
+/// the process exits, as the writers it runs do.
+///
+/// Returns:
+///     A handle for `SharedBroker::with_writer_runtime`.
+///
+/// Raises:
+///     String: When the runtime's threads can't be started.
+fn writer_runtime() -> Result<tokio::runtime::Handle, String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("popsub-writer")
+        .enable_all()
+        .build()
+        .map_err(|e| format!("can't start the topic writers' runtime: {e}"))?;
+    let handle = runtime.handle().clone();
+    std::mem::forget(runtime);
+    Ok(handle)
 }
 
 /// Opens the storage backend the `[storage]` section names.

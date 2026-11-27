@@ -25,20 +25,43 @@
 
 use crate::health::StorageHealth;
 use popsub_utils::metrics::{attr, metrics};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use popsub_storage::{NewRecord, Result as StorageResult, Storage};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
+use tungstenite::protocol::Message as WsMessage;
 
 use popsub_protocol::{RequestId, ServerFrame, ServerMessage, StartFrom, Subscribed, Truncated};
 
+use crate::engine::{DeliverOutcome, DeliverProgress};
+use crate::frame::delivery_ws;
 use crate::replay;
 use crate::shared::{BrokerCell, LogSettings};
+use crate::sink::PublishReply;
 use crate::topic::CursorUpdate;
 
 /// How many records a catch-up reads from the log at a time.
 pub(crate) const REPLAY_PAGE: usize = 256;
+
+/// The most queued commands a writer takes at once, and so the most records
+/// it appends with one write.
+const PUBLISH_BATCH: usize = 256;
+
+/// The payload bytes at which a batch of publishes is closed, however few
+/// records it holds. A batch is delivered in one go, so one much larger than
+/// a subscriber's outgoing queue allows would leave every subscriber behind
+/// and reading the rest back from the log.
+const PUBLISH_BATCH_BYTES: usize = 256 * 1024;
+
+/// How long a writer delivers under one hold of the broker lock before it
+/// lets go, so other topics get a turn.
+const LOCK_HOLD: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// Roughly what a `message` frame adds to a record's own size: the JSON
+/// field names, the topic and the sequence number.
+const FRAME_OVERHEAD_BYTES: u64 = 160;
 
 /// The outcome of a publish.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +99,7 @@ pub(crate) enum Command {
         /// The record, with its id and time already filled in.
         record: NewRecord,
         /// Where the outcome is sent.
-        reply: oneshot::Sender<StorageResult<Published>>,
+        reply: PublishReply,
     },
     /// Add a subscription and replay history to it.
     Subscribe {
@@ -113,6 +136,11 @@ pub(crate) struct TopicWriter {
     /// The log's `last_seq` as this writer last saw it, or `None` until it
     /// has been read or after a failed append, when it is read again.
     last_seq: Option<u64>,
+    /// The average size of a `message` frame in the last page a catch-up
+    /// read, 0 before the first. A catch-up reads only as many records as
+    /// fit in the subscriber's queue, so large records aren't read and thrown
+    /// away.
+    frame_bytes: u64,
     /// A weak handle on this writer's own queue, for catch-ups that start
     /// once a client's outgoing queue drains. Weak, so the writer still
     /// stops when every `SharedBroker` is dropped.
@@ -130,6 +158,8 @@ impl TopicWriter {
     ///     storage: Where the topic's log lives.
     ///     log: Durability and retention settings.
     ///     health: Where append outcomes are recorded.
+    ///     runtime: The runtime to run the writer on, when writers have
+    ///         their own. Otherwise it runs on the caller's.
     ///
     /// Returns:
     ///     The sending side of the writer's queue.
@@ -139,6 +169,7 @@ impl TopicWriter {
         storage: Arc<dyn Storage>,
         log: LogSettings,
         health: Arc<StorageHealth>,
+        runtime: Option<&tokio::runtime::Handle>,
     ) -> mpsc::UnboundedSender<Command> {
         let (tx, rx) = mpsc::unbounded_channel();
         let writer = TopicWriter {
@@ -148,13 +179,21 @@ impl TopicWriter {
             log,
             health,
             last_seq: None,
+            frame_bytes: 0,
             queue: tx.downgrade(),
         };
-        tokio::spawn(writer.run(rx));
+        match runtime {
+            Some(runtime) => runtime.spawn(writer.run(rx)),
+            None => tokio::spawn(writer.run(rx)),
+        };
         tx
     }
 
-    /// Handles queued commands one at a time until the queue closes.
+    /// Handles queued commands in order until the queue closes.
+    ///
+    /// Commands are taken up to `PUBLISH_BATCH` at a time, and publishes that
+    /// sit next to each other in the queue are stored and delivered together
+    /// by `publish_batch`. Everything else is handled one command at a time.
     ///
     /// A caller that stopped waiting for its result is ignored, and a failed
     /// catch-up is logged; the next ACK or subscribe tries again.
@@ -162,31 +201,45 @@ impl TopicWriter {
     /// Args:
     ///     rx: The receiving side of the writer's queue.
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Command>) {
-        while let Some(command) = rx.recv().await {
-            match command {
-                Command::Publish { record, reply } => {
-                    let _ = reply.send(self.publish(record).await);
-                }
-                Command::Subscribe {
-                    client_id,
-                    from,
-                    request_id,
-                    group,
-                    reply,
-                } => {
-                    let outcome = match group {
-                        Some(group) => {
-                            self.subscribe_group(&client_id, &group, from, request_id)
-                                .await
+        let mut queued = Vec::with_capacity(PUBLISH_BATCH);
+        while rx.recv_many(&mut queued, PUBLISH_BATCH).await > 0 {
+            let mut commands = queued.drain(..).peekable();
+            while let Some(command) = commands.next() {
+                match command {
+                    Command::Publish { record, reply } => {
+                        let mut bytes = record.payload.len();
+                        let mut publishes = vec![(record, reply)];
+                        while bytes < PUBLISH_BATCH_BYTES
+                            && let Some(Command::Publish { .. }) = commands.peek()
+                        {
+                            if let Some(Command::Publish { record, reply }) = commands.next() {
+                                bytes += record.payload.len();
+                                publishes.push((record, reply));
+                            }
                         }
-                        None => self.subscribe(&client_id, from, request_id).await,
-                    };
-                    let _ = reply.send(outcome);
-                }
-                Command::CatchUp { client_id } => {
-                    if let Err(e) = self.catch_up(&client_id).await {
-                        warn!(topic = %self.topic, client = %client_id, %e, "catch-up failed");
-                        metrics().storage_errors.add(1, &attr("operation", "read"));
+                        self.publish_batch(publishes).await;
+                    }
+                    Command::Subscribe {
+                        client_id,
+                        from,
+                        request_id,
+                        group,
+                        reply,
+                    } => {
+                        let outcome = match group {
+                            Some(group) => {
+                                self.subscribe_group(&client_id, &group, from, request_id)
+                                    .await
+                            }
+                            None => self.subscribe(&client_id, from, request_id).await,
+                        };
+                        let _ = reply.send(outcome);
+                    }
+                    Command::CatchUp { client_id } => {
+                        if let Err(e) = self.catch_up(&client_id).await {
+                            warn!(topic = %self.topic, client = %client_id, %e, "catch-up failed");
+                            metrics().storage_errors.add(1, &attr("operation", "read"));
+                        }
                     }
                 }
             }
@@ -233,73 +286,131 @@ impl TopicWriter {
         }
     }
 
-    /// Appends a record, delivers it if it is new, and trims the log.
+    /// Appends a batch of records, delivers the new ones, and trims the log.
+    ///
+    /// The batch is everything that was waiting in the writer's queue, up to
+    /// `PUBLISH_BATCH`, so a busy topic stores many records with one write.
+    /// The `message` frames are built before the broker lock is taken. Under
+    /// the lock each subscriber is given the whole batch in a row
+    /// (`Broker::deliver_batch`), for at most about `LOCK_HOLD` at a time: a
+    /// topic with few subscribers delivers a batch in one hold, and a large
+    /// fan-out gives the lock to any waiting thread every few subscribers,
+    /// so it can't keep other topics waiting for a batch.
+    /// Records keep their order, and each publisher gets its own result.
     ///
     /// A duplicate (same publisher and message id, still retained) is
     /// neither stored again nor delivered again. A failed trim is logged and
-    /// doesn't fail the publish; the retention loop tries again later.
+    /// doesn't fail a publish; the retention loop tries again later.
+    ///
+    /// Each reply is the record's `seq` and id and whether it was a
+    /// duplicate, or `StorageError::Unavailable` when the log couldn't be
+    /// read or appended to, or `StorageError::Unsupported` when the backend
+    /// can't honour the configured durability. `SharedBroker::new` checks
+    /// the durability, so that only happens with a backend that misreports
+    /// its capabilities.
     ///
     /// Args:
-    ///     record: The record to publish.
-    ///
-    /// Returns:
-    ///     The record's `seq` and id, and whether it was a duplicate.
-    ///
-    /// Raises:
-    ///     StorageError::Unavailable: When the log can't be read or appended to.
-    ///     StorageError::Unsupported: When the backend can't honour the
-    ///         configured durability. `SharedBroker::new` checks this, so it
-    ///         only happens with a backend that misreports its capabilities.
-    async fn publish(&mut self, record: NewRecord) -> StorageResult<Published> {
+    ///     publishes: The records to publish, oldest first, each with where
+    ///         to send its result.
+    async fn publish_batch(&mut self, publishes: Vec<(NewRecord, PublishReply)>) {
         let started = std::time::Instant::now();
-        let qos = i64::from(record.qos);
-        let last_seq = self.last_seq().await?;
-        let stored = match self
-            .storage
-            .append(&self.topic, record, self.log.durability)
-            .await
-        {
-            Ok(stored) => {
-                self.health.record_success();
-                stored
-            }
+        let last_seq = match self.last_seq().await {
+            Ok(last_seq) => last_seq,
             Err(e) => {
-                self.health.record_failure();
-                metrics()
-                    .storage_errors
-                    .add(1, &attr("operation", "append"));
-                self.last_seq = None;
-                return Err(e);
+                for (_, reply) in publishes {
+                    reply.send(&self.topic, Err(e.clone()));
+                }
+                return;
             }
         };
-        let published = Published {
-            seq: stored.seq,
-            message_id: stored.message_id.clone(),
-            duplicate: stored.seq <= last_seq,
-        };
-        if published.duplicate {
-            return Ok(published);
-        }
-        self.last_seq = Some(stored.seq);
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let outcome = self.broker.with(|broker| broker.deliver(&stored, now_ms));
-        self.store_cursors(outcome.cursors).await;
-        for client_id in outcome.backed_up {
-            self.catch_up_when_ready(client_id);
-        }
-        if let Err(e) = self
+        let (records, replies): (Vec<NewRecord>, Vec<PublishReply>) = publishes.into_iter().unzip();
+        let results = self
             .storage
-            .trim(&self.topic, &self.log.retention, now_ms)
-            .await
-        {
-            warn!(topic = %self.topic, %e, "trimming after publish failed");
-            metrics().storage_errors.add(1, &attr("operation", "trim"));
+            .append_batch(&self.topic, records, self.log.durability)
+            .await;
+
+        let mut newest = last_seq;
+        let mut failed = false;
+        let mut fresh = Vec::with_capacity(results.len());
+        let mut outcomes = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Ok(stored) => {
+                    self.health.record_success();
+                    let duplicate = stored.seq <= newest;
+                    outcomes.push(Ok(Published {
+                        seq: stored.seq,
+                        message_id: stored.message_id.clone(),
+                        duplicate,
+                    }));
+                    if !duplicate {
+                        newest = stored.seq;
+                        fresh.push(stored);
+                    }
+                }
+                Err(e) => {
+                    self.health.record_failure();
+                    metrics()
+                        .storage_errors
+                        .add(1, &attr("operation", "append"));
+                    failed = true;
+                    outcomes.push(Err(e));
+                }
+            }
         }
-        metrics().published.add(1, &attr("qos", qos));
-        metrics()
-            .publish_duration
-            .record(started.elapsed().as_secs_f64(), &[]);
-        Ok(published)
+        self.last_seq = (!failed).then_some(newest);
+
+        if !fresh.is_empty() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut frames: Vec<Option<WsMessage>> = if self
+                .broker
+                .with(|broker| broker.has_subscribers(&self.topic))
+            {
+                fresh.iter().map(delivery_ws).collect()
+            } else {
+                vec![None; fresh.len()]
+            };
+            let mut outcome = DeliverOutcome::default();
+            let mut progress = DeliverProgress::default();
+            while !self.broker.with_fair(|broker| {
+                broker.deliver_batch(
+                    &self.topic,
+                    &fresh,
+                    &mut frames,
+                    &mut progress,
+                    now_ms,
+                    LOCK_HOLD,
+                    &mut outcome,
+                )
+            }) {}
+            let backed_up = outcome.backed_up;
+            let mut cursors: HashMap<String, CursorUpdate> = HashMap::new();
+            for update in outcome.cursors {
+                cursors.insert(update.session.clone(), update);
+            }
+            self.store_cursors(cursors.into_values()).await;
+            for client_id in backed_up {
+                self.catch_up_when_ready(client_id);
+            }
+            if let Err(e) = self
+                .storage
+                .trim(&self.topic, &self.log.retention, now_ms)
+                .await
+            {
+                warn!(topic = %self.topic, %e, "trimming after publish failed");
+                metrics().storage_errors.add(1, &attr("operation", "trim"));
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            for record in &fresh {
+                metrics()
+                    .published
+                    .add(1, &attr("qos", i64::from(record.qos)));
+                metrics().publish_duration.record(elapsed, &[]);
+            }
+        }
+        for (reply, outcome) in replies.into_iter().zip(outcomes) {
+            reply.send(&self.topic, outcome);
+        }
     }
 
     /// Adds a subscription, tells the client what will be replayed, and
@@ -550,7 +661,21 @@ impl TopicWriter {
             if next > last_seq {
                 break;
             }
-            let page = self.storage.read(&self.topic, next, REPLAY_PAGE).await?;
+            let room = self
+                .broker
+                .with(|broker| broker.subscriber_outbox(&self.topic, client_id))
+                .map_or(0, |outbox| outbox.room_bytes() as u64);
+            let fits = match self.frame_bytes {
+                0 => REPLAY_PAGE,
+                frame_bytes => usize::try_from(room / frame_bytes)
+                    .unwrap_or(REPLAY_PAGE)
+                    .clamp(1, REPLAY_PAGE),
+            };
+            let page = self.storage.read(&self.topic, next, fits).await?;
+            if !page.is_empty() {
+                let bytes: u64 = page.iter().map(popsub_storage::Record::size).sum();
+                self.frame_bytes = bytes / page.len() as u64 + FRAME_OVERHEAD_BYTES;
+            }
             let first_available = page.first().map_or(last_seq + 1, |r| r.seq);
             if first_available > next {
                 let update = self.broker.with(|broker| {
@@ -581,6 +706,12 @@ impl TopicWriter {
             if sent < page.len() {
                 break;
             }
+        }
+        if self
+            .broker
+            .with(|broker| broker.mark_awaiting_room(&self.topic, client_id, last_seq))
+        {
+            self.catch_up_when_ready(client_id.to_string());
         }
         Ok(sent_total)
     }

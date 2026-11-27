@@ -2,6 +2,31 @@
 
 Each release lists what changed for people running the server and people using a client library. Versions follow [Semantic Versioning](https://semver.org); while the version is 0.x, a minor release may change the protocol or a library's API, and the notes say so.
 
+## [0.3.0] - Unreleased
+
+A performance release. The server stores and delivers many times more messages a second than 0.2.0 on the same machine; [`docs/BENCHMARKS.md`](https://github.com/soumyadepp/popsub/blob/main/docs/BENCHMARKS.md) has the numbers before and after, and beside NATS and Mosquitto. The protocol is unchanged and no client library changed. Four behaviours did change; read "Upgrading from 0.2.0" first.
+
+### Upgrading from 0.2.0
+
+- **Replies can arrive in a different order from requests.** A connection no longer waits for a publish to be stored before it reads the next frame. A publish that is refused straight away (a bad frame, no permission, the rate limit) can be answered before an earlier publish that is still being stored. Match replies by `id`, as the client libraries already do. A request other than `publish`, `ack` and `ping` still waits for the connection's earlier publishes.
+- **A publish without a `message_id` is never treated as a retry.** The server gives it a random id, as before, but no longer looks that id up among earlier ones. Only an id the publisher chose makes a publish idempotent.
+- **Trimmed records can come back after a crash.** With the `file` backend, retention no longer writes the topic's head file on every publish. After a stop that wasn't clean, up to one segment of records that had been trimmed is in the log again until the next trim removes it. Purging a topic is still written at once.
+- **One log line per publish is gone.** The `published` line is now at `debug`. A publish gets a trace span only while `telemetry.enabled` is on, and the span covers accepting the publish, not storing it.
+
+### Server
+
+- Publishes waiting for the same topic are stored with one write and, with `synced` durability, one disk flush. A busy topic no longer pays a flush per message.
+- The default retention no longer slows a full topic to the speed of a disk flush per publish.
+- A topic's subscribers each get a waiting batch of messages in one socket write, and delivering to a large fan-out gives the broker lock up every 50 microseconds or so, so one busy topic doesn't hold the others up.
+- Topic writers run on their own threads (named `popsub-writer`), apart from the threads that read sockets.
+- A subscriber whose outgoing queue filled is caught up once the queue has drained to half its soft limit, and the log is read a page at a time with one file read.
+- A connection's permission to publish to a topic is remembered until any account changes, instead of being read from the user store for every message. Revoking a grant or disabling an account still refuses the next publish.
+- A panic while the broker lock is held no longer marks the lock as poisoned; the lock is released and the server carries on, as it did before by recovering from the poisoning.
+
+### Tools
+
+- `popsub-bench` (`make bench`) measures a release build: throughput, delivery latency, fan-out, replay, restart time, idle connections and isolation between topics. `--target nats`, `nats-jetstream` or `mosquitto` runs the comparable loads against those brokers.
+
 ## [0.2.0] - 2026-11-21
 
 Two changes can affect an upgrade from 0.1.0. Read "Upgrading from 0.1.0" first.
