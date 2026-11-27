@@ -325,6 +325,11 @@ async fn admin(client: &Client, command: &Value) -> Result<Value, Value> {
             .await
             .map(|topic| json!({"result": topic}))
             .map_err(error),
+        "backup" => admin
+            .backup(params["name"].as_str().map(str::to_string))
+            .await
+            .map(|backup| json!({"result": backup}))
+            .map_err(error),
         other => Err(failure(
             "protocol",
             &format!("unknown admin method {other}"),

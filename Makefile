@@ -12,7 +12,7 @@ SERVER_ENV := SERVER_HOST=$(HOST) SERVER_PORT=$(PORT)
 .DEFAULT_GOAL := help
 
 .PHONY: help setup build release server server-release client demo \
-	test test-crate scenarios bench fmt fmt-check lint ci schema schema-check doc watch coverage reset-data clean
+	test test-crate scenarios fuzz upgrade-fixture bench fmt fmt-check lint ci schema schema-check doc watch coverage reset-data clean
 
 help:
 	@printf "PopSub make targets\n\n"
@@ -33,6 +33,8 @@ help:
 	@printf "    make ci              Exactly what GitHub Actions runs: fmt check, clippy, tests, schema check\n"
 	@printf "    make schema          Regenerate docs/protocol/*.json from the protocol types\n"
 	@printf "    make coverage        Coverage report (cargo-llvm-cov)\n"
+	@printf "    make upgrade-fixture Write this build's data for the upgrade test (VERSION=0.4.0, at release time)\n"
+	@printf "    make fuzz            Fuzz a network parser (FUZZ_TARGET=client_frame or proxy_header, FUZZ_SECONDS=0 runs until stopped)\n"
 	@printf "    make bench           Measure throughput and latency of a release build (BENCH=\"--scenario one-topic\")\n\n"
 	@printf "  Housekeeping\n"
 	@printf "    make build           Debug build\n"
@@ -40,7 +42,7 @@ help:
 	@printf "    make doc             Build and open the API docs\n"
 	@printf "    make reset-data      Delete stored messages and sessions ($(DATA_DIR), and the old pubsub_db)\n"
 	@printf "    make clean           cargo clean plus reset-data\n\n"
-	@printf "  Options: HOST, PORT, URL, CRATE, DRIVER, BENCH, JOBS (parallel build jobs, lower it if builds run out of memory)\n"
+	@printf "  Options: HOST, PORT, URL, CRATE, DRIVER, BENCH, FUZZ_TARGET, FUZZ_SECONDS, JOBS (parallel build jobs, lower it if builds run out of memory)\n"
 
 setup:
 	@command -v $(CARGO) >/dev/null || { echo "Rust is not installed. See https://rustup.rs"; exit 1; }
@@ -84,6 +86,21 @@ DRIVER ?= target/debug/popsub-sdk-driver
 scenarios:
 	$(CARGO) build -p popsub_scenarios $(JOBS_FLAG)
 	target/debug/popsub-scenarios --driver "$(DRIVER)"
+
+VERSION ?=
+
+upgrade-fixture:
+	@test -n "$(VERSION)" || { echo "Usage: make upgrade-fixture VERSION=0.4.0"; exit 1; }
+	cd scripts/upgrade-fixture && $(CARGO) run -q $(JOBS_FLAG) -- $(CURDIR)/crates/popsub/tests/fixtures/upgrade/v$(VERSION)
+
+FUZZ_TARGET ?= client_frame
+FUZZ_SECONDS ?= 0
+
+fuzz:
+	@command -v cargo-fuzz >/dev/null || { echo "Install it first: rustup toolchain install nightly && cargo install cargo-fuzz --locked"; exit 1; }
+	mkdir -p fuzz/corpus/$(FUZZ_TARGET)
+	cd fuzz && $(CARGO) +nightly fuzz run $(FUZZ_TARGET) corpus/$(FUZZ_TARGET) seeds/$(FUZZ_TARGET) -- \
+		-max_total_time=$(FUZZ_SECONDS) $(if $(wildcard fuzz/$(FUZZ_TARGET).dict),-dict=$(FUZZ_TARGET).dict,)
 
 BENCH ?=
 

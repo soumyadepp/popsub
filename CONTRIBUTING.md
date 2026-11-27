@@ -85,9 +85,34 @@ Open an issue with:
 
 For a protocol problem, the frames sent and received are the most useful thing you can include.
 
+## Fuzzing
+
+The parsers that read raw network input have fuzz targets in `fuzz/`. Run them after changing `popsub_protocol`'s client frames, `parse_frame` or the PROXY header reader.
+
+You need nightly Rust and cargo-fuzz:
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+```
+
+Then run a target until you stop it, or for a set time:
+
+```bash
+make fuzz FUZZ_TARGET=client_frame
+make fuzz FUZZ_TARGET=proxy_header FUZZ_SECONDS=300
+```
+
+| Target | What it checks |
+|---|---|
+| `client_frame` | `parse_frame` never panics and gives the same result as the general `ClientFrame` parser, and `salvage_request_id` never panics |
+| `proxy_header` | `read_proxy_header` never panics on any bytes, and consumes bytes whenever it reads a header |
+
+A crash is saved under `fuzz/artifacts/<target>/`. Turn it into a unit test that fails before you fix the bug.
+
 ## Security issues
 
-Please don't open a public issue for a vulnerability. Report it privately with the **Report a vulnerability** button on the repository's Security tab, and allow time for a fix before disclosing it.
+Please don't open a public issue for a vulnerability. [`SECURITY.md`](SECURITY.md) says how to report one privately, what to include, and what happens next.
 
 ## License
 

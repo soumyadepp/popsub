@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from popsub.errors import ProtocolError
-from popsub.protocol import Access, RoleSpec, TopicInfo, UserInfo
+from popsub.protocol import Access, BackupInfo, RoleSpec, TopicInfo, UserInfo
 
 if TYPE_CHECKING:
     from popsub.client import Client
@@ -249,6 +249,39 @@ class Admin:
             ProtocolError: When the server answers with something else.
         """
         return await self._topic({"type": "purge_topic", "topic": topic})
+
+    async def backup(self, name: str | None = None) -> BackupInfo:
+        """Asks the server to back itself up while it keeps running.
+
+        The server copies its topic logs, sessions and accounts into a new
+        directory under its `storage.backup_path`. The reply comes when the
+        copy is finished, which for a large store can take longer than the
+        default request timeout; use a client with a longer one for backups.
+
+        Args:
+            name: The backup's directory name. Defaults to the time in UTC,
+                such as `20261127T101500Z`.
+
+        Returns:
+            The backup's name, where it is on the server, and what it holds.
+
+        Raises:
+            ServerError: `backup_exists`, `backup_unsupported` for the memory
+                backend, `bad_request` for an invalid name,
+                `storage_unavailable` when another backup is running, or
+                `forbidden`.
+            ProtocolError: When the server answers with something else.
+        """
+        frame: dict[str, Any] = {"type": "backup"}
+        if name is not None:
+            frame["name"] = name
+        reply = await self._client._request(frame)
+        if reply.get("type") != "backup_created":
+            raise ProtocolError(f"expected backup_created, got {reply.get('type')!r}")
+        try:
+            return BackupInfo.from_json(reply.get("backup"))
+        except ValueError as error:
+            raise ProtocolError(str(error)) from error
 
     async def _topic(self, frame: dict[str, Any]) -> TopicInfo:
         """Sends a request answered by a `topic_info` frame.

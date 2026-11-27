@@ -130,12 +130,15 @@ struct PublishFrame<'a> {
 
 /// Reads a client frame, trying the direct shape of a `publish` first.
 ///
-/// A frame that mentions `"publish"` is read as a `PublishFrame`. When that
-/// works and its `type` is `publish`, the result is the same `ClientFrame`
-/// the general parser would give, since the fields have the same names and
-/// types. Anything else, including a publish with a field of the wrong type,
+/// A JSON object that mentions `"publish"` is read as a `PublishFrame`. When
+/// that works and its `type` is `publish`, the result is the same
+/// `ClientFrame` the general parser would give, since the fields have the
+/// same names and types. Only objects take the direct path: serde reads a
+/// struct from a JSON array too, by position, which the general parser
+/// refuses. Anything else, including a publish with a field of the wrong type,
 /// goes through the general parser, so every other frame and every error is
-/// exactly as before.
+/// exactly as before. Public so the fuzz targets in `fuzz/` can call it; the
+/// server is its only other caller.
 ///
 /// Args:
 ///     text: The frame's JSON text.
@@ -143,10 +146,14 @@ struct PublishFrame<'a> {
 /// Returns:
 ///     The frame.
 ///
+///
 /// Raises:
 ///     serde_json::Error: When the text isn't a valid client frame.
-pub(crate) fn parse_frame(text: &str) -> serde_json::Result<ClientFrame> {
-    if text.contains("\"publish\"")
+pub fn parse_frame(text: &str) -> serde_json::Result<ClientFrame> {
+    if text
+        .trim_start_matches([' ', '\t', '\n', '\r'])
+        .starts_with('{')
+        && text.contains("\"publish\"")
         && let Ok(publish) = serde_json::from_str::<PublishFrame>(text)
         && publish.kind == "publish"
     {
@@ -351,6 +358,10 @@ pub struct Server {
     tls: Option<ServerTls>,
     /// Whether connections from trusted proxies start with a PROXY protocol header.
     proxy_protocol: bool,
+    /// The directory the `backup` admin request writes backups into.
+    backup_dir: std::path::PathBuf,
+    /// Whether a backup is running, shared by every clone, so only one runs at a time.
+    backup_running: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -385,6 +396,8 @@ impl Server {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             tls: None,
             proxy_protocol: false,
+            backup_dir: std::path::PathBuf::from("pubsub_backups"),
+            backup_running: Arc::new(AtomicBool::new(false)),
             broker,
         }
     }
@@ -511,6 +524,19 @@ impl Server {
     ///     The server with the setting applied.
     pub fn with_proxy_protocol(mut self, enabled: bool) -> Self {
         self.proxy_protocol = enabled;
+        self
+    }
+
+    /// Sets the directory the `backup` admin request writes backups into,
+    /// in place of the default `pubsub_backups` in the working directory.
+    ///
+    /// Args:
+    ///     dir: The directory. It is created on the first backup.
+    ///
+    /// Returns:
+    ///     The server with the directory set.
+    pub fn with_backup_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.backup_dir = dir.into();
         self
     }
 
@@ -1460,7 +1486,8 @@ impl Session {
             | ClientMessage::DeleteUser { .. }
             | ClientMessage::ListTopics {}
             | ClientMessage::GetTopic { .. }
-            | ClientMessage::PurgeTopic { .. }) => self.admin(id, admin).await,
+            | ClientMessage::PurgeTopic { .. }
+            | ClientMessage::Backup { .. }) => self.admin(id, admin).await,
         }
     }
 
@@ -2437,12 +2464,15 @@ impl Session {
 /// Reads the request id out of a frame that didn't parse, so the
 /// `bad_request` error can still be matched to it.
 ///
+/// Public so the fuzz targets in `fuzz/` can call it; the server is its only
+/// other caller.
+///
 /// Args:
 ///     text: The frame as received.
 ///
 /// Returns:
 ///     The id, when the text is a JSON object with a valid `id`.
-fn salvage_request_id(text: &str) -> Option<RequestId> {
+pub fn salvage_request_id(text: &str) -> Option<RequestId> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     serde_json::from_value(value.get("id")?.clone()).ok()
 }

@@ -157,6 +157,16 @@ pub enum ClientMessage {
         /// The topic.
         topic: String,
     },
+    /// Admin only. Copies the server's topic logs, sessions and accounts
+    /// into a new directory under the server's `storage.backup_path` while
+    /// it keeps running. Answered with `backup_created`.
+    Backup {
+        /// The new directory's name: 1 to 64 letters, digits, `_`, `.` or
+        /// `-`, not starting with `.`. Defaults to the time in UTC, such as
+        /// `20261127T101500Z`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// Asks the server to answer with `pong`, so a client that can't see
     /// WebSocket pings (a browser) can tell the connection is still alive.
     /// Accepted before `auth` too.
@@ -245,6 +255,7 @@ impl ClientMessage {
             ClientMessage::ListTopics { .. } => "list_topics",
             ClientMessage::GetTopic { .. } => "get_topic",
             ClientMessage::PurgeTopic { .. } => "purge_topic",
+            ClientMessage::Backup { .. } => "backup",
             ClientMessage::CreateUser { .. } => "create_user",
             ClientMessage::GetUser { .. } => "get_user",
             ClientMessage::ListUsers { .. } => "list_users",

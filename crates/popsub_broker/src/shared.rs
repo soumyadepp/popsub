@@ -27,7 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use popsub_storage::{
-    Durability, NewRecord, Result as StorageResult, Retention, Storage, StorageError, Subscription,
+    BackupSummary, Durability, NewRecord, Result as StorageResult, Retention, Storage,
+    StorageError, Subscription,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -448,6 +449,27 @@ impl SharedBroker {
         let removed = self.storage.trim(topic, &nothing, now_ms()).await?;
         info!(topic, removed, "purged a topic");
         self.topic_info(topic).await
+    }
+
+    /// Copies the storage backend's topic logs and sessions into a new
+    /// directory while the broker keeps running.
+    ///
+    /// The backend captures each topic under its own lock, the same lock the
+    /// topic's writer appends under, so this never reads around a writer and
+    /// never takes the broker lock.
+    ///
+    /// Args:
+    ///     dest: The directory to create.
+    ///
+    /// Returns:
+    ///     What was copied.
+    ///
+    /// Raises:
+    ///     StorageError::Unsupported: When the backend can't be backed up while running.
+    ///     StorageError::Unavailable: When `dest` exists or a file can't be
+    ///         read or written.
+    pub async fn backup(&self, dest: &std::path::Path) -> StorageResult<BackupSummary> {
+        self.storage.backup(dest).await
     }
 
     /// A snapshot of the broker's size, for gauges.

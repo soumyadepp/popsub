@@ -148,6 +148,29 @@ func (a *Admin) PurgeTopic(ctx context.Context, topic string) (TopicInfo, error)
 	return a.topic(ctx, topicRequest{Type: "purge_topic", Topic: topic})
 }
 
+// Backup asks the server to back itself up while it keeps running: its
+// topic logs, sessions and accounts, into a new directory under its
+// storage.backup_path. An empty name means the time in UTC, such as
+// 20261127T101500Z. The reply comes when the copy is finished, which for a
+// large store can take a while, so give ctx enough time. It fails with
+// CodeBackupExists, CodeBackupUnsupported for the memory backend,
+// CodeBadRequest for an invalid name, or CodeStorageUnavailable when
+// another backup is running.
+func (a *Admin) Backup(ctx context.Context, name string) (BackupInfo, error) {
+	frame, err := a.client.request(ctx, backupRequest{Type: "backup", Name: name})
+	if err != nil {
+		return BackupInfo{}, err
+	}
+	if frame.Type != "backup_created" {
+		return BackupInfo{}, protocolError("expected backup_created, got " + frame.Type)
+	}
+	var info BackupInfo
+	if err := json.Unmarshal(frame.Backup, &info); err != nil {
+		return BackupInfo{}, protocolError("the backup_created frame doesn't parse: " + err.Error())
+	}
+	return info, nil
+}
+
 // topic sends a request answered by a topic_info frame and returns the
 // topic in it.
 func (a *Admin) topic(ctx context.Context, message any) (TopicInfo, error) {

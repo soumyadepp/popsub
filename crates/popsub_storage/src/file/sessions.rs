@@ -193,30 +193,7 @@ impl SessionLog {
             return Ok(());
         }
         let temp = self.path.with_extension("log.tmp");
-        let mut out = File::create(&temp).map_err(|e| io_error(e, &temp))?;
-        let mut ops = 0;
-        for (session_id, at_ms, subscriptions) in snapshot {
-            let mut write = |op: Op| -> Result<()> {
-                let body = serde_json::to_vec(&op)
-                    .map_err(|e| StorageError::Other(format!("encoding a session change: {e}")))?;
-                out.write_all(&codec::encode(&body))
-                    .map_err(|e| io_error(e, &temp))?;
-                ops += 1;
-                Ok(())
-            };
-            write(Op::Touch {
-                session_id: session_id.clone(),
-                at_ms,
-            })?;
-            for subscription in subscriptions {
-                write(Op::Subscribe {
-                    session_id: session_id.clone(),
-                    topic: subscription.topic,
-                    acked_seq: subscription.acked_seq,
-                })?;
-            }
-        }
-        out.sync_all().map_err(|e| io_error(e, &temp))?;
+        let ops = write_compacted(&temp, snapshot)?;
         fs::rename(&temp, &self.path).map_err(|e| io_error(e, &self.path))?;
         if let Some(dir) = self.path.parent() {
             sync_dir(dir)?;
@@ -227,6 +204,14 @@ impl SessionLog {
             .map_err(|e| io_error(e, &self.path))?;
         self.ops = ops;
         Ok(())
+    }
+
+    /// Captures every session's state for a backup. Call it with the log locked.
+    ///
+    /// Returns:
+    ///     Each session id with its last activity and subscriptions.
+    pub(crate) fn snapshot(&self) -> SessionSnapshot {
+        self.table.snapshot()
     }
 
     /// Lists a session's subscriptions.
@@ -342,4 +327,51 @@ impl SessionLog {
     pub(crate) fn ops(&self) -> usize {
         self.ops
     }
+}
+
+/// Every session's id, last activity time and subscriptions.
+pub(crate) type SessionSnapshot = Vec<(String, i64, Vec<Subscription>)>;
+
+/// Writes a session log holding exactly the given state, one `touch` per
+/// session followed by a `subscribe` per subscription, and flushes it.
+///
+/// Used for compaction and for backups, so both produce a log that `open`
+/// replays to the same table.
+///
+/// Args:
+///     path: The file to create or replace.
+///     snapshot: The state to write.
+///
+/// Returns:
+///     How many operations were written.
+///
+/// Raises:
+///     StorageError::Unavailable: When the file can't be written or flushed.
+///     StorageError::Other: When an operation can't be encoded.
+pub(crate) fn write_compacted(path: &Path, snapshot: SessionSnapshot) -> Result<usize> {
+    let mut out = File::create(path).map_err(|e| io_error(e, path))?;
+    let mut ops = 0;
+    for (session_id, at_ms, subscriptions) in snapshot {
+        let mut write = |op: Op| -> Result<()> {
+            let body = serde_json::to_vec(&op)
+                .map_err(|e| StorageError::Other(format!("encoding a session change: {e}")))?;
+            out.write_all(&codec::encode(&body))
+                .map_err(|e| io_error(e, path))?;
+            ops += 1;
+            Ok(())
+        };
+        write(Op::Touch {
+            session_id: session_id.clone(),
+            at_ms,
+        })?;
+        for subscription in subscriptions {
+            write(Op::Subscribe {
+                session_id: session_id.clone(),
+                topic: subscription.topic,
+                acked_seq: subscription.acked_seq,
+            })?;
+        }
+    }
+    out.sync_all().map_err(|e| io_error(e, path))?;
+    Ok(ops)
 }

@@ -134,42 +134,43 @@ impl FileUserStore {
         let mut users = self.users();
         let mut next = users.clone();
         let result = change(&mut next)?;
-        self.write(&next)?;
+        write_file(&self.path, &next)?;
         *users = next;
         self.revision.fetch_add(1, Ordering::Release);
         Ok(result)
     }
+}
 
-    /// Writes the accounts to the file atomically.
-    ///
-    /// Args:
-    ///     users: The accounts to write.
-    ///
-    /// Raises:
-    ///     AuthError::Internal: When any step of writing fails.
-    fn write(&self, users: &BTreeMap<String, User>) -> Result<()> {
-        let internal = |what: &str, e: std::io::Error| {
-            AuthError::Internal(format!("can't {what} {}: {e}", self.path.display()))
-        };
-        let file = UsersFile {
-            version: FORMAT_VERSION,
-            users: users.values().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file)
-            .map_err(|e| AuthError::Internal(format!("can't encode the users: {e}")))?;
-        let temp = self.path.with_extension("json.tmp");
-        let mut out =
-            create_private(&temp).map_err(|e| internal("create a temporary file for", e))?;
-        out.write_all(&bytes).map_err(|e| internal("write", e))?;
-        out.sync_all().map_err(|e| internal("flush", e))?;
-        fs::rename(&temp, &self.path).map_err(|e| internal("replace", e))?;
-        if let Some(dir) = self.path.parent()
-            && let Ok(dir) = File::open(dir)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+/// Writes accounts to a file atomically: a private temporary file beside it,
+/// flushed, then renamed over it.
+///
+/// Args:
+///     path: The file to create or replace.
+///     users: The accounts to write.
+///
+/// Raises:
+///     AuthError::Internal: When any step of writing fails.
+fn write_file(path: &Path, users: &BTreeMap<String, User>) -> Result<()> {
+    let internal = |what: &str, e: std::io::Error| {
+        AuthError::Internal(format!("can't {what} {}: {e}", path.display()))
+    };
+    let file = UsersFile {
+        version: FORMAT_VERSION,
+        users: users.values().cloned().collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|e| AuthError::Internal(format!("can't encode the users: {e}")))?;
+    let temp = path.with_extension("json.tmp");
+    let mut out = create_private(&temp).map_err(|e| internal("create a temporary file for", e))?;
+    out.write_all(&bytes).map_err(|e| internal("write", e))?;
+    out.sync_all().map_err(|e| internal("flush", e))?;
+    fs::rename(&temp, path).map_err(|e| internal("replace", e))?;
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = File::open(dir)
+    {
+        let _ = dir.sync_all();
     }
+    Ok(())
 }
 
 /// Creates (or truncates) a file only its owner can read and write.
@@ -296,6 +297,23 @@ impl UserStore for FileUserStore {
     ///     Never returns an error.
     async fn user_count(&self) -> Result<usize> {
         Ok(self.users().len())
+    }
+
+    /// Writes the accounts as they are now to `users.json` in `dir`, in the
+    /// same format and with the same permissions as the store's own file.
+    ///
+    /// Args:
+    ///     dir: The backup directory. It must exist.
+    ///
+    /// Returns:
+    ///     True, since the accounts were written.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the file can't be written.
+    async fn backup(&self, dir: &Path) -> Result<bool> {
+        let users = self.users();
+        write_file(&dir.join("users.json"), &users)?;
+        Ok(true)
     }
 
     /// Counts the changes made since the store was opened. The file is only

@@ -252,3 +252,16 @@ fn a_record_writes_the_same_json_as_serde() {
         }
     }
 }
+
+/// Checks that the in-memory backend refuses a backup, since it has nothing
+/// on disk to copy.
+#[test]
+fn memory_storage_refuses_a_backup() {
+    crate::conformance::block_on(async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let result = crate::MemoryStorage::default()
+            .backup(&dir.path().join("b"))
+            .await;
+        assert!(matches!(result, Err(crate::StorageError::Unsupported(_))));
+    });
+}

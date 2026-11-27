@@ -72,6 +72,22 @@ export interface WireTopicInfo {
   subscribers: number;
 }
 
+/** A backup as the server describes it in a `backup_created` frame. */
+export interface WireBackupInfo {
+  /** The backup's directory name. */
+  name: string;
+  /** Where the backup is on the server's file system. */
+  path: string;
+  /** How many topics it holds. */
+  topics: number;
+  /** How many records it holds across every topic. */
+  records: number;
+  /** How many bytes were written. */
+  bytes: number;
+  /** Whether accounts were included. */
+  users: boolean;
+}
+
 /** The admin requests, which are never queued or resent. */
 export type AdminRequest =
   | { type: "create_user"; username: string; password: string; role: RoleSpec }
@@ -85,7 +101,8 @@ export type AdminRequest =
   | { type: "delete_user"; username: string }
   | { type: "list_topics" }
   | { type: "get_topic"; topic: string }
-  | { type: "purge_topic"; topic: string };
+  | { type: "purge_topic"; topic: string }
+  | { type: "backup"; name?: string };
 
 /** Every frame this client sends, without its request id. */
 export type ClientMessage =
@@ -162,6 +179,7 @@ export type ServerMessage =
   | { type: "pong" }
   | { type: "topic_info"; topic: WireTopicInfo }
   | { type: "topics"; topics: WireTopicInfo[] }
+  | { type: "backup_created"; backup: WireBackupInfo }
   | { type: "error"; code: string; message: string; retry_after?: number | null };
 
 /** A server frame: a message plus the id of the request it answers, if any. */
@@ -187,6 +205,8 @@ export const ERROR_CODES = [
   "user_not_found",
   "user_exists",
   "topic_not_found",
+  "backup_exists",
+  "backup_unsupported",
   "internal",
 ] as const;
 
@@ -280,6 +300,7 @@ const REQUIRED_FIELDS: Readonly<Record<ServerMessage["type"], Readonly<Record<st
   pong: {},
   topic_info: { topic: "object" },
   topics: { topics: "object" },
+  backup_created: { backup: "object" },
   error: { code: "string", message: "string" },
 };
 

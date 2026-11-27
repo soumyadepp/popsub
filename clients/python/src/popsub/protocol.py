@@ -36,6 +36,8 @@ ERROR_CODES = frozenset(
         "user_not_found",
         "user_exists",
         "topic_not_found",
+        "backup_exists",
+        "backup_unsupported",
     }
 )
 """Every error code protocol version 1 defines. Newer servers may add more."""
@@ -460,3 +462,67 @@ class TopicInfo:
             )
         except (KeyError, TypeError) as error:
             raise ValueError(f"not a topic: {value!r}") from error
+
+
+@dataclass(frozen=True)
+class BackupInfo:
+    """A backup the server wrote of itself, as the `backup` admin request returns it.
+
+    Attributes:
+        name: The backup's directory name.
+        path: Where the backup is on the server's file system.
+        topics: How many topics it holds.
+        records: How many messages it holds across every topic.
+        bytes: How many bytes were written.
+        users: Whether accounts were included; false when the server doesn't
+            keep them in `users.json`.
+    """
+
+    name: str
+    path: str
+    topics: int
+    records: int
+    bytes: int
+    users: bool
+
+    def to_json(self) -> dict[str, Any]:
+        """Encodes the backup as on the wire.
+
+        Returns:
+            The `backup` object of a `backup_created` frame.
+        """
+        return {
+            "name": self.name,
+            "path": self.path,
+            "topics": self.topics,
+            "records": self.records,
+            "bytes": self.bytes,
+            "users": self.users,
+        }
+
+    @classmethod
+    def from_json(cls, value: Any) -> BackupInfo:
+        """Decodes a backup.
+
+        Args:
+            value: The `backup` object of a `backup_created` frame.
+
+        Returns:
+            The backup.
+
+        Raises:
+            ValueError: When the value isn't a valid backup object.
+        """
+        if not isinstance(value, dict):
+            raise ValueError(f"not a backup: {value!r}")
+        try:
+            return cls(
+                name=str(value["name"]),
+                path=str(value["path"]),
+                topics=int(value["topics"]),
+                records=int(value["records"]),
+                bytes=int(value["bytes"]),
+                users=bool(value["users"]),
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"not a backup: {value!r}") from error

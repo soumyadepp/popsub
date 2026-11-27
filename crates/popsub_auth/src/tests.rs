@@ -619,3 +619,35 @@ async fn a_password_change_moves_the_token_version() {
     .expect("an old record");
     assert_eq!(stored.token_version, 0);
 }
+
+/// Checks that backing up a file store writes a private `users.json` that
+/// opens with the same accounts, and that an in-memory store writes nothing.
+#[tokio::test]
+async fn file_store_backs_up_its_accounts() {
+    use crate::store::UserStore;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = crate::FileUserStore::open(dir.path().join("users.json")).expect("open");
+    store
+        .add_user(crate::User::new("bob", "hash", Role::admin()))
+        .await
+        .expect("add");
+    let backup = dir.path().join("backup");
+    std::fs::create_dir(&backup).expect("create");
+    assert!(store.backup(&backup).await.expect("backup"));
+    let copy = crate::FileUserStore::open(backup.join("users.json")).expect("open the copy");
+    assert_eq!(copy.list_usernames().await.expect("list"), vec!["bob"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(backup.join("users.json"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let memory = crate::InMemoryUserStore::new();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).expect("create");
+    assert!(!memory.backup(&empty).await.expect("backup"));
+    assert!(std::fs::read_dir(&empty).expect("list").next().is_none());
+}

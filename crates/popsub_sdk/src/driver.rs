@@ -1267,7 +1267,8 @@ impl Driver {
             | ServerMessage::Users { .. }
             | ServerMessage::UserDeleted { .. }
             | ServerMessage::TopicInfo { .. }
-            | ServerMessage::Topics { .. } => {}
+            | ServerMessage::Topics { .. }
+            | ServerMessage::BackupCreated { .. } => {}
         }
         Ok(())
     }

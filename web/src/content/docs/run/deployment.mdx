@@ -11,21 +11,22 @@ import { Aside } from "@astrojs/starlight/components";
 </p>
 
 <Aside type="caution" title="One server only">
-  PopSub doesn't cluster or replicate yet. One machine is the whole deployment, so back up its
-  data folder.
+  PopSub doesn't cluster or replicate yet. One machine is the whole deployment, so back it up. See
+  [Backups and upgrades](/run/backups-and-upgrades/).
 </Aside>
 
 ## With Docker
 
 ```bash
 docker run -d --name popsub --restart unless-stopped \
-  -p 8080:8080 -v popsub-data:/data \
+  -p 8080:8080 -v popsub-data:/data -v popsub-backups:/backups \
   -e SERVER__JWT_SECRET="$(openssl rand -hex 32)" \
   -e SERVER_PASSWORD=choose-an-admin-password \
   ghcr.io/soumyadepp/popsub:0.2
 ```
 
-- The **volume** keeps messages, sessions and accounts across container restarts.
+- The **`/data` volume** keeps messages, sessions and accounts across container restarts.
+- The **`/backups` volume** is where `popsub backup` writes.
 - **`docker stop`** shuts it down cleanly. Clients are told the server is going away, and
   they reconnect on their own when it's back.
 

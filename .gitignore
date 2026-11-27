@@ -18,6 +18,7 @@ db
 conf
 pubsub_db
 pubsub_data
+pubsub_backups
 cobertura.xml
 *.profraw
 
@@ -42,3 +43,6 @@ node_modules
 # Website build output
 web/dist/
 web/.astro/
+
+# Upgrade fixtures are data written by earlier releases, session logs included
+!crates/popsub/tests/fixtures/upgrade/**/sessions.log

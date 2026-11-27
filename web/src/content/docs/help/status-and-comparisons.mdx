@@ -47,24 +47,22 @@ From section 12 of the design doc, most important first.
 1. Your own backend can't issue PopSub tokens. Tokens only come from PopSub's own login.
 2. There's no HTTP publish, so a serverless function has to open a WebSocket.
 3. There are no storage quotas per account, so one account can fill the disk.
-4. Backups and upgrades aren't documented yet.
 
 ### For devices
 
-5. No MQTT listener.
-6. No "last will", so a dashboard can't learn a device dropped off.
-7. No retained value that every new subscriber gets without asking.
-8. Logging in again needs the password on the device.
-9. JSON and base64 are expensive on metered links.
+4. No MQTT listener.
+5. No "last will", so a dashboard can't learn a device dropped off.
+6. No retained value that every new subscriber gets without asking.
+7. Logging in again needs the password on the device.
+8. JSON and base64 are expensive on metered links.
 
 ### For running it
 
-10. Capacity is measured on one laptop only. The [performance page](/run/performance/) compares PopSub with NATS and Mosquitto and lists where it loses: large messages, latency, and a quiet topic beside very busy ones.
-11. Power loss and consumers that never read aren't covered by tests yet.
-12. A renewed TLS certificate needs a restart.
-13. Metrics are pushed over OTLP. There's no Prometheus endpoint.
-14. No `SECURITY.md`, and the frame parser isn't fuzzed.
-15. No Swift, Kotlin, C or MicroPython client.
+9. Capacity is measured on one laptop only. The [performance page](/run/performance/) compares PopSub with NATS and Mosquitto and lists where it loses: large messages, latency, and a quiet topic beside very busy ones.
+10. Power loss and consumers that never read aren't covered by tests yet.
+11. A renewed TLS certificate needs a restart.
+12. Metrics are pushed over OTLP. There's no Prometheus endpoint.
+13. No Swift, Kotlin, C or MicroPython client.
 
 Where it's heading, clustering included, is in
 [section 13 of the design doc](https://github.com/soumyadepp/popsub/blob/main/docs/DESIGN.md#13-proposed-direction).

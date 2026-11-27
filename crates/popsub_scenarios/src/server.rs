@@ -78,8 +78,10 @@ impl ScenarioServer {
         let users: Arc<dyn UserStore> = Arc::new(InMemoryUserStore::new());
         let storage = open_storage(dir.as_ref()).await?;
         let broker = new_broker(&settings, storage)?;
-        let server =
-            Server::from_settings_with_users(broker.clone(), &settings.server, users.clone()).await;
+        let server = with_backups(
+            Server::from_settings_with_users(broker.clone(), &settings.server, users.clone()).await,
+            dir.as_ref(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;
@@ -151,12 +153,15 @@ impl ScenarioServer {
         self.retrying.abort();
         let placeholder = new_broker(&self.settings, Arc::new(MemoryStorage::new()))?;
         drop(std::mem::replace(&mut self.broker, placeholder));
-        self.server = Server::from_settings_with_users(
-            self.broker.clone(),
-            &self.settings.server,
-            self.users.clone(),
-        )
-        .await;
+        self.server = with_backups(
+            Server::from_settings_with_users(
+                self.broker.clone(),
+                &self.settings.server,
+                self.users.clone(),
+            )
+            .await,
+            self.dir.as_ref(),
+        );
         let mut storage = None;
         for _ in 0..500 {
             match open_storage(self.dir.as_ref()).await {
@@ -170,12 +175,15 @@ impl ScenarioServer {
         let storage = storage.ok_or("the storage was still locked after five seconds")?;
         self.broker = new_broker(&self.settings, storage)?;
         self.retrying = tokio::spawn(self.broker.clone().run_retry_loop());
-        self.server = Server::from_settings_with_users(
-            self.broker.clone(),
-            &self.settings.server,
-            self.users.clone(),
-        )
-        .await;
+        self.server = with_backups(
+            Server::from_settings_with_users(
+                self.broker.clone(),
+                &self.settings.server,
+                self.users.clone(),
+            )
+            .await,
+            self.dir.as_ref(),
+        );
         self.resume().await
     }
 
@@ -305,4 +313,21 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// Points a server's backups into its temporary directory, so a scenario
+/// never writes into the working directory. The memory backend refuses
+/// backups before writing anything, so it needs no directory.
+///
+/// Args:
+///     server: The server.
+///     dir: The storage directory, for the file backend.
+///
+/// Returns:
+///     The server, writing backups to `backups` in `dir` when there is one.
+fn with_backups(server: Server, dir: Option<&TempDir>) -> Server {
+    match dir {
+        Some(dir) => server.with_backup_dir(dir.path().join("backups")),
+        None => server,
+    }
 }

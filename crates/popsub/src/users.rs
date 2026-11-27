@@ -163,6 +163,26 @@ pub async fn run(
 ///     popsub_sdk::Error: When connecting or logging in fails.
 ///     String: When the password can't be read, or the `--ca-cert` file can't be read.
 pub async fn connect(connection: Connection) -> Result<Client, Box<dyn std::error::Error>> {
+    connect_waiting(connection, Duration::from_secs(10)).await
+}
+
+/// Connects as the admin the connection options name, without retrying, and
+/// waits up to `request_timeout` for each reply.
+///
+/// Args:
+///     connection: Where to connect and who to log in as.
+///     request_timeout: How long to wait for connecting and for each reply.
+///
+/// Returns:
+///     The connected client.
+///
+/// Raises:
+///     popsub_sdk::Error: When connecting or logging in fails.
+///     String: When the password can't be read, or the `--ca-cert` file can't be read.
+pub async fn connect_waiting(
+    connection: Connection,
+    request_timeout: Duration,
+) -> Result<Client, Box<dyn std::error::Error>> {
     let password = match connection.password {
         Some(password) => password,
         None => secret(
@@ -180,7 +200,7 @@ pub async fn connect(connection: Connection) -> Result<Client, Box<dyn std::erro
             max_attempts: Some(0),
             ..ReconnectPolicy::default()
         })
-        .request_timeout(Duration::from_secs(10)),
+        .request_timeout(request_timeout),
         connection.ca_cert.as_deref(),
     )?;
     Ok(Client::connect(config).await?)

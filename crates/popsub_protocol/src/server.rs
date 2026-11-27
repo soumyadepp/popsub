@@ -138,6 +138,11 @@ pub enum ServerMessage {
         /// The topics.
         topics: Vec<TopicInfo>,
     },
+    /// A backup was written, in answer to `backup`.
+    BackupCreated {
+        /// What was written and where.
+        backup: BackupInfo,
+    },
     /// A request failed.
     Error {
         /// What went wrong, for programs.
@@ -196,6 +201,11 @@ pub enum ErrorCode {
     UserExists,
     /// The topic has no log: nothing was ever published to it.
     TopicNotFound,
+    /// A backup with that name already exists.
+    BackupExists,
+    /// The server's storage backend can't be backed up while running, such
+    /// as the `memory` backend.
+    BackupUnsupported,
 }
 
 impl ErrorCode {
@@ -224,6 +234,8 @@ impl ErrorCode {
             ErrorCode::UserNotFound => "user_not_found",
             ErrorCode::UserExists => "user_exists",
             ErrorCode::TopicNotFound => "topic_not_found",
+            ErrorCode::BackupExists => "backup_exists",
+            ErrorCode::BackupUnsupported => "backup_unsupported",
         }
     }
 }
@@ -256,6 +268,25 @@ pub struct TopicInfo {
     pub messages: u64,
     /// How many live subscriptions it has.
     pub subscribers: u64,
+}
+
+/// A backup the server wrote, in answer to `backup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupInfo {
+    /// The backup's directory name.
+    pub name: String,
+    /// Where the backup is on the server's file system.
+    pub path: String,
+    /// How many topics it holds.
+    pub topics: u64,
+    /// How many records it holds across every topic.
+    pub records: u64,
+    /// How many bytes were written.
+    pub bytes: u64,
+    /// Whether accounts were included. False when the server keeps accounts
+    /// somewhere other than `users.json`, such as only in memory.
+    pub users: bool,
 }
 
 /// Limits the server advertises in `authenticated`.

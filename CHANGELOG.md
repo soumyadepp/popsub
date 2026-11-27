@@ -2,6 +2,22 @@
 
 Each release lists what changed for people running the server and people using a client library. Versions follow [Semantic Versioning](https://semver.org); while the version is 0.x, a minor release may change the protocol or a library's API, and the notes say so.
 
+## [Unreleased]
+
+### Server
+
+- Back up a running server with `popsub backup`, or the new `backup` admin request. It copies every topic, the sessions and `users.json` into a new folder under `storage.backup_path` (default `pubsub_backups`; `/backups` in the container image) while publishing carries on. `BACKUP.json` is written last, so a folder without it is unfinished. Restoring is copying the folder back to `storage.path` with the server stopped. The `memory` backend refuses with the new error code `backup_unsupported`, and a name already used gets `backup_exists`.
+- Every release is now tested against data written by each earlier one: a newer release opens an older release's data, and an older release can't be assumed to read a newer one's. `make upgrade-fixture` adds a release's data to the test when it is cut.
+
+### Client libraries
+
+- `admin.backup()` (`Backup` in Go) in the Rust, TypeScript, Python and Go clients. Each knows the two new error codes.
+
+### Project
+
+- `SECURITY.md` says how to report a vulnerability privately, what happens next, and which versions get fixes.
+- The client frame parser and the PROXY protocol header reader are fuzzed. `make fuzz` runs a target locally, and the `Fuzz` workflow runs both on pull requests that touch them and every week.
+
 ## [0.3.0] - 2026-11-27
 
 A performance release. The server stores and delivers many times more messages a second than 0.2.0 on the same machine; [`docs/BENCHMARKS.md`](https://github.com/soumyadepp/popsub/blob/main/docs/BENCHMARKS.md) has the numbers before and after, and beside NATS and Mosquitto. The protocol is unchanged and no client library changed. Four behaviours did change; read "Upgrading from 0.2.0" first.

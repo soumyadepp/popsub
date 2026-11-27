@@ -63,6 +63,34 @@ async fn start_server_on(
     SharedBroker,
     tokio::task::JoinHandle<()>,
 ) {
+    start_server_on_with(settings, limiters, storage, durability, |server| server).await
+}
+
+/// Starts a server on a free local port with the given storage, letting the
+/// caller change the server before it starts serving.
+///
+/// Args:
+///     settings: The settings to configure the server's auth service and
+///         retention from.
+///     limiters: The rate limiters the server uses.
+///     storage: Where topic logs and sessions live.
+///     durability: The durability appends are stored at.
+///     configure: Applied to the server last, such as `with_backup_dir`.
+///
+/// Returns:
+///     The address to connect to, the server's broker, and the task
+///     accepting connections, which the caller can abort to stop the server.
+async fn start_server_on_with(
+    settings: &Settings,
+    limiters: RateLimiters,
+    storage: Arc<dyn Storage>,
+    durability: Durability,
+    configure: impl FnOnce(Server) -> Server,
+) -> (
+    std::net::SocketAddr,
+    SharedBroker,
+    tokio::task::JoinHandle<()>,
+) {
     let broker = SharedBroker::new(
         Broker::new(settings.broker.clone()),
         storage,
@@ -77,9 +105,11 @@ async fn start_server_on(
         .await
         .expect("Failed to bind");
     let addr = listener.local_addr().expect("No local address");
-    let server = Server::from_settings(broker.clone(), &settings.server)
-        .await
-        .with_rate_limiters(limiters);
+    let server = configure(
+        Server::from_settings(broker.clone(), &settings.server)
+            .await
+            .with_rate_limiters(limiters),
+    );
     let accepting = tokio::spawn(server.serve(listener));
     (addr, broker, accepting)
 }
@@ -2894,6 +2924,8 @@ fn the_publish_fast_path_parses_like_the_general_parser() {
         r#"{"type":"subscribe","topic":"\"publish\""}"#,
         r#"{"type":"publish","topic":5,"payload":"hi"}"#,
         r#"not json "publish""#,
+        "[\"publish\",\"alish\",\"ibypshh\",\"ib5ype\"]",
+        r#" ["publish", 1, "t", "p"]"#,
     ];
     for text in frames {
         let general = serde_json::from_str::<popsub_protocol::ClientFrame>(text);
@@ -2904,4 +2936,121 @@ fn the_publish_fast_path_parses_like_the_general_parser() {
             (general, fast) => panic!("{text}: general {general:?}, fast {fast:?}"),
         }
     }
+}
+
+/// Checks that an admin can back up a running server on the file backend:
+/// the reply says what was written, the backup opens as a store with the
+/// records and session cursors, holds the accounts and `BACKUP.json`, the
+/// connection keeps working, and a second backup under the same name or
+/// with an unsafe name is refused.
+#[tokio::test]
+async fn admins_back_up_a_running_server() {
+    let settings = Settings::default();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().join("data");
+    let backups = dir.path().join("backups");
+    let storage = FileStorage::open(&data).await.expect("open storage");
+    let broker = SharedBroker::new(
+        Broker::new(settings.broker.clone()),
+        Arc::new(storage),
+        LogSettings {
+            durability: Durability::Buffered,
+            retention: settings.storage.retention.to_retention(),
+            session_expiry: Duration::from_secs(settings.storage.session_expiry_secs),
+        },
+    )
+    .expect("the backend accepts buffered durability");
+    let users = Arc::new(
+        popsub_auth::FileUserStore::open(data.join("users.json")).expect("open users.json"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = Server::from_settings_with_users(broker, &settings.server, users)
+        .await
+        .with_backup_dir(&backups);
+    tokio::spawn(server.serve(listener));
+
+    let mut admin = admin_connection(addr, &settings).await;
+    for (n, topic) in ["orders", "orders", "audit"].into_iter().enumerate() {
+        let published = request(
+            &mut admin,
+            serde_json::json!({"type": "publish", "id": n, "topic": topic, "payload": "x", "qos": 1}),
+        )
+        .await;
+        assert_eq!(published["type"], "published", "{published}");
+    }
+    let created = request(
+        &mut admin,
+        serde_json::json!({"type": "backup", "id": 10, "name": "nightly"}),
+    )
+    .await;
+    assert_eq!(created["type"], "backup_created", "{created}");
+    assert_eq!(created["backup"]["name"], "nightly");
+    assert_eq!(created["backup"]["topics"], 2);
+    assert_eq!(created["backup"]["records"], 3);
+    assert_eq!(created["backup"]["users"], true);
+    let path = std::path::PathBuf::from(created["backup"]["path"].as_str().expect("a path"));
+    assert!(path.ends_with("nightly"), "{}", path.display());
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("BACKUP.json")).expect("BACKUP.json"))
+            .expect("JSON");
+    assert_eq!(manifest["name"], "nightly");
+    assert_eq!(manifest["records"], 3);
+    let accounts = popsub_auth::FileUserStore::open(path.join("users.json")).expect("users.json");
+    assert!(
+        popsub_auth::UserStore::user_exists(&accounts, &settings.server.username)
+            .await
+            .expect("exists")
+    );
+    let copy = FileStorage::open(&path).await.expect("open the backup");
+    let orders = popsub_storage::MessageLog::read(&copy, "orders", 0, 10)
+        .await
+        .expect("read");
+    assert_eq!(orders.len(), 2);
+
+    let again = request(
+        &mut admin,
+        serde_json::json!({"type": "backup", "id": 11, "name": "nightly"}),
+    )
+    .await;
+    assert_eq!(again["code"], "backup_exists", "{again}");
+    let unsafe_name = request(
+        &mut admin,
+        serde_json::json!({"type": "backup", "id": 12, "name": "../escape"}),
+    )
+    .await;
+    assert_eq!(unsafe_name["code"], "bad_request", "{unsafe_name}");
+    assert!(!dir.path().join("escape").exists());
+    let after = request(
+        &mut admin,
+        serde_json::json!({"type": "publish", "id": 13, "topic": "orders", "payload": "y", "qos": 1}),
+    )
+    .await;
+    assert_eq!(after["seq"], 3, "{after}");
+}
+
+/// Checks that a backup of a server on the memory backend is refused with
+/// `backup_unsupported` and leaves nothing behind.
+#[tokio::test]
+async fn a_backup_of_the_memory_backend_is_refused() {
+    let settings = Settings::default();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (addr, _broker, _accepting) = start_server_on_with(
+        &settings,
+        RateLimiters::default(),
+        Arc::new(MemoryStorage::new()),
+        Durability::None,
+        |server| server.with_backup_dir(dir.path().join("backups")),
+    )
+    .await;
+    let mut admin = admin_connection(addr, &settings).await;
+    let refused = request(&mut admin, serde_json::json!({"type": "backup", "id": 1})).await;
+    assert_eq!(refused["code"], "backup_unsupported", "{refused}");
+    let left = std::fs::read_dir(dir.path().join("backups"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0);
 }

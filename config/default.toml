@@ -31,6 +31,7 @@ backend = "file"
 path = "pubsub_data"
 durability = "buffered"
 session_expiry_secs = 86400
+backup_path = "pubsub_backups"
 
 [storage.retention]
 max_messages = 1000

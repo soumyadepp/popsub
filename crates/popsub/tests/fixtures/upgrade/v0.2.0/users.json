@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "users": [
+    {
+      "username": "admin",
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$UnJPCIOvLAqmz6x7cOai9g$d4klhalv/eiPlEgWA1TAkZ39oKdIuF6oKaTVW1LTZq0",
+      "role": {
+        "type": "admin"
+      },
+      "enabled": true,
+      "created_at": 1795781239,
+      "token_version": 0
+    },
+    {
+      "username": "gone",
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$WENES/OYHsZl+LkMCgeglA$vtWbjBzxLq1rV+qC6gM0Kv9DNEul5DVeGamdEUkdJm0",
+      "role": {
+        "type": "admin"
+      },
+      "enabled": false,
+      "created_at": 1795781240,
+      "token_version": 0
+    },
+    {
+      "username": "rita",
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$9sPgouTX7RoESJIG4sfXyA$eg9mv38T+c2sPi5T97Fyk+A537Hh3ePJgeT0ofpcHss",
+      "role": {
+        "type": "user",
+        "allowed_topics": [
+          {
+            "pattern": "news/#",
+            "can_subscribe": true,
+            "can_publish": false
+          },
+          {
+            "pattern": "rita/#",
+            "can_subscribe": true,
+            "can_publish": true
+          }
+        ]
+      },
+      "enabled": true,
+      "created_at": 1795781240,
+      "token_version": 0
+    },
+    {
+      "username": "viewer",
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$zBlm0Bc0oF5Oqyl2+Lr8Tg$eLTmy2xEsqCg37vRKpwI9uC+O7+uuROyYJUJiAUIjuo",
+      "role": {
+        "type": "readonly",
+        "allowed_topics": [
+          "metrics/#"
+        ]
+      },
+      "enabled": true,
+      "created_at": 1795781240,
+      "token_version": 0
+    }
+  ]
+}

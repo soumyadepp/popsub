@@ -76,7 +76,7 @@ In place of `payload`, `"bytes": "AP8="` gives the body as base64: the driver de
 {"id": 8, "op": "admin", "method": "grant", "params": {"username": "rita", "pattern": "news/#", "access": "subscribe"}}
 ```
 
-Calls the library's admin method. `method` and the names in `params` are the protocol's own (`create_user` takes `username`, `password` and `role`; `role` is `{"kind": "user", "topics": [...]}` as on the wire). Responds `{"ok": true, "result": ...}` with the user object for most methods, a list of them for `list_users`, and `null` for `delete_user`. The topic methods are `list_topics` (no params; a list of topic objects), and `get_topic` and `purge_topic` (`topic`; one topic object, `{"name", "first_seq", "last_seq", "messages", "subscribers"}`).
+Calls the library's admin method. `method` and the names in `params` are the protocol's own (`create_user` takes `username`, `password` and `role`; `role` is `{"kind": "user", "topics": [...]}` as on the wire). Responds `{"ok": true, "result": ...}` with the user object for most methods, a list of them for `list_users`, and `null` for `delete_user`. The topic methods are `list_topics` (no params; a list of topic objects), and `get_topic` and `purge_topic` (`topic`; one topic object, `{"name", "first_seq", "last_seq", "messages", "subscribers"}`). `backup` takes an optional `name` and returns the backup object, `{"name", "path", "topics", "records", "bytes", "users"}`.
 
 ### `close` and `exit`
 

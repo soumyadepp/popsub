@@ -48,6 +48,6 @@ pub use driver::Published;
 pub use error::Error;
 pub use message::{Event, Message, Subscription};
 pub use popsub_protocol::{
-    Access, CloseCode, Encoding, ErrorCode, RoleKind, RoleSpec, StartFrom, TopicGrant, TopicInfo,
-    UserInfo,
+    Access, BackupInfo, CloseCode, Encoding, ErrorCode, RoleKind, RoleSpec, StartFrom, TopicGrant,
+    TopicInfo, UserInfo,
 };

@@ -1,5 +1,5 @@
 //! The admin requests: creating, reading, changing and deleting accounts,
-//! and listing, describing and purging topics.
+//! listing, describing and purging topics, and backing the server up.
 //!
 //! Every request first checks, against the user store, that the caller is
 //! an enabled admin; anyone else gets `forbidden`. Changes take effect on
@@ -11,17 +11,146 @@
 //! `CloseCode::TokenExpired`, so they have to log in again. The last enabled
 //! admin can't be disabled, deleted or demoted, so the server can't be left
 //! without one.
+//!
+//! A backup runs in its own task and is answered when it finishes, so the
+//! admin's connection keeps being served (heartbeats included) while files
+//! are copied. One backup runs at a time. The storage backend copies the
+//! topic logs and sessions, the user store writes `users.json`, and
+//! `BACKUP.json` is written last: a backup directory without it is incomplete.
 
-use popsub_auth::{AuthError, Role, TopicPermission, User, validate_pattern};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use popsub_auth::{AuthError, AuthService, Role, TopicPermission, User, validate_pattern};
+use popsub_broker::SharedBroker;
 use popsub_protocol::{
-    Access, ClientMessage, CloseCode, ErrorCode, RequestId, RoleKind, RoleSpec, ServerFrame,
-    ServerMessage, TopicGrant, UserInfo,
+    Access, BackupInfo, ClientMessage, CloseCode, ErrorCode, RequestId, RoleKind, RoleSpec,
+    ServerFrame, ServerMessage, TopicGrant, UserInfo,
 };
+use popsub_storage::StorageError;
+use popsub_utils::metrics::{attr, metrics};
 use popsub_utils::pii::pii;
 use tracing::{info, warn};
 
-use super::{Flow, Session};
+use super::{Flow, Session, queue_reply};
 use popsub_utils::error::Result;
+
+/// The longest backup name, in characters.
+const MAX_BACKUP_NAME_CHARS: usize = 64;
+
+/// The file written last into a finished backup.
+const BACKUP_MANIFEST: &str = "BACKUP.json";
+
+/// Checks a backup's directory name.
+///
+/// Args:
+///     name: The name.
+///
+/// Returns:
+///     True for 1 to `MAX_BACKUP_NAME_CHARS` ASCII letters, digits, `_`, `.`
+///     or `-` that don't start with `.` or end with `.partial`, the suffix
+///     a backup in progress is written under.
+fn valid_backup_name(name: &str) -> bool {
+    (1..=MAX_BACKUP_NAME_CHARS).contains(&name.len())
+        && !name.starts_with('.')
+        && !name.ends_with(".partial")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Names a backup after the current time in UTC.
+///
+/// Returns:
+///     A name such as `20261127T101500Z`.
+fn default_backup_name() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// Clears the server's "a backup is running" flag when dropped, so the flag
+/// is cleared even if the backup task panics.
+struct BackupSlot(Arc<AtomicBool>);
+
+impl Drop for BackupSlot {
+    /// Marks the backup as finished.
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Writes a backup: the storage backend's copy, then the accounts, then
+/// `BACKUP.json`. Anything written is removed if a later step fails.
+///
+/// Args:
+///     broker: The broker, for its storage backend.
+///     auth: The auth service, for its user store.
+///     dest: The backup's directory. It must not exist.
+///     name: The backup's name.
+///
+/// Returns:
+///     What was written.
+///
+/// Raises:
+///     (ErrorCode, String): `backup_unsupported` when the storage backend
+///         can't be backed up while running, `storage_unavailable` when its
+///         files can't be read or written, or `internal` when the accounts
+///         or the manifest can't be written.
+async fn write_backup(
+    broker: &SharedBroker,
+    auth: &AuthService,
+    dest: &Path,
+    name: &str,
+) -> std::result::Result<BackupInfo, (ErrorCode, String)> {
+    let summary = broker.backup(dest).await.map_err(|e| match e {
+        StorageError::Unsupported(_) => (
+            ErrorCode::BackupUnsupported,
+            "this server's storage backend can't be backed up while it runs".to_string(),
+        ),
+        StorageError::Unavailable(message) => (
+            ErrorCode::StorageUnavailable,
+            format!("the backup failed: {message}"),
+        ),
+        other => (ErrorCode::Internal, format!("the backup failed: {other}")),
+    })?;
+    let undo = |message: String| async move {
+        let _ = tokio::fs::remove_dir_all(dest).await;
+        (ErrorCode::Internal, message)
+    };
+    let users = match auth.backup_users(dest).await {
+        Ok(users) => users,
+        Err(e) => return Err(undo(format!("writing the accounts failed: {}", e.kind())).await),
+    };
+    let path = tokio::fs::canonicalize(dest)
+        .await
+        .unwrap_or_else(|_| dest.to_path_buf());
+    let info = BackupInfo {
+        name: name.to_string(),
+        path: path.display().to_string(),
+        topics: summary.topics,
+        records: summary.records,
+        bytes: summary.bytes,
+        users,
+    };
+    let manifest = serde_json::json!({
+        "name": info.name,
+        "created_at_ms": chrono::Utc::now().timestamp_millis(),
+        "topics": info.topics,
+        "records": info.records,
+        "bytes": info.bytes,
+        "users": info.users,
+    });
+    let temp = dest.join(format!("{BACKUP_MANIFEST}.tmp"));
+    let written = async {
+        tokio::fs::write(&temp, manifest.to_string()).await?;
+        tokio::fs::rename(&temp, dest.join(BACKUP_MANIFEST)).await
+    }
+    .await;
+    if let Err(e) = written {
+        return Err(undo(format!("writing {BACKUP_MANIFEST} failed: {e}")).await);
+    }
+    Ok(info)
+}
 
 /// Turns an account's role into what admins see.
 ///
@@ -275,6 +404,10 @@ impl Session {
             )?;
             return Ok(Flow::Continue);
         }
+        if let ClientMessage::Backup { name } = request {
+            self.start_backup(id, &caller, name)?;
+            return Ok(Flow::Continue);
+        }
         let outcome = self.run_admin(request).await;
         match outcome {
             Ok(reply) => {
@@ -287,6 +420,81 @@ impl Session {
             }
         }
         Ok(Flow::Continue)
+    }
+
+    /// Checks a backup request and starts it in its own task, which answers
+    /// with `backup_created` or an error when it finishes.
+    ///
+    /// Args:
+    ///     id: The request id to answer with.
+    ///     caller: The admin who asked, for the log.
+    ///     name: The backup's name, or `None` for the current time.
+    ///
+    /// Raises:
+    ///     PopSubError::Serialization: When a refusal can't be serialised.
+    ///     PopSubError::Client: When the outgoing channel is closed.
+    fn start_backup(
+        &self,
+        id: Option<&RequestId>,
+        caller: &str,
+        name: Option<String>,
+    ) -> Result<()> {
+        let name = name.unwrap_or_else(default_backup_name);
+        if !valid_backup_name(&name) {
+            return self.fail(
+                id,
+                ErrorCode::BadRequest,
+                format!(
+                    "a backup name is 1 to {MAX_BACKUP_NAME_CHARS} letters, digits, '_', '.' or '-', not starting with '.'"
+                ),
+                None,
+            );
+        }
+        let dest = self.server.backup_dir.join(&name);
+        if dest.exists() || dest.with_file_name(format!("{name}.partial")).exists() {
+            return self.fail(
+                id,
+                ErrorCode::BackupExists,
+                format!("a backup named {name} already exists"),
+                None,
+            );
+        }
+        if self.server.backup_running.swap(true, Ordering::AcqRel) {
+            return self.fail(
+                id,
+                ErrorCode::StorageUnavailable,
+                "another backup is running; try again when it finishes",
+                None,
+            );
+        }
+        let slot = BackupSlot(self.server.backup_running.clone());
+        let broker = self.server.broker.clone();
+        let auth = self.server.auth.clone();
+        let outbox = self.outbox.clone();
+        let client_id = self.client_id.clone();
+        let caller = caller.to_string();
+        let id = id.cloned();
+        info!(client_id = %client_id, caller = %pii(&caller), backup = %name, "backup started");
+        tokio::spawn(async move {
+            let _slot = slot;
+            let reply = match write_backup(&broker, &auth, &dest, &name).await {
+                Ok(backup) => {
+                    info!(client_id = %client_id, caller = %pii(&caller), backup = %backup.name, topics = backup.topics, records = backup.records, bytes = backup.bytes, "backup written");
+                    ServerMessage::BackupCreated { backup }
+                }
+                Err((code, message)) => {
+                    warn!(client_id = %client_id, caller = %pii(&caller), backup = %name, code = code.as_str(), "backup failed");
+                    metrics().errors.add(1, &attr("code", code.as_str()));
+                    ServerMessage::Error {
+                        code,
+                        message,
+                        retry_after: None,
+                    }
+                }
+            };
+            let _ = queue_reply(&outbox, id, reply);
+        });
+        Ok(())
     }
 
     /// Carries out an admin request for an admin caller.

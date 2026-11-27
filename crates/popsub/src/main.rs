@@ -10,6 +10,7 @@
 //! Everything here is wiring; the protocol, routing and storage live in the
 //! transport, broker and storage crates.
 
+mod backup;
 mod telemetry;
 mod topics;
 mod users;
@@ -78,6 +79,15 @@ enum Command {
         #[command(subcommand)]
         command: topics::TopicsCommand,
     },
+    /// Back up a running server's messages, sessions and accounts, as an admin
+    Backup {
+        /// Where to connect and who to log in as
+        #[command(flatten)]
+        connection: users::Connection,
+        /// The backup's name and how long to wait
+        #[command(flatten)]
+        args: backup::BackupArgs,
+    },
 }
 
 /// Parses the command line, starts logging and runs the chosen subcommand.
@@ -116,6 +126,10 @@ async fn main() -> ExitCode {
         } => {
             popsub_utils::logging::init("warn");
             topics::run(connection, command).await
+        }
+        Command::Backup { connection, args } => {
+            popsub_utils::logging::init("warn");
+            backup::run(connection, args).await
         }
     };
     match result {
@@ -275,7 +289,8 @@ async fn run_server(
     let mut server = Server::from_settings_with_users(broker.clone(), &config.server, users)
         .await
         .with_rate_limiters(RateLimiters::from_settings(&config.limits))
-        .with_trusted_proxies(proxies);
+        .with_trusted_proxies(proxies)
+        .with_backup_dir(&config.storage.backup_path);
     if let Some(tls) = tls {
         server = server.with_tls(tls);
     }

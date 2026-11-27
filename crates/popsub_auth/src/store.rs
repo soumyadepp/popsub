@@ -151,6 +151,25 @@ pub trait UserStore: Send + Sync {
     fn revision(&self) -> Option<u64> {
         None
     }
+
+    /// Writes the accounts into a backup directory, for stores that keep
+    /// them on local disk.
+    ///
+    /// The default writes nothing: an in-memory store has nothing that
+    /// survives a restart, and a database is backed up with its own tools.
+    ///
+    /// Args:
+    ///     dir: The backup directory. It must exist.
+    ///
+    /// Returns:
+    ///     Whether the accounts were written.
+    ///
+    /// Raises:
+    ///     AuthError::Internal: When the backup can't be written.
+    async fn backup(&self, dir: &std::path::Path) -> Result<bool> {
+        let _ = dir;
+        Ok(false)
+    }
 }
 
 /// A `UserStore` backed by a `HashMap` behind a `std::sync::RwLock`.

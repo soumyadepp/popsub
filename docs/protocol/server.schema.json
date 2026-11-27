@@ -20,6 +20,50 @@
         }
       ]
     },
+    "BackupInfo": {
+      "description": "A backup the server wrote, in answer to `backup`.",
+      "properties": {
+        "bytes": {
+          "description": "How many bytes were written.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "The backup's directory name.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Where the backup is on the server's file system.",
+          "type": "string"
+        },
+        "records": {
+          "description": "How many records it holds across every topic.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "topics": {
+          "description": "How many topics it holds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "users": {
+          "description": "Whether accounts were included. False when the server keeps accounts\nsomewhere other than `users.json`, such as only in memory.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "topics",
+        "records",
+        "bytes",
+        "users"
+      ],
+      "type": "object"
+    },
     "Delivery": {
       "description": "A record delivered to a subscriber, live or replayed.",
       "properties": {
@@ -181,6 +225,16 @@
         {
           "const": "topic_not_found",
           "description": "The topic has no log: nothing was ever published to it.",
+          "type": "string"
+        },
+        {
+          "const": "backup_exists",
+          "description": "A backup with that name already exists.",
+          "type": "string"
+        },
+        {
+          "const": "backup_unsupported",
+          "description": "The server's storage backend can't be backed up while running, such\nas the `memory` backend.",
           "type": "string"
         }
       ]
@@ -755,6 +809,24 @@
       "required": [
         "type",
         "topics"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A backup was written, in answer to `backup`.",
+      "properties": {
+        "backup": {
+          "$ref": "#/$defs/BackupInfo",
+          "description": "What was written and where."
+        },
+        "type": {
+          "const": "backup_created",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "backup"
       ],
       "type": "object"
     },

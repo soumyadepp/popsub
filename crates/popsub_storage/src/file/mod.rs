@@ -10,6 +10,9 @@
 //!   in hex so any topic name is a safe file name. See `topic`.
 //! - `sessions.log`: the session write-ahead log. See `sessions`.
 //!
+//! `Storage::backup` copies all of it, except `LOCK`, while the store runs.
+//! See `backup`.
+//!
 //! Every topic and the session log sit behind their own mutex. The file I/O
 //! is synchronous and runs on Tokio's blocking thread pool, so storage calls
 //! never stall the async workers. Each record's location is indexed in
@@ -22,6 +25,7 @@
 //! returns. Each synced append is flushed on its own; flushes are not yet
 //! grouped across appends.
 
+mod backup;
 mod body;
 mod codec;
 mod sessions;
@@ -36,7 +40,9 @@ use async_trait::async_trait;
 
 use crate::error::{Result, StorageError};
 use crate::record::{LogBounds, NewRecord, Record, Subscription};
-use crate::storage::{Capabilities, Durability, MessageLog, Retention, Storage, SubscriptionStore};
+use crate::storage::{
+    BackupSummary, Capabilities, Durability, MessageLog, Retention, Storage, SubscriptionStore,
+};
 
 use sessions::SessionLog;
 use topic::TopicFiles;
@@ -577,6 +583,7 @@ impl SubscriptionStore for FileStorage {
     }
 }
 
+#[async_trait]
 impl Storage for FileStorage {
     /// Reports that this backend persists data and can flush to disk.
     ///
@@ -584,6 +591,25 @@ impl Storage for FileStorage {
     ///     `Durability::Synced` and persistent.
     fn capabilities(&self) -> Capabilities {
         CAPABILITIES
+    }
+
+    /// Copies every topic and the session log into `dest` while the store
+    /// keeps serving. The copy opens with `FileStorage::open`. See `backup`.
+    ///
+    /// Args:
+    ///     dest: The directory to create. It must not exist yet.
+    ///
+    /// Returns:
+    ///     What was copied.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When `dest` exists or a file can't be
+    ///         read, written, flushed or renamed.
+    ///     StorageError::Other: When a session change can't be encoded.
+    async fn backup(&self, dest: &Path) -> Result<BackupSummary> {
+        let dest = dest.to_path_buf();
+        self.blocking(move |inner| backup::backup(inner, &dest))
+            .await
     }
 }
 
