@@ -2894,6 +2894,8 @@ fn the_publish_fast_path_parses_like_the_general_parser() {
         r#"{"type":"subscribe","topic":"\"publish\""}"#,
         r#"{"type":"publish","topic":5,"payload":"hi"}"#,
         r#"not json "publish""#,
+        "[\"publish\",\"alish\",\"ibypshh\",\"ib5ype\"]",
+        r#" ["publish", 1, "t", "p"]"#,
     ];
     for text in frames {
         let general = serde_json::from_str::<popsub_protocol::ClientFrame>(text);

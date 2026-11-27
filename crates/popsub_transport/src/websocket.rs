@@ -130,12 +130,15 @@ struct PublishFrame<'a> {
 
 /// Reads a client frame, trying the direct shape of a `publish` first.
 ///
-/// A frame that mentions `"publish"` is read as a `PublishFrame`. When that
-/// works and its `type` is `publish`, the result is the same `ClientFrame`
-/// the general parser would give, since the fields have the same names and
-/// types. Anything else, including a publish with a field of the wrong type,
+/// A JSON object that mentions `"publish"` is read as a `PublishFrame`. When
+/// that works and its `type` is `publish`, the result is the same
+/// `ClientFrame` the general parser would give, since the fields have the
+/// same names and types. Only objects take the direct path: serde reads a
+/// struct from a JSON array too, by position, which the general parser
+/// refuses. Anything else, including a publish with a field of the wrong type,
 /// goes through the general parser, so every other frame and every error is
-/// exactly as before.
+/// exactly as before. Public so the fuzz targets in `fuzz/` can call it; the
+/// server is its only other caller.
 ///
 /// Args:
 ///     text: The frame's JSON text.
@@ -143,13 +146,14 @@ struct PublishFrame<'a> {
 /// Returns:
 ///     The frame.
 ///
-/// Public so the fuzz targets in `fuzz/` can call it; the server is its only
-/// other caller.
 ///
 /// Raises:
 ///     serde_json::Error: When the text isn't a valid client frame.
 pub fn parse_frame(text: &str) -> serde_json::Result<ClientFrame> {
-    if text.contains("\"publish\"")
+    if text
+        .trim_start_matches([' ', '\t', '\n', '\r'])
+        .starts_with('{')
+        && text.contains("\"publish\"")
         && let Ok(publish) = serde_json::from_str::<PublishFrame>(text)
         && publish.kind == "publish"
     {
@@ -2440,11 +2444,11 @@ impl Session {
 /// Reads the request id out of a frame that didn't parse, so the
 /// `bad_request` error can still be matched to it.
 ///
-/// Args:
-///     text: The frame as received.
-///
 /// Public so the fuzz targets in `fuzz/` can call it; the server is its only
 /// other caller.
+///
+/// Args:
+///     text: The frame as received.
 ///
 /// Returns:
 ///     The id, when the text is a JSON object with a valid `id`.
