@@ -121,6 +121,7 @@ export default defineConfig({
           items: [
             { label: "Configuration", slug: "run/configuration" },
             { label: "Deploy to a server", slug: "run/deployment" },
+            { label: "Performance", slug: "run/performance" },
           ],
         },
         {

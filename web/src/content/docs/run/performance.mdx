@@ -1,0 +1,64 @@
+---
+title: Performance
+description: What one PopSub server handles on one machine, and how it compares with NATS and Mosquitto under the same load, including where it loses.
+---
+
+<p class="lede">
+  Measured on one laptop with <code>popsub-bench</code>, beside NATS and Mosquitto running the same
+  loads. The wins and the losses are both here.
+</p>
+
+## The short version
+
+| What | PopSub 0.3.0 | PopSub 0.2.0 |
+|---|---:|---:|
+| One topic, flat out | 1.9 million messages a second | 33,000 |
+| Confirmed publishing (QoS 1) | 369,000 a second | 25,000 |
+| Eight topics at once | 5.2 million a second | 68,000 |
+| One topic to 100 subscribers | 13.7 million deliveries a second | 554,000 |
+| Replaying stored history | 2.7 million a second | 496,000 |
+| 10,000 idle connections | 384 MiB | 1,027 MiB |
+
+Every message is stored on disk before it is delivered, in all of these.
+
+## Beside other brokers
+
+Same machine, same run, 128-byte messages.
+
+| Test | PopSub | NATS JetStream | NATS core | Mosquitto |
+|---|---:|---:|---:|---:|
+| One topic, messages a second | 1.9M | 1.5M | 3.4M | 0.34M |
+| Eight publishers, one topic | 2.3M | 1.5M | 1.9M | 0.35M |
+| Eight topics | 5.2M | 2.0M | 4.5M | 0.35M |
+| Fan-out to 100, deliveries a second | 13.7M | 3.5M | 3.0M | 0.39M |
+| Confirmed publishing, a second | 369K | 292K | not offered | 187K |
+| 10,000 idle connections | 384 MiB | 603 MiB | 546 MiB | 53 MiB |
+
+NATS core and Mosquitto don't store messages here. JetStream does, like PopSub.
+
+## Where PopSub loses
+
+- **Large messages.** At 16 KiB, PopSub is behind all three. It writes each message to the operating system before delivering it, so a server crash never loses a message a subscriber saw, and at that size the disk can't keep up.
+- **Raw speed against NATS core** on a single topic: 1.9 against 3.4 million a second. NATS core keeps nothing.
+- **Latency.** A median of 0.23 ms at 1,000 messages a second, against 0.10 to 0.14 ms for the others.
+- **A quiet topic beside very busy ones.** Its median rises to about 0.8 ms when the machine is nearly saturated. NATS stays under 0.1 ms.
+- **Memory against Mosquitto,** which is tiny.
+
+## How it was measured
+
+- Apple M4 Pro laptop, macOS, 2026-11-27. The load generator ran on the same machine.
+- Each broker speaks its own protocol, with no client library in between.
+- 2 seconds of warm-up, then 8 seconds measured, with a quiet disk before each test.
+- Not measured yet: Linux, a real network, TLS, or runs longer than a few seconds.
+
+The [full results](https://github.com/soumyadepp/popsub/blob/main/docs/BENCHMARKS.md) have every
+scenario, latency percentiles, the settings that differ from defaults, and the known limits.
+
+## Run it yourself
+
+```bash
+make bench
+make bench BENCH="--target nats-jetstream"
+```
+
+You need `nats-server` or `mosquitto` installed to compare against them.
