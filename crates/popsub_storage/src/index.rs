@@ -25,8 +25,10 @@ pub(crate) struct Entry<T> {
     pub published_at_ms: i64,
     /// The record's `Record::size`, counted against the byte limit.
     pub size: u64,
-    /// The publisher and message id, for retry detection.
-    pub key: RetryKey,
+    /// The publisher and message id, for retry detection, or `None` when
+    /// the record has no id of the publisher's. Boxed, so a record without
+    /// one costs a pointer in memory rather than two empty strings.
+    pub key: Option<Box<RetryKey>>,
     /// What the backend keeps for this record.
     pub value: T,
 }
@@ -148,9 +150,12 @@ impl<T> LogIndex<T> {
         self.last_seq = slot.seq;
         self.last_published_at_ms = slot.published_at_ms;
         self.bytes += size;
-        if !key.1.is_empty() {
+        let key = if key.1.is_empty() {
+            None
+        } else {
             self.ids.insert(key.clone(), slot.seq);
-        }
+            Some(Box::new(key))
+        };
         self.entries.push_back(Entry {
             seq: slot.seq,
             published_at_ms: slot.published_at_ms,
@@ -172,8 +177,10 @@ impl<T> LogIndex<T> {
                 break;
             };
             self.bytes -= entry.size;
-            if self.ids.get(&entry.key) == Some(&entry.seq) {
-                self.ids.remove(&entry.key);
+            if let Some(key) = &entry.key
+                && self.ids.get(key.as_ref()) == Some(&entry.seq)
+            {
+                self.ids.remove(key.as_ref());
             }
         }
         self.last_seq = last_seq;
@@ -241,8 +248,10 @@ impl<T> LogIndex<T> {
             && let Some(entry) = self.entries.pop_front()
         {
             self.bytes -= entry.size;
-            if self.ids.get(&entry.key) == Some(&entry.seq) {
-                self.ids.remove(&entry.key);
+            if let Some(key) = &entry.key
+                && self.ids.get(key.as_ref()) == Some(&entry.seq)
+            {
+                self.ids.remove(key.as_ref());
             }
             removed.push(entry);
         }

@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 
 use crate::conformance::{Fixture, block_on};
 use crate::error::StorageError;
+use crate::file::body;
 use crate::file::codec::{self, Decoded};
 use crate::file::sessions::SessionLog;
 use crate::file::{FileOptions, FileStorage, MAX_TOPIC_BYTES, topic_dir_name, topic_from_dir_name};
-use crate::record::NewRecord;
+use crate::record::{NewRecord, PayloadEncoding, Record};
 use crate::storage::{Durability, MessageLog, Retention, SubscriptionStore};
 
 /// Segment size used by most tests, small enough that a few records roll
@@ -378,5 +379,100 @@ fn sessions_survive_reopening() {
         let storage = open(dir.path()).await;
         assert!(storage.load("s").await.expect("load").is_empty());
         assert_eq!(storage.load("kept").await.expect("load")[0].acked_seq, 4);
+    });
+}
+
+/// Builds a stored record for the format tests.
+///
+/// Args:
+///     message_id: The id.
+///     publisher: The publisher.
+///     payload: The payload.
+///
+/// Returns:
+///     A record on topic `t` with `seq` 7.
+fn stored(message_id: &str, publisher: &str, payload: &str) -> Record {
+    Record {
+        topic: "t".to_string(),
+        seq: 7,
+        message_id: message_id.to_string(),
+        publisher: publisher.to_string(),
+        payload: payload.to_string(),
+        encoding: None,
+        qos: 1,
+        published_at_ms: 1_795_700_000_123,
+    }
+}
+
+/// Checks that every kind of record reads back exactly from the binary
+/// form, including ids that look like UUIDs but aren't written the way the
+/// server writes one, and fields too long for the binary form.
+#[test]
+fn records_read_back_exactly_from_the_binary_form() {
+    let mut base64 = stored("custom-id", "alice", "aGVsbG8=");
+    base64.encoding = Some(PayloadEncoding::Base64);
+    base64.qos = 0;
+    let long_publisher = "p".repeat(70_000);
+    let records = [
+        stored("8c9d5cf2-2fa3-4fc1-bc27-d9b5de9da192", "alice", "hello"),
+        stored(
+            "8C9D5CF2-2FA3-4FC1-BC27-D9B5DE9DA192",
+            "alice",
+            "upper case id",
+        ),
+        stored(
+            "8c9d5cf22fa34fc1bc27d9b5de9da192",
+            "alice",
+            "id without hyphens",
+        ),
+        stored("custom-id", "bob", ""),
+        stored("", "", "quotes \" and \n newlines, and caf\u{e9}"),
+        stored("custom-id", &long_publisher, "too long for the binary form"),
+        base64,
+    ];
+    for record in records {
+        let mut bytes = Vec::new();
+        body::encode(&record, &mut bytes);
+        assert_eq!(body::decode(&bytes, "t").expect("decodes"), record);
+    }
+    let mut bytes = Vec::new();
+    body::encode(
+        &stored("8c9d5cf2-2fa3-4fc1-bc27-d9b5de9da192", "alice", ""),
+        &mut bytes,
+    );
+    assert!(
+        bytes.len() < 60,
+        "a server-assigned id is stored as 16 bytes"
+    );
+    assert!(body::decode(&bytes[..bytes.len() - 3], "t").is_err());
+    assert!(body::decode(b"", "t").is_err());
+}
+
+/// Checks that a log holding JSON records, as older versions wrote, opens,
+/// reads back, and takes new records after them.
+#[test]
+fn a_log_written_as_json_still_reads() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    block_on(async {
+        let storage = open(dir.path()).await;
+        append_range(&storage, 1, 1).await;
+    });
+    let segment = topic_files(dir.path(), "seg").pop().expect("a segment");
+    let mut old = stored("m2", "alice", "m2");
+    old.seq = 2;
+    old.published_at_ms = 1;
+    OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .expect("segment")
+        .write_all(&codec::encode(old.to_json().as_bytes()))
+        .expect("write");
+    block_on(async {
+        let storage = open(dir.path()).await;
+        append_range(&storage, 3, 3).await;
+        let records = storage.read("t", 0, usize::MAX).await.expect("read");
+        let ids: Vec<&str> = records.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, ["m1", "m2", "m3"]);
+        assert_eq!(records[1], old);
     });
 }

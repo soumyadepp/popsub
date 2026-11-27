@@ -330,6 +330,58 @@ fn spawn(
         .map_err(|e| format!("starting {}: {e}", program.display()))
 }
 
+/// Writes everything the operating system still holds for the disk before
+/// a scenario starts, including what an earlier run left.
+///
+/// A scenario can write several gigabytes. Without this the next one starts
+/// while the disk is still taking them, and measures that instead of the
+/// broker: the same build then gives results that fall with every scenario.
+///
+/// `sync` alone isn't enough, because on macOS it returns before the writes
+/// finish and freeing a deleted data directory takes disk time too. So where
+/// `iostat` reports disk throughput, this also waits, for at most
+/// `SETTLE_LIMIT_SECS`, until the disks are writing less than
+/// `QUIET_MB_PER_SEC`. Where it doesn't, the `sync` is all there is.
+pub fn settle_disk() {
+    let _ = Command::new("sync").status();
+    for _ in 0..SETTLE_LIMIT_SECS {
+        match disk_mb_per_sec() {
+            Some(rate) if rate >= QUIET_MB_PER_SEC => {}
+            _ => return,
+        }
+    }
+}
+
+/// Disk throughput, in megabytes a second, below which the disk counts as quiet.
+const QUIET_MB_PER_SEC: f64 = 20.0;
+
+/// The longest `settle_disk` waits for a quiet disk, in seconds.
+const SETTLE_LIMIT_SECS: usize = 60;
+
+/// Measures every disk's throughput over one second with `iostat`.
+///
+/// Returns:
+///     The total megabytes a second, or `None` when `iostat` isn't there or
+///     prints something other than the macOS layout (kilobytes per
+///     transfer, transfers and megabytes a second for each disk).
+fn disk_mb_per_sec() -> Option<f64> {
+    let output = Command::new("iostat")
+        .args(["-d", "-w", "1", "-c", "2"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let last = text.lines().last()?;
+    let columns: Vec<f64> = last
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if columns.is_empty() || !columns.len().is_multiple_of(3) {
+        return None;
+    }
+    Some(columns.iter().skip(2).step_by(3).sum())
+}
+
 /// Finds an executable by name on `PATH` and in the usual places a package manager puts
 /// server programs.
 ///

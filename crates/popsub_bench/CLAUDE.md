@@ -21,6 +21,7 @@
 - **Latency is only reported for paced or confirmed publishers.** A flat-out publisher fills the socket, so its delivery time is queueing in the load generator's own buffers.
 - **Every broker gets the same pacing and the same measuring.** Anything about how a load is applied or counted goes in `load.rs`, never in a wire module. A wire module only translates.
 - **A comparison scenario must mean the same thing on every broker.** `Target::supports` leaves out anything PopSub-specific. When a broker's defaults would lose messages or skew latency, change them in `ServerProcess` and list the change in `docs/BENCHMARKS.md`.
+- **Each scenario starts on a quiet disk.** `settle_disk` runs before every one. Don't remove it to save time: without it a scenario measures the disk flushing the previous one's data.
 - **A scenario stops if the broker passes `MEMORY_LIMIT_MIB`.** A flat-out fan-out can make a broker buffer without bound, and the run must not exhaust the machine.
 - **Check the load generator isn't the limit.** The `loadgen cores` column is there for that. A scenario where it is close to the cores the machine has measures the load generator.
 - Benchmark topics and payloads contain no characters JSON escapes. `Incoming` borrows them, and acknowledgements write the topic back unescaped.

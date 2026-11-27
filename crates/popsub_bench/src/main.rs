@@ -170,6 +170,7 @@ async fn bench(options: Options) -> Result<Vec<ScenarioResult>, String> {
     eprintln!("server:  {}", run_options.binary.display());
     let mut results = Vec::new();
     for scenario in &chosen {
+        server::settle_disk();
         eprintln!("running {}: {}", scenario.name, scenario.about);
         results.push(run(scenario, &run_options).await?);
     }

@@ -67,6 +67,14 @@ const MAX_SESSION_ID_CHARS: usize = 128;
 /// The longest `message_id` a publisher may choose, in characters.
 const MAX_MESSAGE_ID_CHARS: usize = 128;
 
+/// The read buffer each connection's WebSocket allocates up front.
+///
+/// The library's default is 128 KiB per connection, which made 10,000 idle
+/// connections hold about 1.5 GiB. At 16 KiB they hold about 390 MiB, and a
+/// flat-out publisher is no slower; a frame larger than the buffer still
+/// reads, since the buffer grows to fit it.
+const READ_BUFFER_BYTES: usize = 16 * 1024;
+
 /// The default longest payload a publish may carry: 1 MiB.
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
@@ -585,6 +593,7 @@ impl Server {
         WebSocketConfig::default()
             .max_message_size(Some(max))
             .max_frame_size(Some(max))
+            .read_buffer_size(READ_BUFFER_BYTES)
     }
 
     /// The limits clients are told about in `authenticated`.
