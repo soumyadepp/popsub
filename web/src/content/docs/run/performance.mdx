@@ -81,7 +81,7 @@ for Mosquitto.
 
 ## How it was measured
 
-- Apple M4 Pro laptop, macOS, 2026-11-27. The load generator ran on the same machine.
+- 14 CPU cores and 24 GB of memory, with the broker's data on a local SSD. The load generator ran on the same machine.
 - Each broker speaks its own protocol, with no client library in between.
 - 2 seconds of warm-up, then 8 seconds measured, with a quiet disk before each test.
 - Not measured yet: Linux, a real network, TLS, or runs longer than a few seconds.
