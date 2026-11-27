@@ -27,13 +27,13 @@ cargo run -p popsub -- server
 | What | How |
 |---|---|
 | Server, prebuilt | Download a `.tar.gz` for Linux (x86_64, aarch64) or macOS (Apple silicon) from [Releases](https://github.com/soumyadepp/popsub/releases), check it against its `.sha256`, and run `./popsub server` |
-| Server, container | `docker run -p 8080:8080 -v popsub-data:/data -e SERVER__JWT_SECRET=... -e SERVER_PASSWORD=... ghcr.io/soumyadepp/popsub:0.2` |
+| Server, container | `docker run -p 8080:8080 -v popsub-data:/data -v popsub-backups:/backups -e SERVER__JWT_SECRET=... -e SERVER_PASSWORD=... ghcr.io/soumyadepp/popsub:0.2` |
 | Rust client | `cargo add popsub_sdk` |
 | TypeScript client | `npm install popsub` |
 | Python client | `pip install popsub` |
 | Go client | `go get github.com/soumyadepp/popsub/clients/go@latest` |
 
-The container listens on all interfaces, so the server refuses to start until you set your own JWT secret and admin password; the defaults are published. It keeps its data in the `/data` volume, serves the health endpoints on port 9090, and runs as an unprivileged user. Every setting except per-topic retention can be passed as an environment variable (see [Configuration](#configuration)).
+The container listens on all interfaces, so the server refuses to start until you set your own JWT secret and admin password; the defaults are published. It keeps its data in the `/data` volume and backups in `/backups`, serves the health endpoints on port 9090, and runs as an unprivileged user. Every setting except per-topic retention can be passed as an environment variable (see [Configuration](#configuration)).
 
 Version 0.x: the protocol and the client APIs may still change between minor versions. [`CHANGELOG.md`](CHANGELOG.md) lists what changed in each release.
 
@@ -181,6 +181,7 @@ The settings you are most likely to change:
 | `server.jwt_secret`, `server.password` | published defaults | Change both before listening anywhere but `localhost`; the server refuses to start otherwise |
 | `server.allow_registration` | `false` | Let clients create accounts; `server.registration_role` decides what they may use |
 | `storage.backend` | `file` | `file` keeps history, sessions and user accounts in `storage.path` (`pubsub_data`); `memory` loses them on restart, and runs the default durability as `none` |
+| `storage.backup_path` | `pubsub_backups` | Where `popsub backup` writes backups, on the server's disk; see [Backups and upgrades](#backups-and-upgrades) |
 | `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush for each batch of publishes a topic stores together |
 | `broker.dead_letter_topic` | none | Copy messages that run out of retries here and keep the subscription going, instead of pausing it |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
@@ -286,6 +287,32 @@ location / {
 A TCP load balancer (such as AWS's Network Load Balancer, or HAProxy in TCP mode) can't add `X-Forwarded-For`. Turn on its PROXY protocol option, list it in `trusted_proxies`, and set `proxy_protocol = true`: PopSub then reads the client's address from the header it sends. Every connection from a listed proxy must carry one; connections from anywhere else are served as usual.
 
 Once the proxy is trusted, you can also cap connections per client with `server.max_connections_per_address`. `proxy_read_timeout` must be longer than `server.heartbeat_secs`, or the proxy will cut quiet connections. Entries in `trusted_proxies` can be CIDR ranges (`10.0.0.0/8`) for a fleet of proxies. Only list proxies you run: a client reaching PopSub directly could otherwise claim any address.
+
+## Backups and upgrades
+
+Back up a running server as an admin. Publishing and subscribing carry on while it copies:
+
+```bash
+popsub backup                     # into storage.backup_path, named after the time in UTC
+popsub backup --name before-0.4   # or name it
+```
+
+- The backup is a folder holding the topic logs, sessions, `users.json` and, written last, `BACKUP.json`. A folder without `BACKUP.json` is unfinished.
+- Each topic is copied as it was at one moment, and sessions are copied before topics, so no session points past the end of its topic. Topics aren't all copied at the same instant.
+- Copy finished backups to another machine. `users.json` holds password hashes, so keep them private.
+- From code, it's `admin.backup()` in every client library.
+
+To restore one:
+
+1. Stop the server.
+2. Move the data folder (`storage.path`) aside, and copy the backup folder in its place.
+3. Start the server. It checks every record as it opens the folder.
+4. Restart your client processes. Messages published after the backup are gone and their numbers are given to new messages, which a client that saw the old ones would skip as duplicates.
+
+To upgrade, read the release's "Upgrading from" notes in [`CHANGELOG.md`](CHANGELOG.md), take a backup, then replace the binary or image and restart.
+
+- A newer release always opens data written by an older one. The upgrade test opens data written by every release since 0.1.0.
+- An older release can't read data a newer one has written. To go back, restore the backup you took before upgrading.
 
 ## Managing users
 

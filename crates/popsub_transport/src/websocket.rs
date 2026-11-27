@@ -358,6 +358,10 @@ pub struct Server {
     tls: Option<ServerTls>,
     /// Whether connections from trusted proxies start with a PROXY protocol header.
     proxy_protocol: bool,
+    /// The directory the `backup` admin request writes backups into.
+    backup_dir: std::path::PathBuf,
+    /// Whether a backup is running, shared by every clone, so only one runs at a time.
+    backup_running: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -392,6 +396,8 @@ impl Server {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             tls: None,
             proxy_protocol: false,
+            backup_dir: std::path::PathBuf::from("pubsub_backups"),
+            backup_running: Arc::new(AtomicBool::new(false)),
             broker,
         }
     }
@@ -518,6 +524,19 @@ impl Server {
     ///     The server with the setting applied.
     pub fn with_proxy_protocol(mut self, enabled: bool) -> Self {
         self.proxy_protocol = enabled;
+        self
+    }
+
+    /// Sets the directory the `backup` admin request writes backups into,
+    /// in place of the default `pubsub_backups` in the working directory.
+    ///
+    /// Args:
+    ///     dir: The directory. It is created on the first backup.
+    ///
+    /// Returns:
+    ///     The server with the directory set.
+    pub fn with_backup_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.backup_dir = dir.into();
         self
     }
 
@@ -1467,7 +1486,8 @@ impl Session {
             | ClientMessage::DeleteUser { .. }
             | ClientMessage::ListTopics {}
             | ClientMessage::GetTopic { .. }
-            | ClientMessage::PurgeTopic { .. }) => self.admin(id, admin).await,
+            | ClientMessage::PurgeTopic { .. }
+            | ClientMessage::Backup { .. }) => self.admin(id, admin).await,
         }
     }
 

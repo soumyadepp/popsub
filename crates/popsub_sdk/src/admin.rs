@@ -6,7 +6,9 @@
 //! fails with `Error::Connect`, and one whose connection drops before the
 //! reply fails the same way, whether or not the server carried it out.
 
-use popsub_protocol::{Access, ClientMessage, RoleSpec, ServerMessage, TopicInfo, UserInfo};
+use popsub_protocol::{
+    Access, BackupInfo, ClientMessage, RoleSpec, ServerMessage, TopicInfo, UserInfo,
+};
 
 use crate::client::Client;
 use crate::error::Error;
@@ -329,6 +331,37 @@ impl<'a> Admin<'a> {
             topic: topic.into(),
         })
         .await
+    }
+
+    /// Asks the server to back itself up while it keeps running: its topic
+    /// logs, sessions and accounts, into a new directory under its
+    /// `storage.backup_path`.
+    ///
+    /// The reply comes when the copy is finished, which for a large store
+    /// can take longer than the default `ClientConfig::request_timeout`;
+    /// give the client a longer one for backups.
+    ///
+    /// Args:
+    ///     name: The backup's directory name, or `None` for the current time
+    ///         in UTC, such as `20261127T101500Z`.
+    ///
+    /// Returns:
+    ///     The backup's name, where it is on the server, and what it holds.
+    ///
+    /// Raises:
+    ///     Error::Server: `bad_request` for an invalid name, `backup_exists`,
+    ///         `backup_unsupported` for the `memory` backend,
+    ///         `storage_unavailable` when another backup is running or a file
+    ///         can't be written, or `forbidden`.
+    ///     Error::Connect: When disconnected, or the connection dropped first.
+    ///     Error::Timeout: When no reply arrived in time.
+    ///     Error::Closed: When the client has stopped.
+    ///     Error::Protocol: When the server answers with something else.
+    pub async fn backup(&self, name: Option<String>) -> Result<BackupInfo, Error> {
+        match self.client.request(ClientMessage::Backup { name }).await? {
+            ServerMessage::BackupCreated { backup } => Ok(backup),
+            other => Err(Error::Protocol(format!("{other:?}"))),
+        }
     }
 
     /// Sends a request answered by a `topic_info` frame.

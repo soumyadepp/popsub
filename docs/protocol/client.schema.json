@@ -430,6 +430,26 @@
       "type": "object"
     },
     {
+      "description": "Admin only. Copies the server's topic logs, sessions and accounts\ninto a new directory under the server's `storage.backup_path` while\nit keeps running. Answered with `backup_created`.",
+      "properties": {
+        "name": {
+          "description": "The new directory's name: 1 to 64 letters, digits, `_`, `.` or\n`-`, not starting with `.`. Defaults to the time in UTC, such as\n`20261127T101500Z`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "const": "backup",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    {
       "description": "Asks the server to answer with `pong`, so a client that can't see\nWebSocket pings (a browser) can tell the connection is still alive.\nAccepted before `auth` too.",
       "properties": {
         "type": {

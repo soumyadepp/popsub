@@ -6,9 +6,9 @@
 use serde_json::{Value, json};
 
 use crate::{
-    Access, ClientFrame, ClientMessage, CloseCode, Delivery, Encoding, ErrorCode, Limits,
-    RequestId, RoleKind, RoleSpec, ServerFrame, ServerMessage, Stalled, StartFrom, Subscribed,
-    TopicGrant, TopicInfo, Truncated, UserInfo,
+    Access, BackupInfo, ClientFrame, ClientMessage, CloseCode, Delivery, Encoding, ErrorCode,
+    Limits, RequestId, RoleKind, RoleSpec, ServerFrame, ServerMessage, Stalled, StartFrom,
+    Subscribed, TopicGrant, TopicInfo, Truncated, UserInfo,
 };
 
 /// Parses a client frame, failing the test if it doesn't parse.
@@ -426,6 +426,8 @@ fn error_codes_are_snake_case() {
         (ErrorCode::UserNotFound, "user_not_found"),
         (ErrorCode::UserExists, "user_exists"),
         (ErrorCode::TopicNotFound, "topic_not_found"),
+        (ErrorCode::BackupExists, "backup_exists"),
+        (ErrorCode::BackupUnsupported, "backup_unsupported"),
         (ErrorCode::Internal, "internal"),
     ];
     for (code, name) in names {
@@ -633,6 +635,8 @@ fn names_match_the_wire() {
         ErrorCode::UserNotFound,
         ErrorCode::UserExists,
         ErrorCode::TopicNotFound,
+        ErrorCode::BackupExists,
+        ErrorCode::BackupUnsupported,
     ] {
         assert_eq!(json!(code), json!(code.as_str()));
     }
@@ -737,4 +741,35 @@ fn base64_payloads_are_checked_without_decoding() {
     for invalid in ["A", "AP8", "AP8=AAAA", "a-_=", "aG k", "====", "QQ==="] {
         assert!(!Encoding::Base64.accepts(invalid), "{invalid:?}");
     }
+}
+
+/// Checks the exact JSON of the backup request and its reply.
+#[test]
+fn backup_frames_have_the_documented_shape() {
+    assert_eq!(
+        parse(json!({"type": "backup", "id": 1})).message,
+        ClientMessage::Backup { name: None }
+    );
+    assert_eq!(
+        parse(json!({"type": "backup", "name": "nightly"})).message,
+        ClientMessage::Backup {
+            name: Some("nightly".to_string())
+        }
+    );
+    assert_eq!(
+        json_of(ServerFrame::reply(
+            Some(RequestId::Number(1)),
+            ServerMessage::BackupCreated {
+                backup: BackupInfo {
+                    name: "nightly".to_string(),
+                    path: "/var/lib/popsub/backups/nightly".to_string(),
+                    topics: 2,
+                    records: 40,
+                    bytes: 9000,
+                    users: true,
+                }
+            }
+        )),
+        json!({"type": "backup_created", "id": 1, "backup": {"name": "nightly", "path": "/var/lib/popsub/backups/nightly", "topics": 2, "records": 40, "bytes": 9000, "users": true}})
+    );
 }

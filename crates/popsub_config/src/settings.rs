@@ -278,11 +278,16 @@ pub struct StorageSettings {
     /// How long a durable session's subscriptions and cursors are kept after
     /// its last connection ends, in seconds.
     pub session_expiry_secs: u64,
+    /// The directory the `backup` admin request writes backups into, one
+    /// directory per backup, relative to the working directory unless
+    /// absolute. Created on the first backup.
+    pub backup_path: String,
 }
 
 impl Default for StorageSettings {
     /// Builds the storage defaults: the file backend in `pubsub_data`,
-    /// buffered durability, the default retention, and sessions kept for a day.
+    /// buffered durability, the default retention, sessions kept for a day,
+    /// and backups in `pubsub_backups`.
     ///
     /// Returns:
     ///     The default `[storage]` section.
@@ -294,6 +299,7 @@ impl Default for StorageSettings {
             retention: RetentionSettings::default(),
             topic_retention: Vec::new(),
             session_expiry_secs: 86_400,
+            backup_path: "pubsub_backups".to_string(),
         }
     }
 }

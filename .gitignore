@@ -18,6 +18,7 @@ db
 conf
 pubsub_db
 pubsub_data
+pubsub_backups
 cobertura.xml
 *.profraw
 

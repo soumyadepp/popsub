@@ -5,6 +5,7 @@ target
 clients
 docs
 pubsub_data
+pubsub_backups
 pubsub_db
 *.profraw
 cobertura.xml
