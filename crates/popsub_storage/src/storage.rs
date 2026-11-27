@@ -134,6 +134,34 @@ pub trait MessageLog: Send + Sync {
         durability: Durability,
     ) -> Result<Record>;
 
+    /// Appends several records to one topic, in order.
+    ///
+    /// The outcome is the same as calling `append` for each record in turn.
+    /// A backend that can store a batch more cheaply than one record at a
+    /// time overrides this: the file backend writes a batch with one write
+    /// and, when synced, one sync. The default appends them one by one.
+    ///
+    /// Args:
+    ///     topic: The topic to append to. Its log is created if needed.
+    ///     records: The records to append, oldest first.
+    ///     durability: How firmly the records must be stored before this returns.
+    ///
+    /// Returns:
+    ///     One result per record, in the same order: the stored record, or
+    ///     the error `append` would have raised for it.
+    async fn append_batch(
+        &self,
+        topic: &str,
+        records: Vec<NewRecord>,
+        durability: Durability,
+    ) -> Vec<Result<Record>> {
+        let mut results = Vec::with_capacity(records.len());
+        for record in records {
+            results.push(self.append(topic, record, durability).await);
+        }
+        results
+    }
+
     /// Reads records in `seq` order, starting at `from`.
     ///
     /// Args:

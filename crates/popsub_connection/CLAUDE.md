@@ -12,6 +12,6 @@
 
 ## Gotchas
 
-- Above the soft limit `has_room` is false: callers that can wait (deliveries, catch-up) must check it and leave the work to the log; `ready()` wakes when the queue drains. `send` ignores the soft limit but refuses anything over the hard limit and closes the connection as `SlowConsumer`.
+- Above the soft limit `has_room` is false: callers that can wait (deliveries, catch-up) must check it and leave the work to the log; `ready()` wakes when the queue has drained to half the soft limit (`QueueLimits::resume_bytes`), so a catch-up has room for more than a record or two. `send` ignores the soft limit but refuses anything over the hard limit and closes the connection as `SlowConsumer`.
 - Every close goes through `Outbox::close`, first reason wins. Queued frames are written before the close frame, except for a slow consumer, whose backlog is dropped.
 - `OutboxReceiver::try_recv` keeps returning the close once closing; test helpers must stop at the first `Outgoing::Close`.

@@ -181,7 +181,7 @@ The settings you are most likely to change:
 | `server.jwt_secret`, `server.password` | published defaults | Change both before listening anywhere but `localhost`; the server refuses to start otherwise |
 | `server.allow_registration` | `false` | Let clients create accounts; `server.registration_role` decides what they may use |
 | `storage.backend` | `file` | `file` keeps history, sessions and user accounts in `storage.path` (`pubsub_data`); `memory` loses them on restart, and runs the default durability as `none` |
-| `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush per publish |
+| `storage.durability` | `buffered` | `buffered` survives a server crash; `synced` also survives a power cut, at the cost of a disk flush for each batch of publishes a topic stores together |
 | `broker.dead_letter_topic` | none | Copy messages that run out of retries here and keep the subscription going, instead of pausing it |
 | `storage.retention.*` | 1000 messages, 1 hour, 64 MiB | History kept per topic |
 | `[[storage.topic_retention]]` | none | Different limits for topics matching a pattern, such as `audit/#` for 30 days; first match wins |

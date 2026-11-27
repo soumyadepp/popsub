@@ -59,7 +59,7 @@ From section 12 of the design doc, most important first.
 
 ### For running it
 
-10. Capacity is measured on one laptop only. The [benchmarks](https://github.com/soumyadepp/popsub/blob/main/docs/BENCHMARKS.md) found four limits that aren't fixed yet, the worst being a busy topic slowing to about 110 messages a second under the default retention.
+10. Capacity is measured on one laptop only. The [benchmarks](https://github.com/soumyadepp/popsub/blob/main/docs/BENCHMARKS.md) compare PopSub with NATS and Mosquitto and list where it loses: large payloads, latency at low rates, memory, and throughput that swings between runs when several topics are busy.
 11. Power loss and consumers that never read aren't covered by tests yet.
 12. A renewed TLS certificate needs a restart.
 13. Metrics are pushed over OTLP. There's no Prometheus endpoint.

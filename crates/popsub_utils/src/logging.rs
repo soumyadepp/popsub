@@ -1,4 +1,32 @@
-//! Sets up `tracing` output for the PopSub binary and tests.
+//! Sets up `tracing` output for the PopSub binary and tests, and holds the
+//! switch for per-publish trace spans.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether each `publish` request gets its own trace span. On until the
+/// binary turns it off, so tests and embedders see every request.
+static PUBLISH_SPANS: AtomicBool = AtomicBool::new(true);
+
+/// Turns per-publish trace spans on or off.
+///
+/// A span costs a formatted line of fields on every publish, which is the
+/// busiest request a server handles. The binary turns them off unless traces
+/// are being exported, where they are what a publish shows up as. Other
+/// requests always get a span.
+///
+/// Args:
+///     enabled: Whether to create a span for each publish.
+pub fn set_publish_spans(enabled: bool) {
+    PUBLISH_SPANS.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether a `publish` request should get its own trace span.
+///
+/// Returns:
+///     The value last given to `set_publish_spans`, true by default.
+pub fn publish_spans() -> bool {
+    PUBLISH_SPANS.load(Ordering::Relaxed)
+}
 
 /// Installs a global `tracing_subscriber` formatter with a fixed maximum level.
 ///

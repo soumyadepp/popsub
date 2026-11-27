@@ -62,6 +62,26 @@ struct Segment {
     len: u64,
 }
 
+/// The largest buffer a topic keeps between batches. A batch of unusually
+/// large records gives its buffer back to the allocator instead.
+const KEPT_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Frames of one batch that are waiting to be written to the active segment
+/// with a single write, and what to undo if that write fails.
+#[derive(Debug, Default)]
+struct Run {
+    /// The encoded frames, back to back.
+    bytes: Vec<u8>,
+    /// The positions, in the batch's results, of the records framed here.
+    results: Vec<usize>,
+    /// The active segment's length before the first frame.
+    start_len: u64,
+    /// The log's last `seq` before the first frame.
+    last_seq: u64,
+    /// The log's last publish time before the first frame.
+    last_published_at_ms: i64,
+}
+
 /// A topic's files and the index of its retained records.
 #[derive(Debug)]
 pub(crate) struct TopicFiles {
@@ -73,10 +93,17 @@ pub(crate) struct TopicFiles {
     segments: Vec<Segment>,
     /// An append handle on the last segment, opened on first use.
     active: Option<File>,
+    /// The buffer the last batch's frames were written from, kept so the
+    /// next batch doesn't allocate and free one of its own.
+    frames: Vec<u8>,
+    /// The buffer each record's JSON is written to before it is framed.
+    json: String,
     /// Retained records and where each one is.
     index: LogIndex<Location>,
     /// The size at which a new segment is started.
     segment_bytes: u64,
+    /// Whether records were trimmed since `head.json` was last written.
+    head_stale: bool,
 }
 
 /// Builds the path of a segment file.
@@ -200,6 +227,9 @@ impl TopicFiles {
             dir: dir.to_path_buf(),
             segments,
             active: None,
+            frames: Vec::new(),
+            json: String::new(),
+            head_stale: false,
             index,
             segment_bytes,
         })
@@ -224,61 +254,147 @@ impl TopicFiles {
         self.index.seq_at(time_ms)
     }
 
-    /// Appends a record, or returns the original for a retried one.
-    ///
-    /// The frame is written to the newest segment, starting a new one first
-    /// if it is full. With `Durability::Synced` the file is flushed to disk
-    /// before returning (and the directory too when a segment was created);
-    /// otherwise the write has reached the operating system, which survives
-    /// the process crashing. If the write fails, the file is cut back to its
-    /// previous length so no partial frame is left.
+    /// Appends one record. See `append_batch`, which this is a batch of one of.
     ///
     /// Args:
     ///     record: The record to append.
-    ///     durability: How firmly to store it.
+    ///     durability: How durable the append must be before this returns.
     ///
     /// Returns:
-    ///     The stored record.
+    ///     The record as stored, or the original when it is a retry.
     ///
     /// Raises:
-    ///     StorageError::Unavailable: When a file can't be created, written or synced.
-    ///     StorageError::Corrupt: When the original of a retried record can't be read back.
+    ///     StorageError::Unavailable: When the segment can't be written or read.
+    ///     StorageError::Corrupt: When a retry's original can't be decoded.
     pub(crate) fn append(&mut self, record: NewRecord, durability: Durability) -> Result<Record> {
-        if let Some(original) = self.index.duplicate_of(&record) {
-            let location = original.value;
-            return self.read_at(&mut HashMap::new(), location);
-        }
-        let slot = self.index.next_slot(&record);
-        let key = (record.publisher.clone(), record.message_id.clone());
-        let stored = Record::from_new(&self.topic, slot.seq, record, slot.published_at_ms);
-        let body = serde_json::to_vec(&stored)
-            .map_err(|e| StorageError::Other(format!("encoding a record: {e}")))?;
-        let frame = codec::encode(&body);
-        self.ensure_segment(slot.seq, durability)?;
-        let segment = self
-            .segments
-            .last_mut()
-            .expect("ensure_segment leaves a segment");
-        let path = segment_path(&self.dir, segment.first_seq);
-        let file = self
-            .active
-            .as_mut()
-            .expect("ensure_segment opens the active segment");
-        let offset = segment.len;
-        if let Err(e) = file.write_all(&frame) {
-            let _ = file.set_len(offset);
-            return Err(io_error(e, &path));
-        }
-        if durability == Durability::Synced {
-            file.sync_data().map_err(|e| io_error(e, &path))?;
-        }
-        segment.len += frame.len() as u64;
-        let location = Location {
-            segment: segment.first_seq,
-            offset,
+        self.append_batch(vec![record], durability)
+            .pop()
+            .expect("one result per record")
+    }
+
+    /// Appends records in order, writing the frames that share a segment with one write.
+    ///
+    /// A record that repeats a retained `(publisher, message id)` isn't
+    /// stored again: its result is the original record. Each new record is
+    /// framed into a buffer and indexed, and the buffer is written to the
+    /// active segment once, at the end or when the segment is full. With
+    /// `Durability::Synced` each write is followed by one sync, so a batch
+    /// costs one sync however many records it holds.
+    ///
+    /// If a write or sync fails, the file is cut back to where the write
+    /// began, the records in it leave the index, and their results are the
+    /// error. Records written by an earlier write of the same batch stay.
+    ///
+    /// Args:
+    ///     records: The records to append, oldest first.
+    ///     durability: How durable the appends must be before this returns.
+    ///
+    /// Returns:
+    ///     One result per record, in the same order.
+    pub(crate) fn append_batch(
+        &mut self,
+        records: Vec<NewRecord>,
+        durability: Durability,
+    ) -> Vec<Result<Record>> {
+        let mut results: Vec<Result<Record>> = Vec::with_capacity(records.len());
+        let mut run = Run {
+            bytes: std::mem::take(&mut self.frames),
+            ..Run::default()
         };
-        self.index.push(slot, stored.size(), key, location);
-        Ok(stored)
+        let mut json = std::mem::take(&mut self.json);
+        for record in records {
+            if let Some(original) = self.index.duplicate_of(&record) {
+                let location = original.value;
+                self.write_run(&mut run, durability, &mut results);
+                results.push(self.read_at(&mut HashMap::new(), location));
+                continue;
+            }
+            let full = self
+                .segments
+                .last()
+                .is_none_or(|s| s.len > 0 && s.len >= self.segment_bytes);
+            if full {
+                self.write_run(&mut run, durability, &mut results);
+            }
+            let slot = self.index.next_slot(&record);
+            if let Err(e) = self.ensure_segment(slot.seq, durability) {
+                results.push(Err(e));
+                continue;
+            }
+            let key = if record.message_id.is_empty() {
+                (String::new(), String::new())
+            } else {
+                (record.publisher.clone(), record.message_id.clone())
+            };
+            let stored = Record::from_new(&self.topic, slot.seq, record, slot.published_at_ms);
+            json.clear();
+            stored.write_json(&mut json);
+            let segment = self
+                .segments
+                .last_mut()
+                .expect("ensure_segment leaves a segment");
+            if run.results.is_empty() {
+                run.start_len = segment.len;
+                run.last_seq = self.index.bounds().last_seq;
+                run.last_published_at_ms = self.index.last_published_at_ms();
+            }
+            let location = Location {
+                segment: segment.first_seq,
+                offset: segment.len,
+            };
+            segment.len += codec::encode_into(&mut run.bytes, json.as_bytes()) as u64;
+            run.results.push(results.len());
+            self.index.push(slot, stored.size(), key, location);
+            results.push(Ok(stored));
+        }
+        self.write_run(&mut run, durability, &mut results);
+        if run.bytes.capacity() <= KEPT_BUFFER_BYTES {
+            self.frames = run.bytes;
+        }
+        if json.capacity() <= KEPT_BUFFER_BYTES {
+            json.clear();
+            self.json = json;
+        }
+        results
+    }
+
+    /// Writes a run's buffered frames to the active segment, and empties the run.
+    ///
+    /// On failure the segment is cut back to its length before the run, the
+    /// run's records are taken out of the index, and their results become
+    /// the error.
+    ///
+    /// Args:
+    ///     run: The frames waiting to be written, and which results they belong to.
+    ///     durability: Whether to sync the segment after writing.
+    ///     results: The batch's results so far.
+    fn write_run(&mut self, run: &mut Run, durability: Durability, results: &mut [Result<Record>]) {
+        if run.results.is_empty() {
+            return;
+        }
+        if let Some(segment) = self.segments.last_mut()
+            && let Some(file) = self.active.as_mut()
+        {
+            let written = file.write_all(&run.bytes).and_then(|()| {
+                if durability == Durability::Synced {
+                    file.sync_data()
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = written {
+                let _ = file.set_len(run.start_len);
+                segment.len = run.start_len;
+                self.index
+                    .rollback(run.results.len(), run.last_seq, run.last_published_at_ms);
+                let error = io_error(e, &segment_path(&self.dir, segment.first_seq));
+                for &index in &run.results {
+                    results[index] = Err(error.clone());
+                }
+            }
+        }
+        run.bytes.clear();
+        run.results.clear();
     }
 
     /// Makes sure there is a segment with room to append to, and an open handle on it.
@@ -340,11 +456,78 @@ impl TopicFiles {
     ///     StorageError::Corrupt: When a record fails its CRC or doesn't decode.
     pub(crate) fn read(&self, from: u64, max: usize) -> Result<Vec<Record>> {
         let locations: Vec<Location> = self.index.range(from, max).map(|e| e.value).collect();
-        let mut files = HashMap::new();
-        locations
-            .into_iter()
-            .map(|location| self.read_at(&mut files, location))
-            .collect()
+        let Some(newest) = self.index.range(from, max).last() else {
+            return Ok(Vec::new());
+        };
+        let after = self.index.get(newest.seq + 1).map(|entry| entry.value);
+        let mut records = Vec::with_capacity(locations.len());
+        let mut start = 0;
+        while start < locations.len() {
+            let segment = locations[start].segment;
+            let count = locations[start..]
+                .iter()
+                .take_while(|location| location.segment == segment)
+                .count();
+            let next = locations.get(start + count).copied().or(after);
+            self.read_run(&locations[start..start + count], next, &mut records)?;
+            start += count;
+        }
+        Ok(records)
+    }
+
+    /// Reads records that sit back to back in one segment with a single read.
+    ///
+    /// Args:
+    ///     run: Where each record's frame starts, in `seq` order, all in the
+    ///         same segment and with no retained record between them.
+    ///     next: Where the record after the run starts, if there is one.
+    ///     records: Gains the run's records, in order.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the segment can't be opened or read.
+    ///     StorageError::Corrupt: When a frame isn't where the index says, or
+    ///         fails its CRC or doesn't decode.
+    fn read_run(
+        &self,
+        run: &[Location],
+        next: Option<Location>,
+        records: &mut Vec<Record>,
+    ) -> Result<()> {
+        let Some(&first) = run.first() else {
+            return Ok(());
+        };
+        let path = segment_path(&self.dir, first.segment);
+        let end = match next {
+            Some(next) if next.segment == first.segment => next.offset,
+            _ => self
+                .segments
+                .iter()
+                .find(|segment| segment.first_seq == first.segment)
+                .map_or(first.offset, |segment| segment.len),
+        };
+        let corrupt = |what: &str, offset: u64| {
+            StorageError::Corrupt(format!("{what} in {} at offset {offset}", path.display()))
+        };
+        let len = usize::try_from(end.saturating_sub(first.offset))
+            .map_err(|_| corrupt("oversized run", first.offset))?;
+        let mut file = File::open(&path).map_err(|e| io_error(e, &path))?;
+        file.seek(SeekFrom::Start(first.offset))
+            .map_err(|e| io_error(e, &path))?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact(&mut bytes)
+            .map_err(|e| io_error(e, &path))?;
+        for location in run {
+            let at = usize::try_from(location.offset - first.offset)
+                .map_err(|_| corrupt("oversized run", location.offset))?;
+            let Decoded::Frame { body, .. } = codec::decode(&bytes, at) else {
+                return Err(corrupt("damaged frame", location.offset));
+            };
+            records.push(
+                serde_json::from_slice(body)
+                    .map_err(|_| corrupt("undecodable record", location.offset))?,
+            );
+        }
+        Ok(())
     }
 
     /// Reads one record from disk and checks it.
@@ -393,29 +576,43 @@ impl TopicFiles {
         serde_json::from_slice(body).map_err(|_| corrupt("undecodable record"))
     }
 
-    /// Trims records outside the policy and deletes segments left with none.
+    /// Drops records outside the policy from the index, without touching a file.
     ///
-    /// The head file is rewritten before any segment is deleted, so a crash
-    /// in between leaves extra files that the next open deletes, never
-    /// trimmed records coming back.
+    /// Readers stop seeing the records at once. `head.json` is only worth
+    /// rewriting when a whole segment can be deleted or the log is now
+    /// empty, so a topic that trims one record on every publish doesn't
+    /// write and sync a file each time. Until then the head is stale: after
+    /// a restart, records trimmed since it was last written are indexed
+    /// again and removed by the next trim.
     ///
     /// Args:
     ///     policy: The limits to apply.
     ///     now_ms: The current time.
     ///
     /// Returns:
-    ///     How many records were removed.
+    ///     How many records were removed, and whether `persist_trim` should
+    ///     run now.
+    pub(crate) fn trim_index(&mut self, policy: &Retention, now_ms: i64) -> (u64, bool) {
+        let removed = self.index.trim(policy, now_ms).len() as u64;
+        if removed == 0 {
+            return (0, false);
+        }
+        self.head_stale = true;
+        let bounds = self.index.bounds();
+        let segment_is_empty =
+            self.segments.len() > 1 && self.segments[1].first_seq <= bounds.first_seq;
+        (removed, bounds.is_empty() || segment_is_empty)
+    }
+
+    /// Writes `head.json` and deletes the segments left with no records.
+    ///
+    /// The head file is rewritten before any segment is deleted, so a crash
+    /// in between leaves extra files that the next open deletes.
     ///
     /// Raises:
     ///     StorageError::Unavailable: When the head can't be written or a
-    ///         segment can't be deleted. Records already dropped from the
-    ///         index stay dropped; on a restart before the head is written
-    ///         they come back and are trimmed again.
-    pub(crate) fn trim(&mut self, policy: &Retention, now_ms: i64) -> Result<u64> {
-        let removed = self.index.trim(policy, now_ms).len() as u64;
-        if removed == 0 {
-            return Ok(0);
-        }
+    ///         segment can't be deleted.
+    pub(crate) fn persist_trim(&mut self) -> Result<()> {
         let bounds = self.index.bounds();
         write_head(
             &self.dir,
@@ -425,12 +622,24 @@ impl TopicFiles {
                 last_published_at_ms: self.index.last_published_at_ms(),
             },
         )?;
+        self.head_stale = false;
         while self.segments.len() > 1 && self.segments[1].first_seq <= bounds.first_seq {
             let path = segment_path(&self.dir, self.segments[0].first_seq);
             fs::remove_file(&path).map_err(|e| io_error(e, &path))?;
             self.segments.remove(0);
         }
-        Ok(removed)
+        Ok(())
+    }
+}
+
+impl Drop for TopicFiles {
+    /// Writes a stale head when the store closes, so a clean restart starts
+    /// from the first retained record. A failure is ignored: the next open
+    /// indexes the trimmed records again and the next trim removes them.
+    fn drop(&mut self) {
+        if self.head_stale {
+            let _ = self.persist_trim();
+        }
     }
 }
 

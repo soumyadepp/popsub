@@ -6,8 +6,10 @@
 //!
 //! - Above the soft limit, `has_room` is false. The broker stops putting new
 //!   deliveries in the queue and the subscription falls behind; once the
-//!   queue drains (`ready`), it is caught up from the topic log. Memory
-//!   stays bounded without dropping anything.
+//!   queue has drained to half the soft limit (`ready`), it is caught up
+//!   from the topic log. Memory stays bounded without dropping anything.
+//!   Waiting for half, not for the first free byte, means a catch-up has
+//!   room for a useful number of records each time.
 //! - A send that would go over the hard limit is refused and the connection
 //!   is closed with `CloseCode::SlowConsumer`. Only frames that ignore the
 //!   soft limit (replies, retries, pings) can get that far.
@@ -16,7 +18,7 @@
 //! end a connection. Frames already queued are still sent before the close
 //! frame, except for a slow consumer, whose backlog is dropped.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use popsub_protocol::CloseCode;
@@ -50,6 +52,16 @@ impl QueueLimits {
             soft_bytes: (hard_bytes / 16).max(64 * 1024).min(hard_bytes),
             hard_bytes,
         }
+    }
+}
+
+impl QueueLimits {
+    /// The queue size a waiting catch-up resumes at: half the soft limit.
+    ///
+    /// Returns:
+    ///     The size in bytes.
+    pub fn resume_bytes(&self) -> usize {
+        self.soft_bytes / 2
     }
 }
 
@@ -91,16 +103,22 @@ struct Shared {
     limits: QueueLimits,
     /// Why the connection is closing, once it is. The first reason wins.
     closing: Mutex<Option<CloseCode>>,
+    /// Set once `closing` holds a code, so the hot paths can check without the lock.
+    is_closing: AtomicBool,
     /// Woken when the queue drains or the connection starts closing.
     changed: Notify,
 }
 
 impl Shared {
-    /// Reads the closing reason.
+    /// Reads the closing reason, without taking the lock while the connection
+    /// is open.
     ///
     /// Returns:
     ///     The reason, or `None` while the connection is open.
     fn closing(&self) -> Option<CloseCode> {
+        if !self.is_closing.load(Ordering::Acquire) {
+            return None;
+        }
         *self.closing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -137,6 +155,7 @@ impl Outbox {
             queued: AtomicUsize::new(0),
             limits,
             closing: Mutex::new(None),
+            is_closing: AtomicBool::new(false),
             changed: Notify::new(),
         });
         (
@@ -186,6 +205,17 @@ impl Outbox {
             && self.shared.queued.load(Ordering::SeqCst) <= self.shared.limits.soft_bytes
     }
 
+    /// How many more bytes can be queued before the soft limit.
+    ///
+    /// Returns:
+    ///     The room left, zero when the queue is at or over the soft limit.
+    pub fn room_bytes(&self) -> usize {
+        self.shared
+            .limits
+            .soft_bytes
+            .saturating_sub(self.shared.queued.load(Ordering::SeqCst))
+    }
+
     /// How many bytes are queued.
     ///
     /// Returns:
@@ -194,13 +224,16 @@ impl Outbox {
         self.shared.queued.load(Ordering::SeqCst)
     }
 
-    /// Waits until there is room again, or the connection starts closing.
+    /// Waits until the queue has drained to half the soft limit, or the
+    /// connection starts closing.
     pub async fn ready(&self) {
         loop {
             let changed = self.shared.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.has_room() || self.shared.closing().is_some() {
+            if self.shared.queued.load(Ordering::SeqCst) <= self.shared.limits.resume_bytes()
+                || self.shared.closing().is_some()
+            {
                 return;
             }
             changed.await;
@@ -222,6 +255,7 @@ impl Outbox {
                 return;
             }
             *closing = Some(code);
+            self.shared.is_closing.store(true, Ordering::Release);
         }
         self.shared.changed.notify_waiters();
     }
@@ -254,14 +288,21 @@ impl Outbox {
 impl OutboxReceiver {
     /// Hands over one frame and takes its bytes off the count.
     ///
+    /// Waiters are woken only by the frame that takes the queue down to half
+    /// the soft limit, which is the level `Outbox::ready` waits for.
+    ///
     /// Args:
     ///     frame: The frame leaving the queue.
     ///
     /// Returns:
     ///     The frame, wrapped for the send loop.
     fn take(&self, frame: WsMessage) -> Outgoing {
-        self.shared.queued.fetch_sub(frame.len(), Ordering::SeqCst);
-        self.shared.changed.notify_waiters();
+        let len = frame.len();
+        let before = self.shared.queued.fetch_sub(len, Ordering::SeqCst);
+        let resume = self.shared.limits.resume_bytes();
+        if before > resume && before - len <= resume {
+            self.shared.changed.notify_waiters();
+        }
         Outgoing::Frame(frame)
     }
 

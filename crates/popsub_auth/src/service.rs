@@ -659,6 +659,19 @@ impl AuthService {
         }
     }
 
+    /// The user store's revision, which is different after any account changes.
+    ///
+    /// A connection that has just been allowed to publish to a topic can
+    /// keep that answer while the revision stays the same, instead of
+    /// reading the account again for every message.
+    ///
+    /// Returns:
+    ///     The revision, or `None` when the store can't tell that accounts
+    ///     changed, in which case nothing may be remembered.
+    pub fn users_revision(&self) -> Option<u64> {
+        self.user_store.revision()
+    }
+
     /// Decides whether a user may subscribe to a topic, using the role in the store.
     ///
     /// Unknown users and store errors both count as a refusal.

@@ -266,6 +266,30 @@ pub async fn trim_by_bytes_keeps_what_fits<F: Fixture>(fixture: F) {
     assert_eq!(all_seqs(&storage, "t").await, vec![3, 4]);
 }
 
+/// Checks that a record with no message id is given one, and that two such
+/// records from one publisher are stored separately, never as a retry.
+///
+/// Args:
+///     fixture: Opens the backend.
+pub async fn empty_message_id_is_assigned_and_never_a_retry<F: Fixture>(fixture: F) {
+    let storage = fixture.open().await;
+    let first = storage
+        .append("t", record("", 1), Durability::None)
+        .await
+        .expect("append");
+    let second = storage
+        .append("t", record("", 2), Durability::None)
+        .await
+        .expect("append");
+    assert_eq!((first.seq, second.seq), (1, 2));
+    assert!(!first.message_id.is_empty());
+    assert!(!second.message_id.is_empty());
+    assert_ne!(first.message_id, second.message_id);
+    let stored = storage.read("t", 1, 2).await.expect("read");
+    assert_eq!(stored[0].message_id, first.message_id);
+    assert_eq!(stored[1].message_id, second.message_id);
+}
+
 /// Checks that appending the same publisher and message id twice returns the
 /// same `seq` and stores one record, while another publisher's identical id
 /// is a new record.
@@ -580,6 +604,7 @@ macro_rules! conformance_tests {
             trim_by_age_keeps_recent,
             trim_by_bytes_keeps_what_fits,
             duplicate_message_id_returns_original_seq,
+            empty_message_id_is_assigned_and_never_a_retry,
             publish_times_never_decrease_and_seq_at_finds_them,
             topics_lists_every_log,
             topics_are_independent,

@@ -12,6 +12,32 @@ pub enum PayloadEncoding {
     Base64,
 }
 
+/// Appends text as a JSON string, quotes included, exactly as `serde_json` writes it.
+///
+/// Most payloads, topics and ids have nothing JSON needs to escape. Those
+/// are copied as they are, which is far cheaper than checking and writing
+/// one byte at a time. Anything with a quote, a backslash or a control
+/// character goes through `serde_json`.
+///
+/// Args:
+///     out: The JSON being built.
+///     text: The string's value.
+pub fn push_json_str(out: &mut String, text: &str) {
+    let escape = text.bytes().fold(false, |found, b| {
+        found | (b < 0x20) | (b == b'"') | (b == b'\\')
+    });
+    if escape {
+        match serde_json::to_string(text) {
+            Ok(quoted) => out.push_str(&quoted),
+            Err(_) => out.push_str("\"\""),
+        }
+    } else {
+        out.push('"');
+        out.push_str(text);
+        out.push('"');
+    }
+}
+
 /// A message to append to a topic log, before the log gives it a sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewRecord {
@@ -59,7 +85,60 @@ pub struct Record {
 }
 
 impl Record {
+    /// Writes the record as JSON, byte for byte what its `Serialize` gives.
+    ///
+    /// The file backend stores every record this way. Writing it directly,
+    /// into space reserved up front, costs much less than going through the
+    /// general serialiser.
+    ///
+    /// Returns:
+    ///     The record as a JSON object.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.write_json(&mut out);
+        out
+    }
+
+    /// Appends the record's JSON, the same bytes as `to_json`, to a buffer.
+    ///
+    /// A backend that frames many records in a row passes one buffer and
+    /// clears it between records, so framing a record allocates nothing.
+    ///
+    /// Args:
+    ///     out: The buffer to append to.
+    pub fn write_json(&self, out: &mut String) {
+        let mut integers = itoa::Buffer::new();
+        out.reserve(
+            self.topic.len()
+                + self.message_id.len()
+                + self.publisher.len()
+                + self.payload.len()
+                + 160,
+        );
+        out.push_str("{\"topic\":");
+        push_json_str(out, &self.topic);
+        out.push_str(",\"seq\":");
+        out.push_str(integers.format(self.seq));
+        out.push_str(",\"message_id\":");
+        push_json_str(out, &self.message_id);
+        out.push_str(",\"publisher\":");
+        push_json_str(out, &self.publisher);
+        out.push_str(",\"payload\":");
+        push_json_str(out, &self.payload);
+        match self.encoding {
+            Some(PayloadEncoding::Base64) => out.push_str(",\"encoding\":\"base64\""),
+            None => {}
+        }
+        out.push_str(",\"qos\":");
+        out.push_str(integers.format(self.qos));
+        out.push_str(",\"published_at_ms\":");
+        out.push_str(integers.format(self.published_at_ms));
+        out.push('}');
+    }
+
     /// Builds the stored form of a new record once the log has chosen its place.
+    ///
+    /// A record whose publisher gave no message id gets a random one here.
     ///
     /// Args:
     ///     topic: The topic whose log holds the record.
@@ -74,7 +153,14 @@ impl Record {
         Self {
             topic: topic.to_string(),
             seq,
-            message_id: new.message_id,
+            message_id: if new.message_id.is_empty() {
+                uuid::Uuid::new_v4()
+                    .hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer())
+                    .to_owned()
+            } else {
+                new.message_id
+            },
             publisher: new.publisher,
             payload: new.payload,
             encoding: new.encoding,

@@ -30,10 +30,11 @@ use popsub_storage::Record;
 use tracing::{debug, info, warn};
 
 use popsub_protocol::{ServerFrame, ServerMessage, Stalled};
+use tungstenite::protocol::Message as WsMessage;
 
-use crate::frame::{delivery, to_ws};
+use crate::frame::{delivery, delivery_ws, to_ws};
 use crate::topic::{
-    CursorUpdate, DeliveryState, Group, InFlight, SubscriberId, Topic, group_subscriber_id,
+    CursorUpdate, DeliveryState, FastMap, Group, InFlight, SubscriberId, Topic, group_subscriber_id,
 };
 
 /// The broker: connected clients and topic subscriptions with their delivery state.
@@ -43,9 +44,9 @@ use crate::topic::{
 #[derive(Debug)]
 pub struct Broker {
     /// Topics by name. A topic is created on its first subscriber and never removed.
-    pub topics: HashMap<String, Topic>,
+    pub topics: FastMap<String, Topic>,
     /// Connected clients by id, used to reach each subscriber's channel.
-    pub clients: HashMap<SubscriberId, Client>,
+    pub clients: FastMap<SubscriberId, Client>,
     /// ACK timeout, retry limit and window size.
     settings: BrokerSettings,
     /// Records given up on since `take_dead_letters` was last called.
@@ -114,6 +115,20 @@ pub struct DeliverOutcome {
     /// catch-up for each once its queue drains.
     pub backed_up: Vec<SubscriberId>,
 }
+
+/// How far `Broker::deliver_batch` has got through a topic's subscriptions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeliverProgress {
+    /// How many subscriptions have been offered the batch.
+    position: usize,
+    /// The topic's `epoch` when `position` was counted.
+    epoch: u64,
+}
+
+/// How many times `Broker::deliver_batch` offers a record to a subscription
+/// between two looks at the clock. Reading the clock costs about as much as
+/// queueing a frame, so it isn't read after every one.
+const OFFERS_PER_CLOCK_CHECK: usize = 64;
 
 /// What happened when one record was offered to one subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,8 +207,8 @@ impl Broker {
     ///     A broker with no topics or clients.
     pub fn new(settings: BrokerSettings) -> Self {
         Self {
-            topics: HashMap::new(),
-            clients: HashMap::new(),
+            topics: FastMap::default(),
+            clients: FastMap::default(),
             settings,
             dead: DeadLetters::default(),
             patterns: HashMap::new(),
@@ -454,6 +469,7 @@ impl Broker {
         if !already {
             leave_groups(topic, &client_id.to_string(), &self.clients, now_ms);
         }
+        topic.epoch += 1;
         topic.subscribers.remove(client_id);
         let state = topic
             .subscribers
@@ -683,10 +699,8 @@ impl Broker {
 
     /// Sends a newly stored record to every subscription that is up to date.
     ///
-    /// Only the topic's writer calls this, once per record and in `seq`
-    /// order. Subscriptions that are behind, stalled, out of window room, or
-    /// whose client's outgoing queue is over its soft limit are skipped; the
-    /// writer catches them up from the log later.
+    /// This is `deliver_batch` for one record, run to the end without giving
+    /// the lock up.
     ///
     /// Args:
     ///     record: The record as the log stored it.
@@ -696,44 +710,150 @@ impl Broker {
     ///     The cursors that moved, and the clients newly skipped for a full
     ///     queue, which need a catch-up once it drains.
     pub fn deliver(&mut self, record: &Record, now_ms: i64) -> DeliverOutcome {
-        let max_inflight = self.settings.max_inflight;
-        let Some(topic) = self.topics.get_mut(&record.topic) else {
-            return DeliverOutcome::default();
-        };
-        topic.last_seq = topic.last_seq.max(record.seq);
         let mut outcome = DeliverOutcome::default();
+        let mut progress = DeliverProgress::default();
+        let mut frames = [None];
+        let records = std::slice::from_ref(record);
+        while !self.deliver_batch(
+            &record.topic,
+            records,
+            &mut frames,
+            &mut progress,
+            now_ms,
+            Duration::MAX,
+            &mut outcome,
+        ) {}
+        outcome
+    }
+
+    /// Reports whether a topic has anyone subscribed.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///
+    /// Returns:
+    ///     True when at least one subscription exists.
+    pub fn has_subscribers(&self, topic: &str) -> bool {
+        self.topics
+            .get(topic)
+            .is_some_and(|topic| !topic.subscribers.is_empty())
+    }
+
+    /// Sends newly stored records to the subscriptions that are up to date,
+    /// for at most about `hold` at a time.
+    ///
+    /// Only the topic's writer calls this, with records in `seq` order. It
+    /// goes through the subscriptions one at a time and gives each one every
+    /// record of the batch in a row, so a subscriber's send loop is woken
+    /// once for the batch and can write it to the socket in one go.
+    /// Subscriptions that are behind, stalled, out of window room, or whose
+    /// client's outgoing queue is over its soft limit are skipped from that
+    /// record on; the writer catches them up from the log later.
+    ///
+    /// When `hold` runs out the call returns false, and the caller lets go
+    /// of the broker lock and calls again with the same `progress`. If a
+    /// subscription was added or removed in between, the pass starts again
+    /// from the first subscription. That is safe because a subscription is
+    /// only ever sent the `seq` it expects next, so one that already got the
+    /// batch takes nothing the second time.
+    ///
+    /// Args:
+    ///     topic: The topic the records were stored in.
+    ///     records: The records as the log stored them, oldest first.
+    ///     frames: Each record's `message` frame, or `None` to have it built
+    ///         the first time it is sent. As long as `records`.
+    ///     progress: How far an earlier call got. Start with the default.
+    ///     now_ms: The current time, recorded as the send time for retries.
+    ///     hold: About how long one call may take.
+    ///     outcome: Gains the cursors that moved, and the clients newly
+    ///         skipped for a full queue, which need a catch-up once it drains.
+    ///
+    /// Returns:
+    ///     True once every subscription has been offered the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver_batch(
+        &mut self,
+        topic: &str,
+        records: &[Record],
+        frames: &mut [Option<WsMessage>],
+        progress: &mut DeliverProgress,
+        now_ms: i64,
+        hold: Duration,
+        outcome: &mut DeliverOutcome,
+    ) -> bool {
+        let max_inflight = self.settings.max_inflight;
+        let Some(topic) = self.topics.get_mut(topic) else {
+            return true;
+        };
+        if let Some(newest) = records.last() {
+            topic.last_seq = topic.last_seq.max(newest.seq);
+        }
+        if progress.epoch != topic.epoch {
+            progress.epoch = topic.epoch;
+            progress.position = 0;
+        }
         let Topic {
             subscribers,
             groups,
             name,
             ..
         } = topic;
-        for (subscriber, state) in subscribers.iter_mut() {
-            let mut group = groups.get_mut(subscriber);
-            let client = match group.as_deref_mut() {
-                Some(group) => pick_member(group, &self.clients),
+        let held = std::time::Instant::now();
+        let mut offers = 0;
+        for (subscriber, state) in subscribers.iter_mut().skip(progress.position) {
+            progress.position += 1;
+            let mut group = if groups.is_empty() {
+                None
+            } else {
+                groups.get_mut(subscriber)
+            };
+            let direct = match group {
+                Some(_) => None,
                 None => self.clients.get(subscriber),
             };
-            let Some(client) = client else {
-                continue;
-            };
-            match send_one(state, &client.sender, record, now_ms, max_inflight) {
-                Offer::Sent => {
-                    if let Some(group) = group
-                        && record.qos == 1
-                    {
-                        group.owners.insert(record.seq, client.id.clone());
+            let mut sent = false;
+            for (record, frame) in records.iter().zip(frames.iter_mut()) {
+                if state.next_seq != record.seq {
+                    continue;
+                }
+                let client = match group.as_deref_mut() {
+                    Some(group) => pick_member(group, &self.clients),
+                    None => direct,
+                };
+                let Some(client) = client else {
+                    break;
+                };
+                match send_one(state, &client.sender, record, frame, now_ms, max_inflight) {
+                    Offer::Sent => {
+                        if let Some(group) = group.as_deref_mut()
+                            && record.qos == 1
+                        {
+                            group.owners.insert(record.seq, client.id.clone());
+                        }
+                        sent = true;
                     }
-                    outcome.cursors.extend(state.take_update(name));
+                    Offer::Busy => {
+                        if !state.awaiting_room {
+                            state.awaiting_room = true;
+                            outcome.backed_up.push(subscriber.clone());
+                        }
+                        break;
+                    }
+                    Offer::NotNext | Offer::NoWindow | Offer::Closed => break,
                 }
-                Offer::Busy if !state.awaiting_room => {
-                    state.awaiting_room = true;
-                    outcome.backed_up.push(subscriber.clone());
+            }
+            if sent {
+                outcome.cursors.extend(state.take_update(name));
+            }
+            offers += records.len();
+            if offers >= OFFERS_PER_CLOCK_CHECK {
+                if held.elapsed() >= hold {
+                    return false;
                 }
-                _ => {}
+                offers = 0;
             }
         }
-        outcome
+        true
     }
 
     /// Notes that a subscription is being caught up, so the next time its
@@ -750,6 +870,52 @@ impl Broker {
         {
             state.awaiting_room = false;
         }
+    }
+
+    /// Notes that a subscription is behind the log only because its client's
+    /// outgoing queue is over the soft limit.
+    ///
+    /// A catch-up can end with every record it read sent and the queue now
+    /// full, with no record refused to report it. Without this, nothing
+    /// would start the next catch-up when the queue drains.
+    ///
+    /// Args:
+    ///     topic: The topic.
+    ///     client_id: The subscribed client.
+    ///     last_seq: The log's last `seq`.
+    ///
+    /// Returns:
+    ///     True the first time, so the caller schedules one catch-up for when
+    ///     the queue has room. False when the subscription is up to date,
+    ///     already waiting, stalled, has a full window, or doesn't exist.
+    pub fn mark_awaiting_room(&mut self, topic: &str, client_id: &str, last_seq: u64) -> bool {
+        let max_inflight = self.settings.max_inflight;
+        let Some(topic) = self.topics.get_mut(topic) else {
+            return false;
+        };
+        let sender_has_room = match topic.groups.get(client_id) {
+            Some(group) => group
+                .members
+                .iter()
+                .filter_map(|member| self.clients.get(member))
+                .any(|client| client.sender.has_room()),
+            None => match self.clients.get(client_id) {
+                Some(client) => client.sender.has_room(),
+                None => return false,
+            },
+        };
+        let Some(state) = topic.subscribers.get_mut(client_id) else {
+            return false;
+        };
+        if sender_has_room
+            || state.awaiting_room
+            || state.next_seq > last_seq
+            || !state.has_room(max_inflight)
+        {
+            return false;
+        }
+        state.awaiting_room = true;
+        true
     }
 
     /// Reports where a subscription that has room wants records from.
@@ -822,7 +988,14 @@ impl Broker {
             let Some(client) = client else {
                 break;
             };
-            match send_one(state, &client.sender, record, now_ms, max_inflight) {
+            match send_one(
+                state,
+                &client.sender,
+                record,
+                &mut None,
+                now_ms,
+                max_inflight,
+            ) {
                 Offer::Sent => {
                     if let Some(group) = group.as_deref_mut()
                         && record.qos == 1
@@ -976,6 +1149,7 @@ impl Broker {
                 groups,
                 name,
                 last_seq,
+                ..
             } = topic;
             for (client_id, state) in subscribers.iter_mut() {
                 if state.stalled.is_some() {
@@ -1075,7 +1249,7 @@ impl Broker {
 ///     The member's client, or `None` when the group has no connected member.
 fn pick_member<'a>(
     group: &mut Group,
-    clients: &'a HashMap<SubscriberId, Client>,
+    clients: &'a FastMap<SubscriberId, Client>,
 ) -> Option<&'a Client> {
     let count = group.members.len();
     let mut fallback = None;
@@ -1105,7 +1279,7 @@ fn pick_member<'a>(
 fn leave_groups(
     topic: &mut Topic,
     client_id: &SubscriberId,
-    clients: &HashMap<SubscriberId, Client>,
+    clients: &FastMap<SubscriberId, Client>,
     now_ms: i64,
 ) {
     let Topic {
@@ -1154,10 +1328,16 @@ fn leave_groups(
 /// A QoS 1 record goes into the subscription's window; a QoS 0 record is
 /// done once sent.
 ///
+/// The record is serialised the first time it is sent and the frame is kept
+/// in `frame`, so a fan-out to many subscriptions serialises it once and
+/// shares the bytes.
+///
 /// Args:
 ///     state: The subscription's delivery state.
 ///     sender: The client's outgoing queue.
 ///     record: The record.
+///     frame: The record's `message` frame once it has been serialised.
+///         Start with `None` for each record.
 ///     now_ms: The send time, for retries.
 ///     max_inflight: The window size.
 ///
@@ -1167,6 +1347,7 @@ fn send_one(
     state: &mut DeliveryState,
     sender: &Outbox,
     record: &Record,
+    frame: &mut Option<WsMessage>,
     now_ms: i64,
     max_inflight: usize,
 ) -> Offer {
@@ -1182,7 +1363,10 @@ fn send_one(
     if !sender.has_room() {
         return Offer::Busy;
     }
-    let Some(ws) = to_ws(&delivery(record)) else {
+    if frame.is_none() {
+        *frame = delivery_ws(record);
+    }
+    let Some(ws) = frame.clone() else {
         return Offer::Closed;
     };
     if sender.send(ws).is_err() {

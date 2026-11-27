@@ -38,10 +38,24 @@ pub(crate) enum Decoded<'a> {
 ///     The header followed by the body.
 pub(crate) fn encode(body: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(HEADER + body.len());
-    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
-    frame.extend_from_slice(body);
+    encode_into(&mut frame, body);
     frame
+}
+
+/// Appends one frame holding `body` to a buffer of frames.
+///
+/// Args:
+///     out: The buffer to append to.
+///     body: The bytes to store.
+///
+/// Returns:
+///     The frame's length: the header and the body.
+pub(crate) fn encode_into(out: &mut Vec<u8>, body: &[u8]) -> usize {
+    out.reserve(HEADER + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+    out.extend_from_slice(body);
+    HEADER + body.len()
 }
 
 /// Reads the frame starting at an offset.

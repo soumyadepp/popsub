@@ -84,6 +84,29 @@ fn queued_frames_go_out_before_an_ordinary_close() {
     assert_eq!(rx.try_recv(), Some(Outgoing::Close(CloseCode::AuthFailed)));
 }
 
+/// Checks that `ready` keeps waiting while the queue is under the soft limit
+/// but above half of it, and wakes once it reaches half.
+#[tokio::test]
+async fn ready_waits_for_half_the_soft_limit() {
+    let (outbox, mut rx) = Outbox::channel(LIMITS);
+    for _ in 0..3 {
+        outbox.send(frame(4)).expect("send");
+    }
+    let waiter = {
+        let outbox = outbox.clone();
+        tokio::spawn(async move { outbox.ready().await })
+    };
+    assert!(matches!(rx.recv().await, Some(Outgoing::Frame(_))));
+    assert!(outbox.has_room());
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    assert!(matches!(rx.recv().await, Some(Outgoing::Frame(_))));
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("ready woke up")
+        .expect("task");
+}
+
 /// Checks that `ready` waits until the queue drains below the soft limit,
 /// and that `closed` and `recv` wake on a close.
 #[tokio::test]

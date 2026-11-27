@@ -373,6 +373,37 @@ impl MessageLog for FileStorage {
     /// Raises:
     ///     StorageError::Unavailable: When a segment can't be read.
     ///     StorageError::Corrupt: When a record fails its CRC or doesn't decode.
+    /// Appends a batch with one trip to the blocking pool and one write per segment.
+    ///
+    /// Args:
+    ///     topic: The topic to append to.
+    ///     records: The records to append, oldest first.
+    ///     durability: How firmly the records must be stored before this returns.
+    ///
+    /// Returns:
+    ///     One result per record. When the topic can't be opened or the
+    ///     durability isn't supported, every result is that error.
+    async fn append_batch(
+        &self,
+        topic: &str,
+        records: Vec<NewRecord>,
+        durability: Durability,
+    ) -> Vec<Result<Record>> {
+        let count = records.len();
+        if let Err(e) = CAPABILITIES.check(durability) {
+            return vec![Err(e); count];
+        }
+        let topic = topic.to_string();
+        let appended = self
+            .blocking(move |inner| {
+                let files = inner.topic(&topic, true)?.expect("created when missing");
+                let mut files = lock(&files);
+                Ok(files.append_batch(records, durability))
+            })
+            .await;
+        appended.unwrap_or_else(|e| vec![Err(e); count])
+    }
+
     async fn read(&self, topic: &str, from: u64, max: usize) -> Result<Vec<Record>> {
         let topic = topic.to_string();
         self.blocking(move |inner| match inner.topic(&topic, false)? {
@@ -431,13 +462,14 @@ impl MessageLog for FileStorage {
     ///     StorageError::Unavailable: When the head can't be written or a
     ///         segment can't be deleted.
     async fn trim(&self, topic: &str, policy: &Retention, now_ms: i64) -> Result<u64> {
-        let topic = topic.to_string();
-        let policy = *policy;
-        self.blocking(move |inner| match inner.topic(&topic, false)? {
-            Some(files) => lock(&files).trim(&policy, now_ms),
-            None => Ok(0),
-        })
-        .await
+        let Some(files) = self.inner.topic(topic, false)? else {
+            return Ok(0);
+        };
+        let (removed, persist) = lock(&files).trim_index(policy, now_ms);
+        if persist {
+            self.blocking(move |_| lock(&files).persist_trim()).await?;
+        }
+        Ok(removed)
     }
 
     /// Lists the topics with a log.

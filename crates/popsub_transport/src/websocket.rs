@@ -32,11 +32,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use popsub_auth::{
     AuthConfig, AuthError, AuthService, DefaultUserRole, InMemoryUserStore, UserStore,
 };
-use popsub_broker::{SharedBroker, close_message, session_key};
+use popsub_broker::{PublishSink, SharedBroker, close_message, session_key};
 use popsub_config::{LimitSettings, ServerSettings};
 use popsub_connection::{Client, Outbox, OutboxReceiver, Outgoing, QueueLimits};
 use popsub_ratelimit::{LoginRateLimiter, LoginStatus, RateLimiter, SlidingWindow, TokenBucket};
@@ -81,6 +81,94 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// How long a new connection has to finish the WebSocket handshake. Without
 /// a limit, sockets that never send one would hold connection slots forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many queued frames the send loop writes to a socket before flushing it.
+///
+/// Frames that are already waiting are written together, so a burst of deliveries costs one
+/// write to the socket instead of one each.
+const SEND_BATCH: usize = 256;
+
+/// How many frames a connection handles in a row before it looks at its
+/// timers and finished publishes again.
+const READ_BATCH: usize = 64;
+
+/// A `publish` frame, read straight into its fields.
+///
+/// `ClientFrame` is a flattened, tagged enum, which `serde` reads by first
+/// buffering every field. A publish is the busiest request there is, so it
+/// is tried in this shape first; see `parse_frame`.
+#[derive(serde::Deserialize)]
+struct PublishFrame<'a> {
+    /// The frame's `type`, which must be `publish`.
+    #[serde(rename = "type")]
+    kind: &'a str,
+    /// The request id.
+    #[serde(default)]
+    id: Option<RequestId>,
+    /// The topic to publish to.
+    topic: String,
+    /// The message body.
+    payload: String,
+    /// How the payload encodes the message's bytes, if it isn't the text itself.
+    #[serde(default)]
+    encoding: Option<Encoding>,
+    /// The publisher's idempotency key.
+    #[serde(default)]
+    message_id: Option<String>,
+    /// The delivery level.
+    #[serde(default)]
+    qos: Option<u8>,
+}
+
+/// Reads a client frame, trying the direct shape of a `publish` first.
+///
+/// A frame that mentions `"publish"` is read as a `PublishFrame`. When that
+/// works and its `type` is `publish`, the result is the same `ClientFrame`
+/// the general parser would give, since the fields have the same names and
+/// types. Anything else, including a publish with a field of the wrong type,
+/// goes through the general parser, so every other frame and every error is
+/// exactly as before.
+///
+/// Args:
+///     text: The frame's JSON text.
+///
+/// Returns:
+///     The frame.
+///
+/// Raises:
+///     serde_json::Error: When the text isn't a valid client frame.
+pub(crate) fn parse_frame(text: &str) -> serde_json::Result<ClientFrame> {
+    if text.contains("\"publish\"")
+        && let Ok(publish) = serde_json::from_str::<PublishFrame>(text)
+        && publish.kind == "publish"
+    {
+        return Ok(ClientFrame {
+            id: publish.id,
+            message: ClientMessage::Publish {
+                topic: publish.topic,
+                payload: publish.payload,
+                encoding: publish.encoding,
+                message_id: publish.message_id,
+                qos: publish.qos,
+            },
+        });
+    }
+    serde_json::from_str::<ClientFrame>(text)
+}
+
+/// The fields of a `publish` request.
+struct PublishRequest {
+    /// The topic to publish to.
+    topic: String,
+    /// The message body.
+    payload: String,
+    /// How the payload encodes the message's bytes, if it isn't the text itself.
+    encoding: Option<Encoding>,
+    /// The publisher's idempotency key.
+    message_id: Option<String>,
+    /// The delivery level, 0 or 1. Defaults to 0.
+    qos: Option<u8>,
+}
 
 /// How long before a connection's token expires the client is sent `auth_expiring`.
 const AUTH_EXPIRY_WARNING: Duration = Duration::from_secs(60);
@@ -734,10 +822,12 @@ impl Server {
         spawn_send_loop(ws_sender, rx, client_id.clone(), cleanup.clone());
 
         let heartbeat = self.heartbeat;
+        let sink = self.broker.publish_sink(outbox.clone());
         let session = Session {
             server: self,
             client_id,
             client_ip: client_ip.to_string(),
+            sink,
             outbox,
             auth: Mutex::new(AuthState::default()),
         };
@@ -749,21 +839,37 @@ impl Server {
             let (warn_at, expire_at) = session.token_deadlines();
             let never = Instant::now() + Duration::from_secs(365 * 24 * 3600);
             tokio::select! {
-                frame = ws_receiver.next() => {
-                    let frame = match frame {
-                        Some(Ok(frame)) => frame,
-                        Some(Err(tungstenite::Error::Capacity(e))) => {
-                            warn!(client_id = %session.client_id, %e, "frame too large");
-                            break Flow::Close(CloseCode::MessageTooBig);
+                frame = ws_receiver.next(), if !session.sink.is_full() => {
+                    let mut next = frame;
+                    let mut handled = 0;
+                    let ending = loop {
+                        let frame = match next {
+                            Some(Ok(frame)) => frame,
+                            Some(Err(tungstenite::Error::Capacity(e))) => {
+                                warn!(client_id = %session.client_id, %e, "frame too large");
+                                break Some(Flow::Close(CloseCode::MessageTooBig));
+                            }
+                            _ => break Some(Flow::Stop),
+                        };
+                        match session.on_frame(frame).await {
+                            Flow::Continue => {}
+                            ending => break Some(ending),
                         }
-                        _ => break Flow::Stop,
+                        handled += 1;
+                        if handled >= READ_BATCH || session.sink.is_full() {
+                            break None;
+                        }
+                        match ws_receiver.next().now_or_never() {
+                            Some(frame) => next = frame,
+                            None => break None,
+                        }
                     };
                     last_heard = Instant::now();
-                    match session.on_frame(frame).await {
-                        Flow::Continue => {}
-                        ending => break ending,
+                    if let Some(ending) = ending {
+                        break ending;
                     }
                 }
+                () = session.sink.has_room(), if session.sink.is_full() => {}
                 _ = ticker.tick() => {
                     if last_heard.elapsed() >= heartbeat.idle_timeout {
                         info!(client_id = %session.client_id, "closing an idle connection");
@@ -963,6 +1069,11 @@ struct AuthState {
     expires_at_ms: Option<i64>,
     /// Whether `auth_expiring` was already sent for the current token.
     warned: bool,
+    /// The account this connection authenticated as, once it has.
+    username: Option<String>,
+    /// The last topic this connection was allowed to publish to, and the
+    /// user store's revision at the time.
+    publish_grant: Option<(u64, String)>,
 }
 
 /// The current time in milliseconds since the Unix epoch.
@@ -1027,9 +1138,27 @@ impl ClientCleanup {
     }
 }
 
+/// Queues a reply on a connection's outgoing channel.
+///
+/// Args:
+///     outbox: The connection's outgoing queue.
+///     id: The id of the request being answered, if it had one.
+///     message: The reply.
+///
+/// Raises:
+///     PopSubError::Serialization: When the reply can't be serialised.
+///     PopSubError::Client: When the outgoing queue is closed or full.
+fn queue_reply(outbox: &Outbox, id: Option<RequestId>, message: ServerMessage) -> Result<()> {
+    let json = serde_json::to_string(&ServerFrame::reply(id, message))?;
+    outbox
+        .send(WsMessage::Text(json.into()))
+        .map_err(|e| PopSubError::Client(format!("outgoing queue refused a reply: {e:?}")))
+}
+
 /// Spawns a task that writes a client's outgoing queue to its WebSocket.
 ///
-/// Frames are written in order. When the `Outbox` closes, the close frame
+/// Frames are written in order. Frames already waiting, up to `SEND_BATCH`,
+/// are written together and flushed once. When the `Outbox` closes, the close frame
 /// is written (after the backlog, unless it is a slow consumer) and the task
 /// stops; it also stops when a write fails or every `Outbox` is dropped.
 /// Then it runs `cleanup`.
@@ -1048,12 +1177,29 @@ fn spawn_send_loop<S>(
     S: futures_util::Sink<WsMessage, Error = tungstenite::Error> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(next) = rx.recv().await {
-            let (frame, last) = match next {
-                Outgoing::Frame(frame) => (frame, false),
-                Outgoing::Close(code) => (close_message(code), true),
-            };
-            if let Err(e) = ws_sender.send(frame).await {
+        'connection: while let Some(first) = rx.recv().await {
+            let mut next = Some(first);
+            let mut last = false;
+            let mut queued = 0;
+            while let Some(outgoing) = next.take() {
+                let frame = match outgoing {
+                    Outgoing::Frame(frame) => frame,
+                    Outgoing::Close(code) => {
+                        last = true;
+                        close_message(code)
+                    }
+                };
+                if let Err(e) = ws_sender.feed(frame).await {
+                    warn!(client_id = %client_id, %e, "failed to write to socket");
+                    break 'connection;
+                }
+                queued += 1;
+                if last || queued >= SEND_BATCH {
+                    break;
+                }
+                next = rx.try_recv();
+            }
+            if let Err(e) = ws_sender.flush().await {
                 warn!(client_id = %client_id, %e, "failed to write to socket");
                 break;
             }
@@ -1077,6 +1223,9 @@ struct Session {
     client_ip: String,
     /// This connection's outgoing queue. Replies are queued here directly.
     outbox: Outbox,
+    /// Where this connection's publishes go, and the count of those that
+    /// haven't been stored yet.
+    sink: Arc<PublishSink>,
     /// The session id and token expiry from `auth`.
     auth: Mutex<AuthState>,
 }
@@ -1090,6 +1239,13 @@ impl Session {
     /// without a close frame of our own. Binary, ping and pong frames need
     /// no handling. A handler failure gets an `internal` error and closes
     /// the connection with `CloseCode::InternalError`.
+    ///
+    /// A publish is queued for its topic and the connection moves on to the
+    /// next frame without waiting for it to be stored; the topic's writer
+    /// answers the client through the session's `PublishSink`. Any request
+    /// other than a publish, an acknowledgement or a ping first waits for the
+    /// connection's publishes to finish, so it sees everything this
+    /// connection published before it.
     ///
     /// Args:
     ///     frame: The frame.
@@ -1106,7 +1262,7 @@ impl Session {
             }
             _ => return Flow::Continue,
         };
-        let parsed = match serde_json::from_str::<ClientFrame>(&text) {
+        let parsed = match parse_frame(&text) {
             Ok(parsed) => parsed,
             Err(err) => {
                 warn!(
@@ -1130,7 +1286,18 @@ impl Session {
                 };
             }
         };
-        let outcome = if matches!(parsed.message, ClientMessage::Ack { .. }) {
+        if !matches!(
+            parsed.message,
+            ClientMessage::Publish { .. } | ClientMessage::Ack { .. } | ClientMessage::Ping {}
+        ) {
+            self.sink.drained().await;
+        }
+        let unspanned = match parsed.message {
+            ClientMessage::Ack { .. } => true,
+            ClientMessage::Publish { .. } => !popsub_utils::logging::publish_spans(),
+            _ => false,
+        };
+        let outcome = if unspanned {
             self.handle(parsed).await
         } else {
             let kind = parsed.message.kind();
@@ -1259,8 +1426,14 @@ impl Session {
                 message_id,
                 qos,
             } => {
-                self.publish(id, &topic, payload, encoding, message_id, qos)
-                    .await
+                let request = PublishRequest {
+                    topic,
+                    payload,
+                    encoding,
+                    message_id,
+                    qos,
+                };
+                self.publish(id, request).await
             }
             ClientMessage::Ack { topic, seq } => self.ack(&topic, seq).await,
             ClientMessage::Ping {} => {
@@ -1292,10 +1465,7 @@ impl Session {
     ///     PopSubError::Serialization: When the frame can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
     fn reply(&self, id: Option<&RequestId>, message: ServerMessage) -> Result<()> {
-        let json = serde_json::to_string(&ServerFrame::reply(id.cloned(), message))?;
-        self.outbox
-            .send(WsMessage::Text(json.into()))
-            .map_err(|e| PopSubError::Client(format!("outgoing queue refused a reply: {e:?}")))
+        queue_reply(&self.outbox, id.cloned(), message)
     }
 
     /// Queues an `error` reply.
@@ -1330,12 +1500,55 @@ impl Session {
         )
     }
 
+    /// Decides whether this connection's user may publish to a topic.
+    ///
+    /// The account is read from the user store the first time, and again
+    /// whenever the topic differs from the last one allowed or any account
+    /// has changed since (`AuthService::users_revision`). So a connection
+    /// publishing to one topic doesn't read its account for every message,
+    /// and a revoked grant or a disabled account still refuses the next
+    /// publish. Refusals are never remembered. With a user store that has no
+    /// revision the account is read every time.
+    ///
+    /// The revision is read before the account, so an answer worked out
+    /// while an account was changing is kept under the old revision and
+    /// checked again next time.
+    ///
+    /// Args:
+    ///     username: The account this connection authenticated as.
+    ///     topic: The topic to publish to.
+    ///
+    /// Returns:
+    ///     True when the publish is allowed.
+    async fn may_publish(&self, username: &str, topic: &str) -> bool {
+        let revision = self.server.auth.users_revision();
+        if let Some(revision) = revision
+            && self
+                .auth_state()
+                .publish_grant
+                .as_ref()
+                .is_some_and(|(at, allowed)| *at == revision && allowed == topic)
+        {
+            return true;
+        }
+        let allowed = self.server.auth.can_publish(username, topic).await;
+        if allowed && let Some(revision) = revision {
+            self.auth_state().publish_grant = Some((revision, topic.to_string()));
+        }
+        allowed
+    }
+
     /// Returns the authenticated user, or tells the client to authenticate first.
     ///
     /// Every handler except `register`, `login` and `auth` starts here. A
     /// client that hasn't authenticated gets an `unauthenticated` error and
     /// its connection is closed with `CloseCode::Unauthenticated`; one that
     /// is no longer registered (taken over) is stopped without another close.
+    ///
+    /// Once `auth` has succeeded the session keeps its own copy of the
+    /// username, so an open, authenticated connection is answered without
+    /// taking the broker lock. A connection that is closing falls through to
+    /// the broker's record.
     ///
     /// Args:
     ///     id: The id of the request being handled.
@@ -1352,6 +1565,11 @@ impl Session {
         id: Option<&RequestId>,
         action: &str,
     ) -> Result<std::result::Result<String, Flow>> {
+        if self.outbox.closing().is_none()
+            && let Some(username) = self.auth_state().username.clone()
+        {
+            return Ok(Ok(username));
+        }
         let state = self.server.broker.with(|broker| {
             broker
                 .clients
@@ -1644,6 +1862,7 @@ impl Session {
             return Ok(Flow::Stop);
         }
         self.set_token_expiry(claims.exp);
+        self.auth_state().username = Some(username.clone());
         self.auth_state().session_id = session_id.map(str::to_string);
         let limits = self.server.limits();
         let Some(session_id) = session_id else {
@@ -2057,24 +2276,25 @@ impl Session {
     /// permission, then the rate limit, so neither a malformed nor a denied
     /// publish uses up the user's allowance. A denied publish gets
     /// `not_authorized` and a limited one `rate_limited` with `retry_after`;
-    /// both keep the connection open. The broker sets the publish time,
-    /// generates an id when `message_id` is missing, stores the record and
-    /// delivers it. A repeated `message_id` from the same user is stored and
-    /// delivered once. A QoS 1 publisher gets `published` with the id and
-    /// `seq` once the record is stored at the configured durability (the
-    /// original `seq` for a retry). If storage fails, the publisher gets
-    /// `storage_unavailable` whatever the QoS, so it knows nothing was sent.
+    /// both keep the connection open. The broker sets the publish time and
+    /// queues the record for its topic's writer, which stores and delivers
+    /// it; a record with no `message_id` is given a random one by storage.
+    /// A repeated `message_id` from the same user is stored and delivered
+    /// once.
+    ///
+    /// This returns as soon as the record is queued. The topic's writer
+    /// answers the client through the session's `PublishSink`: a QoS 1
+    /// publisher gets `published` with the id and `seq` once the record is
+    /// stored at the configured durability (the original `seq` for a
+    /// retry), and if storage fails the publisher gets `storage_unavailable`
+    /// whatever the QoS, so it knows nothing was sent. Publishes to one
+    /// topic are stored in the order they were sent.
     ///
     /// Args:
     ///     id: The request id.
-    ///     topic: The topic to publish to.
-    ///     payload: The message body.
-    ///     encoding: How the payload encodes the message's bytes, if it
-    ///         isn't the text itself. A payload that isn't valid in it is
-    ///         refused with `bad_request`.
-    ///     message_id: The publisher's idempotency key.
-    ///     qos: The delivery level, 0 or 1. Defaults to 0; any other value is
-    ///         refused with `bad_request`.
+    ///     request: The topic, payload, encoding, message id and QoS. An
+    ///         encoding the payload isn't valid in, or a QoS other than 0 or
+    ///         1, is refused with `bad_request`.
     ///
     /// Returns:
     ///     A closing flow when the client isn't authenticated, otherwise
@@ -2083,15 +2303,15 @@ impl Session {
     /// Raises:
     ///     PopSubError::Serialization: When a reply can't be serialised.
     ///     PopSubError::Client: When the outgoing channel is closed.
-    async fn publish(
-        &self,
-        id: Option<&RequestId>,
-        topic: &str,
-        payload: String,
-        encoding: Option<Encoding>,
-        message_id: Option<String>,
-        qos: Option<u8>,
-    ) -> Result<Flow> {
+    async fn publish(&self, id: Option<&RequestId>, request: PublishRequest) -> Result<Flow> {
+        let PublishRequest {
+            topic,
+            payload,
+            encoding,
+            message_id,
+            qos,
+        } = request;
+        let topic = topic.as_str();
         let username = match self.require_user(id, "publish")? {
             Ok(username) => username,
             Err(flow) => return Ok(flow),
@@ -2138,7 +2358,7 @@ impl Session {
             )?;
             return Ok(Flow::Continue);
         }
-        if !self.server.auth.can_publish(&username, topic).await {
+        if !self.may_publish(&username, topic).await {
             warn!(client_id = %self.client_id, username = %pii(&username), topic, "publish denied");
             self.fail(
                 id,
@@ -2171,36 +2391,9 @@ impl Session {
             qos,
             published_at_ms: 0,
         };
-        match self.server.broker.publish(topic, record).await {
-            Ok(published) => {
-                info!(
-                    client_id = %self.client_id,
-                    username = %pii(&username),
-                    topic,
-                    seq = published.seq,
-                    duplicate = published.duplicate,
-                    "published"
-                );
-                if qos == 1 {
-                    self.reply(
-                        id,
-                        ServerMessage::Published {
-                            message_id: published.message_id,
-                            seq: published.seq,
-                        },
-                    )?;
-                }
-            }
-            Err(e) => {
-                error!(client_id = %self.client_id, username = %pii(&username), topic, qos, %e, "publish not stored");
-                self.fail(
-                    id,
-                    ErrorCode::StorageUnavailable,
-                    "storage unavailable, nothing was published",
-                    None,
-                )?;
-            }
-        }
+        self.server
+            .broker
+            .publish_from(&self.sink, topic, record, id.cloned());
         Ok(Flow::Continue)
     }
 

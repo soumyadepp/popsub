@@ -52,7 +52,7 @@ pub(crate) struct LogIndex<T> {
     /// The total `size` of `entries`.
     bytes: u64,
     /// Maps each retained record's retry key to its `seq`.
-    ids: HashMap<RetryKey, u64>,
+    ids: HashMap<RetryKey, u64, ahash::RandomState>,
 }
 
 impl<T> Default for LogIndex<T> {
@@ -83,7 +83,7 @@ impl<T> LogIndex<T> {
             last_seq,
             last_published_at_ms,
             bytes: 0,
-            ids: HashMap::new(),
+            ids: HashMap::default(),
         }
     }
 
@@ -114,6 +114,9 @@ impl<T> LogIndex<T> {
     /// Returns:
     ///     The original entry, if there is one.
     pub(crate) fn duplicate_of(&self, record: &NewRecord) -> Option<&Entry<T>> {
+        if record.message_id.is_empty() {
+            return None;
+        }
         let seq = *self
             .ids
             .get(&(record.publisher.clone(), record.message_id.clone()))?;
@@ -145,7 +148,9 @@ impl<T> LogIndex<T> {
         self.last_seq = slot.seq;
         self.last_published_at_ms = slot.published_at_ms;
         self.bytes += size;
-        self.ids.insert(key.clone(), slot.seq);
+        if !key.1.is_empty() {
+            self.ids.insert(key.clone(), slot.seq);
+        }
         self.entries.push_back(Entry {
             seq: slot.seq,
             published_at_ms: slot.published_at_ms,
@@ -153,6 +158,26 @@ impl<T> LogIndex<T> {
             key,
             value,
         });
+    }
+
+    /// Takes back the newest records, for a backend whose write of them failed.
+    ///
+    /// Args:
+    ///     count: How many of the newest records to remove.
+    ///     last_seq: The log's last `seq` before they were pushed.
+    ///     last_published_at_ms: The log's last publish time before they were pushed.
+    pub(crate) fn rollback(&mut self, count: usize, last_seq: u64, last_published_at_ms: i64) {
+        for _ in 0..count {
+            let Some(entry) = self.entries.pop_back() else {
+                break;
+            };
+            self.bytes -= entry.size;
+            if self.ids.get(&entry.key) == Some(&entry.seq) {
+                self.ids.remove(&entry.key);
+            }
+        }
+        self.last_seq = last_seq;
+        self.last_published_at_ms = last_published_at_ms;
     }
 
     /// Looks up a retained record by `seq`.

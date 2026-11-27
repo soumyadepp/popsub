@@ -8,8 +8,11 @@ license = "Apache-2.0"
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-uuid = { version = "1.8", features = ["v4"] }
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
 chrono = { version = "0.4.41", features = ["serde"] }
+itoa = "1"
+ahash = "0.8"
+parking_lot = "0.12"
 
 popsub_connection = { path = "../popsub_connection" }
 popsub_config = { path = "../popsub_config" }
