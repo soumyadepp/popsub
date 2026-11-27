@@ -1,6 +1,6 @@
 [package]
 name = "popsub_protocol"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "The PopSub WebSocket protocol: every frame clients and the server exchange"
 license = "Apache-2.0"

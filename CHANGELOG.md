@@ -2,7 +2,7 @@
 
 Each release lists what changed for people running the server and people using a client library. Versions follow [Semantic Versioning](https://semver.org); while the version is 0.x, a minor release may change the protocol or a library's API, and the notes say so.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-11-27
 
 A performance release. The server stores and delivers many times more messages a second than 0.2.0 on the same machine; [`docs/BENCHMARKS.md`](https://github.com/soumyadepp/popsub/blob/main/docs/BENCHMARKS.md) has the numbers before and after, and beside NATS and Mosquitto. The protocol is unchanged and no client library changed. Four behaviours did change; read "Upgrading from 0.2.0" first.
 
