@@ -4,7 +4,9 @@
  *
  * One bar is the point (`focus`) and wears the accent colour; the rest are
  * context and stay grey. Every bar is named and carries its value, so
- * nothing depends on telling colours apart. The page that uses it keeps the
+ * nothing depends on telling colours apart. Bars grow in, one row after
+ * another, when the chart first scrolls into view; without script, or with
+ * reduced motion asked for, they are simply drawn. The page that uses it keeps the
  * exact numbers in a table for screen readers and anyone who wants them.
  */
 interface Row {
@@ -42,9 +44,10 @@ const width = (value: number) =>
   </figcaption>
   <div class="bar-chart-rows">
     {
-      rows.map((row) => (
+      rows.map((row, index) => (
         <div
           class:list={["bar-chart-row", { focus: row.focus }]}
+          style={`--row: ${index}`}
           title={`${row.name}: ${row.absent ?? row.label}`}
         >
           <span class="bar-chart-name">{row.name}</span>
@@ -63,6 +66,28 @@ const width = (value: number) =>
     }
   </div>
 </figure>
+
+<script>
+  const charts = document.querySelectorAll<HTMLElement>(".bar-chart");
+  const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!still && "IntersectionObserver" in window) {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("shown");
+            observer.unobserve(entry.target);
+          }
+        }
+      },
+      { threshold: 0.35 },
+    );
+    for (const chart of charts) {
+      chart.classList.add("animated");
+      observer.observe(chart);
+    }
+  }
+</script>
 
 <style>
   .bar-chart {
@@ -128,6 +153,25 @@ const width = (value: number) =>
   }
   .bar-chart-row.focus .bar-chart-bar {
     background: var(--focus);
+  }
+  .bar-chart.animated .bar-chart-bar {
+    transform: scaleX(0);
+    transform-origin: left center;
+  }
+  .bar-chart.animated .bar-chart-value,
+  .bar-chart.animated .bar-chart-absent {
+    opacity: 0;
+  }
+  .bar-chart.animated.shown .bar-chart-bar {
+    transform: scaleX(1);
+    transition: transform 0.9s cubic-bezier(0.22, 1, 0.36, 1);
+    transition-delay: calc(var(--row) * 0.12s);
+  }
+  .bar-chart.animated.shown .bar-chart-value,
+  .bar-chart.animated.shown .bar-chart-absent {
+    opacity: 1;
+    transition: opacity 0.4s ease;
+    transition-delay: calc(var(--row) * 0.12s + 0.55s);
   }
   .bar-chart-value,
   .bar-chart-absent {
