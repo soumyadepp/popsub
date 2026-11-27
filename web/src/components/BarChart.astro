@@ -2,8 +2,9 @@
 /**
  * A horizontal bar chart drawn at build time, with no script.
  *
- * One bar is the point (`focus`) and wears the accent colour; the rest are
- * context and stay grey. Every bar is named and carries its value, so
+ * Bars are sorted best first, by `better`, and rows with no value (`absent`)
+ * go last. One bar is the point (`focus`) and wears the accent colour; the
+ * rest are context and stay grey. Every bar is named and carries its value, so
  * nothing depends on telling colours apart. Bars grow in, one row after
  * another, when the chart first scrolls into view; without script, or with
  * reduced motion asked for, they are simply drawn. The page that uses it keeps the
@@ -27,11 +28,19 @@ interface Props {
   title: string;
   /** The unit, shown under the title. */
   unit: string;
-  /** The bars, in the order they should appear. */
+  /** The bars, in any order; they are drawn best first. */
   rows: Row[];
+  /** Whether a higher or a lower value is better. Defaults to higher. */
+  better?: "higher" | "lower";
 }
 
-const { title, unit, rows } = Astro.props;
+const { title, unit, rows: given, better = "higher" } = Astro.props;
+const rows = [...given].sort((a, b) => {
+  if (a.absent || b.absent) {
+    return Number(Boolean(a.absent)) - Number(Boolean(b.absent));
+  }
+  return better === "higher" ? b.value - a.value : a.value - b.value;
+});
 const max = Math.max(...rows.filter((r) => !r.absent).map((r) => r.value), 1);
 const width = (value: number) =>
   `calc((100% - 4.5rem) * ${Math.max(value / max, 0.006).toFixed(4)})`;
