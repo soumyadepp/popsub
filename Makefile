@@ -12,7 +12,7 @@ SERVER_ENV := SERVER_HOST=$(HOST) SERVER_PORT=$(PORT)
 .DEFAULT_GOAL := help
 
 .PHONY: help setup build release server server-release client demo \
-	test test-crate scenarios fmt fmt-check lint ci schema schema-check doc watch coverage reset-data clean
+	test test-crate scenarios bench fmt fmt-check lint ci schema schema-check doc watch coverage reset-data clean
 
 help:
 	@printf "PopSub make targets\n\n"
@@ -32,14 +32,15 @@ help:
 	@printf "    make lint            Clippy with warnings as errors\n"
 	@printf "    make ci              Exactly what GitHub Actions runs: fmt check, clippy, tests, schema check\n"
 	@printf "    make schema          Regenerate docs/protocol/*.json from the protocol types\n"
-	@printf "    make coverage        Coverage report (cargo-llvm-cov)\n\n"
+	@printf "    make coverage        Coverage report (cargo-llvm-cov)\n"
+	@printf "    make bench           Measure throughput and latency of a release build (BENCH=\"--scenario one-topic\")\n\n"
 	@printf "  Housekeeping\n"
 	@printf "    make build           Debug build\n"
 	@printf "    make release         Release build\n"
 	@printf "    make doc             Build and open the API docs\n"
 	@printf "    make reset-data      Delete stored messages and sessions ($(DATA_DIR), and the old pubsub_db)\n"
 	@printf "    make clean           cargo clean plus reset-data\n\n"
-	@printf "  Options: HOST, PORT, URL, CRATE, DRIVER, JOBS (parallel build jobs, lower it if builds run out of memory)\n"
+	@printf "  Options: HOST, PORT, URL, CRATE, DRIVER, BENCH, JOBS (parallel build jobs, lower it if builds run out of memory)\n"
 
 setup:
 	@command -v $(CARGO) >/dev/null || { echo "Rust is not installed. See https://rustup.rs"; exit 1; }
@@ -83,6 +84,12 @@ DRIVER ?= target/debug/popsub-sdk-driver
 scenarios:
 	$(CARGO) build -p popsub_scenarios $(JOBS_FLAG)
 	target/debug/popsub-scenarios --driver "$(DRIVER)"
+
+BENCH ?=
+
+bench:
+	$(CARGO) build --release -p popsub -p popsub_bench $(JOBS_FLAG)
+	ulimit -n 65536 2>/dev/null || ulimit -n 10240; target/release/popsub-bench $(BENCH)
 
 fmt:
 	$(CARGO) fmt --all

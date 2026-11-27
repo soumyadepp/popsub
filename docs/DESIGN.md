@@ -495,7 +495,7 @@ What stands between PopSub and production use by small applications and IoT devi
 
 **Running it**
 
-10. **No capacity numbers.** How many connections, topics and messages a second one box handles is unmeasured, including the cost of the single broker lock (section 8). Benchmarks are planned (section 13).
+10. **Capacity is measured on one machine only, and the run found limits.** `docs/BENCHMARKS.md` has the numbers from `make bench` on one laptop. It found four things to fix: with the default retention every publish to a full topic syncs the head file, which holds a busy topic to about 110 messages a second there; every publish writes an `INFO` log line through the standard output lock, which stops throughput growing with more topics; fan-out runs under the single broker lock (section 8), so a topic with 1,000 subscribers raises another topic's median latency from 0.2 ms to 5.8 ms; and `synced` durability does one sync per publish. Nothing is measured on Linux, over a real network, or against another broker.
 11. **Failure tests missing:** power loss, which killing the process does not simulate, and a consumer that never reads its socket until it hits the hard queue limit and is closed with `slow_consumer`, which is only unit tested. A subscriber that stops reading for a while is tested: it is paced from the log and catches up (section 14).
 12. **A renewed certificate needs a restart,** and there is no built-in ACME (Let's Encrypt).
 13. **Metrics are push only.** They go out over OTLP; there is no Prometheus endpoint to scrape.
@@ -536,7 +536,7 @@ Done: a per-address connection limit, `server.max_connections_per_address`, off 
 - Done: version 0.1.0, released by a tag-driven workflow (`docs/RELEASING.md`): server binaries, a container image on ghcr.io, and the client libraries on crates.io, npm, PyPI and Go modules.
 - Done: `/healthz` and `/readyz`, and OpenTelemetry metrics, traces and logs over OTLP (section 3.3).
 - Done: a dead-letter topic (`broker.dead_letter_topic`), wildcard and shared subscriptions, per-topic retention (`storage.topic_retention`), topic admin requests and `popsub topics`, base64 payloads (`encoding`), and `hold_resumed` on `auth`.
-- Published benchmarks against NATS and Redis pub/sub, including where PopSub loses.
+- Done: `popsub-bench` and `docs/BENCHMARKS.md`, a baseline for one server on one machine. Not done: the same loads against NATS and Redis pub/sub, including where PopSub loses.
 
 ### Later: clustering
 

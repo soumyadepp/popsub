@@ -332,6 +332,7 @@ admin.revoke("alice", "orders/#").await?;
 | `popsub` | The binary: `server`, a demo `client`, and `users` and `topics` for managing a running server |
 | `popsub_sdk` | The Rust client library |
 | `popsub_scenarios` | The scenario suite every client library must pass, and the Rust client's driver for it |
+| `popsub_bench` | The load generator behind [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) |
 | `popsub_protocol` | Every frame type, shared by the server and clients |
 | `popsub_transport` | The WebSocket server: authentication, permissions, rate limits, connection lifecycle |
 | `popsub_broker` | Topic writers, delivery, replay, acknowledgements, sessions |
@@ -349,6 +350,7 @@ make            # list every target
 make test       # all tests
 make ci         # the Rust checks CI runs: format check, clippy, tests, schema check
 make scenarios  # the client scenario suite, against the Rust client by default
+make bench      # throughput and latency of a release build; results in docs/BENCHMARKS.md
 make demo       # start a server, run the client against it, stop
 make schema     # regenerate docs/protocol/ after changing a protocol type
 ```
