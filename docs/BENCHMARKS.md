@@ -34,6 +34,7 @@ Against the other brokers, on the same machine in the same run:
 - **Deliveries a second** counts messages that arrived at subscribers inside the window, added up over all subscribers.
 - **Latency** is the time from a publish being sent to it arriving at a subscriber. It is only reported for publishers that are paced or wait for confirmation. A flat-out publisher fills its own socket, so its latency would mostly be time queued in the load generator.
 - **Server cores** is CPU time the broker used divided by the window's length. **Loadgen cores** is the same for the load generator.
+- Before each scenario the tool waits for the disk to go quiet (a `sync`, then until it writes less than 20 MB/s, for at most a minute). A scenario can write several gigabytes, and without the wait the next one measures the disk catching up.
 - After the window, publishers stop and the run waits for deliveries still on their way. A scenario that doesn't receive everything is listed under [Known limits](#known-limits).
 
 ### The machine
@@ -177,7 +178,8 @@ Opening, authenticating and subscribing 10,001 connections, 64 at a time, took P
 
 ## Known limits
 
-- **Throughput swings between runs.** With several busy topics, or large payloads, the same build gives a fast result or a slow one: `topics-8` between 1.3 and 4.7 million a second, `payload-16k` between 30,000 and 130,000. The slow level is close to the replay speed, which suggests subscribers that fall behind are being served from the log. This is not fixed.
+- **The numbers on this page were measured before two later fixes.** The run-to-run swing (eight topics between 1.3 and 4.7 million a second) came from the benchmark: each scenario started while the disk was still writing the gigabytes the previous one left. The tool now waits for a quiet disk, and records are stored in a smaller format; with both, eight topics gives about 4.5 million a second back to back. An SSD also slows down after tens of gigabytes of writes, so run the full set on a rested machine.
+- **16 KiB payloads are limited by the disk.** PopSub hands every message to the operating system before delivering it, so a crash of the server never loses a message a subscriber saw. When the disk falls behind, the operating system holds those writes up, and delivery waits with them. A broker that delivers from memory and writes in the background keeps going, at the cost of losing its latest messages if it crashes.
 - **A flat-out fan-out to 1,000 subscribers drops connections on macOS.** The broker can now write faster than the load generator reads, the kernel runs out of socket buffer space, and a write fails with `ENOBUFS`. PopSub closes that connection, because the write may have been partly sent. NATS core and JetStream lost deliveries in the same scenario. A client that reconnects with a durable session resumes from the log. This hasn't been run on Linux.
 - **`one-topic-memory` stopped early.** With the `memory` backend and everything retained, the server passed the benchmark's 6 GiB limit within the window: it now stores messages faster than the run can hold in memory.
 - **Many topics use a lot of CPU.** `topics-1000` and `wildcard-100` deliver 6 to 7 times what 0.2.0 did, but on 11 to 12 cores.

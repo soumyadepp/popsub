@@ -27,7 +27,7 @@ A performance release. The server stores and delivers many times more messages a
 
 ### Tools
 
-- `popsub-bench` (`make bench`) measures a release build: throughput, delivery latency, fan-out, replay, restart time, idle connections and isolation between topics. `--target nats`, `nats-jetstream` or `mosquitto` runs the comparable loads against those brokers.
+- `popsub-bench` (`make bench`) measures a release build: throughput, delivery latency, fan-out, replay, restart time, idle connections and isolation between topics. `--target nats`, `nats-jetstream` or `mosquitto` runs the comparable loads against those brokers. Before each scenario it waits for the disk to finish writing what the last one left, so one scenario doesn't slow the next.
 
 ## [0.2.0] - 2026-11-21
 
