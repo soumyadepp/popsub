@@ -501,8 +501,7 @@ What stands between PopSub and production use by small applications and IoT devi
 11. **Failure tests missing:** power loss, which killing the process does not simulate, and a consumer that never reads its socket until it hits the hard queue limit and is closed with `slow_consumer`, which is only unit tested. A subscriber that stops reading for a while is tested: it is paced from the log and catches up (section 14).
 12. **A renewed certificate needs a restart,** and there is no built-in ACME (Let's Encrypt).
 13. **Metrics are push only.** They go out over OTLP; there is no Prometheus endpoint to scrape.
-14. **Security process.** No `SECURITY.md` saying how to report a vulnerability, and no fuzzing of the frame parser, which faces the network.
-15. **No mobile or embedded clients** (Swift, Kotlin, C, MicroPython). For devices, MQTT (5) matters more.
+14. **No mobile or embedded clients** (Swift, Kotlin, C, MicroPython). For devices, MQTT (5) matters more.
 
 ## 13. Proposed direction
 
@@ -554,6 +553,7 @@ Replicate topic logs across three nodes with Raft (for example `openraft`). Only
   - The `file` backend runs the same conformance suite with 256-byte segments, plus tests for torn writes, damaged segments, trimming across reopens, the directory lock and the session log. A crash test runs a child process that appends with `synced` durability, kills it at random points over four rounds, and checks every confirmed record is readable. A WebSocket test stops a whole server and starts a new one on the same directory, and a durable session resumes from its cursor.
 - The client scenario suite (`popsub_scenarios`, 21 scenarios) starts a real server per scenario and drives a client library through its driver. `make test` runs it against `popsub_sdk`, and the `Clients` workflow runs it against the TypeScript, Python and Go clients.
 - CI runs `cargo fmt --check`, `cargo clippy -D warnings`, a build, the tests and the protocol schema check on pushes to `main`, `feat/*`, `feature/*` and `fix/*`, and on every pull request. `make ci` runs the same locally.
+- Two fuzz targets in `fuzz/` (cargo-fuzz, nightly Rust) cover the parsers that read raw network input. `client_frame` runs every input through `parse_frame` and checks it agrees with the general `ClientFrame` parser, then through `salvage_request_id`. `proxy_header` runs every input through `read_proxy_header`. The `Fuzz` workflow runs each for five minutes on pull requests that touch `popsub_protocol`, `popsub_transport` or `fuzz/`, and for 30 minutes every week. `make fuzz FUZZ_TARGET=client_frame` runs one locally.
 - Missing: a consumer that never reads its socket, hitting the hard queue limit and being closed with `slow_consumer`, end to end (the close is only unit tested in `popsub_connection`), and power-loss testing (killing a process doesn't lose what the operating system has buffered).
 
 ## 15. Why these choices

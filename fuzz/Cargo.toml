@@ -1,0 +1,33 @@
+[package]
+name = "popsub-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+popsub_protocol = { path = "../crates/popsub_protocol" }
+popsub_transport = { path = "../crates/popsub_transport" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "client_frame"
+path = "fuzz_targets/client_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_header"
+path = "fuzz_targets/proxy_header.rs"
+test = false
+doc = false
+bench = false

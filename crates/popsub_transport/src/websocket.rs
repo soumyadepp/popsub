@@ -143,9 +143,12 @@ struct PublishFrame<'a> {
 /// Returns:
 ///     The frame.
 ///
+/// Public so the fuzz targets in `fuzz/` can call it; the server is its only
+/// other caller.
+///
 /// Raises:
 ///     serde_json::Error: When the text isn't a valid client frame.
-pub(crate) fn parse_frame(text: &str) -> serde_json::Result<ClientFrame> {
+pub fn parse_frame(text: &str) -> serde_json::Result<ClientFrame> {
     if text.contains("\"publish\"")
         && let Ok(publish) = serde_json::from_str::<PublishFrame>(text)
         && publish.kind == "publish"
@@ -2440,9 +2443,12 @@ impl Session {
 /// Args:
 ///     text: The frame as received.
 ///
+/// Public so the fuzz targets in `fuzz/` can call it; the server is its only
+/// other caller.
+///
 /// Returns:
 ///     The id, when the text is a JSON object with a valid `id`.
-fn salvage_request_id(text: &str) -> Option<RequestId> {
+pub fn salvage_request_id(text: &str) -> Option<RequestId> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     serde_json::from_value(value.get("id")?.clone()).ok()
 }
