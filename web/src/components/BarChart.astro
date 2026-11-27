@@ -4,8 +4,10 @@
  *
  * One bar is the point (`focus`) and wears the accent colour; the rest are
  * context and stay grey. Every bar is named and carries its value, so
- * nothing depends on telling colours apart, and the table the numbers came
- * from sits under the chart for screen readers and anyone who wants it.
+ * nothing depends on telling colours apart. Bars grow in, one row after
+ * another, when the chart first scrolls into view; without script, or with
+ * reduced motion asked for, they are simply drawn. The page that uses it keeps the
+ * exact numbers in a table for screen readers and anyone who wants them.
  */
 interface Row {
   /** What the bar measures, such as a broker's name. */
@@ -42,9 +44,10 @@ const width = (value: number) =>
   </figcaption>
   <div class="bar-chart-rows">
     {
-      rows.map((row) => (
+      rows.map((row, index) => (
         <div
           class:list={["bar-chart-row", { focus: row.focus }]}
+          style={`--row: ${index}`}
           title={`${row.name}: ${row.absent ?? row.label}`}
         >
           <span class="bar-chart-name">{row.name}</span>
@@ -62,40 +65,48 @@ const width = (value: number) =>
       ))
     }
   </div>
-  <details class="bar-chart-table">
-    <summary>Show the numbers</summary>
-    <table>
-      <thead>
-        <tr><th>{title.split(",")[0]}</th><th>{unit}</th></tr>
-      </thead>
-      <tbody>
-        {rows.map((row) => (
-          <tr><td>{row.name}</td><td>{row.absent ?? row.value.toLocaleString("en-US")}</td></tr>
-        ))}
-      </tbody>
-    </table>
-  </details>
 </figure>
+
+<script>
+  const charts = document.querySelectorAll<HTMLElement>(".bar-chart");
+  const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!still && "IntersectionObserver" in window) {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("shown");
+            observer.unobserve(entry.target);
+          }
+        }
+      },
+      { threshold: 0.35 },
+    );
+    for (const chart of charts) {
+      chart.classList.add("animated");
+      observer.observe(chart);
+    }
+  }
+</script>
 
 <style>
   .bar-chart {
     --focus: #ec6a3c;
-    --context: #7a7a75;
+    --context: #4a4a46;
     margin: 0;
-    padding: 1rem 1.1rem 0.75rem;
-    border: 1px solid var(--pop-border);
-    border-radius: 12px;
-    background: var(--pop-panel);
   }
   :global(:root[data-theme="light"]) .bar-chart {
     --focus: #d9481c;
-    --context: #8a8a85;
+    --context: #c9c9c4;
   }
   figcaption {
     display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-    margin-bottom: 0.85rem;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-bottom: 0.6rem;
+    margin-bottom: 0.9rem;
+    border-bottom: 1px solid var(--pop-border);
   }
   .bar-chart-title {
     color: var(--pop-ink);
@@ -104,25 +115,24 @@ const width = (value: number) =>
   }
   .bar-chart-unit {
     color: var(--pop-muted);
-    font-size: 0.8rem;
+    font-size: 0.78rem;
+    white-space: nowrap;
   }
   .bar-chart-rows {
     display: grid;
-    gap: 0.5rem;
+    gap: 0.7rem;
   }
   .bar-chart-row {
     display: grid;
-    grid-template-columns: 7.5rem minmax(0, 1fr);
+    grid-template-columns: 5.75rem minmax(0, 1fr);
     align-items: center;
     gap: 0.75rem;
     margin: 0;
   }
   .bar-chart-name {
-    color: var(--pop-text);
+    color: var(--pop-muted);
     font-size: 0.85rem;
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
   .bar-chart-row.focus .bar-chart-name {
     color: var(--pop-ink);
@@ -131,12 +141,12 @@ const width = (value: number) =>
   .bar-chart-track {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.55rem;
     min-width: 0;
   }
   .bar-chart-bar {
     display: block;
-    height: 14px;
+    height: 10px;
     border-radius: 0 4px 4px 0;
     background: var(--context);
     flex: 0 0 auto;
@@ -144,14 +154,29 @@ const width = (value: number) =>
   .bar-chart-row.focus .bar-chart-bar {
     background: var(--focus);
   }
-  .bar-chart-row:hover .bar-chart-bar {
-    outline: 2px solid var(--pop-border-strong);
-    outline-offset: 1px;
+  .bar-chart.animated .bar-chart-bar {
+    transform: scaleX(0);
+    transform-origin: left center;
+  }
+  .bar-chart.animated .bar-chart-value,
+  .bar-chart.animated .bar-chart-absent {
+    opacity: 0;
+  }
+  .bar-chart.animated.shown .bar-chart-bar {
+    transform: scaleX(1);
+    transition: transform 0.9s cubic-bezier(0.22, 1, 0.36, 1);
+    transition-delay: calc(var(--row) * 0.12s);
+  }
+  .bar-chart.animated.shown .bar-chart-value,
+  .bar-chart.animated.shown .bar-chart-absent {
+    opacity: 1;
+    transition: opacity 0.4s ease;
+    transition-delay: calc(var(--row) * 0.12s + 0.55s);
   }
   .bar-chart-value,
   .bar-chart-absent {
-    color: var(--pop-text);
-    font-size: 0.8rem;
+    color: var(--pop-muted);
+    font-size: 0.82rem;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
@@ -160,24 +185,6 @@ const width = (value: number) =>
     font-weight: 600;
   }
   .bar-chart-absent {
-    color: var(--pop-muted);
     font-style: italic;
-  }
-  .bar-chart-table {
-    margin-top: 0.75rem;
-    font-size: 0.8rem;
-  }
-  .bar-chart-table summary {
-    color: var(--pop-muted);
-    cursor: pointer;
-  }
-  .bar-chart-table table {
-    margin-top: 0.5rem;
-  }
-  @media (max-width: 30rem) {
-    .bar-chart-row {
-      grid-template-columns: 5.5rem minmax(0, 1fr);
-      gap: 0.5rem;
-    }
   }
 </style>

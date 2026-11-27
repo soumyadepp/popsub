@@ -6,70 +6,9 @@ description: What one PopSub server handles on one machine, and how it compares 
 import BarChart from "../../../components/BarChart.astro";
 
 <p class="lede">
-  Measured on one laptop with <code>popsub-bench</code>, beside NATS and Mosquitto running the same
-  loads. The wins and the losses are both here.
+  One PopSub server beside NATS and Mosquitto, running the same loads on the same machine.
+  Every message PopSub handles here is stored on disk before it is delivered.
 </p>
-
-## The short version
-
-PopSub 0.3.0 against the previous release, on the same machine.
-
-<div class="chart-grid">
-  <BarChart
-    title="One topic, flat out"
-    unit="messages a second"
-    rows={[
-      { name: "PopSub 0.3.0", value: 1901314, label: "1.9M", focus: true },
-      { name: "PopSub 0.2.0", value: 32772, label: "33K" },
-    ]}
-  />
-  <BarChart
-    title="Confirmed publishing (QoS 1)"
-    unit="messages a second"
-    rows={[
-      { name: "PopSub 0.3.0", value: 369310, label: "369K", focus: true },
-      { name: "PopSub 0.2.0", value: 24785, label: "25K" },
-    ]}
-  />
-  <BarChart
-    title="Eight topics at once"
-    unit="messages a second"
-    rows={[
-      { name: "PopSub 0.3.0", value: 5186172, label: "5.2M", focus: true },
-      { name: "PopSub 0.2.0", value: 68220, label: "68K" },
-    ]}
-  />
-  <BarChart
-    title="One topic to 100 subscribers"
-    unit="deliveries a second"
-    rows={[
-      { name: "PopSub 0.3.0", value: 13695946, label: "13.7M", focus: true },
-      { name: "PopSub 0.2.0", value: 553758, label: "554K" },
-    ]}
-  />
-  <BarChart
-    title="Replaying stored history"
-    unit="messages a second"
-    rows={[
-      { name: "PopSub 0.3.0", value: 2682615, label: "2.7M", focus: true },
-      { name: "PopSub 0.2.0", value: 496312, label: "496K" },
-    ]}
-  />
-  <BarChart
-    title="10,000 idle connections"
-    unit="memory, lower is better"
-    rows={[
-      { name: "PopSub 0.3.0", value: 384, label: "384 MiB", focus: true },
-      { name: "PopSub 0.2.0", value: 1027, label: "1,027 MiB" },
-    ]}
-  />
-</div>
-
-Every message is stored on disk before it is delivered, in all of these.
-
-## Beside other brokers
-
-Same machine, same run, 128-byte messages. Longer is better, except for memory.
 
 <div class="chart-grid">
   <BarChart
@@ -80,16 +19,6 @@ Same machine, same run, 128-byte messages. Longer is better, except for memory.
       { name: "JetStream", value: 1542922, label: "1.5M" },
       { name: "NATS core", value: 3360014, label: "3.4M" },
       { name: "Mosquitto", value: 339923, label: "340K" },
-    ]}
-  />
-  <BarChart
-    title="Eight publishers, one topic"
-    unit="messages a second"
-    rows={[
-      { name: "PopSub", value: 2267515, label: "2.3M", focus: true },
-      { name: "JetStream", value: 1461050, label: "1.5M" },
-      { name: "NATS core", value: 1939848, label: "1.9M" },
-      { name: "Mosquitto", value: 346136, label: "346K" },
     ]}
   />
   <BarChart
@@ -122,19 +51,25 @@ Same machine, same run, 128-byte messages. Longer is better, except for memory.
       { name: "Mosquitto", value: 187123, label: "187K" },
     ]}
   />
-  <BarChart
-    title="10,000 idle connections"
-    unit="memory, lower is better"
-    rows={[
-      { name: "PopSub", value: 384, label: "384 MiB", focus: true },
-      { name: "JetStream", value: 603, label: "603 MiB" },
-      { name: "NATS core", value: 546, label: "546 MiB" },
-      { name: "Mosquitto", value: 53, label: "53 MiB" },
-    ]}
-  />
 </div>
 
-NATS core and Mosquitto don't store messages here. JetStream does, like PopSub.
+NATS core and Mosquitto don't store messages in these tests. JetStream does, like PopSub. With
+10,000 idle connections PopSub used 384 MiB, against 546 for NATS core, 603 for JetStream and 53
+for Mosquitto.
+
+<details>
+<summary>All the numbers</summary>
+
+| Test | PopSub | JetStream | NATS core | Mosquitto |
+|---|---:|---:|---:|---:|
+| One topic, messages a second | 1,901,314 | 1,542,922 | 3,360,014 | 339,923 |
+| Eight publishers, one topic | 2,267,515 | 1,461,050 | 1,939,848 | 346,136 |
+| Eight topics | 5,186,172 | 1,961,965 | 4,502,057 | 352,791 |
+| Fan-out to 100, deliveries a second | 13,695,946 | 3,528,342 | 2,969,895 | 385,785 |
+| Confirmed publishing, messages a second | 369,310 | 291,954 | not offered | 187,123 |
+| 10,000 idle connections, MiB | 384 | 603 | 546 | 53 |
+
+</details>
 
 ## Where PopSub loses
 
@@ -146,7 +81,7 @@ NATS core and Mosquitto don't store messages here. JetStream does, like PopSub.
 
 ## How it was measured
 
-- Apple M4 Pro laptop, macOS, 2026-11-27. The load generator ran on the same machine.
+- 14 CPU cores and 24 GB of memory, with the broker's data on a local SSD. The load generator ran on the same machine.
 - Each broker speaks its own protocol, with no client library in between.
 - 2 seconds of warm-up, then 8 seconds measured, with a quiet disk before each test.
 - Not measured yet: Linux, a real network, TLS, or runs longer than a few seconds.
