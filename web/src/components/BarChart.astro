@@ -1,0 +1,183 @@
+---
+/**
+ * A horizontal bar chart drawn at build time, with no script.
+ *
+ * One bar is the point (`focus`) and wears the accent colour; the rest are
+ * context and stay grey. Every bar is named and carries its value, so
+ * nothing depends on telling colours apart, and the table the numbers came
+ * from sits under the chart for screen readers and anyone who wants it.
+ */
+interface Row {
+  /** What the bar measures, such as a broker's name. */
+  name: string;
+  /** The value that sets the bar's length. */
+  value: number;
+  /** The value as it should read, such as "1.9M". */
+  label: string;
+  /** Whether this is the bar the chart is about. */
+  focus?: boolean;
+  /** A short note shown instead of a bar, such as "not offered". */
+  absent?: string;
+}
+
+interface Props {
+  /** The chart's title: what is compared. */
+  title: string;
+  /** The unit, shown under the title. */
+  unit: string;
+  /** The bars, in the order they should appear. */
+  rows: Row[];
+}
+
+const { title, unit, rows } = Astro.props;
+const max = Math.max(...rows.filter((r) => !r.absent).map((r) => r.value), 1);
+const width = (value: number) =>
+  `calc((100% - 4.5rem) * ${Math.max(value / max, 0.006).toFixed(4)})`;
+---
+
+<figure class="bar-chart">
+  <figcaption>
+    <span class="bar-chart-title">{title}</span>
+    <span class="bar-chart-unit">{unit}</span>
+  </figcaption>
+  <div class="bar-chart-rows">
+    {
+      rows.map((row) => (
+        <div
+          class:list={["bar-chart-row", { focus: row.focus }]}
+          title={`${row.name}: ${row.absent ?? row.label}`}
+        >
+          <span class="bar-chart-name">{row.name}</span>
+          <span class="bar-chart-track">
+            {row.absent ? (
+              <span class="bar-chart-absent">{row.absent}</span>
+            ) : (
+              <>
+                <span class="bar-chart-bar" style={`width: ${width(row.value)}`} />
+                <span class="bar-chart-value">{row.label}</span>
+              </>
+            )}
+          </span>
+        </div>
+      ))
+    }
+  </div>
+  <details class="bar-chart-table">
+    <summary>Show the numbers</summary>
+    <table>
+      <thead>
+        <tr><th>{title.split(",")[0]}</th><th>{unit}</th></tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => (
+          <tr><td>{row.name}</td><td>{row.absent ?? row.value.toLocaleString("en-US")}</td></tr>
+        ))}
+      </tbody>
+    </table>
+  </details>
+</figure>
+
+<style>
+  .bar-chart {
+    --focus: #ec6a3c;
+    --context: #7a7a75;
+    margin: 0;
+    padding: 1rem 1.1rem 0.75rem;
+    border: 1px solid var(--pop-border);
+    border-radius: 12px;
+    background: var(--pop-panel);
+  }
+  :global(:root[data-theme="light"]) .bar-chart {
+    --focus: #d9481c;
+    --context: #8a8a85;
+  }
+  figcaption {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    margin-bottom: 0.85rem;
+  }
+  .bar-chart-title {
+    color: var(--pop-ink);
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .bar-chart-unit {
+    color: var(--pop-muted);
+    font-size: 0.8rem;
+  }
+  .bar-chart-rows {
+    display: grid;
+    gap: 0.5rem;
+  }
+  .bar-chart-row {
+    display: grid;
+    grid-template-columns: 7.5rem minmax(0, 1fr);
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0;
+  }
+  .bar-chart-name {
+    color: var(--pop-text);
+    font-size: 0.85rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .bar-chart-row.focus .bar-chart-name {
+    color: var(--pop-ink);
+    font-weight: 600;
+  }
+  .bar-chart-track {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+  .bar-chart-bar {
+    display: block;
+    height: 14px;
+    border-radius: 0 4px 4px 0;
+    background: var(--context);
+    flex: 0 0 auto;
+  }
+  .bar-chart-row.focus .bar-chart-bar {
+    background: var(--focus);
+  }
+  .bar-chart-row:hover .bar-chart-bar {
+    outline: 2px solid var(--pop-border-strong);
+    outline-offset: 1px;
+  }
+  .bar-chart-value,
+  .bar-chart-absent {
+    color: var(--pop-text);
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .bar-chart-row.focus .bar-chart-value {
+    color: var(--pop-ink);
+    font-weight: 600;
+  }
+  .bar-chart-absent {
+    color: var(--pop-muted);
+    font-style: italic;
+  }
+  .bar-chart-table {
+    margin-top: 0.75rem;
+    font-size: 0.8rem;
+  }
+  .bar-chart-table summary {
+    color: var(--pop-muted);
+    cursor: pointer;
+  }
+  .bar-chart-table table {
+    margin-top: 0.5rem;
+  }
+  @media (max-width: 30rem) {
+    .bar-chart-row {
+      grid-template-columns: 5.5rem minmax(0, 1fr);
+      gap: 0.5rem;
+    }
+  }
+</style>

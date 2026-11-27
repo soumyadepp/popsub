@@ -689,3 +689,12 @@ html[data-has-hero] .content-panel {
 .sl-markdown-content > .section-head + * {
   margin-top: 0;
 }
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+  gap: 1rem;
+}
+.chart-grid > * {
+  margin-top: 0;
+}
