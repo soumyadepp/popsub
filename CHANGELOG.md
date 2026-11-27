@@ -16,6 +16,7 @@ A performance release. The server stores and delivers many times more messages a
 
 ### Server
 
+- Less memory: each connection's WebSocket read buffer is 16 KiB instead of 128 KiB, so 10,000 idle connections take about 390 MiB instead of 1.5 GiB, and each retained record costs about 50 bytes in memory instead of about 90.
 - Stored records are about 40% smaller (about 180 bytes for a 128-byte payload, from about 300), so a busy server writes much less to disk, and replay reads them back without parsing JSON.
 - Publishes waiting for the same topic are stored with one write and, with `synced` durability, one disk flush. A busy topic no longer pays a flush per message.
 - The default retention no longer slows a full topic to the speed of a disk flush per publish.
