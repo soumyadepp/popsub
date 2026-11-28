@@ -26,6 +26,7 @@ fn test_default_settings() {
     assert_eq!(settings.storage.retention.max_age_secs, 3600);
     assert_eq!(settings.storage.session_expiry_secs, 86_400);
     assert_eq!(settings.storage.backup_path, "pubsub_backups");
+    assert_eq!(settings.limits.max_topics_per_user, 100);
     assert_eq!(settings.broker.max_inflight, 100);
 }
 
@@ -190,6 +191,7 @@ fn limits_and_trusted_proxies_load_from_the_environment() {
     let env = std::collections::HashMap::from([
         ("LIMITS__LOGIN_ATTEMPTS".to_string(), "3".to_string()),
         ("LIMITS__PUBLISH_PER_SECOND".to_string(), "10".to_string()),
+        ("LIMITS__MAX_TOPICS_PER_USER".to_string(), "7".to_string()),
         (
             "SERVER__TRUSTED_PROXIES".to_string(),
             "10.0.0.1,192.168.0.0/16".to_string(),
@@ -200,6 +202,7 @@ fn limits_and_trusted_proxies_load_from_the_environment() {
     assert_eq!(settings.limits.login_attempts, 3);
     assert_eq!(settings.limits.publish_per_second, 10);
     assert_eq!(settings.limits.publish_burst, 50);
+    assert_eq!(settings.limits.max_topics_per_user, 7);
     assert_eq!(
         settings.server.trusted_proxies,
         vec!["10.0.0.1".to_string(), "192.168.0.0/16".to_string()]

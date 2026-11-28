@@ -38,6 +38,7 @@ ERROR_CODES = frozenset(
         "topic_not_found",
         "backup_exists",
         "backup_unsupported",
+        "topic_limit_reached",
     }
 )
 """Every error code protocol version 1 defines. Newer servers may add more."""

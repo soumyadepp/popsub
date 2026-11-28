@@ -57,8 +57,8 @@ impl ServerProcess {
     /// Starts `popsub server` on a free local port and waits until it accepts connections.
     ///
     /// The child gets a clean environment, so nothing from the caller's shell changes its
-    /// settings. Two settings always differ from the defaults: the connection limit is off and
-    /// the publish rate limit is out of reach. The data directory is a fresh temporary folder.
+    /// settings. Three settings always differ from the defaults: the connection limit and the
+    /// topic limit are off, and the publish rate limit is out of reach. The data directory is a fresh temporary folder.
     /// The admin account keeps its default name and password, which the server accepts on
     /// `127.0.0.1`.
     ///
@@ -98,6 +98,7 @@ impl ServerProcess {
                 "LIMITS__PUBLISH_BURST".to_string(),
                 UNLIMITED_PUBLISHES.to_string(),
             ),
+            ("LIMITS__MAX_TOPICS_PER_USER".to_string(), "0".to_string()),
         ];
         for (key, value) in settings {
             env.push(((*key).to_string(), (*value).to_string()));

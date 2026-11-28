@@ -4,13 +4,19 @@ Each release lists what changed for people running the server and people using a
 
 ## [Unreleased]
 
+### Upgrading from 0.3.0
+
+- **An account may create at most 100 topics.** A publish that would create one more is refused with the new error code `topic_limit_reached`. Publishing to existing topics, anyone's, is unaffected, and admins aren't limited. Set `limits.max_topics_per_user` higher, or to `0` for no limit, if your accounts create topics freely, such as one per user or per session. Topics created before upgrading count for no one.
+
 ### Server
 
+- A topic now belongs to the account whose publish created it, kept in the topic's `head.json`, and `limits.max_topics_per_user` caps how many one account creates. With each topic's retention limits, this bounds the disk one account can take.
 - Back up a running server with `popsub backup`, or the new `backup` admin request. It copies every topic, the sessions and `users.json` into a new folder under `storage.backup_path` (default `pubsub_backups`; `/backups` in the container image) while publishing carries on. `BACKUP.json` is written last, so a folder without it is unfinished. Restoring is copying the folder back to `storage.path` with the server stopped. The `memory` backend refuses with the new error code `backup_unsupported`, and a name already used gets `backup_exists`.
 - Every release is now tested against data written by each earlier one: a newer release opens an older release's data, and an older release can't be assumed to read a newer one's. `make upgrade-fixture` adds a release's data to the test when it is cut.
 
 ### Client libraries
 
+- The TypeScript, Python and Go clients know the `topic_limit_reached` error code.
 - `admin.backup()` (`Backup` in Go) in the Rust, TypeScript, Python and Go clients. Each knows the two new error codes.
 
 ### Project

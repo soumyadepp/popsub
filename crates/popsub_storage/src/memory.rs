@@ -91,6 +91,9 @@ impl MessageLog for MemoryStorage {
             return Ok(original.value.clone());
         }
         let slot = log.next_slot(&record);
+        if slot.seq == 1 {
+            log.set_creator(Some(record.publisher.clone()));
+        }
         let key = (record.publisher.clone(), record.message_id.clone());
         let stored = Record::from_new(topic, slot.seq, record, slot.published_at_ms);
         log.push(slot, stored.size(), key, stored.clone());
@@ -177,6 +180,23 @@ impl MessageLog for MemoryStorage {
         let mut topics: Vec<String> = self.logs().keys().cloned().collect();
         topics.sort();
         Ok(topics)
+    }
+
+    /// Lists the creator of every topic that has one, from memory.
+    ///
+    /// Returns:
+    ///     `(topic, creator)` pairs, sorted by topic.
+    ///
+    /// Raises:
+    ///     Never returns an error.
+    async fn creators(&self) -> Result<Vec<(String, String)>> {
+        let mut creators: Vec<(String, String)> = self
+            .logs()
+            .iter()
+            .filter_map(|(topic, log)| Some((topic.clone(), log.creator()?.to_string())))
+            .collect();
+        creators.sort();
+        Ok(creators)
     }
 }
 

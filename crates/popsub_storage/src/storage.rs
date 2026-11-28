@@ -240,6 +240,24 @@ pub trait MessageLog: Send + Sync {
     /// Raises:
     ///     StorageError::Unavailable: When the backend can't be read now.
     async fn topics(&self) -> Result<Vec<String>>;
+
+    /// Names the account that created each topic: the publisher of its
+    /// `seq` 1. A creator is kept when records are trimmed or purged, and
+    /// across reopening a persistent backend, so per-account topic limits
+    /// hold after a restart.
+    ///
+    /// The default knows no creators. A backend that keeps it lets topic
+    /// limits forget every topic created before a restart.
+    ///
+    /// Returns:
+    ///     `(topic, creator)` for every topic whose creator is known, sorted
+    ///     by topic.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the backend can't be read now.
+    async fn creators(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Durable sessions, their subscriptions, and each subscription's cursor.

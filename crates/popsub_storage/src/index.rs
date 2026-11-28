@@ -55,6 +55,9 @@ pub(crate) struct LogIndex<T> {
     bytes: u64,
     /// Maps each retained record's retry key to its `seq`.
     ids: HashMap<RetryKey, u64, ahash::RandomState>,
+    /// The publisher of `seq` 1, which created the topic, kept when records
+    /// are trimmed. `None` for a topic created before creators were kept.
+    creator: Option<String>,
 }
 
 impl<T> Default for LogIndex<T> {
@@ -86,7 +89,25 @@ impl<T> LogIndex<T> {
             last_published_at_ms,
             bytes: 0,
             ids: HashMap::default(),
+            creator: None,
         }
+    }
+
+    /// The account whose publish created the topic.
+    ///
+    /// Returns:
+    ///     The publisher of `seq` 1, or `None` when it isn't known.
+    pub(crate) fn creator(&self) -> Option<&str> {
+        self.creator.as_deref()
+    }
+
+    /// Records the account that created the topic. A backend calls it when
+    /// `seq` 1 is appended, and when it reopens a topic whose creator it kept.
+    ///
+    /// Args:
+    ///     creator: The publisher of `seq` 1.
+    pub(crate) fn set_creator(&mut self, creator: Option<String>) {
+        self.creator = creator;
     }
 
     /// Reports which sequence numbers are retained.

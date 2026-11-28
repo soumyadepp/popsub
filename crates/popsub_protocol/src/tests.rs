@@ -428,6 +428,7 @@ fn error_codes_are_snake_case() {
         (ErrorCode::TopicNotFound, "topic_not_found"),
         (ErrorCode::BackupExists, "backup_exists"),
         (ErrorCode::BackupUnsupported, "backup_unsupported"),
+        (ErrorCode::TopicLimitReached, "topic_limit_reached"),
         (ErrorCode::Internal, "internal"),
     ];
     for (code, name) in names {
@@ -637,6 +638,7 @@ fn names_match_the_wire() {
         ErrorCode::TopicNotFound,
         ErrorCode::BackupExists,
         ErrorCode::BackupUnsupported,
+        ErrorCode::TopicLimitReached,
     ] {
         assert_eq!(json!(code), json!(code.as_str()));
     }

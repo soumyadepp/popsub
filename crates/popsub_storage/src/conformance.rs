@@ -568,6 +568,47 @@ pub async fn records_survive_reopen<F: Fixture>(fixture: F) {
     assert_eq!(next, 4);
 }
 
+/// Checks that a topic's creator is the publisher of its `seq` 1, isn't
+/// changed by later publishers or by trimming every record, and survives
+/// reopening a persistent backend.
+///
+/// Args:
+///     fixture: Opens the backend.
+pub async fn the_first_publisher_creates_the_topic<F: Fixture>(fixture: F) {
+    let storage = fixture.open().await;
+    let durability = storage.capabilities().max_durability;
+    let mut from_bob = record("b1", 1);
+    from_bob.publisher = "bob".to_string();
+    storage
+        .append("t", from_bob, durability)
+        .await
+        .expect("append");
+    storage
+        .append("t", record("a1", 2), durability)
+        .await
+        .expect("append");
+    storage
+        .append("u", record("a2", 3), durability)
+        .await
+        .expect("append");
+    let everything = Retention {
+        max_messages: Some(0),
+        ..Retention::default()
+    };
+    storage.trim("t", &everything, 10).await.expect("trim");
+    let expected = vec![
+        ("t".to_string(), "bob".to_string()),
+        ("u".to_string(), "alice".to_string()),
+    ];
+    assert_eq!(storage.creators().await.expect("creators"), expected);
+    if !storage.capabilities().persistent {
+        return;
+    }
+    drop(storage);
+    let storage = fixture.open().await;
+    assert_eq!(storage.creators().await.expect("creators"), expected);
+}
+
 /// Checks that cursors and session activity survive reopening a persistent
 /// backend. Passes trivially for backends that aren't persistent.
 ///
@@ -617,6 +658,7 @@ macro_rules! conformance_tests {
             expire_removes_idle_sessions,
             records_survive_reopen,
             cursors_survive_reopen,
+            the_first_publisher_creates_the_topic,
         );
     };
     (@checks $fixture:expr; $($check:ident),* $(,)?) => {

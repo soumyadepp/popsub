@@ -14,6 +14,7 @@
 pub mod engine;
 mod frame;
 mod health;
+mod quota;
 mod replay;
 pub mod shared;
 mod sink;
@@ -26,6 +27,7 @@ pub use engine::{
 };
 pub use frame::close_message;
 pub use health::StorageHealth;
+pub use quota::TopicClaim;
 pub use shared::{Authorizer, LogSettings, SharedBroker, session_key};
 pub use sink::{MAX_IN_FLIGHT_PUBLISHES, PublishSink};
 pub use topic::{CursorUpdate, GROUP_PREFIX, Group, group_subscriber_id};

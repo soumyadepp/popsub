@@ -207,6 +207,7 @@ export const ERROR_CODES = [
   "topic_not_found",
   "backup_exists",
   "backup_unsupported",
+  "topic_limit_reached",
   "internal",
 ] as const;
 

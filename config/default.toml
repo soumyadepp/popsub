@@ -47,6 +47,7 @@ max_lockout_secs = 3600
 registrations_per_hour = 5
 publish_per_second = 100
 publish_burst = 50
+max_topics_per_user = 100
 
 [telemetry]
 enabled = false

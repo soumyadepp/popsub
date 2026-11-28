@@ -236,6 +236,11 @@
           "const": "backup_unsupported",
           "description": "The server's storage backend can't be backed up while running, such\nas the `memory` backend.",
           "type": "string"
+        },
+        {
+          "const": "topic_limit_reached",
+          "description": "The publish would create a topic, and the account has already created\nas many topics as `limits.max_topics_per_user` allows.",
+          "type": "string"
         }
       ]
     },

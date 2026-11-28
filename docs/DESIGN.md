@@ -133,7 +133,7 @@ Gauges are read from `SharedBroker::stats` at each export (every 60 seconds by d
 All frames are JSON text, tagged with `type`. The types live in `popsub_protocol`, which the server and client SDKs share. This is protocol version 1 (`PROTOCOL_VERSION`). A JSON Schema generated from those types is in `docs/protocol/` for SDKs in other languages; CI fails if it falls out of date.
 
 - **Request ids.** Any client frame may carry an `id`, a number or a string. The reply carries the same `id`. Frames the server sends on its own have none.
-- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists`, `topic_not_found`, `backup_exists`, `backup_unsupported` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
+- **Errors.** Every failure is `{"type":"error","id":...,"code":"...","message":"...","retry_after":...}`. `code` is one of `bad_request`, `unauthenticated`, `auth_failed`, `invalid_credentials`, `locked_out`, `rate_limited`, `not_authorized`, `registration_failed`, `invalid_session_id`, `session_unavailable`, `unsupported_protocol`, `storage_unavailable`, `payload_too_large`, `invalid_topic`, `forbidden`, `user_not_found`, `user_exists`, `topic_not_found`, `backup_exists`, `backup_unsupported`, `topic_limit_reached` or `internal`. `retry_after` is set for `locked_out` and `rate_limited`.
 - **Evolution.** Within a version, frames, fields and error codes are only added. Clients ignore fields and frame types they don't know, and treat an unknown error code like `internal`. Removing or changing anything needs a new version, named by the client in `auth`.
 
 Topic names in `subscribe` and `publish` are 1 to 120 bytes (the `file` backend's limit, `popsub_storage::MAX_TOPIC_BYTES`) with no control characters and no `+` or `#`, which are kept for wildcard permission patterns. Anything else gets `invalid_topic`. `subscribe` and `unsubscribe` also take a pattern, in which a whole level may be `+` (any one level) and the last level may be `#` (the rest); see wildcard subscriptions below. `publish` never does.
@@ -388,6 +388,7 @@ Environment variables name a section and a key. Keys made of one word take a sin
 | `limits.max_lockout_secs` | `3600` | Each repeat lockout doubles, up to this |
 | `limits.registrations_per_hour` | `5` | Registration attempts per address, successful or not |
 | `limits.publish_per_second`, `limits.publish_burst` | `100`, `50` | Publishes per user, shared by all their connections |
+| `limits.max_topics_per_user` | `100` | Topics one account may create; admins aren't limited, and `0` means no limit. See section 10 |
 
 Every `limits` value below 1 is treated as 1, so a limit can't be switched off by setting it to 0.
 
@@ -426,7 +427,9 @@ The defaults below are set in the `[limits]` section (section 9).
 | Failed logins | address, across all usernames | 20, then a lockout from 15 minutes that doubles up to an hour |
 | Registration attempts | address | 5 per hour, successful or not |
 | Publishing | username, shared by all of a user's connections | 100 a second, bursts of 50 |
+| Creating topics | the account whose publish created the topic | 100 topics; admins aren't limited |
 
+- A topic belongs to the account whose publish created it (the publisher of its `seq` 1), which the storage backend keeps across restarts (`MessageLog::creators`; `head.json` for the `file` backend). A publish that would create one topic more than `limits.max_topics_per_user` is refused with `topic_limit_reached` and stores nothing; publishing to topics that exist, anyone's, is never limited. With each topic's retention limits this bounds what one account can store: by default 100 topics of at most 64 MiB each. Topics are never deleted, so a purge doesn't free one; raise the limit instead. Topics created before creators were kept count for no one.
 - Keying failed logins by address and username together means someone guessing a password from one machine locks out only themselves.
 - Limits use the client's address. By default that is the socket's peer, so behind a reverse proxy every client would share the proxy's address. List the proxies in `server.trusted_proxies` and, for connections from them only, the server reads `X-Forwarded-For` from the right, skipping trusted proxies; the first other address is the client. Addresses further left were written by the client and are ignored. A header from a peer that isn't listed is ignored entirely, so a client that reaches the server directly can't choose its own address.
 - TCP load balancers can't add HTTP headers, so with `server.proxy_protocol` on, a connection from a trusted proxy must start with a PROXY protocol header (HAProxy's format, version 1 text or version 2 binary, read before TLS). Its source address replaces the peer's, and `X-Forwarded-For` processing starts from there, so a TCP load balancer in front of an HTTP proxy in front of PopSub still resolves to the client. A trusted peer that sends no valid header within the handshake deadline is dropped; a header with no address (version 1 `UNKNOWN`, version 2 `LOCAL`, as health checks send) keeps the peer's. Version 2 extension fields are skipped. Peers that aren't trusted are never asked for a header. Only list proxies you run, and make sure they append to `X-Forwarded-For` rather than pass on what the client sent unchecked.
@@ -488,23 +491,22 @@ What stands between PopSub and production use by small applications and IoT devi
 
 1. **An application's backend can't issue tokens.** A web app wants its own server to give each signed-in user a short-lived PopSub token. Tokens come only from PopSub's own login, signed with one shared HS256 secret; there is no public-key or JWKS verification and no documented way for a backend to mint them.
 2. **No HTTP publish.** Serverless functions and scheduled jobs want to publish with one HTTP request instead of holding a WebSocket open. The only HTTP endpoints are `/healthz` and `/readyz`.
-3. **No per-user storage or topic quotas.** Publishing is rate limited, but nothing caps how many topics an account creates or how much disk they take, so one account can fill the disk.
 
 **IoT devices**
 
-4. **No MQTT.** Most devices speak MQTT over TCP; a WebSocket handshake, TLS, JSON and a login is heavy for a microcontroller. The topic syntax (`+`, `#`), QoS 0 and 1 and sessions already match MQTT's, so an MQTT listener could feed the same broker.
-5. **No last will or presence.** A device can't name a message to publish if it drops off, which is how dashboards learn it went offline.
-6. **No retained latest value.** A new subscriber can ask for `{"last": 1}`, but a device can't mark a message as the current state that every newcomer gets without asking.
-7. **Credentials don't suit devices.** Logging in again needs the password on the device; there are no client certificates and no long-lived per-device keys.
-8. **Bandwidth.** JSON frames, base64 for binary bodies and no WebSocket compression all cost on metered links.
+3. **No MQTT.** Most devices speak MQTT over TCP; a WebSocket handshake, TLS, JSON and a login is heavy for a microcontroller. The topic syntax (`+`, `#`), QoS 0 and 1 and sessions already match MQTT's, so an MQTT listener could feed the same broker.
+4. **No last will or presence.** A device can't name a message to publish if it drops off, which is how dashboards learn it went offline.
+5. **No retained latest value.** A new subscriber can ask for `{"last": 1}`, but a device can't mark a message as the current state that every newcomer gets without asking.
+6. **Credentials don't suit devices.** Logging in again needs the password on the device; there are no client certificates and no long-lived per-device keys.
+7. **Bandwidth.** JSON frames, base64 for binary bodies and no WebSocket compression all cost on metered links.
 
 **Running it**
 
-9. **Capacity is measured on one laptop only, and throughput isn't steady.** `docs/BENCHMARKS.md` has the numbers from `make bench`, before and after the 0.3.0 performance work and beside NATS and Mosquitto. The four limits the first run found (a disk sync per publish under the default retention, a log line per publish, fan-out holding the broker lock, and a sync per publish with `synced`) are fixed. What it shows now: with several busy topics or large payloads the same build gives a fast result or one about a third of it; 16 KiB payloads are slower than on every broker compared; a quiet topic's latency rises beside busy ones; and a flat-out fan-out to 1,000 subscribers drops connections on macOS when the kernel runs out of socket buffer space. Nothing is measured on Linux or over a real network.
-10. **Failure tests missing:** power loss, which killing the process does not simulate, and a consumer that never reads its socket until it hits the hard queue limit and is closed with `slow_consumer`, which is only unit tested. A subscriber that stops reading for a while is tested: it is paced from the log and catches up (section 14).
-11. **A renewed certificate needs a restart,** and there is no built-in ACME (Let's Encrypt).
-12. **Metrics are push only.** They go out over OTLP; there is no Prometheus endpoint to scrape.
-13. **No mobile or embedded clients** (Swift, Kotlin, C, MicroPython). For devices, MQTT (4) matters more.
+8. **Capacity is measured on one laptop only, and throughput isn't steady.** `docs/BENCHMARKS.md` has the numbers from `make bench`, before and after the 0.3.0 performance work and beside NATS and Mosquitto. The four limits the first run found (a disk sync per publish under the default retention, a log line per publish, fan-out holding the broker lock, and a sync per publish with `synced`) are fixed. What it shows now: with several busy topics or large payloads the same build gives a fast result or one about a third of it; 16 KiB payloads are slower than on every broker compared; a quiet topic's latency rises beside busy ones; and a flat-out fan-out to 1,000 subscribers drops connections on macOS when the kernel runs out of socket buffer space. Nothing is measured on Linux or over a real network.
+9. **Failure tests missing:** power loss, which killing the process does not simulate, and a consumer that never reads its socket until it hits the hard queue limit and is closed with `slow_consumer`, which is only unit tested. A subscriber that stops reading for a while is tested: it is paced from the log and catches up (section 14).
+10. **A renewed certificate needs a restart,** and there is no built-in ACME (Let's Encrypt).
+11. **Metrics are push only.** They go out over OTLP; there is no Prometheus endpoint to scrape.
+12. **No mobile or embedded clients** (Swift, Kotlin, C, MicroPython). For devices, MQTT (3) matters more.
 
 ## 13. Proposed direction
 

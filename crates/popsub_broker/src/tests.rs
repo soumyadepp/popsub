@@ -1590,3 +1590,111 @@ fn a_batch_survives_a_subscriber_leaving_between_lock_holds() {
         }
     }
 }
+
+/// Checks that claiming topics counts new ones against the publishing
+/// account, refuses a new one at the limit, always allows existing topics,
+/// and keeps each account's count separate.
+#[tokio::test]
+async fn topic_claims_stop_at_the_limit() {
+    use crate::TopicClaim;
+    let broker = shared(Retention::default());
+    let limit = Some(2);
+    assert_eq!(
+        broker
+            .claim_topic("a", "alice", limit)
+            .await
+            .expect("claim"),
+        TopicClaim::Created
+    );
+    assert_eq!(
+        broker
+            .claim_topic("b", "alice", limit)
+            .await
+            .expect("claim"),
+        TopicClaim::Created
+    );
+    assert_eq!(
+        broker
+            .claim_topic("c", "alice", limit)
+            .await
+            .expect("claim"),
+        TopicClaim::LimitReached { limit: 2 }
+    );
+    assert_eq!(
+        broker
+            .claim_topic("a", "alice", limit)
+            .await
+            .expect("claim"),
+        TopicClaim::Existing
+    );
+    assert_eq!(
+        broker.claim_topic("b", "bob", limit).await.expect("claim"),
+        TopicClaim::Existing
+    );
+    assert_eq!(
+        broker.claim_topic("c", "bob", limit).await.expect("claim"),
+        TopicClaim::Created
+    );
+    assert_eq!(
+        broker.claim_topic("d", "alice", None).await.expect("claim"),
+        TopicClaim::Created
+    );
+    assert_eq!(broker.topics_created_by("alice").await.expect("count"), 3);
+    assert_eq!(broker.topics_created_by("bob").await.expect("count"), 1);
+}
+
+/// Checks that topic counts are rebuilt from storage when a broker is
+/// rebuilt on the same storage, so the limit holds across a restart.
+#[tokio::test]
+async fn topic_counts_survive_a_restart() {
+    use crate::TopicClaim;
+    let storage = Arc::new(MemoryStorage::new());
+    let first = shared_on(
+        Settings::default().broker,
+        storage.clone(),
+        Retention::default(),
+    );
+    for topic in ["a", "b"] {
+        assert_eq!(
+            first
+                .claim_topic(topic, "alice", Some(2))
+                .await
+                .expect("claim"),
+            TopicClaim::Created
+        );
+        first
+            .publish(topic, new_record("", 1))
+            .await
+            .expect("publish");
+    }
+    drop(first);
+    let second = shared_on(Settings::default().broker, storage, Retention::default());
+    assert_eq!(second.topics_created_by("alice").await.expect("count"), 2);
+    assert_eq!(
+        second
+            .claim_topic("c", "alice", Some(2))
+            .await
+            .expect("claim"),
+        TopicClaim::LimitReached { limit: 2 }
+    );
+}
+
+/// Checks that a topic the server creates itself, such as the dead letter
+/// topic, counts against no account and exists for everyone afterwards.
+#[tokio::test]
+async fn topics_the_server_creates_count_against_no_one() {
+    use crate::TopicClaim;
+    let broker = shared(Retention::default());
+    assert_eq!(broker.topics_created_by("alice").await.expect("count"), 0);
+    let mut dead = new_record("", 1);
+    dead.publisher = "popsub".to_string();
+    broker.publish("dead", dead).await.expect("publish");
+    assert_eq!(
+        broker
+            .claim_topic("dead", "alice", Some(0))
+            .await
+            .expect("claim"),
+        TopicClaim::Existing
+    );
+    assert_eq!(broker.topics_created_by("alice").await.expect("count"), 0);
+}
