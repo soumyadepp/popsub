@@ -491,6 +491,34 @@ impl MessageLog for FileStorage {
         topics.sort();
         Ok(topics)
     }
+
+    /// Lists the creator of every topic that has one, from each topic's
+    /// head as it was read at open or written since. Runs on the blocking
+    /// pool, since a topic's lock can be held by a write in progress.
+    ///
+    /// Returns:
+    ///     `(topic, creator)` pairs, sorted by topic.
+    ///
+    /// Raises:
+    ///     StorageError::Other: When the blocking task panics.
+    async fn creators(&self) -> Result<Vec<(String, String)>> {
+        self.blocking(|inner| {
+            let topics: Vec<(String, Arc<Mutex<TopicFiles>>)> = lock(&inner.topics)
+                .iter()
+                .map(|(name, topic)| (name.clone(), topic.clone()))
+                .collect();
+            let mut creators: Vec<(String, String)> = topics
+                .into_iter()
+                .filter_map(|(name, topic)| {
+                    let creator = lock(&topic).creator()?.to_string();
+                    Some((name, creator))
+                })
+                .collect();
+            creators.sort();
+            Ok(creators)
+        })
+        .await
+    }
 }
 
 #[async_trait]

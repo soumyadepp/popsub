@@ -40,6 +40,7 @@ The connection stays open after these.
 | `user_exists` | That username is taken |
 | `topic_not_found` | Nothing was ever published to that topic |
 | `backup_exists` | A backup with that name already exists |
+| `topic_limit_reached` | The publish would create a topic, and the account has already created as many as `limits.max_topics_per_user` allows |
 | `backup_unsupported` | The server's storage can't be backed up while it runs, such as the `memory` backend |
 
 `invalid_credentials` and `registration_failed` never say whether a username exists.

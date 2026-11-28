@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::engine::Broker;
+use crate::quota::{TopicClaim, TopicOwners};
 use crate::sink::{ClientReply, PublishReply, PublishSink};
 use crate::writer::{Command, Published, SubscribeOutcome, TopicWriter};
 use popsub_protocol::{CloseCode, RequestId, StartFrom};
@@ -182,6 +183,9 @@ pub struct SharedBroker {
     authorizer: Arc<std::sync::OnceLock<Authorizer>>,
     /// The runtime topic writers run on, when they have their own.
     writer_runtime: Option<tokio::runtime::Handle>,
+    /// Who created each topic and how many each account created, loaded
+    /// from storage on first use.
+    owners: Arc<tokio::sync::OnceCell<Mutex<TopicOwners>>>,
 }
 
 /// Decides whether a user (first argument) may subscribe to a topic (second).
@@ -233,6 +237,7 @@ impl SharedBroker {
             topic_retention: Arc::new(Vec::new()),
             authorizer: Arc::new(std::sync::OnceLock::new()),
             writer_runtime: None,
+            owners: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -616,6 +621,75 @@ impl SharedBroker {
         sink.queue(topic, Command::Publish { record, reply });
     }
 
+    /// Decides whether a publish may go to a topic under the limit on how
+    /// many topics one account may create, and counts a new topic against
+    /// the account when it may.
+    ///
+    /// Call it before `publish_from`. Two publishes racing to create topics
+    /// can't both get past the limit: the check and the count happen
+    /// together. A claimed topic stays counted even if its first append
+    /// then fails; after a restart, only topics with a stored creator count.
+    ///
+    /// Args:
+    ///     topic: The topic being published to.
+    ///     username: The publishing account.
+    ///     limit: The most topics the account may create, or `None` for no limit.
+    ///
+    /// Returns:
+    ///     Whether the topic exists, was just created, or is over the limit.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the topics and their creators
+    ///         can't be read from storage the first time.
+    pub async fn claim_topic(
+        &self,
+        topic: &str,
+        username: &str,
+        limit: Option<usize>,
+    ) -> StorageResult<TopicClaim> {
+        let owners = self.topic_owners().await?;
+        Ok(owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .claim(topic, username, limit))
+    }
+
+    /// How many topics an account has created.
+    ///
+    /// Args:
+    ///     username: The account.
+    ///
+    /// Returns:
+    ///     The count.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the topics and their creators
+    ///         can't be read from storage the first time.
+    pub async fn topics_created_by(&self, username: &str) -> StorageResult<usize> {
+        let owners = self.topic_owners().await?;
+        Ok(owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .count(username))
+    }
+
+    /// The topic counts, loaded from the storage backend the first time.
+    ///
+    /// Returns:
+    ///     The counts behind their lock.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When storage can't be read.
+    async fn topic_owners(&self) -> StorageResult<&Mutex<TopicOwners>> {
+        self.owners
+            .get_or_try_init(|| async {
+                let topics = self.storage.topics().await?;
+                let creators = self.storage.creators().await?;
+                Ok(Mutex::new(TopicOwners::from_storage(topics, creators)))
+            })
+            .await
+    }
+
     /// Returns the queue of a topic's writer, starting the writer if needed.
     ///
     /// Args:
@@ -676,6 +750,12 @@ impl SharedBroker {
                 )))
             })?;
             if published.seq == 1 && !published.duplicate {
+                if let Some(owners) = broker.owners.get() {
+                    owners
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .note(&topic);
+                }
                 broker.join_pattern_holders(&topic).await;
             }
             Ok(published)

@@ -24,6 +24,7 @@
 //! `&self` and its user store does its own locking.
 
 mod admin;
+mod topic_limit;
 
 use popsub_utils::pii::pii;
 use std::collections::HashMap;
@@ -360,6 +361,8 @@ pub struct Server {
     proxy_protocol: bool,
     /// The directory the `backup` admin request writes backups into.
     backup_dir: std::path::PathBuf,
+    /// How many topics one non-admin account may create, or `None` for no limit.
+    max_topics_per_user: Option<usize>,
     /// Whether a backup is running, shared by every clone, so only one runs at a time.
     backup_running: Arc<AtomicBool>,
 }
@@ -397,6 +400,9 @@ impl Server {
             tls: None,
             proxy_protocol: false,
             backup_dir: std::path::PathBuf::from("pubsub_backups"),
+            max_topics_per_user: usize::try_from(LimitSettings::default().max_topics_per_user)
+                .ok()
+                .filter(|max| *max > 0),
             backup_running: Arc::new(AtomicBool::new(false)),
             broker,
         }
@@ -524,6 +530,19 @@ impl Server {
     ///     The server with the setting applied.
     pub fn with_proxy_protocol(mut self, enabled: bool) -> Self {
         self.proxy_protocol = enabled;
+        self
+    }
+
+    /// Sets how many topics one account may create, in place of the
+    /// `[limits]` default of 100. Admins aren't limited.
+    ///
+    /// Args:
+    ///     max: The most topics, or `None` for no limit.
+    ///
+    /// Returns:
+    ///     The server with the limit set.
+    pub fn with_max_topics_per_user(mut self, max: Option<usize>) -> Self {
+        self.max_topics_per_user = max;
         self
     }
 
@@ -1109,6 +1128,9 @@ struct AuthState {
     /// The last topic this connection was allowed to publish to, and the
     /// user store's revision at the time.
     publish_grant: Option<(u64, String)>,
+    /// The last topic this connection found to exist, or created, under the
+    /// topic limit. Topics are never deleted, so it never goes stale.
+    claimed_topic: Option<String>,
 }
 
 /// The current time in milliseconds since the Unix epoch.
@@ -2402,6 +2424,11 @@ impl Session {
                 format!("not authorized to publish to '{topic}'"),
                 None,
             )?;
+            return Ok(Flow::Continue);
+        }
+        if let Err((code, message)) = self.may_create(&username, topic).await {
+            warn!(client_id = %self.client_id, username = %pii(&username), topic, code = code.as_str(), "publish refused by the topic limit");
+            self.fail(id, code, message, None)?;
             return Ok(Flow::Continue);
         }
         let limiter = &self.server.limiters.message_limiter;

@@ -108,6 +108,9 @@ const (
 	// CodeBackupUnsupported is a backup request to a server whose storage
 	// backend can't be backed up while it runs, such as the memory backend.
 	CodeBackupUnsupported ErrorCode = "backup_unsupported"
+	// CodeTopicLimitReached is a publish that would create a topic when the
+	// account has already created as many as limits.max_topics_per_user allows.
+	CodeTopicLimitReached ErrorCode = "topic_limit_reached"
 	// CodeInternal is a failure inside the server, or a code this client
 	// does not know.
 	CodeInternal ErrorCode = "internal"
@@ -122,7 +125,8 @@ var knownCodes = map[ErrorCode]bool{
 	CodeSessionUnavailable: true, CodeUnsupportedProtocol: true, CodeStorageUnavailable: true,
 	CodePayloadTooLarge: true, CodeInvalidTopic: true, CodeForbidden: true,
 	CodeUserNotFound: true, CodeUserExists: true, CodeTopicNotFound: true,
-	CodeBackupExists: true, CodeBackupUnsupported: true, CodeInternal: true,
+	CodeBackupExists: true, CodeBackupUnsupported: true, CodeTopicLimitReached: true,
+	CodeInternal: true,
 }
 
 // normalizeCode maps a code from the wire to an ErrorCode, treating codes

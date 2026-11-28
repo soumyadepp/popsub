@@ -197,13 +197,18 @@ pub struct LimitSettings {
     pub publish_per_second: u64,
     /// How many publishes a user may send at once before the per-second rate applies.
     pub publish_burst: u64,
+    /// How many topics one account may create, where a topic belongs to the
+    /// account whose publish created it. With each topic's retention
+    /// limits, this bounds the disk one account can fill. Admins aren't
+    /// limited. 0 means no limit.
+    pub max_topics_per_user: u64,
 }
 
 impl Default for LimitSettings {
     /// Builds the default limits: 5 failed logins per address and username
     /// (5 minute lockout), 20 per address (15 minutes), lockouts growing to
-    /// an hour, 5 registrations per address per hour, and 100 publishes per
-    /// second per user with bursts of 50.
+    /// an hour, 5 registrations per address per hour, 100 publishes per
+    /// second per user with bursts of 50, and 100 topics created per account.
     ///
     /// Returns:
     ///     The default `[limits]` section.
@@ -217,6 +222,7 @@ impl Default for LimitSettings {
             registrations_per_hour: 5,
             publish_per_second: 100,
             publish_burst: 50,
+            max_topics_per_user: 100,
         }
     }
 }

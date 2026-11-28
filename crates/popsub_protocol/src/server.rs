@@ -206,6 +206,9 @@ pub enum ErrorCode {
     /// The server's storage backend can't be backed up while running, such
     /// as the `memory` backend.
     BackupUnsupported,
+    /// The publish would create a topic, and the account has already created
+    /// as many topics as `limits.max_topics_per_user` allows.
+    TopicLimitReached,
 }
 
 impl ErrorCode {
@@ -236,6 +239,7 @@ impl ErrorCode {
             ErrorCode::TopicNotFound => "topic_not_found",
             ErrorCode::BackupExists => "backup_exists",
             ErrorCode::BackupUnsupported => "backup_unsupported",
+            ErrorCode::TopicLimitReached => "topic_limit_reached",
         }
     }
 }

@@ -43,7 +43,7 @@ pub(crate) struct Location {
 }
 
 /// The contents of `head.json`.
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Head {
     /// The oldest retained `seq`. Records below it were trimmed, even if
     /// their segment file still exists.
@@ -52,6 +52,10 @@ struct Head {
     last_seq: u64,
     /// The highest publish time ever appended when the head was written.
     last_published_at_ms: i64,
+    /// The publisher of `seq` 1, which created the topic. Absent in heads
+    /// written before creators were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creator: Option<String>,
 }
 
 /// One segment file.
@@ -152,6 +156,7 @@ impl TopicFiles {
         let mut segments = Vec::with_capacity(first_seqs.len());
         let mut expected: Option<u64> = None;
         let mut scanned_last = (0, 0);
+        let mut scanned_creator = None;
         let newest = first_seqs.len().saturating_sub(1);
         for (position, &first_seq) in first_seqs.iter().enumerate() {
             let path = segment_path(dir, first_seq);
@@ -197,6 +202,9 @@ impl TopicFiles {
                         }
                         expected_here = record.seq + 1;
                         scanned_last = (record.seq, record.published_at_ms);
+                        if record.seq == 1 {
+                            scanned_creator = Some(record.publisher.clone());
+                        }
                         if record.seq >= head.first_seq {
                             let slot = crate::index::Slot {
                                 seq: record.seq,
@@ -223,6 +231,7 @@ impl TopicFiles {
                 head.last_published_at_ms.max(scanned_last.1),
             );
         }
+        index.set_creator(head.creator.clone().or(scanned_creator));
         Ok(Self {
             topic: topic.to_string(),
             dir: dir.to_path_buf(),
@@ -318,6 +327,13 @@ impl TopicFiles {
                 self.write_run(&mut run, durability, &mut results);
             }
             let slot = self.index.next_slot(&record);
+            if slot.seq == 1
+                && self.index.creator().is_none()
+                && let Err(e) = self.record_creator(&record.publisher)
+            {
+                results.push(Err(e));
+                continue;
+            }
             if let Err(e) = self.ensure_segment(slot.seq, durability) {
                 results.push(Err(e));
                 continue;
@@ -605,6 +621,39 @@ impl TopicFiles {
         (removed, bounds.is_empty() || segment_is_empty)
     }
 
+    /// The account whose publish created the topic.
+    ///
+    /// Returns:
+    ///     The publisher of `seq` 1, or `None` for a topic created before
+    ///     creators were kept.
+    pub(crate) fn creator(&self) -> Option<&str> {
+        self.index.creator()
+    }
+
+    /// Writes `head.json` naming the topic's creator before its first record
+    /// is written, so a crash can't lose who created it, then keeps it in
+    /// the index.
+    ///
+    /// Args:
+    ///     creator: The publisher of `seq` 1.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the head can't be written.
+    fn record_creator(&mut self, creator: &str) -> Result<()> {
+        let bounds = self.index.bounds();
+        write_head(
+            &self.dir,
+            Head {
+                first_seq: bounds.first_seq,
+                last_seq: bounds.last_seq,
+                last_published_at_ms: self.index.last_published_at_ms(),
+                creator: Some(creator.to_string()),
+            },
+        )?;
+        self.index.set_creator(Some(creator.to_string()));
+        Ok(())
+    }
+
     /// Writes `head.json` and deletes the segments left with no records.
     ///
     /// The head file is rewritten before any segment is deleted, so a crash
@@ -621,6 +670,7 @@ impl TopicFiles {
                 first_seq: bounds.first_seq,
                 last_seq: bounds.last_seq,
                 last_published_at_ms: self.index.last_published_at_ms(),
+                creator: self.index.creator().map(str::to_string),
             },
         )?;
         self.head_stale = false;
@@ -685,6 +735,7 @@ impl TopicFiles {
                 first_seq: bounds.first_seq,
                 last_seq: bounds.last_seq,
                 last_published_at_ms: self.index.last_published_at_ms(),
+                creator: self.index.creator().map(str::to_string),
             },
             segments,
             records,

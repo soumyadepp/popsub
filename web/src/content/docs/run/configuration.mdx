@@ -50,6 +50,7 @@ Set both of these:
 | `server.allow_registration` | `false` | Let clients create their own accounts |
 | `server.max_payload_bytes` | 1 MiB | The largest message |
 | `broker.max_connections` | `1000` | Connections at once. `0` means no limit. |
+| `limits.max_topics_per_user` | `100` | Topics one account may create. Admins aren't limited. `0` means no limit. |
 | `broker.dead_letter_topic` | none | Where messages go after running out of retries |
 | `server.tls_cert`, `server.tls_key` | none | Serve `wss://`. See [Deploy](/run/deployment/#tls). |
 | `server.health_address` | none | Serve health checks, such as `0.0.0.0:9091` |

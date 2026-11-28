@@ -3054,3 +3054,58 @@ async fn a_backup_of_the_memory_backend_is_refused() {
         .unwrap_or(0);
     assert_eq!(left, 0);
 }
+
+/// Checks the topic limit: a user's publishes create topics up to the limit,
+/// one more is refused with `topic_limit_reached` and nothing is stored,
+/// topics that exist (including another account's) stay open to it, and an
+/// admin isn't limited.
+#[tokio::test]
+async fn publishing_stops_creating_topics_at_the_limit() {
+    let settings = Settings::default();
+    let (addr, broker, _accepting) = start_server_on_with(
+        &settings,
+        RateLimiters::default(),
+        Arc::new(MemoryStorage::new()),
+        Durability::None,
+        |server| server.with_max_topics_per_user(Some(2)),
+    )
+    .await;
+    let mut admin = admin_connection(addr, &settings).await;
+    let created = request(
+        &mut admin,
+        serde_json::json!({"type": "create_user", "id": 1, "username": "erin", "password": "erin-password", "role": {"kind": "user", "topics": [{"pattern": "#", "access": "both"}]}}),
+    )
+    .await;
+    assert_eq!(created["type"], "user", "{created}");
+    let shared = request(
+        &mut admin,
+        serde_json::json!({"type": "publish", "id": 2, "topic": "shared", "payload": "x", "qos": 1}),
+    )
+    .await;
+    assert_eq!(shared["type"], "published", "{shared}");
+    let (mut erin, _) = user_connection(addr, "erin", "erin-password").await;
+    for (n, topic) in ["a", "b", "a", "shared"].into_iter().enumerate() {
+        let published = request(
+            &mut erin,
+            serde_json::json!({"type": "publish", "id": n, "topic": topic, "payload": "x", "qos": 1}),
+        )
+        .await;
+        assert_eq!(published["type"], "published", "{topic}: {published}");
+    }
+    let refused = request(
+        &mut erin,
+        serde_json::json!({"type": "publish", "id": 10, "topic": "c", "payload": "x", "qos": 1}),
+    )
+    .await;
+    assert_eq!(refused["code"], "topic_limit_reached", "{refused}");
+    assert!(broker.topic_info("c").await.expect("info").is_none());
+    assert_eq!(broker.topics_created_by("erin").await.expect("count"), 2);
+    for n in 0..3 {
+        let published = request(
+            &mut admin,
+            serde_json::json!({"type": "publish", "id": 20 + n, "topic": format!("admin-{n}"), "payload": "x", "qos": 1}),
+        )
+        .await;
+        assert_eq!(published["type"], "published", "{published}");
+    }
+}

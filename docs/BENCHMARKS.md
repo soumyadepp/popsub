@@ -51,6 +51,7 @@ Against the other brokers, on the same machine in the same run:
 | Broker | Setting | Benchmark value | Why |
 |---|---|---|---|
 | PopSub | `limits.publish_per_second`, `limits.publish_burst` | Out of reach | The default is 100 publishes a second per account |
+| PopSub | `limits.max_topics_per_user` | `0` (no limit) | The default is 100 topics per account, and the 1,000-topic scenario's publishers create more |
 | PopSub | `broker.max_connections` | No limit | The default is 1,000 |
 | PopSub | `storage.retention.*` | Keeps everything for the run | So trimming isn't part of what a scenario measures. `one-topic-default-retention` leaves it alone |
 | Mosquitto | `persistence` | Off | Its default |

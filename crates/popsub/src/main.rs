@@ -290,7 +290,12 @@ async fn run_server(
         .await
         .with_rate_limiters(RateLimiters::from_settings(&config.limits))
         .with_trusted_proxies(proxies)
-        .with_backup_dir(&config.storage.backup_path);
+        .with_backup_dir(&config.storage.backup_path)
+        .with_max_topics_per_user(
+            usize::try_from(config.limits.max_topics_per_user)
+                .ok()
+                .filter(|max| *max > 0),
+        );
     if let Some(tls) = tls {
         server = server.with_tls(tls);
     }

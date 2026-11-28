@@ -152,6 +152,17 @@ impl MessageLog for FaultyStorage {
     async fn topics(&self) -> Result<Vec<String>> {
         self.inner.topics().await
     }
+
+    /// Lists creators through the wrapped backend.
+    ///
+    /// Returns:
+    ///     The wrapped backend's `(topic, creator)` pairs.
+    ///
+    /// Raises:
+    ///     StorageError::Unavailable: When the wrapped backend fails.
+    async fn creators(&self) -> Result<Vec<(String, String)>> {
+        self.inner.creators().await
+    }
 }
 
 #[async_trait]

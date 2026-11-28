@@ -195,6 +195,7 @@ The settings you are most likely to change:
 | `telemetry.enabled`, `telemetry.sample_ratio` | `false`, `1.0` | Export metrics, traces and logs over OTLP; see [Metrics, traces and logs](#metrics-traces-and-logs) |
 | `server.health_address` | none | Serve `/healthz` and `/readyz` here, such as `0.0.0.0:9091` |
 | `server.tls_cert`, `server.tls_key` | none | PEM certificate chain and key; set both to serve `wss://` |
+| `limits.max_topics_per_user` | `100` | Topics one account may create, so one account can't fill the disk; admins aren't limited, `0` means no limit |
 | `limits.*` | see [`docs/DESIGN.md`](docs/DESIGN.md) section 9 | Failed logins before a lockout, lockout lengths, registrations per hour, publishes per second |
 
 Topics can keep different amounts of history:
